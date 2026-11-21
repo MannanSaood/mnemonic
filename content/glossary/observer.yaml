@@ -1,0 +1,12 @@
+- id: observer-subject
+  term: Subject
+  short: In Observer, the object that keeps a list of subscribers and notifies each of them when something happens. Also called the publisher.
+- id: lapsed-listener
+  term: Lapsed listener
+  short: A subscriber that is no longer needed but was never unsubscribed. The subject still holds it, so it is never freed and still runs on every event.
+- id: transactional-outbox
+  term: Transactional outbox
+  short: Writing an event to a table in the same database transaction as the change it describes, so a separate process can publish it reliably afterwards.
+- id: weak-reference
+  term: Weak reference
+  short: A reference that does not keep its target alive. When nothing else refers to the target, the garbage collector may free it and the weak reference becomes empty.

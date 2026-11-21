@@ -1,0 +1,621 @@
+---
+title: Observer
+track: design-patterns
+group: Behavioral
+order: 46
+summary: Let an object announce that something happened, and let any number of other objects subscribe to hear about it, without the announcer knowing who they are.
+intent: When one thing happens, several parts of the system react, and the code where it happens should not change each time a new reaction is added.
+changeRequest: The risk team needs every new order sent to their fraud-scoring service.
+languages: [go, python, typescript, rust]
+glossary: [observer-subject, interface, lapsed-listener, transactional-outbox, weak-reference, open-closed]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: observer
+  scenarios:
+    - try: "Make the email listener throw, then place an order."
+      notice: "In the in-process loop the customer sees an error for an order that was saved, and Inventory and Analytics are never called. Behind a queue, checkout is unaffected and the email waits for a retry."
+    - try: "Subscribe Fraud, set it to Slow, and place an order."
+      notice: "The in-process checkout now takes over 2.5 s and times out. The order service never mentions Fraud, yet it waits for it on every order."
+    - try: "Untick unsubscribe-on-close, open and close two admin tabs, then place five orders."
+      notice: "The closed tabs are still in the listener list and run on every order. This is the lapsed listener: a leak that nothing reports."
+    - try: "Set the broken listener back to OK."
+      notice: "The queue delivers every message it held. The in-process deliveries that were skipped are gone for good."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: main, sub: passes clients }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: main, sub: subscribes }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: OrderService, sub: calls each client }
+      after:  { x: 168, y: 30, w: 150, h: 56, title: OrderService, sub: list of listeners }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 30, w: 180, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 180, h: 56, title: OrderListener, sub: { go: OnOrderPlaced(e), python: "Callable[[OrderPlaced], None]", typescript: "(e) => void", rust: on_order_placed(&e) } }
+    - id: email
+      kind: concrete
+      before: { x: 188, y: 88, w: 222, h: 32, title: { go: mailer.SendConfirmation, python: mailer.send_confirmation, typescript: mailer.sendConfirmation, rust: mailer.send_confirmation } }
+      after:  { x: 270, y: 204, w: 66, h: 40, title: Email }
+    - id: inventory
+      kind: concrete
+      before: { x: 188, y: 128, w: 222, h: 32, title: { go: stock.Reserve, python: stock.reserve, typescript: stock.reserve, rust: stock.reserve } }
+      after:  { x: 342, y: 204, w: 66, h: 40, title: Stock }
+    - id: analytics
+      kind: concrete
+      before: { x: 188, y: 168, w: 222, h: 32, title: { go: analytics.Track, python: analytics.track, typescript: analytics.track, rust: analytics.track } }
+      after:  { x: 414, y: 204, w: 66, h: 40, title: Analytics }
+    - id: fraud
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 214, w: 222, h: 32, title: { go: fraud.Score, python: fraud.score, typescript: fraud.score, rust: fraud.score } }
+      after:  { x: 486, y: 204, w: 66, h: 40, title: Fraud }
+  edges:
+    - { from: client, to: context, label: subscribes }
+    - { from: context, to: strategy, label: notifies }
+    - { from: email, to: strategy, kind: implements }
+    - { from: inventory, to: strategy, kind: implements, label: implements }
+    - { from: analytics, to: strategy, kind: implements }
+    - { from: fraud, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: orders.go · main.go
+      source: |
+        // orders.go
+        type OrderService struct {
+            repo      OrderRepo
+            mailer    *email.Client
+            stock     *inventory.Client
+            analytics *analytics.Client
+        }
+
+        func (s *OrderService) PlaceOrder(ctx context.Context, o Order) error {
+            if err := s.repo.Save(ctx, o); err != nil {
+                return err
+            }
+            // best effort: each client logs its own failures
+            s.mailer.SendConfirmation(ctx, o.Email, o.ID)
+            s.stock.Reserve(ctx, o.Items)
+            s.analytics.Track(ctx, "order_placed", o.ID, o.Total)
+            return nil
+        }
+
+        // main.go
+        svc := &OrderService{repo: repo, mailer: mailer, stock: stock, analytics: tracker}
+      roles: { context: [2, 18], email: [14, 14], inventory: [15, 15], analytics: [16, 16], client: [21, 21] }
+      change:
+        - { after: 6, add: ['    fraud     *fraud.Client'] }
+        - { after: 16, add: ['    s.fraud.Score(ctx, o.ID, o.Total)'] }
+        - { line: 21, replace: 'svc := &OrderService{repo: repo, mailer: mailer, stock: stock, analytics: tracker, fraud: scorer}' }
+    after:
+      file: orders.go · main.go
+      source: |
+        type OrderPlaced struct {
+            OrderID string
+            Email   string
+            Items   []Item
+            Total   Money
+        }
+
+        type OrderListener interface {
+            OnOrderPlaced(ctx context.Context, e OrderPlaced)
+        }
+
+        type OrderService struct {
+            repo      OrderRepo
+            listeners []OrderListener
+        }
+
+        func (s *OrderService) Subscribe(l OrderListener) {
+            s.listeners = append(s.listeners, l)
+        }
+
+        func (s *OrderService) PlaceOrder(ctx context.Context, o Order) error {
+            if err := s.repo.Save(ctx, o); err != nil {
+                return err
+            }
+            e := OrderPlaced{o.ID, o.Email, o.Items, o.Total}
+            for _, l := range s.listeners {
+                l.OnOrderPlaced(ctx, e)
+            }
+            return nil
+        }
+
+        // main.go: wiring
+        svc.Subscribe(mailer)
+        svc.Subscribe(stock)
+        svc.Subscribe(tracker)
+      roles: { strategy: [8, 10], context: [12, 30], client: [32, 35], subscribe: [17, 19], event: [25, 25], notify: [26, 28] }
+    again:
+      file: fraud.go
+      source: |
+        // fraud.go: a new type; OrderService does not change
+        type FraudScorer struct{ client *fraud.Client }
+
+        func (f FraudScorer) OnOrderPlaced(ctx context.Context, e OrderPlaced) {
+            f.client.Score(ctx, e.OrderID, e.Total)
+        }
+
+        // main.go: one more line of wiring
+        svc.Subscribe(FraudScorer{client: scorer})
+    cost:
+      before: { text: 3 lines · 3 places, value: 0.7 }
+      after: { text: 1 new type · 1 wiring line, value: 0.18 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A slice of small interfaces or of `func(OrderPlaced)` values covers most cases. Funcs are not comparable in Go, so `Subscribe` should return an unsubscribe func rather than ask for the listener back. When listeners must not slow the caller, hand each one a channel instead, and decide what happens when it is full.'
+      seenIn: '`signal.Notify(c, os.Interrupt)` registers a channel to be told about signals, and `signal.Stop(c)` unsubscribes it. `context.AfterFunc(ctx, f)` subscribes `f` to cancellation and returns a `stop` func. `http.Server.RegisterOnShutdown` registers shutdown listeners.'
+
+  python:
+    before:
+      file: orders.py · main.py
+      source: |
+        # orders.py
+        class OrderService:
+            def __init__(self, repo, mailer, stock, analytics):
+                self.repo = repo
+                self.mailer = mailer
+                self.stock = stock
+                self.analytics = analytics
+
+            def place_order(self, order: Order) -> None:
+                self.repo.save(order)
+                self.mailer.send_confirmation(order.email, order.id)
+                self.stock.reserve(order.items)
+                self.analytics.track("order_placed", order.id, order.total)
+
+        # main.py
+        service = OrderService(repo, mailer, stock, tracker)
+      roles: { context: [2, 13], email: [11, 11], inventory: [12, 12], analytics: [13, 13], client: [16, 16] }
+      change:
+        - { line: 3, replace: '    def __init__(self, repo, mailer, stock, analytics, fraud):' }
+        - { after: 7, add: ['        self.fraud = fraud'] }
+        - { after: 13, add: ['        self.fraud.score(order.id, order.total)'] }
+        - { line: 16, replace: 'service = OrderService(repo, mailer, stock, tracker, scorer)' }
+    after:
+      file: orders.py · main.py
+      source: |
+        from dataclasses import dataclass
+        from typing import Callable
+
+        @dataclass(frozen=True)
+        class OrderPlaced:
+            order_id: str
+            email: str
+            items: list[Item]
+            total: Decimal
+
+        Listener = Callable[[OrderPlaced], None]
+
+        class OrderService:
+            def __init__(self, repo: OrderRepo):
+                self.repo = repo
+                self._listeners: list[Listener] = []
+
+            def subscribe(self, listener: Listener) -> Callable[[], None]:
+                self._listeners.append(listener)
+                return lambda: self._listeners.remove(listener)
+
+            def place_order(self, order: Order) -> None:
+                self.repo.save(order)
+                event = OrderPlaced(order.id, order.email, order.items, order.total)
+                for listener in list(self._listeners):
+                    listener(event)
+
+        # main.py: wiring
+        service.subscribe(mailer.on_order_placed)
+        service.subscribe(stock.on_order_placed)
+        service.subscribe(tracker.on_order_placed)
+      roles: { strategy: [11, 11], context: [13, 26], client: [28, 31], subscribe: [18, 20], event: [24, 24], notify: [25, 26] }
+    again:
+      file: fraud.py
+      source: |
+        # fraud.py: a new function; OrderService does not change
+        def score_order(event: OrderPlaced) -> None:
+            fraud_client.score(event.order_id, event.total)
+
+        # main.py: one more line of wiring
+        service.subscribe(score_order)
+    cost:
+      before: { text: 4 lines · 3 places, value: 0.75 }
+      after: { text: 1 new function · 1 wiring line, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A listener is just a callable: a function, a bound method or a lambda. Returning an unsubscribe function from `subscribe` keeps the caller from having to hold on to the exact callable. Loop over a copy of the list, so a listener that unsubscribes itself does not make the loop skip its neighbour.'
+      seenIn: 'Django signals: `post_save.connect(receiver)`. `atexit.register(func)`. `logging.Logger.addHandler(handler)`, where every handler hears every record. `asyncio.Future.add_done_callback(fn)`.'
+
+  typescript:
+    before:
+      file: order-service.ts · main.ts
+      source: |
+        // order-service.ts
+        export class OrderService {
+          constructor(
+            private repo: OrderRepo,
+            private mailer: Mailer,
+            private stock: InventoryClient,
+            private analytics: Analytics,
+          ) {}
+
+          async placeOrder(order: Order): Promise<void> {
+            await this.repo.save(order);
+            await this.mailer.sendConfirmation(order.email, order.id);
+            await this.stock.reserve(order.items);
+            this.analytics.track("order_placed", { id: order.id, total: order.total });
+          }
+        }
+
+        // main.ts
+        const orders = new OrderService(repo, mailer, stock, analytics);
+      roles: { context: [2, 16], email: [12, 12], inventory: [13, 13], analytics: [14, 14], client: [19, 19] }
+      change:
+        - { after: 7, add: ['    private fraud: FraudClient,'] }
+        - { after: 14, add: ['    await this.fraud.score(order.id, order.total);'] }
+        - { line: 19, replace: 'const orders = new OrderService(repo, mailer, stock, analytics, fraud);' }
+    after:
+      file: order-service.ts · main.ts
+      source: |
+        export interface OrderPlaced {
+          orderId: string;
+          email: string;
+          items: Item[];
+          total: number;
+        }
+
+        export type OrderListener = (e: OrderPlaced) => void | Promise<void>;
+
+        export class OrderService {
+          private listeners = new Set<OrderListener>();
+
+          constructor(private repo: OrderRepo) {}
+
+          subscribe(listener: OrderListener): () => void {
+            this.listeners.add(listener);
+            return () => this.listeners.delete(listener);
+          }
+
+          async placeOrder(order: Order): Promise<void> {
+            await this.repo.save(order);
+            const e = { orderId: order.id, email: order.email, items: order.items, total: order.total };
+            for (const listener of this.listeners) {
+              await listener(e);
+            }
+          }
+        }
+
+        // main.ts: wiring
+        orders.subscribe((e) => mailer.sendConfirmation(e.email, e.orderId));
+        orders.subscribe((e) => stock.reserve(e.items));
+        orders.subscribe((e) => analytics.track("order_placed", e));
+      roles: { strategy: [8, 8], context: [10, 27], client: [29, 32], subscribe: [15, 18], event: [22, 22], notify: [23, 25] }
+    again:
+      file: fraud.ts
+      source: |
+        // fraud.ts: a new listener; OrderService does not change
+        export const scoreOrder: OrderListener = async (e) => {
+          await fraud.score(e.orderId, e.total);
+        };
+
+        // main.ts: one more line of wiring
+        orders.subscribe(scoreOrder);
+    cost:
+      before: { text: 3 lines · 3 places, value: 0.7 }
+      after: { text: 1 new function · 1 wiring line, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'JavaScript runs on events, so Observer is everywhere and usually spelled as a callback plus an unsubscribe function. A `Set` of listener functions is enough for your own subjects. For anything long-lived, tie the subscription to a lifetime: return the unsubscribe function, or pass an `AbortSignal`.'
+      seenIn: '`EventTarget.addEventListener(type, fn, { signal })` in browsers and Node. Node''s `EventEmitter` (`on`, `off`, `once`). RxJS `Observable.subscribe()`, which returns a `Subscription` you must `unsubscribe()`.'
+
+  rust:
+    before:
+      file: orders.rs · main.rs
+      source: |
+        // orders.rs
+        pub struct OrderService {
+            repo: OrderRepo,
+            mailer: Mailer,
+            stock: InventoryClient,
+            analytics: Analytics,
+        }
+
+        impl OrderService {
+            pub fn place_order(&self, order: &Order) -> Result<(), OrderError> {
+                self.repo.save(order)?;
+                self.mailer.send_confirmation(&order.email, &order.id);
+                self.stock.reserve(&order.items);
+                self.analytics.track("order_placed", &order.id, order.total);
+                Ok(())
+            }
+        }
+
+        // main.rs
+        let orders = OrderService { repo, mailer, stock, analytics };
+      roles: { context: [2, 17], email: [12, 12], inventory: [13, 13], analytics: [14, 14], client: [20, 20] }
+      change:
+        - { after: 6, add: ['    fraud: FraudClient,'] }
+        - { after: 14, add: ['        self.fraud.score(&order.id, order.total);'] }
+        - { line: 20, replace: 'let orders = OrderService { repo, mailer, stock, analytics, fraud };' }
+    after:
+      file: orders.rs · main.rs
+      source: |
+        pub struct OrderPlaced {
+            pub order_id: String,
+            pub email: String,
+            pub items: Vec<Item>,
+            pub total: Money,
+        }
+
+        pub trait OrderListener {
+            fn on_order_placed(&self, e: &OrderPlaced);
+        }
+
+        pub struct OrderService {
+            repo: OrderRepo,
+            listeners: Vec<Box<dyn OrderListener>>,
+        }
+
+        impl OrderService {
+            pub fn subscribe(&mut self, l: Box<dyn OrderListener>) {
+                self.listeners.push(l);
+            }
+
+            pub fn place_order(&self, order: &Order) -> Result<(), OrderError> {
+                self.repo.save(order)?;
+                let e = OrderPlaced::from(order);
+                for l in &self.listeners {
+                    l.on_order_placed(&e);
+                }
+                Ok(())
+            }
+        }
+
+        // main.rs: wiring
+        orders.subscribe(Box::new(mailer));
+        orders.subscribe(Box::new(stock));
+        orders.subscribe(Box::new(tracker));
+      roles: { strategy: [8, 10], context: [12, 30], client: [32, 35], subscribe: [18, 20], event: [24, 24], notify: [25, 27] }
+    again:
+      file: fraud.rs
+      source: |
+        // fraud.rs: a new type; OrderService does not change
+        pub struct FraudScorer { client: fraud::Client }
+
+        impl OrderListener for FraudScorer {
+            fn on_order_placed(&self, e: &OrderPlaced) {
+                self.client.score(&e.order_id, e.total);
+            }
+        }
+
+        // main.rs: one more line of wiring
+        orders.subscribe(Box::new(FraudScorer { client: scorer }));
+    cost:
+      before: { text: 3 lines · 3 places, value: 0.7 }
+      after: { text: 1 new type · 1 wiring line, value: 0.18 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Ownership shapes it. If the subject owns its listeners as `Box<dyn OrderListener>`, as here, it is simple. Listeners that also live elsewhere need `Rc` or `Arc`, and a listener that points back at the subject needs `Weak` to avoid a reference cycle. Across threads or tasks, a channel per subscriber is usually cleaner than callbacks.'
+      seenIn: '`tokio::sync::broadcast`: every receiver gets every message, and one that falls too far behind gets `RecvError::Lagged`. `tokio::sync::watch` for "tell me when the value changes". `std::sync::mpsc` for one consumer.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'At startup `main` calls `svc.Subscribe` once per listener. The order service stores them in a slice and learns nothing else about them.', python: 'At startup `main` calls `service.subscribe` with one callable per listener. The order service keeps them in a list and learns nothing else about them.', typescript: 'At startup `main` calls `orders.subscribe` with one function per listener. The order service keeps them in a `Set` and learns nothing else about them.', rust: 'At startup `main` boxes each listener and hands it to `orders.subscribe`. The order service owns them and only knows they implement `OrderListener`.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: subscribe
+  - text: A customer places an order. The service saves it, then builds one OrderPlaced event that carries what listeners need, so none of them has to call back for details.
+    nodes: [context]
+    edges: []
+    role: event
+  - text: The loop hands the same event to each listener in the order they subscribed. Email, stock and analytics each do their own job.
+    nodes: [context, strategy, email, inventory, analytics]
+    edges: [context>strategy, email>strategy, inventory>strategy, analytics>strategy]
+    role: notify
+  - text: { go: 'The loop runs inside the customer''s request. Every listener''s time adds to the wait, and a panic in one unwinds through `PlaceOrder` and skips the rest.', python: 'The loop runs inside the customer''s request. Every listener''s time adds to the wait, and an exception from one leaves `place_order` and skips the rest.', typescript: 'The loop runs inside the customer''s request. Every `await` adds to the wait, and a rejection from one leaves `placeOrder` and skips the rest.', rust: 'The loop runs inside the customer''s request. Every listener''s time adds to the wait, and a panic in one unwinds through `place_order` and skips the rest.' }
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: notify
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these calls for Observer?
+    options:
+      - text: When a user signs up, the welcome email, the CRM sync and the referral tracker all need to react, and more teams will want to later.
+        correct: true
+        why: Right. One event, several independent reactions, and the list keeps growing. The sign-up code should not change each time a team joins.
+      - text: Before accepting an order, checkout must get a fraud score and reject the order if it is too high.
+        why: Checkout needs an answer and acts on it, so this is a plain call. A subject does not wait for answers from its observers or let them veto.
+      - text: Each country uses one tax calculator, chosen from config when the request starts.
+        why: That is Strategy. One implementation is picked and called. In Observer, every subscriber hears every event.
+  engineer:
+    question: Your email listener now takes two seconds, and checkout waits for it on every order. What is the best fix?
+    options:
+      - text: Make the email listener only put a job on a queue and return, or publish the event through an outbox that a worker reads.
+        correct: true
+        why: Right. The order service then pays for one quick write, and the slow work happens outside the request. You accept that the email arrives a little later.
+      - text: Subscribe the email listener last, so the others run first.
+        why: Order changes who runs first, not the total. The customer still waits for every listener in turn.
+      - text: Start each listener in a new thread or goroutine and return without waiting.
+        why: Checkout gets fast, but a failure is now invisible, and a crash or deploy loses whatever was in flight. A queue gives you the speed and keeps the work.
+  deep:
+    question: An admin page subscribes a live-orders panel each time it opens and never unsubscribes. Why does memory keep growing in a garbage-collected language?
+    options:
+      - text: The subject's listener list still refers to each panel's callback, and through it to the panel, so the collector sees them as in use.
+        correct: true
+        why: Right. Reachable means alive. The fix is to unsubscribe when the panel closes, or to hold listeners through weak references where the language offers them.
+      - text: Garbage collectors cannot free closures.
+        why: They can. A closure is freed like any other object once nothing refers to it. Here the subject still does.
+      - text: Each event is copied once per listener and never freed.
+        why: Events are freed after the loop. What grows is the list of listeners, and every one of them still runs on every order.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Subject
+      example: OrderService
+      job: Keeps the list of listeners, lets them subscribe and unsubscribe, and notifies all of them.
+    - role: Observer
+      example: { go: "OrderListener (interface)", python: "Listener (a Callable type)", typescript: "OrderListener (function type)", rust: "OrderListener (trait)" }
+      job: The one method every listener has.
+    - role: Concrete observer
+      example: "Email, Stock, Analytics, Fraud"
+      job: Reacts to the event in its own way.
+    - role: Client
+      example: main
+      job: Creates the listeners and subscribes them.
+  useWhen:
+    - One event, several independent reactions, and the set of reactions changes more often than the event does.
+    - The code that raises the event sits lower in the layers than the code that reacts, and should not depend on it.
+    - Listeners come and go at runtime, like open UI panels or connected clients.
+  avoidWhen:
+    - The caller needs an answer or a veto from the reaction. Call it directly.
+    - The reactions must happen in a strict order, or all succeed or fail together. Write that sequence out where it can be read.
+    - There is exactly one reaction and no second in sight.
+  tradeoffs:
+    - Reading the subject no longer tells you what happens after the event. You have to find who subscribed.
+    - In-process, every listener's time and errors land on the code that raised the event.
+    - Every subscribe needs a matching unsubscribe, or the listener lives as long as the subject.
+    - A chain of listeners that change other subjects can set off a cascade of updates that is hard to trace.
+  lookalikes:
+    - name: Publish-subscribe through a broker
+      how: The same idea across processes. A broker or outbox sits between publisher and subscribers, so neither waits for the other and messages survive crashes.
+    - name: Mediator
+      how: Colleagues talk to one hub that decides who does what. Observer only broadcasts; the subject decides nothing about the reactions.
+    - name: Chain of Responsibility
+      how: The request goes along a chain until one handler takes it. In Observer every subscriber gets the event.
+---
+
+## [concept] Observer
+
+**Let an object announce that something happened, and let any number of other objects subscribe to hear about it, without the announcer knowing who they are.**
+
+The <Term id="observer-subject">subject</Term> keeps a list of listeners and calls each one when the event happens. Adding a new reaction means adding a listener, not editing the subject.
+
+<Depth level={2}>
+Four roles do the work. The **subject** (`OrderService`) holds the list and notifies it. The **observer** is the one method every listener has, named as an <Term id="interface">interface</Term> or a function type. Each **concrete observer** (email, stock, analytics) reacts in its own way. The **client**, usually `main`, creates the listeners and subscribes them.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Observer under behavioral patterns and also calls it Dependents or Publish-Subscribe. It names the main benefit as abstract coupling: the subject only knows that its observers have one method. It also names the main cost, unexpected updates: because observers do not know about each other, a harmless-looking change to the subject can set off a costly cascade. The book describes a push model, where the subject sends the details with the notification, and a pull model, where it sends almost nothing and observers ask. Our `OrderPlaced` event is the push model.
+</Depth>
+
+## [problem] An order service that calls everyone
+
+When an order is placed, the shop sends a confirmation email, reserves stock and records the sale for analytics. The order service calls all three clients, one after the other.
+
+Read it once. The service knows the name, the method and the arguments of every team that cares about orders.
+
+<Depth level={2}>
+Each new reaction adds a field, a constructor argument and a call. The service's tests have to build or fake every client, even to test saving an order.
+</Depth>
+
+<Depth level={3}>
+The dependencies point the wrong way. Orders are the core of the business. Email, analytics and fraud scoring are supporting features, yet the core module imports all of them, and a change to any of their client libraries can break the build of the order service.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the risk team needs every new order sent to their fraud-scoring service.
+
+The marked lines change in three places: a new field, a new call and new wiring. None of them is about orders. The order service is edited because another team needs something.
+
+<Depth level={2}>
+The next team asks next month: loyalty points, a warehouse webhook, a Slack alert for large orders. Each one edits the same method, and the order team reviews every change to a module that should be about saving orders.
+</Depth>
+
+<Depth level={3}>
+It also gets harder to test. The fraud client now has to be faked in every order-service test, including the ones that only check that an order is saved.
+</Depth>
+
+## [morph] Turn each call into a subscriber
+
+Drag the slider. The three calls leave the order service. Each becomes a listener that implements one method, and the service keeps a list of them.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The order service now depends on one small type, `OrderListener`, instead of on every client library. New reactions extend the system without editing it, the <Term id="open-closed">open/closed principle</Term>. Each listener can be tested alone with a hand-made `OrderPlaced`, and the service can be tested with a fake listener that records what it heard.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go funcs cannot be compared, so a listener stored as a `func` cannot be found again to remove it. If listeners come and go, have `Subscribe` return a func that removes this subscription, the way `context.AfterFunc` returns `stop`. If they can come and go while orders flow, guard the slice with a `sync.Mutex`, copy it under the lock, and call the listeners after releasing it.</Lang>
+<Lang only="python">Bound methods compare equal when they wrap the same function and object, so `list.remove(mailer.on_order_placed)` finds the right entry. The loop iterates over `list(self._listeners)`, a copy, because removing an item from a list while iterating over it makes the loop skip the next item.</Lang>
+<Lang only="typescript">Arrow functions are compared by identity. `orders.subscribe((e) => …)` cannot be undone later by passing an identical-looking arrow, because it is a different object. Returning the unsubscribe function avoids the problem. A `Set` keeps insertion order, so listeners are still called in the order they subscribed.</Lang>
+<Lang only="rust">The subject owns each listener as a `Box<dyn OrderListener>`. That is the simple case. If a listener needs shared state, give it an `Arc` to that state. If it needs to reach back into the subject, use a `Weak` reference, because two `Rc`s pointing at each other are never freed.</Lang>
+</Depth>
+
+## [walk] Follow one order
+
+One order through the design, start to finish. Step through it with the numbered buttons.
+
+<Depth level={2}>
+The last step is the one people forget. The subject does not know its listeners, but it still runs them. In-process, the code that raised the event pays for every listener's time and is exposed to every listener's errors. Decide for each listener whether that is acceptable. If it is not, catch and log its errors in the loop, or move it behind a queue.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">A panic in a listener unwinds through `PlaceOrder`. `net/http` recovers a panic in a handler and logs it, so the server survives, but the customer's connection is dropped after the order was saved. Recover per listener only if you also log and alert, or the bug goes unseen.</Lang>
+<Lang only="python">An exception from one listener leaves the `for` loop and `place_order`. Wrap each call in `try`/`except Exception` and log it if the listeners are independent; let it propagate if a failed listener should fail the request.</Lang>
+<Lang only="typescript">Node's `EventEmitter` calls listeners synchronously, in the order they were added, and an exception from one propagates out of `emit`, so later listeners do not run. The DOM's `EventTarget` behaves differently: it reports a listener's exception and goes on to the next listener.</Lang>
+<Lang only="rust">A panic in a listener unwinds through `place_order` and skips the rest. `std::panic::catch_unwind` can contain it, but panics are meant for bugs. A listener that can fail should handle and log its own errors, since the trait method returns nothing.</Lang>
+</Depth>
+
+## [again] Fraud scoring, the second time
+
+The same request after the refactor. Fraud scoring is one new listener and one line of wiring. The order service does not change, and its tests do not change.
+
+<Depth level={2}>
+Decide what each listener may cost before you subscribe it. Fraud scoring calls a remote service; if it is slow or down, the in-process loop makes every checkout slow or failed. Have the listener enqueue a job and return, so the risk team's outage stays the risk team's.
+</Depth>
+
+<Depth level={3}>
+Once listeners live in other services, the event has to survive crashes. Publishing to a broker after the database commit can lose the event if the process dies between the two. A <Term id="transactional-outbox">transactional outbox</Term> writes the event in the same transaction as the order, and a relay publishes it afterwards. Delivery becomes at least once, so listeners must handle duplicates.
+</Depth>
+
+## [play] Break the subscribers
+
+One order service, two ways to deliver its event. On the left, the classic in-process loop. On the right, the same subscribers behind a queue. Every order you place runs through both.
+
+Make listeners slow or throw, add Fraud, open admin tabs that forget to unsubscribe, and watch what the customer pays in each design.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. How much ceremony it needs is not.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="observer" />
+
+### Unsubscribe, or leak
+
+Every `subscribe` needs a matching unsubscribe. The subject holds a reference to each listener, so a listener nobody removed stays alive as long as the subject does and keeps running on every event. This is the <Term id="lapsed-listener">lapsed listener</Term> problem, and garbage collection does not fix it. Tie each subscription to a lifetime: return an unsubscribe function and call it when the panel, request or connection ends, or use an `AbortSignal` in JavaScript. Some languages offer a <Term id="weak-reference">weak reference</Term> (`weakref.WeakMethod` in Python, `Weak` in Rust) so the subject does not keep listeners alive. Node prints a `MaxListenersExceededWarning` when one event gets more than ten listeners, which is often the first sign of a leak.
