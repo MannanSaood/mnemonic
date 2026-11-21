@@ -1,0 +1,19 @@
+# Terms introduced by the Names, references, mutability, recycling lesson (python track).
+- id: reference-count
+  term: Reference count
+  short: The number of references to an object. CPython keeps it in the object's header and frees the object the moment it reaches zero.
+- id: cycle-collector
+  term: Cycle collector
+  short: CPython's garbage collector. It finds groups of container objects that refer only to each other, which reference counting can never free, and frees them.
+- id: mutable-default-argument
+  term: Mutable default argument
+  short: A list, dict or set used as a parameter default in Python. It is created once, when def runs, and shared by every call that does not pass the argument.
+- id: call-by-sharing
+  term: Call by sharing
+  short: How Python passes arguments. The function gets a new name for the caller's object, so it can change the object but cannot rebind the caller's variable.
+- id: immortal-object
+  term: Immortal object
+  short: A CPython object, such as None or a small int, whose reference count is fixed since 3.12 and never reaches zero, so it is never freed.
+- id: tracing-gc
+  term: Tracing garbage collector
+  short: A collector that starts from roots (globals, stacks) and marks everything it can reach; the rest is garbage. Cycles need no special handling. Go, the JVM and V8 work this way.

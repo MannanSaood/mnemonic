@@ -1,0 +1,517 @@
+---
+title: "Names, references, mutability, recycling"
+track: python
+group: Objects
+order: 6
+summary: A Python variable is a name bound to an object. Assignment, arguments and defaults share objects instead of copying them, and CPython frees an object when its last reference goes, unless it sits in a cycle.
+intent: Know which lines make a new object and which only add a reference, and know what frees an object when you are done with it.
+changeRequest: CC each account's billing contacts on its invoices.
+languages: [python, go, typescript, rust]
+glossary: [aliasing, call-by-sharing, mutable-default-argument, reference-count, cycle-collector, weak-reference, immortal-object, tracing-gc]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [python, memory]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: references-and-gc
+  scenarios:
+    - try: "Keep Mutable default, As written. Make your prediction, then run the lines one at a time."
+      notice: "Line 1 creates the list before any call. Lines 2 and 3 only add arrows from a and b to that same list, and its refcount badge climbs to 3."
+    - try: "Switch to Fixed and run the same lines."
+      notice: "Each call builds its own list with a refcount of 1, so a is b is False. Same calls, different heap."
+    - try: "Open Nested lists. Run it As written, then Fixed."
+      notice: "As written there is one row with a refcount of 3: every day is the same list. The comprehension builds three rows with a refcount of 1 each."
+    - try: "Open A reference cycle. Run to del run, then run the nightly job 50 times with gc.disable()."
+      notice: "After del, the run and its 40 MB turn red: unreachable, refcount still 1. With the collector off, 50 runs hold 2,000 MB. With WeakMethod they hold nothing."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: { python: send_invoice, go: queueInvoice, typescript: sendInvoice, rust: send_invoice }, sub: one call per invoice }
+      after:  { x: 12, y: 24, w: 112, h: 48, title: { python: send_invoice, go: queueInvoice, typescript: sendInvoice, rust: send_invoice }, sub: one call per invoice }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: recipients(), sub: "variables hold values?" }
+      after:  { x: 150, y: 24, w: 180, h: 56, title: { python: function object, go: alwaysCC, typescript: ALWAYS_CC, rust: Notifier }, sub: { python: __defaults__, go: package var, typescript: module const, rust: owns cc } }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 360, y: 24, w: 190, h: 56, title: "" }
+      after:  { x: 360, y: 24, w: 190, h: 56, title: names, sub: "refer to objects, never copy" }
+    - id: defaults
+      kind: concrete
+      before: { x: 170, y: 56, w: 230, h: 32, title: "cc: a fresh empty list" }
+      after:  { x: 150, y: 120, w: 180, h: 48, title: { python: default list, go: backing array, typescript: shared array, rust: self.cc }, sub: { python: "made once, at def", go: "len 1, cap 4", typescript: "one array, module-wide", rust: "changed only via &mut" } }
+    - id: calllist
+      kind: concrete
+      before: { x: 170, y: 98, w: 230, h: 32, title: "invoice 1 → 1 address" }
+      after:  { x: 360, y: 120, w: 190, h: 48, title: new list per call, sub: "refcount 1, then 0" }
+    - id: gc
+      kind: concrete
+      before: { x: 170, y: 140, w: 230, h: 32, title: "invoice 500 → 1 address" }
+      after:  { x: 360, y: 200, w: 190, h: 48, title: { python: cycle collector, go: tracing GC, typescript: tracing GC, rust: drop at scope end }, sub: { python: only for cycles, go: marks from roots, typescript: marks from roots, rust: no collector } }
+    - id: contacts
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 200, w: 230, h: 32, title: + billing contacts }
+      after:  { x: 150, y: 200, w: 180, h: 48, title: billing contacts, sub: copied in per call }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: context, to: defaults, label: holds }
+    - { from: strategy, to: calllist, label: binds }
+    - { from: contacts, to: calllist, label: copied in }
+    - { from: gc, to: calllist, label: frees }
+
+# ---------------------------------------------------------------- code
+code:
+  python:
+    before:
+      file: billing/notify.py
+      source: |
+        # billing/notify.py
+        def recipients(invoice: Invoice, cc: list[str] = []) -> list[str]:
+            cc.append(invoice.customer_email)
+            return cc
+
+
+        def send_invoice(invoice: Invoice) -> None:
+            mailer.send(
+                to=recipients(invoice),
+                subject=f"Invoice {invoice.number}",
+                attachment=invoice.pdf,
+            )
+      roles: { context: [2, 4], defaults: [2, 2], calllist: [3, 4], client: [7, 12] }
+      change:
+        - { after: 2, add: ['    cc.extend(invoice.account.billing_contacts)'] }
+    after:
+      file: billing/notify.py
+      source: |
+        # billing/notify.py
+        def recipients(invoice: Invoice, cc: list[str] | None = None) -> list[str]:
+            to = [] if cc is None else list(cc)  # a new list on every call
+            to.append(invoice.customer_email)
+            return to
+
+
+        def send_invoice(invoice: Invoice) -> None:
+            mailer.send(
+                to=recipients(invoice),
+                subject=f"Invoice {invoice.number}",
+                attachment=invoice.pdf,
+            )  # the list's last reference goes here: refcount 0, freed
+      roles: { context: [2, 5], defaults: [2, 2], strategy: [3, 3], calllist: [3, 5], client: [8, 13], gc: [13, 13], define: [2, 2], call: [10, 10], append: [3, 4], release: [9, 13] }
+    again:
+      file: billing/notify.py
+      source: |
+        # The billing-contacts change, after the fix: one line, still per call.
+        def recipients(invoice: Invoice, cc: list[str] | None = None) -> list[str]:
+            to = [] if cc is None else list(cc)
+            to.extend(invoice.account.billing_contacts)  # copies the references in
+            to.append(invoice.customer_email)
+            return to
+    cost:
+      before: { text: "invoice #500 → 500 customers", value: 0.95 }
+      after: { text: "1 customer + its contacts", value: 0.1 }
+    lens:
+      need: 4
+      needLabel: Every day
+      note: 'Every name, argument, attribute and container slot is a reference, so assignment and calls share objects. Defaults are evaluated once, when `def` runs. CPython frees an object when its reference count reaches zero and runs a cycle collector for objects that only refer to each other. Use `None` defaults, copy at the boundary, and `weakref` for back-references.'
+      seenIn: '`sys.getrefcount`, `gc.collect`, `gc.freeze` (before `fork`), `weakref.WeakMethod` and `WeakValueDictionary`, `copy.copy`. Ruff and flake8-bugbear flag mutable defaults as B006; pylint calls it W0102, dangerous-default-value.'
+
+  go:
+    before:
+      file: notify.go
+      source: |
+        // notify.go
+        var alwaysCC = append(make([]string, 0, 4), "ar@shop.io") // len 1, cap 4
+
+        func recipients(inv Invoice, cc []string) []string {
+        	return append(cc, inv.CustomerEmail)
+        }
+
+        func queueInvoice(inv Invoice) {
+        	outbox <- Email{
+        		To:      recipients(inv, alwaysCC),
+        		Subject: "Invoice " + inv.Number,
+        	}
+        }
+      roles: { defaults: [2, 2], context: [4, 6], calllist: [5, 5], client: [8, 13] }
+      change:
+        - { after: 4, add: ['	cc = append(cc, inv.Account.BillingContacts...)'] }
+    after:
+      file: notify.go
+      source: |
+        // notify.go
+        var alwaysCC = []string{"ar@shop.io"}
+
+        func recipients(inv Invoice, cc []string) []string {
+        	to := make([]string, 0, len(cc)+1) // a new backing array on every call
+        	to = append(to, cc...)
+        	return append(to, inv.CustomerEmail)
+        }
+
+        func queueInvoice(inv Invoice) {
+        	outbox <- Email{
+        		To:      recipients(inv, alwaysCC),
+        		Subject: "Invoice " + inv.Number,
+        	}
+        }
+      roles: { context: [2, 2], defaults: [2, 2], strategy: [5, 5], calllist: [5, 7], client: [10, 15], gc: [11, 14], define: [2, 2], call: [12, 12], append: [5, 7], release: [11, 14] }
+    again:
+      file: notify.go
+      source: |
+        // The billing-contacts change, after the fix: still a fresh array per call.
+        func recipients(inv Invoice, cc []string) []string {
+        	to := make([]string, 0, len(cc)+len(inv.Account.BillingContacts)+1)
+        	to = append(to, cc...)
+        	to = append(to, inv.Account.BillingContacts...)
+        	return append(to, inv.CustomerEmail)
+        }
+    cost:
+      before: { text: "every queued email → last customer", value: 0.9 }
+      after: { text: "1 array per email", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Slices bite
+      note: 'Go copies on assignment, but a slice value is a small header (pointer, length, capacity). Two headers can share one backing array, and `append` writes into spare capacity when there is some. There are no default arguments. The garbage collector is a concurrent tracing mark-and-sweep, so cycles are freed like anything else.'
+      seenIn: '`slices.Clone` (Go 1.21), the full slice expression `s[:len(s):len(s)]` that forces the next `append` to copy, `runtime.AddCleanup` and the `weak` package (Go 1.24).'
+
+  typescript:
+    before:
+      file: notify.ts
+      source: |
+        // notify.ts
+        const ALWAYS_CC = ["ar@shop.io"];
+
+        function recipients(inv: Invoice, cc: string[] = ALWAYS_CC): string[] {
+          cc.push(inv.customerEmail);
+          return cc;
+        }
+
+        function sendInvoice(inv: Invoice): Promise<void> {
+          return mailer.send({
+            to: recipients(inv),
+            subject: `Invoice ${inv.number}`,
+          });
+        }
+      roles: { defaults: [2, 2], context: [4, 7], calllist: [5, 6], client: [9, 14] }
+      change:
+        - { after: 4, add: ['  cc.push(...inv.account.billingContacts);'] }
+    after:
+      file: notify.ts
+      source: |
+        // notify.ts
+        const ALWAYS_CC: readonly string[] = ["ar@shop.io"];
+
+        function recipients(inv: Invoice, cc: readonly string[] = ALWAYS_CC): string[] {
+          return [...cc, inv.customerEmail]; // a new array on every call
+        }
+
+        function sendInvoice(inv: Invoice): Promise<void> {
+          return mailer.send({
+            to: recipients(inv),
+            subject: `Invoice ${inv.number}`,
+          });
+        }
+      roles: { context: [2, 2], defaults: [2, 2], strategy: [5, 5], calllist: [5, 5], client: [8, 13], gc: [9, 12], define: [2, 2], call: [10, 10], append: [5, 5], release: [9, 12] }
+    again:
+      file: notify.ts
+      source: |
+        // The billing-contacts change, after the fix: one spread more.
+        function recipients(inv: Invoice, cc: readonly string[] = ALWAYS_CC): string[] {
+          return [...cc, ...inv.account.billingContacts, inv.customerEmail];
+        }
+    cost:
+      before: { text: "invoice #500 → 500 customers", value: 0.95 }
+      after: { text: "1 customer + its contacts", value: 0.1 }
+    lens:
+      need: 2
+      needLabel: Mostly safe
+      note: 'A default parameter expression is evaluated on every call, so `cc: string[] = []` is safe, unlike in Python. The trap returns when the default names a shared object. Objects and arrays are passed by sharing, exactly as in Python. `readonly string[]` makes `push` a compile error. V8 has a tracing, generational collector, so cycles are freed.'
+      seenIn: '`readonly` arrays and `Readonly<T>`, `Object.freeze`, `structuredClone`, `WeakMap`, `WeakRef` and `FinalizationRegistry` (ES2021).'
+
+  rust:
+    before:
+      file: notify.rs
+      source: |
+        // notify.rs
+        struct Notifier {
+            cc: Vec<String>, // starts as the AR team's address
+            mailer: Mailer,
+        }
+
+        impl Notifier {
+            fn recipients(&mut self, inv: &Invoice) -> Vec<String> {
+                self.cc.push(inv.customer_email.clone());
+                self.cc.clone()
+            }
+
+            fn send_invoice(&mut self, inv: &Invoice) {
+                let to = self.recipients(inv);
+                self.mailer.send(&to, &format!("Invoice {}", inv.number));
+            }
+        }
+      roles: { defaults: [2, 5], context: [8, 11], calllist: [9, 10], client: [13, 16] }
+      change:
+        - { after: 8, add: ['        self.cc.extend(inv.account.billing_contacts.iter().cloned());'] }
+    after:
+      file: notify.rs
+      source: |
+        // notify.rs
+        struct Notifier {
+            cc: Vec<String>, // the AR team's address
+            mailer: Mailer,
+        }
+
+        impl Notifier {
+            fn recipients(&self, inv: &Invoice) -> Vec<String> {
+                let mut to = self.cc.clone(); // a new Vec, owned by the caller
+                to.push(inv.customer_email.clone());
+                to
+            }
+
+            fn send_invoice(&self, inv: &Invoice) {
+                let to = self.recipients(inv);
+                self.mailer.send(&to, &format!("Invoice {}", inv.number));
+            } // `to` is dropped here
+        }
+      roles: { context: [2, 5], defaults: [3, 3], strategy: [9, 9], calllist: [9, 11], client: [14, 17], gc: [17, 17], define: [2, 5], call: [15, 15], append: [9, 11], release: [17, 17] }
+    again:
+      file: notify.rs
+      source: |
+        // The billing-contacts change, after the fix: &self still forbids touching self.cc.
+            fn recipients(&self, inv: &Invoice) -> Vec<String> {
+                let mut to = self.cc.clone();
+                to.extend(inv.account.billing_contacts.iter().cloned());
+                to.push(inv.customer_email.clone());
+                to
+            }
+    cost:
+      before: { text: "&mut self: the growth is in plain sight", value: 0.55 }
+      after: { text: "1 Vec per call", value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Compiler enforced
+      note: 'Every value has one owner, and a function that changes shared state says `&mut` in its signature. The bug above compiles, but `&mut self` on a method called `recipients` is a review flag. A value is dropped when its owner goes out of scope. `Rc` counts references like CPython, with no cycle collector: an `Rc` cycle leaks unless one side is a `Weak`.'
+      seenIn: '`Rc::strong_count`, `Rc::downgrade` and `Weak`, `Arc` for threads, `std::mem::take`, and `Cow` for copy-only-when-changed.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { python: '`def` runs once, when the module is imported. Python evaluates the default, `None`, and stores it in `recipients.__defaults__`. Had it been `[]`, that one list would live there for the life of the process.', go: '`alwaysCC` is initialised once, when the package loads. It is a slice header that points at a backing array holding one string.', typescript: '`ALWAYS_CC` is created once, when the module loads. Unlike Python, the default expression `= ALWAYS_CC` runs on every call, but it names the same array each time.', rust: '`Notifier` owns its `cc` vector. Nothing else can change it while `recipients` holds only `&self`.' }
+    nodes: [context, defaults]
+    edges: [context>defaults]
+    role: define
+  - text: { python: '`send_invoice` calls `recipients(invoice)`. Inside, `invoice` is a new name for the caller''s object: arguments are passed by sharing. No invoice is copied.', go: '`queueInvoice` passes `alwaysCC`, which copies the three-word slice header. The backing array is not copied.', typescript: '`sendInvoice` calls `recipients(inv)`. `inv` and `cc` are references to the caller''s objects.', rust: '`send_invoice` lends `self` and `inv` to `recipients` as shared borrows. Nothing is moved or copied.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: call
+  - text: { python: '`to` is bound to a new, empty list, refcount 1. `append` stores a reference to the customer''s email string in it; the string itself is not copied.', go: '`make` allocates a new backing array, so the `append` calls cannot write into `alwaysCC`''s spare capacity.', typescript: 'The spread builds a new array and copies the references in. `ALWAYS_CC` is never written to.', rust: '`self.cc.clone()` makes a new `Vec` with its own `String`s, owned by `to`. `push` moves the cloned email into it.' }
+    nodes: [strategy, calllist]
+    edges: [strategy>calllist]
+    role: append
+  - text: { python: 'When `mailer.send` returns, the call''s last reference to the list goes away. Its refcount reaches zero and CPython frees it on that line. There is no cycle, so the collector never needs to look at it.', go: 'The `Email` in the channel keeps the slice alive. Once the sender is done with it, the next garbage collection finds the array unreachable from any root and frees it.', typescript: 'Once the send settles, nothing refers to the array. V8''s next young-generation collection frees it.', rust: '`to` goes out of scope at the closing brace, and its `Vec` and strings are dropped right there. No collector exists to run.' }
+    nodes: [calllist, gc]
+    edges: [gc>calllist]
+    role: release
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: "`def recipients(invoice, cc=[])` appends the customer's email to `cc` and returns it. The process sends three invoices, never passing `cc`. How many addresses does the third email go to?"
+    options:
+      - text: Three. Every call appended to the same default list.
+        correct: true
+        why: Right. The default list was created once, when def ran, and every call that omits cc shares it.
+      - text: One. Each call starts with a fresh empty list.
+        why: That is how TypeScript defaults behave. Python evaluates the default once and keeps that object on the function.
+      - text: It raises an error, because a default cannot be changed.
+        why: Nothing stops a function from changing its own default object. That is why the bug is silent.
+  engineer:
+    question: "`a = [1]`, `b = a`, then `b += [2]`. What is `a`? And what if the last line is `b = b + [2]` instead?"
+    options:
+      - text: "`[1, 2]` with `+=`, and `[1]` with `b = b + [2]`."
+        correct: true
+        why: Right. On a list, += calls __iadd__, which extends the list in place. b + [2] builds a new list and rebinds b, leaving a's list alone.
+      - text: "`[1]` both times: assignment copied the list."
+        why: Assignment binds another name to the same list. Nothing was copied.
+      - text: "`[1, 2]` both times: a and b are the same name."
+        why: They are two names for one object until b is rebound. b = b + [2] rebinds b to a new list.
+  deep:
+    question: "A long-running service calls `gc.disable()` at startup to avoid collector pauses. Its `InvoiceRun.__init__` does `self.on_error = self.log_failure`. What happens to finished runs?"
+    options:
+      - text: They are never freed. Each run and its bound method keep each other's refcount above zero, and nothing else would free them.
+        correct: true
+        why: Right. Reference counting cannot free a cycle, and the collector that could is switched off. Memory grows by one run per night. Use weakref.WeakMethod, or call gc.collect() at a quiet moment.
+      - text: They are freed when the last name goes, by reference counting.
+        why: The bound method's __self__ still refers to the run, so its count stays at 1.
+      - text: They are freed at the next collection, because gc.disable() only delays it.
+        why: gc.disable() stops automatic collection entirely. Only an explicit gc.collect() would run.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Name
+      example: "`a`, a parameter, `self.cc`, a list slot"
+      job: Refers to one object. Binding a name never copies.
+    - role: Object
+      example: "a list, a dict, an InvoiceRun"
+      job: Has an identity (`id`), a type and a value. Lives on the heap.
+    - role: Reference count
+      example: "`sys.getrefcount(x)`"
+      job: Counts the references to an object. At zero, CPython frees it at once.
+    - role: Cycle collector
+      example: "`gc.collect()`"
+      job: Frees groups of objects that refer only to each other.
+    - role: Weak reference
+      example: "`weakref.WeakMethod`, `WeakValueDictionary`"
+      job: Refers to an object without keeping it alive.
+  useWhen:
+    - A function has a list, dict or set as a parameter default.
+    - You build nested lists with `*`, or store a caller's list in an object.
+    - An object stores a callback, bound method or parent pointer that leads back to itself.
+    - Memory grows in a long-running process although everything is "deleted".
+  avoidWhen:
+    - The values are immutable (str, int, tuples of immutables, frozen dataclasses). Sharing them is safe, and copying wastes time.
+  tradeoffs:
+    - Copying at a boundary (`list(cc)`) costs an allocation per call but removes a whole class of aliasing bugs.
+    - Weak references can go dead at any moment, so every use must check for `None`.
+    - "`gc.disable()` and `gc.freeze()` trade collector pauses for memory: fine for short-lived workers, dangerous with cycles."
+  lookalikes:
+    - name: Call by reference
+      how: The callee could rebind the caller's variable. Python cannot; it can only change the shared object.
+    - name: Call by value
+      how: The callee gets a copy. Python never copies an argument.
+    - name: copy.deepcopy
+      how: Copies everything reachable. Needed only when nested mutable objects must be independent.
+---
+
+## [concept] Names, references, mutability, recycling
+
+**A Python variable is a name bound to an object. Assignment, arguments and defaults never copy: they add a reference. CPython frees an object the moment its last reference goes, unless it is part of a cycle.**
+
+Two names can refer to one list, and a change made through one is seen through the other. That is <Term id="aliasing">aliasing</Term>, and in Python it is the default.
+
+<Depth level={2}>
+Three rules cover most bugs. Assignment binds a name; it does not copy. Arguments are passed by sharing (<Term id="call-by-sharing">call by sharing</Term>): the function gets a new name for your object. Default values are evaluated once, when `def` runs, so a <Term id="mutable-default-argument">mutable default argument</Term> is one object shared by every call. `is` compares identity and `==` compares value; they agree only by accident.
+</Depth>
+
+<Depth level={3}>
+In CPython every object header holds a <Term id="reference-count">reference count</Term>. Binding a name or storing the object in a container adds one; unbinding removes one; at zero the object's deallocator runs immediately. Objects that only refer to each other never reach zero, so a separate <Term id="cycle-collector">cycle collector</Term> looks for them among container objects (lists, dicts, instances, functions). Strings and ints cannot form cycles and are not tracked by it.
+</Depth>
+
+## [problem] Who gets this invoice
+
+A billing service emails each invoice to the customer. A helper builds the recipient list, with an optional `cc` list for the callers that need one. It works, and it is tested: each test sends one invoice and checks one address.
+
+Read it with the model most people start with: a variable is a box that holds a value, and `cc=[]` means "an empty list each time".
+
+<Depth level={2}>
+The default list is made once. The first invoice appends to it, the second appends to the same list, and so on. Tests pass because each test process sends a single invoice, or because the test calls `recipients` with an explicit `cc`.
+</Depth>
+
+<Depth level={3}>
+<Lang only="python">`recipients.__defaults__` holds the list. You can watch it grow in a REPL: call the function twice and print `recipients.__defaults__`.</Lang>
+<Lang only="go">`append` returns a slice that shares `alwaysCC`'s backing array whenever there is spare capacity. Every queued `Email` gets a `To` that points into the same array, at index 1.</Lang>
+<Lang only="typescript">The default is evaluated per call, but `ALWAYS_CC` is one module-level array, and `push` changes it in place.</Lang>
+<Lang only="rust">`&mut self` lets `recipients` change `self.cc`, and it does, on every call. The compiler allows it because it was asked for.</Lang>
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** CC each account's billing contacts on its invoices.
+
+The marked line goes into the shared list too. In production the process runs for days. Invoice 500 goes to 500 customers, each with every earlier account's billing contacts in CC. The incident is a data leak, not a crash.
+
+<Depth level={2}>
+The naive model cannot explain it: the code never shares anything on purpose. The sharing is in the semantics. The list on the `def` line is one object, created at import, and every call that leaves `cc` out appends to it. Restarting the service "fixes" it until the list grows again.
+</Depth>
+
+<Depth level={3}>
+<Lang only="python">The same rule applies to dict and set defaults, to class attributes such as `tags = []` on a class body (one list shared by every instance), and to `[[]] * n`, which repeats one reference n times.</Lang>
+<Lang only="go">The Go symptom is different: every queued email is sent to the last customer queued, because each `To` slice reads the same array slot, which the most recent `append` overwrote.</Lang>
+<Lang only="typescript">The TypeScript symptom matches Python's. Any module-level array or object used as a default, or as a starting value that gets mutated, is shared across requests.</Lang>
+<Lang only="rust">Rust shows the same growth, but only because the signature asked for `&mut self`. A reviewer can see it; the borrow checker cannot know it was not meant.</Lang>
+</Depth>
+
+## [morph] From boxes that hold values to names that refer
+
+Drag the slider. The picture of a fresh box per call gives way to what is really there: a function object holding one default list, names that refer to objects, and a reference count that frees each per-call list when the call is done.
+
+The code morphs to make a new list inside the call, so nothing is shared between invoices.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+`None` is the idiomatic default: it is immutable, so sharing it is harmless, and `cc is None` distinguishes "not given" from "given and empty". `list(cc)` also copies a caller's list, so `recipients` never changes something it was handed. Copy at the boundary where you start mutating.
+</Depth>
+
+<Depth level={3}>
+<Lang only="python">`list(cc)` is a <Term id="shallow-copy">shallow copy</Term>: the new list holds references to the same email strings. That is safe because strings are immutable. A list of dicts would need each dict copied too, or a `copy.deepcopy`.</Lang>
+<Lang only="go">`make([]string, 0, len(cc)+1)` gives the result its own array. `slices.Clone(cc)` followed by `append` does the same in one call.</Lang>
+<Lang only="typescript">Typing the parameter as `readonly string[]` turns any future `push` on `cc` into a compile error, so the fix stays fixed.</Lang>
+<Lang only="rust">With `&self`, the method cannot change `self.cc` at all. The clone makes the caller the owner of the result.</Lang>
+</Depth>
+
+## [walk] Follow one invoice's recipient list
+
+One invoice, from `def` to the moment its recipient list is freed. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="python">CPython frees the list inside the `Py_DECREF` that drops its count to zero. On PyPy, which uses a <Term id="tracing-gc">tracing garbage collector</Term>, the same list is freed at some later collection. Code that relies on immediate freeing, such as a file closed by its destructor, behaves differently there; `with` blocks behave the same everywhere.</Lang>
+<Lang only="go">Go's collector is concurrent: it marks reachable objects while your goroutines run, then sweeps the rest. Small, short-lived slices may be stack-allocated by escape analysis and never reach the heap at all.</Lang>
+<Lang only="typescript">V8 allocates new objects in a young generation that is collected often by copying the survivors out. A short-lived recipients array usually dies there, cheaply.</Lang>
+<Lang only="rust">Drop order is deterministic: locals are dropped in reverse order of declaration at the end of their scope. No collector and no reference counts are involved unless you use `Rc` or `Arc`.</Lang>
+</Depth>
+
+## [again] Billing contacts, the second time
+
+The same request after the fix. One `extend` into the list this call made, and invoice 500 goes to one customer and that account's contacts.
+
+<Depth level={2}>
+The test that would have caught the original bug is cheap: call `recipients` twice without `cc` and assert the second result has one address. Linters catch the pattern too: Ruff and flake8-bugbear report B006, pylint reports W0102.
+</Depth>
+
+<Depth level={3}>
+The other half of the lesson is objects that never reach zero. A bound method stored on its own instance (`self.on_error = self.log_failure`), a parent and child that point at each other, or an exception kept in a local inside its own frame all form cycles. They are freed only when the cycle collector runs. Use a <Term id="weak-reference">weak reference</Term> for back-pointers, or break the cycle when you are done.
+</Depth>
+
+## [play] Run it a line at a time
+
+Three short programs: the mutable default, an on-call rota built with `*`, and a nightly invoice run that keeps itself alive. Run each one as written and fixed, and watch the arrows and the refcount badges.
+
+## [lens] How each language meets it
+
+All four languages share objects through references somewhere. They differ in where copies happen by default, whether defaults are re-evaluated, and what frees memory: reference counts, a tracing collector, or ownership.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Python and TypeScript behave alike for objects and arrays, except for defaults. Go copies structs on assignment but shares slice and map contents. Rust makes sharing a type-level decision (`&`, `&mut`, `Rc`, `Arc`).
+</Depth>
+
+<Depth level={3}>
+CPython counts references and adds a cycle collector. Go and V8 trace from roots and never count. Rust frees at scope end and counts only inside `Rc` and `Arc`, without a cycle collector, so an `Rc` cycle leaks.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="references-and-gc" />
+
+### What frees an object in CPython
+
+Reference counting frees almost everything, the moment the last reference goes. The cycle collector exists for the rest. It tracks container objects in three generations and runs when allocations minus deallocations pass a threshold (`gc.get_threshold()`). It copies each candidate's count, subtracts the references that come from other candidates, and anything still above zero is reachable from outside; what is left unreached is a cycle of garbage and is freed. Since 3.4, objects with `__del__` in a cycle are collected too.
+
+A few details matter in practice. Since 3.12, `None`, `True`, small ints and some other objects are <Term id="immortal-object">immortal</Term>: their refcount is fixed and `sys.getrefcount` shows a huge number. Python 3.14.0 to 3.14.4 shipped an incremental collector, and 3.14.5 went back to the 3.13 generational one after reports of memory pressure. The free-threaded build uses biased reference counting and a non-generational collector that pauses all threads and scans the whole heap. `gc.freeze()` before `fork()` moves existing objects out of the collector's sight, so forked workers do not touch, and copy, their pages.
