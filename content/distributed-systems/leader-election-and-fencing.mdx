@@ -1,0 +1,576 @@
+---
+title: Leader election, leases and fencing
+track: distributed-systems
+group: Consensus
+order: 16
+summary: Elect a leader by giving it a lease, a lock that expires. A paused leader can outlive its lease without knowing it, so every write carries a fencing token and the storage rejects old ones.
+intent: Make sure that a deposed leader, one that was paused or cut off while another took over, cannot change anything once a newer leader exists.
+changeRequest: An invoice export must never be overwritten by a worker that has lost its lease.
+languages: [go, python, typescript, rust]
+glossary: [lease, fencing-token, process-pause, split-brain, raft-term, majority-quorum]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [distributed-systems/failure-detection, distributed-systems/consistency-models]
+skills: [consensus]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: leader-election-and-fencing
+  scenarios:
+    - try: "Choose a 5 s pause and press GC pause A."
+      notice: "A wakes before its 10 s lease runs out, renews, and carries on. A pause shorter than the lease is harmless."
+    - try: "Choose 15 s and pause A again."
+      notice: "A's lease expires, B takes it with token 34 and writes. A wakes and sends its batch with 33. Plain storage takes it over B's newer export; fenced storage refuses it."
+    - try: "After B takes over, pause B."
+      notice: "A acquires the lease again with token 35. Now B is the zombie, and its 34 is refused. Tokens only grow, so whoever was paused is always the one with the lower number."
+    - try: "Watch the workers' cards during a 30 s pause."
+      notice: "For seconds at a time both workers believe they lead. The lease cannot prevent that belief; the token makes it harmless."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 118, h: 52, title: Lock service, sub: lease 10 s }
+      after:  { x: 12, y: 30, w: 118, h: 52, title: Lock service, sub: lease + token }
+    - id: context
+      kind: context
+      before: { x: 156, y: 18, w: 250, h: 236, title: Worker A, sub: holds the lease }
+      after:  { x: 156, y: 30, w: 130, h: 52, title: Worker, sub: sends its token }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 310, y: 30, w: 120, h: 52, title: "" }
+      after:  { x: 310, y: 30, w: 130, h: 52, title: Fencing token, sub: "33 · 34 · 35" }
+    - id: check
+      kind: concrete
+      before: { x: 176, y: 110, w: 210, h: 40, title: lease still valid? }
+      after:  { x: 310, y: 200, w: 130, h: 52, title: Token check, sub: "token ≥ highest" }
+    - id: store
+      kind: concrete
+      before: { x: 430, y: 110, w: 118, h: 52, title: Storage, sub: accepts any write }
+      after:  { x: 456, y: 200, w: 92, h: 52, title: Storage, sub: keeps highest }
+  edges:
+    - { from: client, to: context, label: grant }
+    - { from: context, to: strategy, label: attach }
+    - { from: strategy, to: check, label: write }
+    - { from: check, to: store, label: accept }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: export.go
+      source: |
+        // export.go: one worker at a time writes the day's invoice export
+        func (w *Worker) Run(ctx context.Context) error {
+            lease, err := w.locks.Acquire(ctx, "invoice-export", 10*time.Second)
+            if err != nil {
+                return err // another worker holds it
+            }
+            defer lease.Release() // the client renews the lease in the background
+            for batch := range w.batches(ctx) {
+                file := render(batch) // can take seconds; a GC pause can land anywhere
+                if err := w.store.Put(ctx, batch.Key, file); err != nil {
+                    return err
+                }
+            }
+            return nil
+        }
+      roles: { client: [3, 7], context: [2, 15], store: [10, 12] }
+      change:
+        - { after: 9, add: ['        if time.Now().After(lease.Expires()) {', '            return ErrLeaseLost // checked, and the pause lands right after', '        }'] }
+    after:
+      file: export.go
+      source: |
+        // export.go: the worker passes its fencing token with every write
+        func (w *Worker) Run(ctx context.Context) error {
+            lease, err := w.locks.Acquire(ctx, "invoice-export", 10*time.Second)
+            if err != nil {
+                return err
+            }
+            defer lease.Release()
+            token := lease.Token() // rises with every grant: 33, then 34, ...
+            for batch := range w.batches(ctx) {
+                file := render(batch)
+                err := w.store.Put(ctx, batch.Key, file, token)
+                if errors.Is(err, ErrStaleToken) {
+                    return err // a newer holder exists: stop, do not retry
+                }
+                if err != nil {
+                    return err
+                }
+            }
+            return nil
+        }
+
+        // store.go: the protected resource checks the token
+        var ErrStaleToken = errors.New("stale fencing token")
+
+        type Store struct {
+            mu      sync.Mutex
+            highest uint64 // the largest token ever accepted for this bucket
+            files   map[string][]byte
+        }
+
+        func (s *Store) Put(_ context.Context, key string, data []byte, token uint64) error {
+            s.mu.Lock()
+            defer s.mu.Unlock()
+            if token < s.highest {
+                return ErrStaleToken // its holder was paused or cut off while another took over
+            }
+            s.highest = token
+            s.files[key] = data
+            return nil
+        }
+      roles: { client: [3, 8], context: [2, 20], strategy: [8, 8], check: [31, 36], store: [22, 40], grant: [3, 8], pause: [9, 11], reject: [31, 36], stop: [12, 14] }
+    again:
+      file: fencing_test.go
+      source: |
+        // fencing_test.go: the same 15 s pause, with tokens
+        func TestPausedWorkerIsFenced(t *testing.T) {
+            s, ctx := NewStore(), context.Background()
+            if err := s.Put(ctx, "2026-11-20.csv", []byte("batch 12 by B"), 34); err != nil {
+                t.Fatal(err) // B took over after A's lease expired
+            }
+            err := s.Put(ctx, "2026-11-20.csv", []byte("batch 11 by A"), 33) // A wakes from its pause
+            if !errors.Is(err, ErrStaleToken) {
+                t.Fatalf("stale write accepted: %v", err)
+            }
+        }
+    cost:
+      before: { text: 1 stale export over newer data per long pause · no error, value: 0.8 }
+      after: { text: 0 stale writes accepted · one integer per write, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'With etcd, `concurrency.NewSession(cli, concurrency.WithTTL(10))` holds the lease and keeps it alive, and `NewElection(sess, "/invoice-export").Campaign(ctx, id)` blocks until you lead. `Election.Rev()` returns the leader key''s creation revision, which only grows: use it as the token. If the protected data lives in etcd itself, wrap writes in a `Txn` that compares that key''s `CreateRevision`; that is what `Mutex.IsOwner()` returns.'
+      seenIn: 'Kubernetes controllers use client-go''s `leaderelection` package, whose docs state it does not guarantee only one leader (fencing); controllers rely on the API server''s `resourceVersion` checks instead. etcd''s `concurrency` package for elections and mutexes.'
+
+  python:
+    before:
+      file: export.py
+      source: |
+        # export.py: one worker at a time writes the day's invoice export
+        async def run(self) -> None:
+            async with self.locks.acquire("invoice-export", ttl=10) as lease:  # renewed in the background
+                async for batch in self.batches():
+                    data = render(batch)  # can take seconds; a GC pause can land anywhere
+                    await self.store.put(batch.key, data)
+      roles: { client: [3, 3], context: [2, 6], store: [6, 6] }
+      change:
+        - { after: 5, add: ['            if lease.expired():', '                raise LeaseLost  # checked, and the pause lands right after'] }
+    after:
+      file: export.py
+      source: |
+        # export.py: the worker passes its fencing token with every write
+        async def run(self) -> None:
+            async with self.locks.acquire("invoice-export", ttl=10) as lease:
+                token = lease.token  # rises with every grant: 33, then 34, ...
+                async for batch in self.batches():
+                    data = render(batch)
+                    try:
+                        await self.store.put(batch.key, data, token)
+                    except StaleToken:
+                        return  # a newer holder exists: stop, do not retry
+
+
+        # store.py: the protected resource checks the token
+        class StaleToken(Exception):
+            pass
+
+
+        class Store:
+            def __init__(self) -> None:
+                self.highest = 0  # the largest token ever accepted for this bucket
+                self.files: dict[str, bytes] = {}
+
+            async def put(self, key: str, data: bytes, token: int) -> None:
+                # No await between the check and the update, so no other put can interleave.
+                if token < self.highest:
+                    raise StaleToken(f"{token} < {self.highest}")
+                self.highest = token
+                self.files[key] = data
+      roles: { client: [3, 4], context: [2, 10], strategy: [4, 4], check: [23, 26], store: [13, 28], grant: [3, 4], pause: [5, 8], reject: [23, 26], stop: [9, 10] }
+    again:
+      file: test_fencing.py
+      source: |
+        # test_fencing.py: the same 15 s pause, with tokens
+        def test_paused_worker_is_fenced() -> None:
+            s = Store()
+            asyncio.run(s.put("2026-11-20.csv", b"batch 12 by B", 34))  # B took over after A's lease expired
+            with pytest.raises(StaleToken):
+                asyncio.run(s.put("2026-11-20.csv", b"batch 11 by A", 33))  # A wakes from its pause
+            assert s.files["2026-11-20.csv"] == b"batch 12 by B"
+    cost:
+      before: { text: 1 stale export over newer data per long pause · no error, value: 0.8 }
+      after: { text: 0 stale writes accepted · one integer per write, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'CPython''s reference counting frees most objects at once, but the cycle collector, a long synchronous call or a swapped-out page can still stop the loop for seconds. With ZooKeeper, `kazoo`''s `Lock` is an ephemeral sequential znode tied to the session; the session timing out is the lease expiring, and the zxid of the lock znode''s creation grows with every grant, so it can serve as the token.'
+      seenIn: '`kazoo`''s `Lock` and `Election` recipes for ZooKeeper. The `etcd3` client''s `lock(name, ttl=...)`. Neither fences for you: the resource must check the number.'
+
+  typescript:
+    before:
+      file: export.ts
+      source: |
+        // export.ts: one worker at a time writes the day's invoice export
+        export async function run(w: Worker): Promise<void> {
+          const lease = await w.locks.acquire("invoice-export", { ttlSeconds: 10 }); // renewed in the background
+          try {
+            for await (const batch of w.batches()) {
+              const file = render(batch); // can take seconds; a GC pause can land anywhere
+              await w.store.put(batch.key, file);
+            }
+          } finally {
+            await lease.release();
+          }
+        }
+      roles: { client: [3, 3], context: [2, 12], store: [7, 7] }
+      change:
+        - { after: 6, add: ['      if (Date.now() > lease.expiresAt) throw new LeaseLost(); // checked, and the pause lands right after'] }
+    after:
+      file: export.ts
+      source: |
+        // export.ts: the worker passes its fencing token with every write
+        export async function run(w: Worker): Promise<void> {
+          const lease = await w.locks.acquire("invoice-export", { ttlSeconds: 10 });
+          const token = lease.token; // rises with every grant: 33, then 34, ...
+          try {
+            for await (const batch of w.batches()) {
+              const file = render(batch);
+              const res = await w.store.put(batch.key, file, token);
+              if (res === "stale") return; // a newer holder exists: stop, do not retry
+            }
+          } finally {
+            await lease.release();
+          }
+        }
+
+        // store.ts: the protected resource checks the token
+        export class Store {
+          private highest = 0; // the largest token ever accepted for this bucket
+          private files = new Map<string, Uint8Array>();
+
+          async put(key: string, data: Uint8Array, token: number): Promise<"ok" | "stale"> {
+            if (token < this.highest) return "stale"; // its holder was paused while another took over
+            this.highest = token;
+            this.files.set(key, data);
+            return "ok";
+          }
+        }
+      roles: { client: [3, 4], context: [2, 14], strategy: [4, 4], check: [21, 22], store: [16, 27], grant: [3, 4], pause: [6, 8], reject: [21, 22], stop: [9, 9] }
+    again:
+      file: fencing.test.ts
+      source: |
+        // fencing.test.ts: the same 15 s pause, with tokens
+        test("a paused worker is fenced off", async () => {
+          const s = new Store();
+          const enc = new TextEncoder();
+          assert.equal(await s.put("2026-11-20.csv", enc.encode("batch 12 by B"), 34), "ok"); // B took over
+          assert.equal(await s.put("2026-11-20.csv", enc.encode("batch 11 by A"), 33), "stale"); // A wakes
+        });
+    cost:
+      before: { text: 1 stale export over newer data per long pause · no error, value: 0.8 }
+      after: { text: 0 stale writes accepted · one integer per write, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'V8 has stop-the-world phases, and any long synchronous function blocks the event loop, so the timer that renews the lease does not fire. That is a pause too. Return the stale result as a value (`"stale"`) so the caller has to look at it, and never retry it: a retry with the same token fails again.'
+      seenIn: 'The `etcd3` npm client''s `lock(...).ttl(...)` and `election(...)`. BullMQ locks each job in Redis for `lockDuration` and renews it; a worker that stalls past it can see its job handed to another worker.'
+
+  rust:
+    before:
+      file: export.rs
+      source: |
+        // export.rs: one worker at a time writes the day's invoice export
+        pub async fn run(&self) -> Result<(), Error> {
+            let lease = self.locks.acquire("invoice-export", Duration::from_secs(10)).await?; // renewed in the background
+            let mut batches = self.batches();
+            while let Some(batch) = batches.next().await {
+                let file = render(&batch); // can take seconds; a process pause can land anywhere
+                self.store.put(&batch.key, file).await?;
+            }
+            lease.release().await
+        }
+      roles: { client: [3, 3], context: [2, 10], store: [7, 7] }
+      change:
+        - { after: 6, add: ['        if Instant::now() >= lease.deadline() { return Err(Error::LeaseLost); } // checked, then paused'] }
+    after:
+      file: export.rs
+      source: |
+        // export.rs: the worker passes its fencing token with every write
+        pub async fn run(&self) -> Result<(), Error> {
+            let lease = self.locks.acquire("invoice-export", Duration::from_secs(10)).await?;
+            let token = lease.token(); // rises with every grant: 33, then 34, ...
+            let mut batches = self.batches();
+            while let Some(batch) = batches.next().await {
+                let file = render(&batch);
+                match self.store.put(&batch.key, file, token).await {
+                    Err(Error::StaleToken { .. }) => break, // a newer holder exists: stop, do not retry
+                    other => other?,
+                }
+            }
+            lease.release().await
+        }
+
+        // store.rs: the protected resource checks the token
+        #[derive(Default)]
+        pub struct Store {
+            inner: tokio::sync::Mutex<Inner>,
+        }
+
+        #[derive(Default)]
+        struct Inner {
+            highest: u64, // the largest token ever accepted for this bucket
+            files: HashMap<String, Vec<u8>>,
+        }
+
+        impl Store {
+            pub async fn put(&self, key: &str, data: Vec<u8>, token: u64) -> Result<(), Error> {
+                let mut s = self.inner.lock().await;
+                if token < s.highest {
+                    return Err(Error::StaleToken { got: token, highest: s.highest });
+                }
+                s.highest = token;
+                s.files.insert(key.to_string(), data);
+                Ok(())
+            }
+        }
+      roles: { client: [3, 4], context: [2, 14], strategy: [4, 4], check: [29, 33], store: [16, 38], grant: [3, 4], pause: [6, 8], reject: [29, 33], stop: [9, 9] }
+    again:
+      file: fencing_test.rs
+      source: |
+        // fencing_test.rs: the same 15 s pause, with tokens
+        #[tokio::test]
+        async fn paused_worker_is_fenced() {
+            let s = Store::default();
+            s.put("2026-11-20.csv", b"batch 12 by B".to_vec(), 34).await.unwrap(); // B took over
+            let err = s.put("2026-11-20.csv", b"batch 11 by A".to_vec(), 33).await.unwrap_err(); // A wakes
+            assert!(matches!(err, Error::StaleToken { got: 33, highest: 34 }));
+        }
+    cost:
+      before: { text: 1 stale export over newer data per long pause · no error, value: 0.8 }
+      after: { text: 0 stale writes accepted · one integer per write, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'No GC does not mean no pauses. A container hitting its CPU quota is throttled, memory can be swapped, a VM can be live-migrated, and a task that is not polled because the runtime is busy is paused as far as its lease is concerned. Make the stale case its own error variant so `match` forces the caller to stop rather than retry.'
+      seenIn: 'The `etcd-client` crate''s `lease_grant`, `lock` and `campaign`; the revision in the response header grows with every grant. In Raft (`openraft`, `raft-rs`) the term plays the same role inside the protocol: messages from a lower term are rejected.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A acquires the lease on invoice-export. The lock service raises its counter and hands A token 33 with the lease.
+    nodes: [client, context]
+    edges: [client>context]
+    role: grant
+  - text: A renders batch 11 and freezes in a 15 s GC pause. Its lease expires after 10 s. B acquires it with token 34 and writes batch 12. Storage now remembers 34.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: pause
+  - text: A wakes and sends batch 11 with token 33. To A no time has passed. Storage compares 33 with 34 and refuses. B's export stays.
+    nodes: [strategy, check, store]
+    edges: [strategy>check, check>store]
+    role: reject
+  - text: A gets the stale error and stops instead of retrying. Its next renewal fails as well, and it goes back to standby.
+    nodes: [context]
+    edges: []
+    role: stop
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: What is a lease?
+    options:
+      - text: A lock that expires unless its holder renews it in time.
+        correct: true
+        why: Right. The expiry is what lets the system move on when the holder crashes, without waiting for it forever.
+      - text: A lock that lasts until its holder releases it.
+        why: Then a crashed holder would block everyone forever. The expiry is the point.
+      - text: A copy of the data that a follower keeps for reads.
+        why: That is a replica. A lease is about who may act, not about where data lives.
+  engineer:
+    question: A worker acquires a 10 s lease, then pauses for 30 s in a stop-the-world GC. What is the risk?
+    options:
+      - text: It resumes believing it still holds the lease and writes while another worker holds it.
+        correct: true
+        why: Right. Nothing ran during the pause, so nothing told it the lease expired. Its next write goes out with no further check.
+      - text: The lock service blocks its write.
+        why: Writes go to storage, not through the lock service. The lock service has no say in them.
+      - text: None, because the client library cancels writes once the lease expires.
+        why: The library is paused too. And a check before the write can pass just before the pause starts.
+  deep:
+    question: Where must the fencing token be checked?
+    options:
+      - text: At the resource being protected, on every write.
+        correct: true
+        why: Right. Only the resource sees writes from both holders, so only it can tell that 33 arrived after 34.
+      - text: In the lock service, when the holder renews.
+        why: The stale write happens before the renewal. The renewal fails, but the damage is already done.
+      - text: In the worker, just before it sends the write.
+        why: A pause can land between that check and the send. A check in the worker narrows the window but never closes it.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Lock service
+      example: etcd, ZooKeeper, Consul, the Kubernetes Lease object
+      job: Grants one lease at a time, expires it when not renewed, and issues a larger token with every grant.
+    - role: Leader (lease holder)
+      example: the worker running the invoice export
+      job: Renews the lease while it works and sends its token with every write.
+    - role: Fencing token
+      example: { go: "Election.Rev()", python: "creation zxid of the lock znode", typescript: "lease.token", rust: "header revision" }
+      job: A number that only grows, so a later holder always has a larger one.
+    - role: Protected resource
+      example: the export bucket, a database row, a file server
+      job: Remembers the highest token it has accepted and rejects any write with a lower one.
+  useWhen:
+    - Exactly one worker should run a job, own a partition or act as primary, and two at once would corrupt data.
+    - Holders can pause, be partitioned or be slow, which is every process on every real machine.
+    - The resource can store one number and compare it on each write, such as a database row, an object store with conditional writes, or a service you control.
+  avoidWhen:
+    - The lock only saves work, like deduplicating a cache refill. An occasional double run is fine, and a TTL lock is enough.
+    - The resource cannot check a token. Then you need idempotent writes or a resource that does its own concurrency control.
+    - You need agreement on a sequence of values. That is consensus; use Raft rather than building it from locks.
+  tradeoffs:
+    - Shorter leases mean faster failover and more spurious failovers when a holder is merely slow.
+    - Fencing needs the resource's cooperation; a third-party API that ignores the token gives no protection.
+    - The lock service itself must be consistent (consensus-backed), or two holders can get the same token.
+  lookalikes:
+    - name: Raft term
+      how: The same idea inside a protocol. A leader from an older term is ignored by servers that have seen a newer one.
+    - name: Compare-and-swap write
+      how: Writes only if the version is still what you read. It fences one row, without a lock service.
+    - name: Redlock
+      how: A lease across several Redis nodes. Kleppmann's analysis shows it relies on timing assumptions and produces no fencing token.
+    - name: Cache lease
+      how: A token that lets one client fill a missing cache key. It saves work rather than protecting correctness.
+---
+
+## [concept] Leader election, leases and fencing
+
+**Elect a leader by giving it a lease, a lock that expires. A paused leader can outlive its lease without knowing it, so every write carries a fencing token and the storage rejects old ones.**
+
+Many jobs need exactly one worker at a time: the nightly invoice export, the scheduler, the primary of a database. A lock service elects one by handing out a <Term id="lease">lease</Term>. The expiry is what lets the system recover when the holder dies. It is also what lets two workers both believe they hold it.
+
+<Depth level={2}>
+A worker that is merely paused looks dead from outside. Its lease expires, another worker takes over, and then the first one wakes up and carries on where it was. A <Term id="fencing-token">fencing token</Term> closes that gap. The lock service attaches a number to each grant, larger every time. Every write carries it, and the resource rejects a number smaller than one it has already accepted.
+</Depth>
+
+<Depth level={3}>
+The lock service has to be right about who holds the lease, which makes it a consensus problem: etcd and ZooKeeper keep that state in a <Term id="majority-quorum">majority quorum</Term>. The token generalises the <Term id="raft-term">term</Term> of Raft or the epoch of ZAB. A number that only grows, checked on every message, makes a stale leader harmless without anyone having to tell it that it is stale.
+</Depth>
+
+## [problem] Hold the lease, then write
+
+The billing service exports each day's invoices to object storage. Two workers run for availability, and a lock service decides which one does the export: whoever holds the `invoice-export` lease. The client library renews the lease in the background every few seconds. In staging, failover works perfectly.
+
+Read it once. The code assumes that while it holds the lease, nobody else does.
+
+<Depth level={2}>
+That holds only while the worker keeps running. The lease is a promise about time, kept by the lock service's clock. The worker's view of it is only as fresh as its last renewal, and a worker that is not running is not renewing.
+</Depth>
+
+<Depth level={3}>
+Kleppmann's 2016 article on distributed locking lists what can stop a process: stop-the-world GC, page faults that hit swap, a SIGSTOP, CPU contention, a VM migration. A delayed network packet has the same effect on the write. None of these is a crash, so nothing reports them.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** an invoice export must never be overwritten by a worker that has lost its lease.
+
+Last Tuesday a customer's export came out with yesterday's totals. The logs show worker A in a 15 s GC pause; B took over and wrote the correct file; A woke up and overwrote it. Someone adds a check of the lease right before the write, the marked lines. Two weeks later it happens again.
+
+<Depth level={2}>
+The check runs, passes, and the pause lands on the next line. Checking more often makes the window smaller and never closes it, because there is always a gap between the last check and the moment the bytes reach storage. Meanwhile both workers believe they lead: a small, silent <Term id="split-brain">split brain</Term>.
+</Depth>
+
+<Depth level={3}>
+Jepsen's 2020 analysis of etcd 3.4.3 found that etcd's locks did not guarantee mutual exclusion under pauses and partitions, and in one test lost about 18% of acknowledged updates guarded by a lock. Its advice matches Kleppmann's: treat a lease as an optimisation, and protect the resource with a token it can check.
+</Depth>
+
+## [morph] Let the storage decide who is current
+
+Drag the slider. A fencing token appears between the worker and the storage, and the lease check moves out of the worker into the storage.
+
+The worker reads its token once, when it gets the lease, and sends it with every write. The storage keeps the highest token it has accepted and refuses lower ones. A paused worker can still send a stale write; it just cannot land.
+
+<Depth level={2}>
+Fence per resource that the lock protects, not per key. If the stale holder writes a key the new holder has not touched yet, a per-key check would let it through. Here the whole export bucket shares one highest token. Equal tokens are accepted, because the current holder writes many times.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`errors.Is(err, ErrStaleToken)` separates "someone newer leads" from a transient storage error. Only the second deserves a retry.</Lang>
+<Lang only="python">`StaleToken` is its own exception class, so `except StaleToken` stops the loop while other errors still propagate.</Lang>
+<Lang only="typescript">`put` returns `"ok" | "stale"`, a union the compiler makes the caller look at, instead of a rejection that a generic retry wrapper might swallow.</Lang>
+<Lang only="rust">`Error::StaleToken { got, highest }` is its own variant, and the `match` handles it before `other?` propagates everything else.</Lang>
+</Depth>
+
+## [walk] Follow one pause through the system
+
+A holds the lease with token 33; B is standing by. Use the numbered buttons.
+
+<Depth level={2}>
+Fencing does not stop A from believing it leads, and it does not shorten failover. It changes what a wrong belief costs: from overwritten data to one refused write and a log line.
+</Depth>
+
+<Depth level={3}>
+The token must come from the same consensus that decides the holder. In etcd the revision of the lock key is assigned by the Raft log, so two grants can never share one and a later grant always has a larger one. A token from a separate counter, or from a random value as in Redlock, does not have that property.
+</Depth>
+
+## [again] The same pause, with tokens
+
+The same 15 s pause on the same worker. B writes batch 12 with token 34; A wakes and sends batch 11 with 33; the store refuses it. The test pins that down.
+
+<Depth level={2}>
+Nothing about the lease changed: same TTL, same renewal. You can still tune the TTL for how fast failover should be, without it being a safety setting. Shorter leases fail over faster and cause more needless takeovers when a holder is slow; the token keeps both cases correct.
+</Depth>
+
+<Depth level={3}>
+If the resource cannot check tokens, as with many third-party APIs, the next best tools are conditional writes (write only if the object's version is still the one you read) and idempotent operations. Both let the resource itself refuse a write that no longer makes sense.
+</Depth>
+
+## [play] Pause the leader
+
+A lock service, two workers and two copies of storage on one timeline. Every write goes to both stores, so you see the same run with and without fencing side by side.
+
+Pause the leader for less than its lease, then for more, then pause the new leader.
+
+## [lens] How each language meets a pause
+
+Every runtime can pause, with or without a garbage collector, and every lock client library gives you a lease and a number that grows. What differs is where the pauses come from and what the library calls the number.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Look for the token in the library before you invent one. In etcd it is the revision of your lock or election key; in ZooKeeper, the zxid of your lock znode; in a database, a row version. Pass it all the way to the write, and make the resource compare it.
+</Depth>
+
+<Depth level={3}>
+Kubernetes shows the pattern at scale. Controllers elect a leader with a Lease object and client-go's `leaderelection`, whose documentation says plainly that it does not fence. The API server does: every object carries a `resourceVersion`, and an update with a stale one is rejected. The lease decides who should work; the version check decides whose write counts.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="leader-election-and-fencing" />
+
+### Lease or fencing token
+
+| | Lease alone | Lease + fencing token |
+|---|---|---|
+| A crashed holder is replaced | Yes, after the TTL | Yes, after the TTL |
+| A paused holder can overwrite newer data | Yes | No, the resource refuses it |
+| Two holders can believe they lead | Yes | Yes, harmlessly |
+| What the resource must do | Nothing | Store and compare one number |
+| Depends on bounded pauses and clock rates | Yes | No |

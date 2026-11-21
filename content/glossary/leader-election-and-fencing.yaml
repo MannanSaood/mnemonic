@@ -1,0 +1,10 @@
+# Terms introduced by distributed-systems/leader-election-and-fencing.
+- id: lease
+  term: Lease
+  short: A lock with an expiry. The holder must renew it before the time runs out; if it does not, the lock service gives it to someone else without asking the holder.
+- id: fencing-token
+  term: Fencing token
+  short: A number the lock service hands out with each grant, larger every time. The holder sends it with every write, and the protected resource rejects any write with a token lower than one it has already seen.
+- id: process-pause
+  term: Process pause
+  short: A stretch of time in which a process runs no code but does not crash, such as a stop-the-world GC, swapping, a SIGSTOP or a VM migration. To the process, no time seems to have passed.
