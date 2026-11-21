@@ -1,0 +1,10 @@
+# Terms introduced by the Go preemption lesson.
+- id: async-preemption
+  term: Asynchronous preemption
+  short: Since Go 1.14, the runtime stops a goroutine that will not yield by sending a signal (SIGURG on Unix) to its thread. The signal handler checks that the goroutine is at a safe point and switches it out.
+- id: safe-point
+  term: Safe point
+  short: A place in running code where the runtime knows exactly which registers and stack slots hold pointers, so it can stop the goroutine there, scan its stack or move it.
+- id: stop-the-world
+  term: Stop the world
+  short: A short phase in which the runtime stops every goroutine at a safe point before doing work that needs them all still. Go's GC does this twice per cycle, briefly.

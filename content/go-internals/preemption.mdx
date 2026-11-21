@@ -1,0 +1,492 @@
+---
+title: Preemption
+track: go-internals
+group: Scheduler
+order: 6
+summary: The runtime can stop a goroutine that never yields. Before Go 1.14 it could only do that at a function call; since 1.14 it interrupts the thread with a signal.
+intent: Know when a long-running goroutine can be stopped, why the garbage collector depends on it, and what CPU-heavy loops still cost the goroutines around them.
+changeRequest: Deduplicate whole 1 GiB VM images, not only 4 MiB blocks.
+languages: [go, python, typescript, rust]
+glossary: [preemption, async-preemption, safe-point, stop-the-world, sysmon, cooperative-scheduling]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [go-runtime]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: preemption
+  scenarios:
+    - try: "Make a prediction, then run Go 1.13 (cooperative only) with GOMAXPROCS 2."
+      notice: "P1 serves requests fine until the GC asks to stop the world at 20 ms. P1 stops at once, P0 cannot stop inside the loop, and the whole program waits 66 ms. 27 requests start late."
+    - try: "Switch to Go 1.14+ (signals) and run again."
+      notice: "sysmon signals the loop every 10 ms, and the GC stops the world within a millisecond. No request is late."
+    - try: "Set GOMAXPROCS to 1 and turn the GC off. Compare cooperative and signals."
+      notice: "Cooperative: a request waits 79 ms behind the loop. Signals: at most 18 ms, but the loop now finishes at 142 ms instead of 85 ms, because it shares the only P."
+    - try: "Run Go 1.13 with Gosched per MiB, the old workaround."
+      notice: "The pause is short again, but the loop yields 79 times where signals needed 8."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: loop
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: fingerprint, sub: { go: "for range data", python: "blake2b(data)", typescript: "hash.update", rust: "blake3::hash" } }
+      after:  { x: 12, y: 24, w: 112, h: 48, title: fingerprint, sub: { go: "for range data", python: "to_thread", typescript: "per chunk", rust: "spawn_blocking" } }
+    - id: runtime
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: Go runtime, sub: "time-slices every goroutine?" }
+      after:  { x: 150, y: 24, w: 150, h: 48, title: sysmon, sub: "ran 10 ms?" }
+    - id: signal
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 100, w: 110, h: 48, title: "" }
+      after:  { x: 330, y: 24, w: 220, h: 48, title: SIGURG, sub: "to the loop's thread" }
+    - id: g
+      kind: concrete
+      before: { x: 170, y: 56, w: 230, h: 30, title: "the loop shares the CPU" }
+      after:  { x: 12, y: 190, w: 96, h: 48, title: G, sub: in the loop }
+    - id: safe
+      kind: concrete
+      before: { x: 170, y: 98, w: 230, h: 30, title: "GC stops it any time" }
+      after:  { x: 120, y: 190, w: 100, h: 48, title: safe point, sub: asyncPreempt }
+    - id: p
+      kind: concrete
+      before: { x: 170, y: 140, w: 230, h: 30, title: "P1 keeps serving" }
+      after:  { x: 232, y: 190, w: 96, h: 48, title: P0, sub: free again }
+    - id: gc
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 200, w: 230, h: 30, title: "1 GiB image: 1 s loop" }
+      after:  { x: 340, y: 190, w: 210, h: 48, title: GC stop the world, sub: every P stops }
+  edges:
+    - { from: loop, to: g, label: runs in }
+    - { from: runtime, to: signal, label: sends }
+    - { from: signal, to: safe, label: stops at }
+    - { from: g, to: safe }
+    - { from: safe, to: p, label: frees }
+    - { from: gc, to: p, label: waits for }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: fingerprint.go · dedupe.go · ingest.go
+      source: |
+        // fingerprint.go (built with Go 1.13)
+        // FNV-1a over the whole object, written inline for speed.
+        func fingerprint(data []byte) uint64 {
+            h := uint64(14695981039346656037)
+            for _, b := range data { // no function calls inside
+                h ^= uint64(b)
+                h *= 1099511628211
+            }
+            return h
+        }
+
+        // dedupe.go
+        func (d *Dedupe) Add(obj []byte) bool {
+            _, dup := d.seen.LoadOrStore(fingerprint(obj), struct{}{})
+            return dup
+        }
+
+        // ingest.go: the same process serves /healthz
+        dup := dedupe.Add(block) // a 4 MiB block: about 4 ms
+      roles: { loop: [3, 10], g: [5, 8], gc: [19, 19] }
+      change:
+        - { line: 19, replace: "dup := dedupe.Add(image) // a whole 1 GiB VM image: about 1 s" }
+    after:
+      file: go.mod · fingerprint.go · dedupe.go
+      source: |
+        // go.mod says go 1.22: loops are preemptible since Go 1.14.
+        // Fingerprints may use every P but one; requests keep the last.
+        var cpuSlots = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)-1))
+
+        func fingerprint(data []byte) uint64 {
+            h := uint64(14695981039346656037)
+            for _, b := range data { // sysmon may interrupt it every 10 ms
+                h ^= uint64(b)
+                h *= 1099511628211
+            }
+            return h
+        }
+
+        func (d *Dedupe) Add(obj []byte) bool {
+            cpuSlots <- struct{}{}
+            fp := fingerprint(obj)
+            <-cpuSlots
+            _, dup := d.seen.LoadOrStore(fp, struct{}{})
+            return dup
+        }
+      roles: { slots: [2, 3], loop: [5, 12], g: [7, 10], runtime: [7, 7], signal: [7, 7], safe: [7, 10], p: [15, 17], gc: [16, 16], detect: [7, 7], sig: [7, 7], switch: [8, 9], stw: [16, 16], limit: [14, 17] }
+    again:
+      file: ingest.go
+      source: |
+        // the same 1 GiB image, built with Go 1.22:
+        // sysmon interrupts the loop every 10 ms, the GC stops the world
+        // in well under a millisecond, and cpuSlots keeps one P free,
+        // so /healthz never queues behind a fingerprint.
+        dup := dedupe.Add(image)
+    cost:
+      before: { text: "GC waits 1 s · /healthz times out", value: 0.95 }
+      after: { text: "pause < 1 ms · requests on time", value: 0.12 }
+    lens:
+      need: 4
+      needLabel: Built in
+      note: 'Since Go 1.14 the runtime interrupts any goroutine that has run for about 10 ms, with a signal if it will not yield on its own. A tight loop can no longer freeze the program or stall the GC. It still holds its P for whole 10 ms slices, so keep CPU-heavy work off the Ps your latency-sensitive goroutines need.'
+      seenIn: '`GODEBUG=asyncpreemptoff=1` turns signals off. `runtime.asyncPreempt` frames in CPU profiles show where loops were interrupted. `/sched/latencies:seconds` in `runtime/metrics` shows how long goroutines waited to run.'
+
+  python:
+    before:
+      file: fingerprint.py · dedupe.py
+      source: |
+        # fingerprint.py
+        def fingerprint(data: bytes) -> bytes:
+            return hashlib.blake2b(data, digest_size=16).digest()
+
+        # dedupe.py (aiohttp)
+        async def add_block(request: web.Request) -> web.Response:
+            data = await request.read()  # a 4 MiB block: about 5 ms
+            fp = fingerprint(data)
+            dup = fp in SEEN
+            SEEN.add(fp)
+            return web.json_response({"dup": dup})
+      roles: { loop: [2, 3], g: [8, 8], gc: [7, 7] }
+      change:
+        - { line: 7, replace: "    data = await request.read()  # a whole 1 GiB image: about 1 s" }
+    after:
+      file: dedupe.py
+      source: |
+        # hashlib releases the GIL while it hashes large inputs,
+        # so a worker thread hashes while the event loop keeps serving.
+        cpu_slots = asyncio.Semaphore(2)
+
+        def fingerprint(data: bytes) -> bytes:
+            return hashlib.blake2b(data, digest_size=16).digest()
+
+        async def add_block(request: web.Request) -> web.Response:
+            data = await request.read()
+            async with cpu_slots:
+                fp = await asyncio.to_thread(fingerprint, data)
+            dup = fp in SEEN
+            SEEN.add(fp)
+            return web.json_response({"dup": dup})
+      roles: { slots: [3, 3], loop: [5, 6], g: [11, 11], runtime: [11, 11], signal: [11, 11], safe: [11, 11], p: [10, 11], gc: [9, 9], detect: [11, 11], sig: [11, 11], switch: [11, 11], stw: [11, 11], limit: [10, 11] }
+    again:
+      file: dedupe.py
+      source: |
+        # the same 1 GiB image, hashed on a worker thread:
+        # the event loop answers /healthz while blake2b runs,
+        # and at most two images are hashed at once.
+    cost:
+      before: { text: "event loop frozen 1 s", value: 0.95 }
+      after: { text: "loop free · 2 hashes at a time", value: 0.25 }
+    lens:
+      need: 2
+      needLabel: Your job
+      note: 'Coroutines are never preempted. A CPU-bound call inside one freezes the whole event loop until it returns. Threads are switched through the GIL every 5 ms, so a CPU-bound thread cannot starve the loop thread; hand the work to one with `asyncio.to_thread`, or to a process pool for pure-Python loops.'
+      seenIn: '`sys.setswitchinterval` (0.005 s by default). asyncio debug mode logs callbacks slower than `loop.slow_callback_duration`, 0.1 s. `concurrent.futures.ProcessPoolExecutor`.'
+
+  typescript:
+    before:
+      file: fingerprint.ts · dedupe.ts
+      source: |
+        // fingerprint.ts
+        const fingerprint = (data: Buffer) =>
+          createHash("sha256").update(data).digest("hex");
+
+        // dedupe.ts (Express)
+        app.post("/blocks", express.raw({ limit: "8mb" }), (req, res) => {
+          const fp = fingerprint(req.body); // a 4 MiB block: about 3 ms
+          const dup = seen.has(fp);
+          seen.add(fp);
+          res.json({ dup });
+        });
+      roles: { loop: [2, 3], g: [7, 7], gc: [6, 6] }
+      change:
+        - { line: 6, replace: 'app.post("/blocks", express.raw({ limit: "2gb" }), (req, res) => { // whole images' }
+    after:
+      file: dedupe.ts
+      source: |
+        // Hash the body as it arrives, one chunk per callback.
+        // The network is slower than the hash, so the loop is free between chunks.
+        app.post("/blocks", async (req, res) => {
+          const hash = createHash("sha256");
+          for await (const chunk of req) {
+            hash.update(chunk); // one network chunk: microseconds
+          }
+          const fp = hash.digest("hex");
+          const dup = seen.has(fp);
+          seen.add(fp);
+          res.json({ dup });
+        });
+      roles: { slots: [1, 2], loop: [4, 8], g: [6, 6], runtime: [5, 5], signal: [5, 5], safe: [5, 6], p: [5, 7], gc: [5, 7], detect: [5, 5], sig: [5, 5], switch: [6, 6], stw: [5, 7], limit: [1, 2] }
+    again:
+      file: dedupe.ts
+      source: |
+        // the same 1 GiB upload, hashed chunk by chunk:
+        // each update takes microseconds, and /healthz is answered
+        // between chunks instead of after a half-second freeze.
+    cost:
+      before: { text: "event loop frozen 0.5 s", value: 0.9 }
+      after: { text: "µs per chunk · loop free", value: 0.15 }
+    lens:
+      need: 1
+      needLabel: Your job
+      note: 'Node never preempts JavaScript. A callback runs to the end, and everything else waits, timers and health checks included. Split CPU work into short pieces that return to the event loop, or move it to a worker thread.'
+      seenIn: '`worker_threads`, Piscina, `perf_hooks.monitorEventLoopDelay`. V8 can interrupt a script for its own needs (a GC, a debugger, `vm` timeouts), never to run your other callbacks.'
+
+  rust:
+    before:
+      file: fingerprint.rs · dedupe.rs
+      source: |
+        // fingerprint.rs
+        fn fingerprint(data: &[u8]) -> blake3::Hash {
+            blake3::hash(data)
+        }
+
+        // dedupe.rs (axum on tokio)
+        async fn add_block(State(app): State<App>, body: Bytes) -> Json<Dup> {
+            let fp = fingerprint(&body); // a 4 MiB block: about 1 ms
+            let dup = !app.seen.lock().unwrap().insert(fp);
+            Json(Dup { dup })
+        }
+      roles: { loop: [2, 4], g: [8, 8], gc: [8, 8] }
+      change:
+        - { line: 8, replace: "    let fp = fingerprint(&body); // a whole 1 GiB image: about 0.3 s" }
+    after:
+      file: dedupe.rs
+      source: |
+        async fn add_block(State(app): State<App>, body: Bytes) -> Json<Dup> {
+            // app.cpu_slots: Arc<Semaphore>, one permit per spare core
+            let _slot = app.cpu_slots.acquire().await.unwrap();
+            // CPU-bound work runs on the blocking pool, off the async workers
+            let fp = tokio::task::spawn_blocking(move || fingerprint(&body))
+                .await
+                .unwrap();
+            let dup = !app.seen.lock().unwrap().insert(fp);
+            Json(Dup { dup })
+        }
+      roles: { slots: [2, 3], loop: [5, 7], g: [5, 5], runtime: [4, 5], signal: [4, 5], safe: [5, 7], p: [4, 5], gc: [5, 7], detect: [4, 5], sig: [4, 5], switch: [5, 7], stw: [5, 7], limit: [2, 3] }
+    again:
+      file: dedupe.rs
+      source: |
+        // the same 1 GiB image on the blocking pool:
+        // the kernel time-slices that thread, the async workers keep
+        // polling other requests, and the semaphore caps the CPU it takes.
+    cost:
+      before: { text: "one worker stuck 0.3 s", value: 0.75 }
+      after: { text: "workers free · capped CPU", value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Your job
+      note: 'Rust threads are OS threads, so the kernel preempts them. Async tasks are cooperative: a task gives up its worker only at an `.await` that is not ready. A long computation in an async fn stalls every task queued on that worker. Move it to `spawn_blocking` or a rayon pool.'
+      seenIn: '`tokio::task::spawn_blocking`, `block_in_place`, `tokio::task::yield_now`. Tokio''s cooperative budget makes tokio resources return Pending after a while, but it cannot interrupt plain computation.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The loop has run on P0 for 10 ms. sysmon sees the same goroutine still running and marks it for preemption. It also poisons the goroutine's stack guard, so the next function call it makes will stop it.
+    nodes: [runtime, g]
+    edges: []
+    role: detect
+  - text: This loop makes no function calls, so it would never see the mark. sysmon sends SIGURG to the thread running it.
+    nodes: [runtime, signal]
+    edges: [runtime>signal]
+    role: sig
+  - text: The signal handler looks at the instruction where the loop was interrupted. At a safe point, it rewrites the thread's context so it looks as if the loop had called asyncPreempt, which saves every register and enters the scheduler. The goroutine goes to the global run queue, and P0 runs the next one.
+    nodes: [signal, safe, g, p]
+    edges: [signal>safe, g>safe, safe>p]
+    role: switch
+  - text: A GC cycle stops the world the same way. It asks every running goroutine to stop, and each one does within a moment, so the pause stays short while a 1 GiB loop is running.
+    nodes: [gc, p]
+    edges: [gc>p]
+    role: stw
+  - text: Preemption bounds the wait at about one 10 ms slice. cpuSlots goes further and keeps one P free of fingerprints, so request goroutines never wait behind one.
+    nodes: [loop, p]
+    edges: []
+    role: limit
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Before Go 1.14, why could a loop with no function calls hold up a whole program, even with spare Ps?
+    options:
+      - text: A goroutine could only be stopped at a function call, and the garbage collector must stop every goroutine before it starts.
+        correct: true
+        why: Right. The other Ps stopped for the GC at once and then waited for the loop, so everything paused until it ended.
+      - text: The loop used every CPU core.
+        why: A goroutine runs on one thread at a time. The other Ps were free until the GC asked them to stop.
+      - text: The loop held a lock that the other goroutines needed.
+        why: No lock is involved. The stall comes from stop-the-world waiting for a goroutine that never reaches a stopping point.
+  engineer:
+    question: After moving a service to Go 1.14, code that calls syscall.Read directly starts returning EINTR now and then. Why?
+    options:
+      - text: Preemption signals interrupt slow system calls, and the raw syscall package passes EINTR up instead of retrying.
+        correct: true
+        why: Right. The release notes warn about this. The os and net packages retry for you; code that uses syscall or x/sys/unix directly must loop on EINTR.
+      - text: The kernel now limits how long a read may block.
+        why: Nothing changed in the kernel. The new source of EINTR is the runtime's own SIGURG.
+      - text: Go 1.14 made all file descriptors non-blocking.
+        why: Files were not switched to non-blocking mode. EINTR means a signal arrived during the call.
+  deep:
+    question: The signal arrives while the goroutine is in the middle of a write barrier sequence. What does the runtime do?
+    options:
+      - text: It leaves the goroutine running and tries again later, because that instruction is not an async safe point.
+        correct: true
+        why: Right. The compiler marks sequences that must not be split, such as write barriers and unsafe.Pointer arithmetic, as unsafe points. The handler returns, and preemption is retried.
+      - text: It stops the goroutine anyway and scans its stack conservatively.
+        why: Go does not stop a goroutine at an unsafe point. It needs exact pointer maps at every place it stops one.
+      - text: It finishes the sequence by emulating the remaining instructions.
+        why: No emulation is done. The handler simply returns and lets the goroutine run on to a safe point.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: sysmon
+      example: a runtime thread with no P
+      job: Notices a goroutine that has run for 10 ms and asks for it to be preempted.
+    - role: Preemption request
+      example: "gp.preempt, a poisoned stack guard"
+      job: Makes the next function call's stack check fail, so the goroutine yields there.
+    - role: Preemption signal
+      example: SIGURG on Unix
+      job: Interrupts a goroutine that makes no calls; the handler switches it out at a safe point.
+    - role: Stop the world
+      example: GC sweep and mark termination
+      job: Needs every goroutine stopped, so it depends on preemption to be fast.
+  useWhen:
+    - A goroutine runs long CPU-bound loops (hashing, compression, parsing, numeric work).
+    - GC pauses or scheduler latency are much longer than expected.
+    - A program built with an old Go version, or with asyncpreemptoff, hangs with one CPU busy.
+  avoidWhen:
+    - The work is I/O. Waits on channels, locks and sockets park the goroutine at once; preemption does not come into it.
+  tradeoffs:
+    - Preemption is coarse. A goroutine can hold a P for 10 ms before sysmon acts, which is long for latency-sensitive work.
+    - Preempted CPU work takes longer to finish, because it now shares its P.
+    - Signals interrupt system calls. Code that calls the raw syscall package must retry on EINTR.
+  lookalikes:
+    - name: Linux timer interrupt
+      how: The kernel preempts threads on a timer tick for any reason. Go preempts goroutines on top of that, per goroutine, every 10 ms.
+    - name: CPython's GIL switch interval
+      how: Forces a thread to give up the GIL after 5 ms. Coroutines on an asyncio loop are never switched this way.
+    - name: "tokio's cooperative budget"
+      how: Tokio resources start returning Pending after a task has done a lot of work, which forces a yield at the next await. Plain computation is never interrupted.
+---
+
+## [concept] Preemption
+
+**<Term id="preemption">Preemption</Term> is the runtime stopping a goroutine that has run long enough, so others can have its P. Since Go 1.14 it can stop any goroutine, anywhere safe, by sending a signal to its thread.**
+
+Before 1.14, a goroutine could only be stopped when it called a function. A loop with no calls inside could not be stopped at all.
+
+<Depth level={2}>
+Two things need preemption. The scheduler needs it to share a P fairly: <Term id="sysmon">sysmon</Term> asks any goroutine that has run for 10 ms to yield. The garbage collector needs it to <Term id="stop-the-world">stop the world</Term>: twice per cycle, every goroutine must stop at a <Term id="safe-point">safe point</Term> before the GC can move on. One goroutine that will not stop holds up all the others.
+</Depth>
+
+<Depth level={3}>
+The runtime has two ways to stop a goroutine. The cooperative one reuses the stack check at the start of almost every function: the runtime sets the goroutine's stack guard to a value that makes the check fail, and the stack-growth code sees the request and yields. The asynchronous one, added in 1.14, sends SIGURG to the thread and lets the signal handler switch the goroutine out, as long as it stopped at an instruction where the compiler recorded which registers hold pointers.
+</Depth>
+
+## [problem] A fingerprint loop in a backup service
+
+A backup service deduplicates uploaded blocks. For each 4 MiB block it computes an FNV-1a fingerprint in a hand-written loop, and looks it up in a set. The hash is written inline for speed, so the loop has no function calls. The same process serves `/healthz` and the upload API.
+
+The model behind it: goroutines take turns, so a long loop just takes longer. The service was built with Go 1.13, and a block takes about 4 ms.
+
+<Depth level={2}>
+At 4 ms per block, the loop finishes long before anything notices. The service runs with GOMAXPROCS 2, so even while one P is hashing, the other serves requests.
+</Depth>
+
+<Depth level={3}>
+On Go 1.13, the only way to stop this goroutine is to wait for it to call a function. The loop calls nothing, so it stops being stoppable for as long as it runs.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** deduplicate whole 1 GiB VM images, not only 4 MiB blocks.
+
+The marked line is the only change. Now one fingerprint runs for about a second. During that second the garbage collector starts a cycle and asks every goroutine to stop. The P serving requests stops at once. The P running the loop cannot stop until the loop ends. For the rest of that second, nothing runs: no requests, no health checks. Liveness probes start to time out, and after a few failures Kubernetes restarts the pod.
+
+<Depth level={2}>
+The spare P did not help, which is what makes the symptom so confusing. CPU usage shows one busy core, yet the whole process is frozen. An execution trace shows the other P idle, waiting for the GC to start.
+</Depth>
+
+<Depth level={3}>
+The same stall happens without a GC. Anything else that stops the world, such as `runtime.ReadMemStats` or `runtime.GOMAXPROCS(n)`, also waits for every goroutine to stop. On one P, it is worse: other goroutines simply never run until the loop ends.
+</Depth>
+
+## [morph] From "goroutines take turns" to "goroutines stop at safe points"
+
+Drag the slider. The picture of a runtime that time-slices every goroutine becomes the real path: sysmon notices the long run, sends SIGURG, and the signal handler stops the loop at a safe point. The GC uses the same path to stop the world.
+
+The code changes the toolchain to a current Go, where the loop is preemptible, and adds a limit so fingerprints never take the last P.
+
+<Depth level={2}>
+Upgrading fixes the freeze. The limit fixes what is left: a preempted loop still holds its P for whole 10 ms slices, and a request that lands behind it waits for one. Keeping one P free of CPU-heavy work keeps request latency flat.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Before 1.14, the usual fix was a `runtime.Gosched()` every few thousand iterations, or a call to a function the compiler would not inline. Both work, and both are now unnecessary on platforms with asynchronous preemption.</Lang>
+<Lang only="python">`hashlib` releases the GIL while it hashes inputs of 2 KiB or more, so the worker thread hashes in parallel with the event loop thread. A pure-Python loop would hold the GIL, and the loop thread would get it back only every 5 ms.</Lang>
+<Lang only="typescript">Each `for await` step waits for the next chunk from the socket. Hashing is faster than the network, so the loop spends that time serving other requests.</Lang>
+<Lang only="rust">`spawn_blocking` moves the call to tokio's blocking pool, where the kernel time-slices it like any thread. The async workers never see it.</Lang>
+</Depth>
+
+## [walk] Follow one interrupted loop
+
+One 10 ms slice of the fingerprint loop, from sysmon noticing it to the scheduler running the next goroutine. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The 10 ms is `forcePreemptNS` in `runtime/proc.go`. sysmon's `retake` calls `preemptone`, which sets `gp.preempt`, sets `gp.stackguard0` to `stackPreempt`, and, unless `asyncpreemptoff=1`, calls `preemptM` to send the signal. The handler, `doSigPreempt`, checks `wantAsyncPreempt` and `isAsyncSafePoint`, then injects a call to `asyncPreempt`. The GC's `suspendG` uses the same requests when it needs to scan a running goroutine's stack.</Lang>
+<Lang only="python">The GIL switch is a request too: a waiting thread sets a flag after the switch interval, and the running thread checks it at regular points in the bytecode loop. A long C call that keeps the GIL is never interrupted.</Lang>
+<Lang only="typescript">V8 checks for interrupts at function entries and loop back edges, for its own work such as GC and termination. It never uses them to run another JavaScript callback.</Lang>
+<Lang only="rust">The kernel's scheduler interrupts a thread with a timer, saves all its registers and runs another thread. No safe-point rules apply, because there is no garbage collector that needs to read the stack.</Lang>
+</Depth>
+
+## [again] The 1 GiB image, the second time
+
+The same image on Go 1.22. sysmon interrupts the loop every 10 ms. When the GC starts, it signals the loop's thread and the world stops in well under a millisecond. With one P kept free of fingerprints, `/healthz` never waits behind one at all.
+
+<Depth level={2}>
+The loop now finishes a little later, because it shares its P with whatever else is queued. That is the trade you want: a fingerprint that takes 5% longer instead of a pod that restarts.
+</Depth>
+
+<Depth level={3}>
+Asynchronous preemption cannot stop a goroutine inside a sequence the compiler marked unsafe, such as a write barrier or `unsafe.Pointer` arithmetic. The handler returns and the request is retried, so a stop is delayed by a few instructions, never by a whole loop.
+</Depth>
+
+## [play] Stop a loop that never calls
+
+Two Ps serve requests every 2 ms. One goroutine runs an 80 ms loop with no function calls, and a GC cycle starts at 20 ms. Pick the Go version and watch which Ps stop, and for how long.
+
+## [lens] How each language stops a long computation
+
+Go preempts goroutines for you. Python switches threads through the GIL but never coroutines. Node runs each callback to the end. Rust leaves threads to the kernel and async tasks to you.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+The rule that carries across all four: anything that runs on an event loop or an async worker must give the thread back often. Only Go's runtime will take it back for you.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="preemption" />
+
+### What stops a goroutine
+
+| Stopping point | Since | When it happens |
+|---|---|---|
+| Blocking (channel, lock, sleep, I/O) | always | The goroutine parks; nothing has to interrupt it. |
+| Function call with a poisoned stack guard | always | sysmon or the GC asked; the next call notices. |
+| Signal at an async safe point | Go 1.14 | sysmon or the GC sent SIGURG; works inside loops with no calls. |
+| `runtime.Gosched()` | always | The goroutine yields on purpose. Rarely needed now. |
