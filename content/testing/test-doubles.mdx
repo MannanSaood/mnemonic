@@ -1,0 +1,539 @@
+---
+title: Mocks, stubs and friends
+track: testing
+group: Test design
+order: 9
+summary: Five kinds of test double, two real roles. Stubs feed the data a service asks for; mocks and spies check the commands it sends out.
+intent: Replace each dependency with the double that matches its role, and assert only on what leaves the code under test.
+changeRequest: "The database team found that SendReceipt loads every order twice. Load it once."
+languages: [go, python, typescript, rust]
+glossary: [test-double, dummy, stub, spy, mock, fake, command-query-separation]
+
+prerequisites: [testing/four-pillars, design-patterns/interfaces-and-polymorphism]
+skills: [test-doubles, testing]
+depths: [overview, engineer, deep]
+
+playground:
+  model: test-doubles
+  scenarios:
+    - try: "Answer the prediction, then press Run all nine rows with a mock on both sides."
+      notice: "Every bug is caught, and two refactorings that change nothing for the customer turn the suite red."
+    - try: "Switch OrderRepo to a stub, then a fake, and run all rows again each time."
+      notice: "The bugs caught stay at 5. The false alarms drop to 1 with a stub and 0 with a fake."
+    - try: "Now put a stub in the Mailer slot."
+      notice: "Four bugs slip through. The email is the outcome, and a stub keeps no record of it."
+    - try: "Put a dummy in either slot and open the first row's trace."
+      notice: "The suite is red before any bug is planted. A dummy is for a parameter the code never uses."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 56, title: receipt test, sub: 4 expectations }
+      after:  { x: 12, y: 107, w: 120, h: 56, title: receipt test, sub: asserts the email }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 408, h: 246, title: SendReceipt, sub: every call is expected }
+      after:  { x: 196, y: 107, w: 160, h: 56, title: SendReceipt, sub: code under test }
+    - id: repo
+      kind: concrete
+      before: { x: 160, y: 70, w: 180, h: 60, title: mock OrderRepo, sub: GetOrder ×2 }
+      after:  { x: 392, y: 20, w: 156, h: 56, title: stub OrderRepo, sub: canned data in }
+    - id: mailer
+      kind: strategy
+      before: { x: 356, y: 70, w: 180, h: 60, title: mock Mailer, sub: Send ×1 }
+      after:  { x: 392, y: 194, w: 156, h: 56, title: { go: spy Mailer, python: mock Mailer, typescript: mock Mailer, rust: mock Mailer }, sub: checks the email }
+    - id: change
+      kind: concrete
+      appears: change
+      before: { x: 160, y: 170, w: 180, h: 60, title: load once, sub: GetOrder ×1 }
+      after:  { x: 392, y: 107, w: 156, h: 56, title: load once, sub: test unchanged }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: repo, to: context, label: data in }
+    - { from: context, to: mailer, label: email out }
+    - { from: client, to: mailer, label: asserts }
+
+code:
+  go:
+    before:
+      file: receipts_test.go
+      source: |
+        // receipts_test.go
+        func TestSendReceipt(t *testing.T) {
+            ctrl := gomock.NewController(t)
+            repo := NewMockOrderRepo(ctrl)
+            mailer := NewMockMailer(ctrl)
+
+            repo.EXPECT().GetOrder("ord_42").Return(order42, nil).Times(2)
+            repo.EXPECT().GetCustomer("cus_7").Return(Customer{Email: "ana@example.com"}, nil)
+            mailer.EXPECT().Send(Email{
+                To: "ana@example.com", Subject: "Receipt for order ord_42", Body: "Total: $107.00",
+            }).Return(nil)
+
+            if err := NewReceipts(repo, mailer).Send("ord_42"); err != nil {
+                t.Fatal(err)
+            }
+        }
+      roles: { context: [2, 16], repo: [7, 8], mailer: [9, 11], client: [13, 15] }
+      change:
+        - { after: 6, add: ['    // the service now loads the order once, so this test fails until it is edited'] }
+        - { line: 7, replace: '    repo.EXPECT().GetOrder("ord_42").Return(order42, nil) // edited: was .Times(2)' }
+    after:
+      file: receipts_test.go
+      source: |
+        type stubOrders struct{ order Order; customer Customer }
+
+        func (s stubOrders) GetOrder(string) (Order, error)       { return s.order, nil }
+        func (s stubOrders) GetCustomer(string) (Customer, error) { return s.customer, nil }
+
+        type spyMailer struct{ sent []Email }
+
+        func (m *spyMailer) Send(e Email) error { m.sent = append(m.sent, e); return nil }
+
+        func TestSendReceipt(t *testing.T) {
+            repo := stubOrders{order: order42, customer: Customer{Email: "ana@example.com"}}
+            mailer := &spyMailer{}
+
+            if err := NewReceipts(repo, mailer).Send("ord_42"); err != nil {
+                t.Fatal(err)
+            }
+            want := []Email{{To: "ana@example.com", Subject: "Receipt for order ord_42", Body: "Total: $107.00"}}
+            if !slices.Equal(mailer.sent, want) {
+                t.Errorf("sent %v, want %v", mailer.sent, want)
+            }
+        }
+      roles: { repo: [1, 4], stub: [1, 4], mailer: [6, 8], spy: [6, 8], context: [10, 21], client: [14, 16], act: [14, 16], verify: [17, 20] }
+    again:
+      file: receipts.go
+      source: |
+        // receipts.go: the order is loaded once. receipts_test.go did not change.
+        func (r *Receipts) Send(id string) error {
+            order, err := r.orders.GetOrder(id)
+            if err != nil {
+                return fmt.Errorf("send receipt %s: %w", id, err)
+            }
+            customer, err := r.orders.GetCustomer(order.CustomerID)
+            if err != nil {
+                return fmt.Errorf("send receipt %s: %w", id, err)
+            }
+            return r.mailer.Send(Email{
+                To:      customer.Email,
+                Subject: "Receipt for order " + id,
+                Body:    "Total: " + formatCents(order.SubtotalCents+order.TaxCents),
+            })
+        }
+    cost:
+      before: { text: 1 test edit · 0 behaviour changed, value: 0.55 }
+      after: { text: 0 test edits, value: 0.08 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'Go has no mocking library in the standard library, and small interfaces make hand-written stubs, spies and fakes a few lines each. That is the common style. `go.uber.org/mock` (gomock) and `mockery` generate strict mocks when you want them; gomock expects each call once unless you say `.Times(n)`.'
+      seenIn: '`io.Discard` is a ready-made dummy `io.Writer`. `httptest.NewRecorder()` records what a handler wrote, like a spy, and `httptest.NewServer` runs a fake HTTP server. `testing/fstest.MapFS` is an in-memory fake file system.'
+
+  python:
+    before:
+      file: test_receipts.py
+      source: |
+        # test_receipts.py
+        def test_send_receipt():
+            repo = create_autospec(OrderRepo, instance=True)
+            mailer = create_autospec(Mailer, instance=True)
+            repo.get_order.return_value = ORDER_42
+            repo.get_customer.return_value = Customer(email="ana@example.com")
+
+            Receipts(repo, mailer).send("ord_42")
+
+            assert repo.get_order.call_args_list == [call("ord_42"), call("ord_42")]
+            repo.get_customer.assert_called_once_with("cus_7")
+            mailer.send.assert_called_once_with(
+                Email(to="ana@example.com", subject="Receipt for order ord_42", body="Total: $107.00")
+            )
+      roles: { context: [2, 14], client: [8, 8], repo: [10, 11], mailer: [12, 14] }
+      change:
+        - { after: 9, add: ['    # the service now loads the order once, so this test fails until it is edited'] }
+        - { line: 10, replace: '    repo.get_order.assert_called_once_with("ord_42")  # edited: was two calls' }
+    after:
+      file: test_receipts.py
+      source: |
+        # test_receipts.py
+        def test_send_receipt():
+            repo = create_autospec(OrderRepo, instance=True)  # a stub: answers, never asserted
+            repo.get_order.return_value = ORDER_42
+            repo.get_customer.return_value = Customer(email="ana@example.com")
+            mailer = create_autospec(Mailer, instance=True)  # a mock: the email is the outcome
+
+            Receipts(repo, mailer).send("ord_42")
+
+            mailer.send.assert_called_once_with(
+                Email(to="ana@example.com", subject="Receipt for order ord_42", body="Total: $107.00")
+            )
+      roles: { repo: [3, 5], stub: [3, 5], mailer: [6, 6], spy: [6, 6], context: [2, 12], client: [8, 8], act: [8, 8], verify: [10, 12] }
+    again:
+      file: receipts.py
+      source: |
+        # receipts.py: the order is loaded once. test_receipts.py did not change.
+        class Receipts:
+            def __init__(self, repo: OrderRepo, mailer: Mailer) -> None:
+                self._repo, self._mailer = repo, mailer
+
+            def send(self, order_id: str) -> None:
+                order = self._repo.get_order(order_id)
+                customer = self._repo.get_customer(order.customer_id)
+                self._mailer.send(Email(
+                    to=customer.email,
+                    subject=f"Receipt for order {order_id}",
+                    body=f"Total: {format_cents(order.subtotal_cents + order.tax_cents)}",
+                ))
+    cost:
+      before: { text: 1 test edit · 0 behaviour changed, value: 0.55 }
+      after: { text: 0 test edits, value: 0.08 }
+    lens:
+      need: 3
+      needLabel: Built in
+      note: '`unittest.mock` ships with Python. One `Mock` can play any role: set `return_value` and never assert on it, and it is a stub; call `assert_called_once_with`, and it is a mock. Use `create_autospec` (or `spec=`) so the double rejects methods and arguments the real class does not have.'
+      seenIn: 'pytest''s `monkeypatch` and `tmp_path` fixtures. `io.StringIO` as a fake file. The `responses` and `respx` libraries fake HTTP for `requests` and `httpx`.'
+
+  typescript:
+    before:
+      file: receipts.test.ts
+      source: |
+        // receipts.test.ts
+        test("sends the receipt", async () => {
+          const repo = {
+            getOrder: vi.fn().mockResolvedValue(order42),
+            getCustomer: vi.fn().mockResolvedValue({ id: "cus_7", email: "ana@example.com" }),
+          };
+          const mailer = { send: vi.fn().mockResolvedValue(undefined) };
+
+          await new Receipts(repo, mailer).send("ord_42");
+
+          expect(repo.getOrder).toHaveBeenCalledTimes(2);
+          expect(repo.getCustomer).toHaveBeenCalledWith("cus_7");
+          expect(mailer.send).toHaveBeenCalledTimes(1);
+          expect(mailer.send).toHaveBeenCalledWith({
+            to: "ana@example.com", subject: "Receipt for order ord_42", body: "Total: $107.00",
+          });
+        });
+      roles: { context: [2, 17], client: [9, 9], repo: [11, 12], mailer: [13, 16] }
+      change:
+        - { after: 10, add: ['  // the service now loads the order once, so this test fails until it is edited'] }
+        - { line: 11, replace: '  expect(repo.getOrder).toHaveBeenCalledTimes(1); // edited: was 2' }
+    after:
+      file: receipts.test.ts
+      source: |
+        // receipts.test.ts
+        test("sends the receipt", async () => {
+          const repo: OrderRepo = { // a stub: answers, never asserted
+            getOrder: async () => order42,
+            getCustomer: async () => ({ id: "cus_7", email: "ana@example.com" }),
+          };
+          const mailer = { send: vi.fn(async (_email: Email) => {}) }; // a mock: the email is the outcome
+
+          await new Receipts(repo, mailer).send("ord_42");
+
+          expect(mailer.send).toHaveBeenCalledTimes(1);
+          expect(mailer.send).toHaveBeenCalledWith({
+            to: "ana@example.com", subject: "Receipt for order ord_42", body: "Total: $107.00",
+          });
+        });
+      roles: { repo: [3, 6], stub: [3, 6], mailer: [7, 7], spy: [7, 7], context: [2, 15], client: [9, 9], act: [9, 9], verify: [11, 14] }
+    again:
+      file: receipts.ts
+      source: |
+        // receipts.ts: the order is loaded once. receipts.test.ts did not change.
+        export class Receipts {
+          constructor(private repo: OrderRepo, private mailer: Mailer) {}
+
+          async send(orderId: string): Promise<void> {
+            const order = await this.repo.getOrder(orderId);
+            const customer = await this.repo.getCustomer(order.customerId);
+            await this.mailer.send({
+              to: customer.email,
+              subject: `Receipt for order ${orderId}`,
+              body: `Total: ${formatCents(order.subtotalCents + order.taxCents)}`,
+            });
+          }
+        }
+    cost:
+      before: { text: 1 test edit · 0 behaviour changed, value: 0.55 }
+      after: { text: 0 test edits, value: 0.08 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`vi.fn()` in Vitest and `jest.fn()` in Jest record every call, so the same function is a stub until you assert on it. Structural typing means an object literal with the right methods is already a stub or a fake, with no library. `vi.spyOn` wraps a real method and records calls to it.'
+      seenIn: 'Mock Service Worker (`msw`) intercepts `fetch` and answers like a fake server. `vi.useFakeTimers()` fakes the clock. `fake-indexeddb` is an in-memory IndexedDB for tests.'
+
+  rust:
+    before:
+      file: receipts.rs (tests)
+      source: |
+        // receipts.rs (tests)
+        #[test]
+        fn sends_the_receipt() {
+            let mut repo = MockOrderRepo::new();
+            repo.expect_get_order().times(2).returning(|_| Ok(order_42()));
+            repo.expect_get_customer()
+                .times(1)
+                .returning(|_| Ok(Customer { email: "ana@example.com".into() }));
+            let mut mailer = MockMailer::new();
+            mailer.expect_send()
+                .withf(|e| e.to == "ana@example.com" && e.body == "Total: $107.00")
+                .times(1)
+                .returning(|_| Ok(()));
+
+            Receipts::new(repo, mailer).send("ord_42").unwrap();
+        }
+      roles: { context: [3, 16], repo: [4, 8], mailer: [9, 13], client: [15, 15] }
+      change:
+        - { after: 4, add: ['    // the service now loads the order once, so this test fails until it is edited'] }
+        - { line: 5, replace: '    repo.expect_get_order().times(1).returning(|_| Ok(order_42())); // edited: was times(2)' }
+    after:
+      file: receipts.rs (tests)
+      source: |
+        struct StubOrders;
+
+        impl OrderRepo for StubOrders {
+            fn get_order(&self, _id: &str) -> Result<Order, RepoError> { Ok(order_42()) }
+            fn get_customer(&self, _id: &str) -> Result<Customer, RepoError> {
+                Ok(Customer { email: "ana@example.com".into() })
+            }
+        }
+
+        #[test]
+        fn sends_the_receipt() {
+            let mut mailer = MockMailer::new();
+            mailer.expect_send()
+                .withf(|e| e.to == "ana@example.com" && e.body == "Total: $107.00")
+                .times(1)
+                .returning(|_| Ok(()));
+
+            Receipts::new(StubOrders, mailer).send("ord_42").unwrap();
+        }
+      roles: { repo: [1, 8], stub: [1, 8], mailer: [12, 16], spy: [12, 13], context: [11, 19], client: [18, 18], act: [18, 18], verify: [14, 15] }
+    again:
+      file: receipts.rs
+      source: |
+        // receipts.rs: the order is loaded once. The test did not change.
+        impl<R: OrderRepo, M: Mailer> Receipts<R, M> {
+            pub fn send(&self, order_id: &str) -> Result<(), ReceiptError> {
+                let order = self.repo.get_order(order_id)?;
+                let customer = self.repo.get_customer(&order.customer_id)?;
+                self.mailer.send(Email {
+                    to: customer.email,
+                    subject: format!("Receipt for order {order_id}"),
+                    body: format!("Total: {}", format_cents(order.subtotal_cents + order.tax_cents)),
+                })?;
+                Ok(())
+            }
+        }
+    cost:
+      before: { text: 1 test edit · 0 behaviour changed, value: 0.55 }
+      after: { text: 0 test edits, value: 0.08 }
+    lens:
+      need: 3
+      needLabel: Library helps
+      note: 'Traits are the seam. A unit struct that implements the trait is a stub in a few lines. The `mockall` crate''s `#[automock]` generates a mock with `expect_*()`, `times`, `withf` and `returning`; an expectation that was not met panics when the mock is dropped at the end of the test.'
+      seenIn: '`std::io::sink()` is a dummy writer, and a `Vec<u8>` implements `Write`, so it can record output like a spy. The `wiremock` crate runs a fake HTTP server for async tests.'
+
+walk:
+  - text: The stub hands over a canned order and customer. The test never asks how they were fetched, so loading them once or twice makes no difference to it.
+    nodes: [repo, context]
+    edges: [repo>context]
+    role: stub
+  - text: The test calls the service once, the way a real caller would.
+    nodes: [client, context]
+    edges: [client>context]
+    role: act
+  - text: { go: 'The email leaves through the mailer. The spy keeps a copy and returns success.', python: 'The email leaves through the mailer. The autospec mock records the call and returns None.', typescript: 'The email leaves through the mailer. `vi.fn` records the call and resolves.', rust: 'The email leaves through the mailer. The mock checks it against its expectation as it arrives.' }
+    nodes: [context, mailer]
+    edges: [context>mailer]
+    role: spy
+  - text: The assertion is about the one email that left the service, its address, subject and total. That is what a customer would notice if it were wrong.
+    nodes: [client, mailer]
+    edges: [client>mailer]
+    role: verify
+
+checks:
+  overview:
+    question: A service reads an order from a repository and then emails a receipt. Which double fits the repository?
+    options:
+      - text: A stub that returns a canned order.
+        correct: true
+        why: Right. The repository supplies data. A stub supplies it, and the test checks what the service did with it.
+      - text: A mock that checks the repository was called with the right id.
+        why: How the order was fetched is the service's own business. Checking it adds no protection and breaks when the fetching changes.
+      - text: A dummy, because the repository is not what is being tested.
+        why: The service calls the repository, so a dummy fails the test at once. A dummy only fills a parameter the code never uses.
+  engineer:
+    question: Your receipt test stubs the repository. A reviewer asks you to also assert that `getOrder` was called exactly once, "to be thorough". What do you answer?
+    options:
+      - text: No. Asserting on a stub ties the test to how data is fetched, which can change without any customer noticing.
+        correct: true
+        why: Right. Stubs feed incoming data; mocks and spies check outgoing commands. Verifying a query adds false alarms and catches no extra bugs.
+      - text: Yes. More assertions always mean more protection.
+        why: Each assertion also has a cost. This one protects nothing a customer can see, and fails on the next harmless refactor.
+      - text: Yes, but only with a strict mock that also checks argument order.
+        why: That makes it more brittle, not less. The call count of a query is an implementation detail.
+  deep:
+    question: A spy and a mock can both check that a receipt was emailed. What is the practical difference?
+    options:
+      - text: A mock is told its expected calls before the code runs and checks them itself; a spy records calls and the test asserts on them afterwards.
+        correct: true
+        why: Right. Both verify an outgoing interaction. A spy keeps the arrange, act, assert order and is easy to write by hand; a mock library builds the expectations for you.
+      - text: A spy can only be used for queries, a mock only for commands.
+        why: Both are for commands that leave the code under test. Queries are fed by stubs.
+      - text: A spy calls the real dependency, a mock never does.
+        why: Some libraries can wrap a real object with a spy, but that is optional. The difference is when and where the expectations are checked.
+
+reference:
+  roles:
+    - role: Dummy
+      example: { go: "nil, io.Discard", python: "None, object()", typescript: "{} as Logger", rust: "std::io::sink()" }
+      job: Fills a parameter that this test path never uses.
+    - role: Stub
+      example: { go: stubOrders, python: "Mock(return_value=...)", typescript: "{ getOrder: async () => order42 }", rust: StubOrders }
+      job: Returns canned data for the code's queries. Never asserted on.
+    - role: Spy
+      example: { go: spyMailer, python: "Mock + assert_called_once_with", typescript: vi.fn(), rust: "Vec<u8> as Write" }
+      job: Records outgoing calls; the test asserts on the record afterwards.
+    - role: Mock
+      example: { go: "gomock EXPECT()", python: create_autospec(Mailer), typescript: "vi.fn() + toHaveBeenCalledWith", rust: "mockall expect_send()" }
+      job: Holds expected outgoing calls and fails when the code makes different ones.
+    - role: Fake
+      example: in-memory repository or outbox
+      job: A working, simplified implementation. Survives changes in how it is called.
+  useWhen:
+    - The real dependency is slow, shared, costs money or sends something to the outside world (email, payments, a partner's API).
+    - You need a case that is hard to stage for real, such as a missing row, a timeout or a declined card.
+    - A command leaves the system and its content is the outcome the test is about.
+  avoidWhen:
+    - The dependency is your own pure code. Use the real thing; a double only hides bugs between the two.
+    - You are about to assert on a query's call count or arguments. Feed it with a stub and assert on the result instead.
+    - The double would be harder to read than the real dependency, such as a stub chain three calls deep.
+  tradeoffs:
+    - Every double is a second implementation of the interface that can drift from the real one; keep some tests against the real dependency.
+    - Mock libraries make strict expectations cheap to write and expensive to keep.
+    - Hand-written fakes cost more up front and less later, because one fake serves every test.
+  lookalikes:
+    - name: Mocking library
+      how: A tool such as unittest.mock, Vitest or mockall that can build any kind of double. Using it does not make the double a mock.
+    - name: Monkey patching
+      how: Replaces a function by name at runtime. It needs no seam in the code, and breaks when the import path or name changes.
+    - name: Contract test
+      how: Runs the same tests against the real dependency and its fake, so the fake cannot drift.
+---
+
+## [concept] Mocks, stubs and friends
+
+**A test double stands in for a real dependency in a test. There are five kinds, but only two roles: feed data in, or check what goes out.**
+
+A <Term id="test-double">test double</Term> replaces something the code depends on, such as a database, a mail provider or a clock. A <Term id="dummy">dummy</Term> fills a parameter, a <Term id="stub">stub</Term> answers queries, a <Term id="spy">spy</Term> records calls, a <Term id="mock">mock</Term> expects calls, and a <Term id="fake">fake</Term> really works, in memory.
+
+Group them by role. Stubs (and fakes and dummies) feed data into the code under test. Mocks and spies check the commands it sends out. Pick the role first, and the kind follows.
+
+<Depth level={2}>
+The split follows <Term id="command-query-separation">command-query separation</Term>. A query returns data and changes nothing, so how often it is called is the code's own business: stub it. A command changes something outside, such as sending an email or charging a card, and that change is the outcome: check it with a mock or a spy. Never assert on a stub.
+</Depth>
+
+<Depth level={3}>
+Gerard Meszaros named the five kinds in *xUnit Test Patterns* (2007), and Martin Fowler's article *Mocks Aren't Stubs* made the distinction widely known. Mock objects themselves come from a 2000 paper by Mackinnon, Freeman and Craig, where they were a tool for designing the interfaces between objects. Vladimir Khorikov's *Unit Testing* reduces the five to the two roles used here, and argues that mocks belong only at the edge of the system.
+</Depth>
+
+## [problem] A test that checks every call
+
+`SendReceipt` loads an order and its customer from a repository, then emails a receipt through a mail provider. Its test replaces both with mocks and expects every call the service makes: the order loaded twice, the customer loaded once, one email sent.
+
+It looks thorough. It passes. Read which lines are about what a customer gets, and which are about how the service got its data.
+
+<Depth level={2}>
+Only the mailer expectation describes an outcome. The two repository expectations describe the service's internal steps. They were copied from what the code did on the day the test was written.
+</Depth>
+
+<Depth level={3}>
+Strict mock libraries push in this direction. gomock and mockall fail on any call that has no matching expectation, so the author must write an expectation for every query just to get the test to run, and then the counts are frozen in.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** The database team found that SendReceipt loads every order twice. Load it once.
+
+The fix is one line in the service. The receipt it sends is byte for byte the same. The test goes red anyway, and the marked line has to be edited before the change can merge.
+
+<Depth level={2}>
+This is a false alarm: a test that fails when nothing a user can see has changed. Each one costs a little time, and together they teach the team that red means "update the test", not "you broke something". That is how real failures get waved through.
+</Depth>
+
+<Depth level={3}>
+The next refactoring, replacing two queries with one joined query, breaks the test again. A per-test stub configured for `getOrder` breaks too, because nothing answers the new method. A fake repository that implements the whole interface survives both. The playground lets you count these.
+</Depth>
+
+## [morph] Stub what comes in, check what goes out
+
+Drag the slider. The repository becomes a stub that hands over canned data and is never checked. The mailer stays a test double that checks the email, because the email is what the test is about.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The test now has one assertion, and it is about the outcome. It still catches every bug that changes the email: a missing send, a wrong address, a double send, a wrong total.
+</Depth>
+
+<Depth level={3}>
+A stub can still carry a little knowledge of the code, such as which methods it answers. A fake goes further: it is a real implementation, so the test holds no knowledge of how the data was fetched at all. Use fakes for dependencies many tests share.
+</Depth>
+
+## [walk] Follow one test
+
+One run of the receipt test, from the canned data to the assertion. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The stub is a struct value that satisfies `OrderRepo` implicitly. The spy needs a pointer receiver so `Send` can append to the slice the test reads afterwards.</Lang>
+<Lang only="python">`create_autospec` builds the double from the real class's signatures, so `mailer.send(wrong, args)` raises `TypeError` instead of silently recording a call that the real class would reject.</Lang>
+<Lang only="typescript">`vi.fn` keeps every call in `mailer.send.mock.calls`. The matchers read that array, so they work the same whether the function was called with `await` or not.</Lang>
+<Lang only="rust">`withf` receives a reference to the argument. If no expectation matches a call, the mock panics at the call; if `times(1)` is not met, it panics when the mock is dropped at the end of the test.</Lang>
+</Depth>
+
+## [again] Load once, the second time
+
+The same request, with the new test. The service loads the order once. The stub does not care how many times it is asked, and the email is unchanged, so the test stays green and nobody edits it.
+
+<Depth level={2}>
+Keep the tests for the cases that matter to a caller: an unknown order returns an error and sends nothing, and a failed send is reported. Each is one stub answer or one assertion on the mailer.
+</Depth>
+
+<Depth level={3}>
+Doubles can drift from the real thing. Run a small set of slower tests against the real repository, or run the same contract tests against both the real repository and the fake, so the fake stays honest.
+</Depth>
+
+## [play] Pick a double, plant bugs, refactor
+
+The same service and the same two tests, with any double in either slot. Run the suite against five planted bugs and three refactorings that change nothing a customer could notice.
+
+A good suite goes red for every bug and stays green for every refactoring. Find the pair of doubles that does both.
+
+## [lens] How each language writes it
+
+Every language here can build all five kinds by hand. They differ in what the standard tools nudge you towards: hand-written doubles in Go, one flexible `Mock` in Python, `vi.fn` in TypeScript, and generated mocks or small trait impls in Rust.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whatever the tool, the rule is the same: the role decides what you assert. A library mock used only for its return values is a stub.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="test-doubles" />
+
+### Mock the edge, not the middle
+
+Mocks are worth their cost where a command leaves your system and someone outside would notice: an email, a payment, a message to another team's service. Between your own classes, use the real objects, and a stub or fake for data that comes from outside. The next lesson, on observable behaviour, explains why.

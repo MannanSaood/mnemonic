@@ -1,0 +1,19 @@
+# Terms introduced by testing/test-doubles
+- id: dummy
+  term: Dummy
+  short: A test double that only fills a parameter. The code under test never calls it.
+- id: stub
+  term: Stub
+  short: A test double that returns canned answers to the code's queries. The test never checks how it was called.
+- id: spy
+  term: Spy
+  short: A test double that records the calls made to it, so the test can assert on them afterwards.
+- id: mock
+  term: Mock
+  short: A test double set up with expected calls; it fails the test when the code makes different ones. Also the name of the libraries that build doubles.
+- id: fake
+  term: Fake
+  short: A test double with a working but simplified implementation, such as an in-memory repository or outbox.
+- id: command-query-separation
+  term: Command-query separation
+  short: A method either changes something (a command) or returns data (a query), not both.
