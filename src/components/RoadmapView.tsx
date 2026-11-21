@@ -31,7 +31,7 @@ export function RoadmapView({ items }: { items: RoadmapItem[] }) {
               <span className="rm-main">
                 <span className="rm-track label">{it.track}</span>
                 <span className="t">{it.title}</span>
-                <span className="rm-why">{it.why.join(" ")}</span>
+                <span className="rm-why">{it.why[0]}{it.why.length > 1 ? ` (and ${it.why.length - 1} more reason${it.why.length > 2 ? "s" : ""})` : ""}</span>
               </span>
               <span className="rm-tags">
                 <span className="badge">{it.depth}</span>

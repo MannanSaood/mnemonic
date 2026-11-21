@@ -2,7 +2,7 @@
 // future roadmap page (and tests) can call them with any data.
 //
 // computeRoadmap:
-// 1. Every lesson tagged with a goal skill is required, at the deepest depth any of its
+// 1. Every lesson whose main skill (first tag) is a goal skill is required, at the deepest depth any of its
 //    matching goals asks for (capped at the depths the lesson covers).
 // 2. Prerequisites of required lessons are pulled in too, at Overview, unless already required.
 // 3. The path is ordered so prerequisites come first (topological order); ties keep the
@@ -36,7 +36,9 @@ export function computeRoadmap(profile: RoadmapProfile, lessons: TopicMeta[], pa
   };
 
   for (const l of lessons) {
-    const goals = profile.goals.filter((g) => l.skills.includes(g.skill));
+    // A lesson belongs to a goal when that goal's skill is the lesson's main skill (its first tag).
+    // Matching any tag pulls in most of the catalogue and makes the path useless.
+    const goals = profile.goals.filter((g) => l.skills[0] === g.skill);
     if (!goals.length) continue;
     const depth = goals.map((g) => g.depth).reduce((a, b) => (RANK[a] >= RANK[b] ? a : b));
     need.set(l.id, { depth: deepestCovered(l, depth), why: goals.map((g) => g.why), prereqOnly: false });
