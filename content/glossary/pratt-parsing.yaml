@@ -1,0 +1,10 @@
+# Terms introduced by compilers/pratt-parsing.
+- id: binding-power
+  term: Binding power
+  short: A number per operator in a Pratt parser. When an operand sits between two operators, the one with the higher binding power takes it.
+- id: associativity
+  term: Associativity
+  short: How a chain of operators with equal precedence groups. Left-associative a - b - c means (a - b) - c; right-associative means a - (b - c).
+- id: precedence-climbing
+  term: Precedence climbing
+  short: Parsing binary operators with one recursive function and a minimum-precedence argument, instead of one function per precedence level. Pratt parsing generalises it.

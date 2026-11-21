@@ -1,0 +1,646 @@
+---
+title: "Pratt parsing: operators and precedence"
+track: compilers
+group: Front end
+order: 6
+summary: A Pratt parser handles every operator with one loop and a table of binding powers. The higher power takes the operand in between, and equal powers group to the left.
+intent: Parse expressions with any number of operators and precedence levels without writing a function per level, and know exactly why a b c groups the way it does.
+changeRequest: SRE wants ratio alerts such as errors / requests > 0.05, mixed with and and or the way every other language mixes them.
+languages: [go, python, typescript, rust]
+glossary: [binding-power, associativity, precedence-climbing, abstract-syntax-tree]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [compilers/recursive-descent-parsing]
+skills: [compilers, parsing]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: pratt-parsing
+  scenarios:
+    - try: Answer the prediction, then step Mixed and/or until and decides whether to bind.
+      notice: "The parser is inside parseExpr(1), the right side of or. and has power 2, which is above 1, so it binds and takes mem > 0.9. The staging host at 97% CPU pages."
+    - try: Lower and from 2 to 1 and look at the tree and the alert.
+      notice: "Now and's power is not above or's minimum, so the inner call returns and or keeps mem > 0.9. The root becomes and, and the staging host goes silent. One number changed the meaning."
+    - try: Pick Minus chain, then switch + - to right-associative.
+      notice: "Left: the right side is parsed with parseExpr(5), so the second - stops there and you get (requests - retries) - timeouts = 390. Right: parseExpr(4) lets it continue, giving 398."
+    - try: Drop the comparison row to 1 and parse Mixed and/or.
+      notice: "The rule still parses, into (cpu > 0.95 or mem) > 0.9 and so on, and fails when it runs: or needs booleans. The table is the grammar, so a wrong number is a wrong language."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: rule engine, sub: parseRule() }
+      after:  { x: 12, y: 30, w: 112, h: 48, title: rule engine, sub: parseExpr(0) }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: left-to-right fold, sub: "cond (and|or cond)*" }
+      after:  { x: 150, y: 30, w: 160, h: 56, title: parseExpr(minBP), sub: one loop }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 30, w: 110, h: 56, title: "" }
+      after:  { x: 340, y: 30, w: 208, h: 56, title: binding powers, sub: "op → number" }
+    - id: prefix
+      kind: concrete
+      before: { x: 170, y: 64, w: 230, h: 32, title: "cond: metric op value" }
+      after:  { x: 12, y: 190, w: 124, h: 52, title: prefix, sub: "name ( not -" }
+    - id: infix
+      kind: concrete
+      before: { x: 170, y: 106, w: 230, h: 32, title: "and, or: same level" }
+      after:  { x: 146, y: 190, w: 124, h: 52, title: infix loop, sub: "bp > minBP?" }
+    - id: assoc
+      kind: concrete
+      before: { x: 170, y: 148, w: 230, h: 32, title: "no + - * /" }
+      after:  { x: 280, y: 190, w: 124, h: 52, title: right side, sub: "parseExpr(bp)" }
+    - id: ratio
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 206, w: 230, h: 32, title: "errors / requests: rejected" }
+      after:  { x: 414, y: 190, w: 134, h: 52, title: "/ is a row", sub: "bp 6" }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: context, to: strategy, label: looks up }
+    - { from: prefix, to: context, label: operand }
+    - { from: infix, to: strategy, label: compares }
+    - { from: assoc, to: context, label: recurses }
+    - { from: ratio, to: strategy, label: one row }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: rules.go
+      source: |
+        // rules.go: conditions joined by and/or, folded left to right
+        func (p *Parser) parseRule() (Expr, error) {
+            left, err := p.parseCondition()
+            if err != nil {
+                return nil, err
+            }
+            for p.peek().Text == "and" || p.peek().Text == "or" {
+                op := p.next().Text
+                right, err := p.parseCondition()
+                if err != nil {
+                    return nil, err
+                }
+                left = &Logic{Op: op, Left: left, Right: right}
+            }
+            return left, nil
+        }
+
+        // parseCondition reads exactly three tokens: metric, comparison, literal
+        func (p *Parser) parseCondition() (Expr, error) {
+            metric, op, value := p.next(), p.next(), p.next()
+            if metric.Kind != Name || !isComparison(op) || !isLiteral(value) {
+                return nil, fmt.Errorf("%d: expected metric, comparison, value", metric.Start)
+            }
+            return &Compare{Metric: metric.Text, Op: op.Text, Value: value}, nil
+        }
+      roles: { client: [2, 3], context: [7, 14], prefix: [19, 25], infix: [7, 13], assoc: [21, 22], ratio: [21, 22] }
+      change:
+        - { after: 25, add: ["", '// cpu > 0.95 or mem > 0.9 and env == "prod"  =>  (cpu > 0.95 or mem > 0.9) and env == "prod"', "// errors / requests > 0.05                   =>  0: expected metric, comparison, value"] }
+    after:
+      file: parser.go
+      source: |
+        // parser.go: one loop, and a table of binding powers
+        var infixBP = map[string]int{
+            "or": 1, "and": 2,
+            "==": 4, "!=": 4, "<": 4, "<=": 4, ">": 4, ">=": 4,
+            "+": 5, "-": 5,
+            "*": 6, "/": 6,
+        }
+
+        const notBP, negBP = 3, 7
+
+        func (p *Parser) parseExpr(minBP int) (Expr, error) {
+            left, err := p.parsePrefix()
+            if err != nil {
+                return nil, err
+            }
+            for {
+                op := p.peek()
+                bp, ok := infixBP[op.Text]
+                if op.Kind == String || !ok || bp <= minBP {
+                    return left, nil // not an operator, or too weak to take left
+                }
+                p.next()
+                right, err := p.parseExpr(bp) // an equal bp stops in there: left-associative
+                if err != nil {
+                    return nil, err
+                }
+                left = &Binary{Op: op.Text, Left: left, Right: right}
+            }
+        }
+
+        func (p *Parser) parsePrefix() (Expr, error) {
+            t := p.next()
+            switch {
+            case t.Text == "(":
+                inner, err := p.parseExpr(0)
+                if err != nil {
+                    return nil, err
+                }
+                return inner, p.expect(")")
+            case t.Text == "not" || t.Text == "-":
+                bp := map[string]int{"not": notBP, "-": negBP}[t.Text]
+                x, err := p.parseExpr(bp)
+                return &Unary{Op: t.Text, X: x}, err
+            case t.Kind == Name || t.Kind == Number || t.Kind == String || t.Text == "true" || t.Text == "false":
+                return &Leaf{t}, nil
+            }
+            return nil, fmt.Errorf("%d: expected an operand, got %q", t.Start, t.Text)
+        }
+      roles: { strategy: [2, 9], context: [11, 29], client: [11, 11], prefix: [31, 48], infix: [16, 21], assoc: [23, 23], ratio: [6, 6], call: [11, 15], loop: [16, 21], grab: [22, 27], table: [2, 7] }
+    again:
+      file: parser.go
+      source: |
+        // The ratio rule needs no new code: "/" is already a row.
+        //   errors / requests > 0.05 or p99 > 300 and env == "prod"
+        //   => ((errors / requests) > 0.05) or ((p99 > 300) and (env == "prod"))
+        // A new operator, such as "%", is one more entry: "%": 6
+    cost:
+      before: { text: ratio rejected · and/or misgrouped, value: 0.8 }
+      after: { text: one table · 0 new functions, value: 0.08 }
+    lens:
+      need: 2
+      needLabel: In the library
+      note: 'Go''s own parser uses this loop. `go/parser` calls `parseBinaryExpr(x, prec1)`, which reads `p.tokPrec()`, returns when the operator''s precedence is below `prec1`, and parses the right side with `oprec+1`. Go has only five binary levels, all left-associative, which is why its precedence table fits in one `switch`.'
+      seenIn: '`token.Token.Precedence()` in `go/token`: `||` is 1, `&&` 2, comparisons 3, `+ - | ^` 4, and `* / % << >> & &^` 5. `go/parser.ParseExpr` gives you the tree for any Go expression.'
+
+  python:
+    before:
+      file: rules.py
+      source: |
+        # rules.py: conditions joined by and/or, folded left to right
+        class RuleParser:
+            def parse_rule(self) -> Expr:
+                left = self.parse_condition()
+                while self.peek().text in ("and", "or"):
+                    op = self.advance().text
+                    right = self.parse_condition()
+                    left = Logic(op, left, right)
+                return left
+
+            def parse_condition(self) -> Expr:
+                """Exactly three tokens: metric, comparison, literal."""
+                metric, op, value = self.advance(), self.advance(), self.advance()
+                if metric.kind != "NAME" or op.text not in COMPARISONS or value.kind not in LITERALS:
+                    raise RuleError(f"expected metric, comparison, value at offset {metric.start}")
+                return Compare(metric.text, op.text, value)
+      roles: { client: [3, 4], context: [5, 8], prefix: [11, 16], infix: [5, 8], assoc: [14, 15], ratio: [14, 15] }
+      change:
+        - { after: 16, add: ["", '# cpu > 0.95 or mem > 0.9 and env == "prod"  =>  (cpu > 0.95 or mem > 0.9) and env == "prod"', "# errors / requests > 0.05                   =>  expected metric, comparison, value at offset 0"] }
+    after:
+      file: parser.py
+      source: |
+        # parser.py: one loop, and a table of binding powers
+        INFIX_BP = {
+            "or": 1, "and": 2,
+            "==": 4, "!=": 4, "<": 4, "<=": 4, ">": 4, ">=": 4,
+            "+": 5, "-": 5,
+            "*": 6, "/": 6,
+        }
+        PREFIX_BP = {"not": 3, "-": 7}
+
+        class Parser:
+            # peek(), advance() and expect() are three-line helpers over the token list
+
+            def parse_expr(self, min_bp: int = 0) -> Expr:
+                left = self.parse_prefix()
+                while True:
+                    op = self.peek()
+                    bp = None if op.kind == "STRING" else INFIX_BP.get(op.text)
+                    if bp is None or bp <= min_bp:
+                        return left  # not an operator, or too weak to take left
+                    self.advance()
+                    right = self.parse_expr(bp)  # an equal bp stops in there: left-associative
+                    left = Binary(op.text, left, right)
+
+            def parse_prefix(self) -> Expr:
+                tok = self.advance()
+                match tok:
+                    case Token(text="("):
+                        inner = self.parse_expr(0)
+                        self.expect(")")
+                        return inner
+                    case Token(kind="OP" | "KEYWORD", text="not" | "-" as op):
+                        return Unary(op, self.parse_expr(PREFIX_BP[op]))
+                    case Token(kind="NAME" | "NUMBER" | "STRING") | Token(text="true" | "false"):
+                        return Leaf(tok)
+                raise RuleError(f"expected an operand at offset {tok.start}, got {tok.text!r}")
+      roles: { strategy: [2, 8], context: [13, 22], client: [13, 13], prefix: [24, 35], infix: [15, 19], assoc: [21, 21], ratio: [6, 6], call: [13, 14], loop: [15, 19], grab: [20, 22], table: [2, 7] }
+    again:
+      file: parser.py
+      source: |
+        # The ratio rule needs no new code: "/" is already a row.
+        #   errors / requests > 0.05 or p99 > 300 and env == "prod"
+        #   => ((errors / requests) > 0.05) or ((p99 > 300) and (env == "prod"))
+        # A new operator, such as "%", is one more entry: "%": 6
+    cost:
+      before: { text: ratio rejected · and/or misgrouped, value: 0.8 }
+      after: { text: one table · 0 new functions, value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Hand-written
+      note: '`match` with class patterns reads like the grammar: one case per kind of prefix. CPython itself does not parse this way. Since 3.9 its parser is generated from a PEG grammar, and precedence is spelled as a chain of rules, one per level (`disjunction`, `conjunction`, `inversion`, `comparison`, then the arithmetic levels). That is the function-per-level style this lesson replaces.'
+      seenIn: '`ast.dump(ast.parse("a or b and c", mode="eval"))` shows `BoolOp(Or, [a, BoolOp(And, [b, c])])`. `-2 ** 2` is `-4` in Python, because `**` binds tighter than the unary minus on its left.'
+
+  typescript:
+    before:
+      file: rules.ts
+      source: |
+        // rules.ts: conditions joined by and/or, folded left to right
+        export class RuleParser {
+          parseRule(): Expr {
+            let left = this.parseCondition();
+            while (this.peek().text === "and" || this.peek().text === "or") {
+              const op = this.next().text;
+              const right = this.parseCondition();
+              left = { kind: "logic", op, left, right };
+            }
+            return left;
+          }
+
+          // exactly three tokens: metric, comparison, literal
+          private parseCondition(): Expr {
+            const [metric, op, value] = [this.next(), this.next(), this.next()];
+            if (metric.kind !== "name" || !COMPARISONS.has(op.text) || !isLiteral(value)) {
+              throw new RuleError(`${metric.start}: expected metric, comparison, value`);
+            }
+            return { kind: "compare", metric: metric.text, op: op.text, value };
+          }
+        }
+      roles: { client: [3, 4], context: [5, 9], prefix: [13, 20], infix: [5, 9], assoc: [16, 18], ratio: [16, 18] }
+      change:
+        - { after: 21, add: ["", '// cpu > 0.95 or mem > 0.9 and env == "prod"  =>  (cpu > 0.95 or mem > 0.9) and env == "prod"', "// errors / requests > 0.05                   =>  0: expected metric, comparison, value"] }
+    after:
+      file: parser.ts
+      source: |
+        // parser.ts: one loop, and a table of binding powers
+        const INFIX_BP = new Map<string, number>([
+          ["or", 1], ["and", 2],
+          ["==", 4], ["!=", 4], ["<", 4], ["<=", 4], [">", 4], [">=", 4],
+          ["+", 5], ["-", 5],
+          ["*", 6], ["/", 6],
+        ]);
+        const PREFIX_BP = new Map<string, number>([["not", 3], ["-", 7]]);
+
+        export class Parser {
+          private pos = 0;
+          constructor(private tokens: Token[]) {}
+
+          parseExpr(minBp = 0): Expr {
+            let left = this.parsePrefix();
+            for (;;) {
+              const op = this.tokens[this.pos];
+              const bp = op.kind === "string" ? undefined : INFIX_BP.get(op.text);
+              if (bp === undefined || bp <= minBp) return left; // not an operator, or too weak to take left
+              this.pos++;
+              const right = this.parseExpr(bp); // an equal bp stops in there: left-associative
+              left = { kind: "binary", op: op.text, left, right };
+            }
+          }
+
+          private parsePrefix(): Expr {
+            const t = this.tokens[this.pos++];
+            if (t.kind === "op" && t.text === "(") {
+              const inner = this.parseExpr(0);
+              this.expect(")");
+              return inner;
+            }
+            const pbp = t.kind === "string" ? undefined : PREFIX_BP.get(t.text);
+            if (pbp !== undefined) return { kind: "unary", op: t.text, x: this.parseExpr(pbp) };
+            if (t.kind === "name" || t.kind === "number" || t.kind === "string" || t.text === "true" || t.text === "false") {
+              return { kind: "leaf", token: t };
+            }
+            throw new RuleError(`${t.start}: expected an operand, got ${JSON.stringify(t.text)}`);
+          }
+        }
+      roles: { strategy: [2, 8], context: [14, 23], client: [14, 14], prefix: [26, 39], infix: [16, 19], assoc: [21, 21], ratio: [6, 6], call: [14, 15], loop: [16, 19], grab: [20, 22], table: [2, 7] }
+    again:
+      file: parser.ts
+      source: |
+        // The ratio rule needs no new code: "/" is already a row.
+        //   errors / requests > 0.05 or p99 > 300 and env == "prod"
+        //   => ((errors / requests) > 0.05) or ((p99 > 300) and (env == "prod"))
+        // A new operator, such as "%", is one more entry: ["%", 6]
+    cost:
+      before: { text: ratio rejected · and/or misgrouped, value: 0.8 }
+      after: { text: one table · 0 new functions, value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Hand-written
+      note: 'A `Map` keeps the table safe from prototype keys such as `constructor`, which a plain object literal would answer for. JavaScript parsers such as Acorn and Babel handle binary operators with an operator-precedence loop of this shape, with one twist for `**`: it is right-associative.'
+      seenIn: 'In JavaScript, `-2 ** 2` is a SyntaxError: the language makes you write `(-2) ** 2` or `-(2 ** 2)`, and TypeScript reports it as error TS17006. `ts.createSourceFile` gives you the tree for any expression to inspect.'
+
+  rust:
+    before:
+      file: rules.rs
+      source: |
+        // rules.rs: conditions joined by and/or, folded left to right
+        impl<'a> RuleParser<'a> {
+            pub fn parse_rule(&mut self) -> Result<Expr<'a>, RuleError> {
+                let mut left = self.parse_condition()?;
+                while let Some(op @ ("and" | "or")) = self.peek_text() {
+                    self.next();
+                    let right = self.parse_condition()?;
+                    left = Expr::Logic(op, Box::new(left), Box::new(right));
+                }
+                Ok(left)
+            }
+
+            // exactly three tokens: metric, comparison, literal
+            fn parse_condition(&mut self) -> Result<Expr<'a>, RuleError> {
+                match (self.next(), self.next(), self.next()) {
+                    (Some(m), Some(op), Some(v)) if m.kind == Kind::Name && is_comparison(&op) && is_literal(&v) => {
+                        Ok(Expr::Compare(m.text, op.text, v))
+                    }
+                    _ => Err(RuleError::Expected("metric, comparison, value")),
+                }
+            }
+        }
+      roles: { client: [3, 4], context: [5, 9], prefix: [13, 20], infix: [5, 9], assoc: [16, 19], ratio: [16, 19] }
+      change:
+        - { after: 21, add: ["", '// cpu > 0.95 or mem > 0.9 and env == "prod"  =>  (cpu > 0.95 or mem > 0.9) and env == "prod"', "// errors / requests > 0.05                   =>  Expected(\"metric, comparison, value\")"] }
+    after:
+      file: parser.rs
+      source: |
+        // parser.rs: one loop, and a table of binding powers
+        fn infix_bp(op: &str) -> Option<u8> {
+            Some(match op {
+                "or" => 1,
+                "and" => 2,
+                "==" | "!=" | "<" | "<=" | ">" | ">=" => 4,
+                "+" | "-" => 5,
+                "*" | "/" => 6,
+                _ => return None,
+            })
+        }
+
+        impl<'a> Parser<'a> {
+            pub fn parse_expr(&mut self, min_bp: u8) -> Result<Expr<'a>, ParseError> {
+                let mut left = self.parse_prefix()?;
+                loop {
+                    let op = match self.peek() {
+                        Some(t) if t.kind != Kind::Str => t.text,
+                        _ => break,
+                    };
+                    match infix_bp(op) {
+                        Some(bp) if bp > min_bp => {
+                            self.next();
+                            let right = self.parse_expr(bp)?; // an equal bp stops in there: left-associative
+                            left = Expr::Binary(op, Box::new(left), Box::new(right));
+                        }
+                        _ => break, // not an operator, or too weak to take left
+                    }
+                }
+                Ok(left)
+            }
+
+            fn parse_prefix(&mut self) -> Result<Expr<'a>, ParseError> {
+                let t = self.next().ok_or(ParseError::UnexpectedEnd)?;
+                match (t.kind, t.text) {
+                    (Kind::Op, "(") => {
+                        let inner = self.parse_expr(0)?;
+                        self.expect(")")?;
+                        Ok(inner)
+                    }
+                    (Kind::Keyword, "not") => Ok(Expr::Unary("not", Box::new(self.parse_expr(3)?))),
+                    (Kind::Op, "-") => Ok(Expr::Unary("-", Box::new(self.parse_expr(7)?))),
+                    (Kind::Name | Kind::Number | Kind::Str, _) | (Kind::Keyword, "true" | "false") => Ok(Expr::Leaf(t)),
+                    _ => Err(ParseError::ExpectedOperand(t.span)),
+                }
+            }
+        }
+      roles: { strategy: [2, 11], context: [14, 31], client: [14, 14], prefix: [33, 46], infix: [16, 27], assoc: [24, 24], ratio: [8, 8], call: [14, 15], loop: [16, 21], grab: [22, 26], table: [2, 11] }
+    again:
+      file: parser.rs
+      source: |
+        // The ratio rule needs no new code: "/" is already an arm.
+        //   errors / requests > 0.05 or p99 > 300 and env == "prod"
+        //   => ((errors / requests) > 0.05) or ((p99 > 300) and (env == "prod"))
+        // A new operator, such as "%", is one more pattern: "*" | "/" | "%" => 6
+    cost:
+      before: { text: ratio rejected · and/or misgrouped, value: 0.8 }
+      after: { text: one table · 0 new functions, value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Hand-written or a crate
+      note: 'A `match` returning `Option<u8>` is the table, and the compiler checks it is a pure function. `Box` gives the recursive `Expr` a known size. rustc parses binary operators by precedence with a loop of this kind too, and rust-analyzer''s parser calls its version `expr_bp`, named after binding power.'
+      seenIn: 'matklad''s article Simple but Powerful Pratt Parsing, by the author of rust-analyzer''s parser, uses a pair of left and right powers per operator. The `chumsky` parser-combinator crate has a `pratt` module. `syn` parses Rust expressions with a precedence table for procedural macros.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The rule engine calls parseExpr(0). The prefix step reads an operand, cpu. Zero is below every operator, so at the top every operator may bind.
+    nodes: [client, context, prefix]
+    edges: [client>context, prefix>context]
+    role: call
+  - text: "The next token is >, power 4. Four is above 0, so > binds and takes cpu. Its right side is parsed by parseExpr(4), which reads 0.95, sees or with power 1, and returns: 1 is not above 4."
+    nodes: [context, strategy, infix]
+    edges: [context>strategy, infix>strategy]
+    role: loop
+  - text: "Back in the outer loop, or (1) binds and its right side is parseExpr(1). That call reads mem > 0.9, then meets and with power 2. Two is above 1, so and takes mem > 0.9. The higher power grabbed the operand in the middle."
+    nodes: [infix, assoc, context]
+    edges: [infix>strategy, assoc>context]
+    role: grab
+  - text: Calling parseExpr with the operator's own power is what makes equal operators group to the left. The inner call stops at the next operator of the same power and hands it back to the outer loop.
+    nodes: [assoc, context]
+    edges: [assoc>context]
+    role: grab
+  - text: The ratio alert needs / and the arithmetic operators. Each is a row in the table. The loop does not change.
+    nodes: [ratio, strategy]
+    edges: [ratio>strategy]
+    role: table
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: In a Pratt parser, and has binding power 2 and or has 1. How does a or b and c group?
+    options:
+      - text: a or (b and c), because the operator with the higher power takes the operand between them.
+        correct: true
+        why: Right. b sits between or and and. and binds more strongly, so b goes to and, and the whole and becomes or's right side.
+      - text: (a or b) and c, because the parser reads left to right.
+        why: That is what a left-to-right fold produces. A Pratt parser also reads left to right, but the powers decide who keeps b.
+      - text: It depends on the values of a, b and c.
+        why: Grouping is decided when the rule is parsed, before any value is known. The tree is the same for every host.
+  engineer:
+    question: Your rule language gains ** for exponents, which should be right-associative. What changes in a Pratt parser?
+    options:
+      - text: Add a row for ** with a power above * and /, and parse its right side with that power minus one.
+        correct: true
+        why: Right. A lower minimum lets the inner call take the next ** too, so a ** b ** c becomes a ** (b ** c). Nothing else changes.
+      - text: Add a new parseExponent function and call it from the function for * and /.
+        why: That is the function-per-level design. It works, but each new level means another function and rewiring its neighbours.
+      - text: Nothing. Right associativity is the default in Pratt parsers.
+        why: With the right side parsed at the operator's own power, equal operators group to the left. Right associativity needs the lower power.
+  deep:
+    question: "Someone puts comparisons below and in the table. The rule cpu > 0.9 and env == \"prod\" still saves. What happens?"
+    options:
+      - text: It parses as cpu > (0.9 and env) == "prod", a valid tree that fails at evaluation because and gets a number.
+        correct: true
+        why: Right. The table is the operator grammar. A wrong power is not a parse error; it produces a different, legal tree. Type checking at save time, or tests of known rules, catch it.
+      - text: The parser throws, because comparisons must bind tighter than and.
+        why: The loop has no idea what the operators mean. It only compares numbers, so any table gives some tree.
+      - text: Nothing changes, because comparisons and and never meet in a real rule.
+        why: They meet in almost every rule. That is exactly why their relative power matters.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: parseExpr(minBP)
+      example: { go: "parseExpr(minBP int)", python: "parse_expr(min_bp)", typescript: "parseExpr(minBp)", rust: "parse_expr(min_bp)" }
+      job: Parses an operand, then takes operators while their power is above minBP.
+    - role: Binding power table
+      example: "or 1 · and 2 · compare 4 · + - 5 · * / 6"
+      job: The whole operator grammar as data. Adding an operator is a row.
+    - role: Prefix parse
+      example: names, numbers, strings, (, not, unary -
+      job: What a token means at the start of an expression.
+    - role: Infix step
+      example: a binary operator
+      job: What a token means after a complete left operand. Builds a node from left and right.
+    - role: Right-side power
+      example: bp (left-assoc) or bp - 1 (right-assoc)
+      job: Decides how a chain of equal operators groups.
+  useWhen:
+    - Expressions with many operators and levels, as in rule, query, filter and formula languages.
+    - You want to add operators without rewiring the parser.
+    - You are writing a parser by hand and want good error messages, which generated parsers make harder.
+  avoidWhen:
+    - The language has an existing parser (CEL, SQL, JSON Logic). Use it.
+    - Expressions have one or two operators. A function per level is just as clear.
+  tradeoffs:
+    - The table is compact, but precedence is now numbers, so reviews need a written table and tests of known groupings.
+    - Prefix, infix and postfix (calls, indexing) all fit one loop, which makes it easy to keep growing the language.
+    - Precedence climbing is the same loop for binary operators only. Pratt adds per-token prefix and infix behaviour.
+  lookalikes:
+    - name: Recursive descent, one function per level
+      how: Same trees. The levels are a chain of calls, so the order of the chain is the precedence.
+    - name: Shunting-yard
+      how: Dijkstra's algorithm uses explicit operator and output stacks instead of recursion; the call stack plays that role in Pratt.
+    - name: LR parsing
+      how: Generated tables also resolve precedence, through declarations such as %left in yacc and bison.
+---
+
+## [concept] One loop and a table of numbers
+
+**A Pratt parser handles every operator with one loop and a table of <Term id="binding-power">binding powers</Term>. When an operand sits between two operators, the one with the higher power takes it.**
+
+`cpu > 0.95 or mem > 0.9 and env == "prod"` has `mem > 0.9` in the middle of `or` and `and`. `and` has the higher power, so it takes `mem > 0.9`. The rule means what it means in Python, SQL and most other languages: CPU above 95%, or memory above 90% in production.
+
+<Depth level={2}>
+The loop is `parseExpr(minBP)`. It reads one operand, the prefix part, then looks at the next token. If it is an operator whose power is above `minBP`, the loop takes it, parses the right side with a recursive call, builds a node and repeats. If the power is not above `minBP`, the loop returns what it has, and the caller decides what to do with that operator. Each token can have a prefix meaning (a name, a number, `(`, `not`, unary minus) and an infix meaning (a binary operator), and both live in tables.
+</Depth>
+
+<Depth level={3}>
+Vaughan Pratt described the technique in Top Down Operator Precedence at the first POPL symposium in 1973. He presented it as a mix of recursive descent and Floyd's operator precedence. Textbooks mostly skipped it. It spread through hand-written parsers such as Douglas Crockford's JSLint and through Crafting Interpreters. For binary operators alone it is the same algorithm as <Term id="precedence-climbing">precedence climbing</Term>, which is what `go/parser` does.
+</Depth>
+
+## [problem] A parser that folds left to right
+
+The alerting service parses rules with a small hand-written parser. A rule is conditions joined by `and` and `or`, and each condition is exactly three tokens: a metric, a comparison and a value. The parser reads conditions and folds them from left to right.
+
+All the existing rules use only `and`, or only `or`, so every test passes.
+
+<Depth level={2}>
+The fold has no notion of precedence. With one kind of connective, grouping does not change the answer, so the tests cannot tell. The fixed shape of a condition also means there is no arithmetic. That was fine while every rule compared one metric with one number.
+</Depth>
+
+<Depth level={3}>
+The fold builds `((a op b) op c) op d`, a left-leaning tree. That is correct for a chain of one associative operator and wrong as soon as two operators with different precedence meet.
+</Depth>
+
+## [pain] Ratio alerts, and and/or mixed
+
+**Change request:** SRE wants ratio alerts such as `errors / requests > 0.05`, mixed with `and` and `or` the way every other language mixes them.
+
+Two lines show the problem. `errors / requests > 0.05` is rejected, because a condition must be metric, comparison, value. Worse, `cpu > 0.95 or mem > 0.9 and env == "prod"` already saves today and means the wrong thing: `(cpu > 0.95 or mem > 0.9) and env == "prod"`. A staging host at 97% CPU never pages, and nothing in the UI says why.
+
+<Depth level={2}>
+The usual fix is recursive descent with a function per precedence level: `parseOr` calls `parseAnd`, which calls `parseComparison`, then `parseSum`, `parseProduct`, `parseUnary` and `parsePrimary`. It works, but the precedence is hidden in which function calls which, and each new level is a new function wired between two others.
+</Depth>
+
+<Depth level={3}>
+Changing the meaning of a saved rule is a migration problem too. Every rule that mixes `and` and `or` now means something else. Find them first and add explicit parentheses, so the change of grouping does not silently change who gets paged.
+</Depth>
+
+## [morph] Replace the fold with a power table
+
+Drag the slider. The fold and the fixed three-token condition give way to one loop and a table. Every operator, logical, comparison and arithmetic, is a row with a number.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The prefix step makes operands general: a name, a number, a string, a parenthesised expression, or `not` and `-` applied to an operand. Because the right side of every operator is a full recursive `parseExpr`, `errors / requests` can appear wherever a metric could.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The table is a `map[string]int`, and a missing key means "not an infix operator", which ends the loop. Go's own `go/parser` uses the same shape with `token.Token.Precedence()`, and it returns when the operator is below `prec1` and recurses with `oprec+1`. That is the same rule as returning when the power is not above `minBP` and recursing with the power itself.</Lang>
+<Lang only="python">`INFIX_BP.get` returns `None` for anything that is not an operator, which ends the loop. Recursion depth follows the expression's nesting, so a machine-generated rule with thousands of nested parentheses can hit `RecursionError`; cap the nesting when the rule is saved.</Lang>
+<Lang only="typescript">The tree is a discriminated union, so later passes (type check, evaluate, compile) switch on `kind` and the compiler checks the cases. The `Map` lookup returns `undefined` for non-operators, which ends the loop.</Lang>
+<Lang only="rust">The table is a `match` that returns `Option<u8>`, and the `Some(bp) if bp > min_bp` guard is the whole precedence rule. `t.text` is a `&'a str` borrowed from the source, so the tree holds slices of the rule and copies nothing.</Lang>
+</Depth>
+
+## [walk] Parse one mixed rule
+
+`cpu > 0.95 or mem > 0.9 and env == "prod"`, one decision at a time. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Term id="associativity">Associativity</Term> comes from the power passed to the right side. Pass the operator's own power and an equal operator stops the inner call, so `a - b - c` is `(a - b) - c`. Pass one less and the inner call keeps going, so `a ** b ** c` is `a ** (b ** c)`. matklad's version gives each operator a pair of left and right powers, which says the same thing with two numbers.
+</Depth>
+
+## [again] Ratio alerts, the second time
+
+The same change request against the table. `/` is already a row, so `errors / requests > 0.05` parses with no new code. The mixed rule now groups as `cpu > 0.95 or (mem > 0.9 and env == "prod")`, and the staging host at 97% CPU pages.
+
+<Depth level={2}>
+Write the table down in the rule language's documentation, and keep tests of known groupings: `a or b and c`, `a - b - c`, `not a == b`. A wrong number does not cause a parse error. It produces a different legal tree.
+</Depth>
+
+<Depth level={3}>
+Postfix operators and calls fit the same loop. `f(x)` and `labels["env"]` are infix steps for `(` and `[` with a high power, whose right side is an argument list or an index instead of one expression.
+</Depth>
+
+## [play] Change a number, change the tree
+
+Step the parser through a rule and watch each operator compare its power with the caller's minimum. Then change the numbers in the table and see the same tokens parse into a different tree, and the alert change its answer.
+
+## [lens] How each language parses its own operators
+
+Go's parser is this loop. CPython's grammar spells precedence as a chain of rules. JavaScript parsers use a precedence loop with special cases. rustc parses by precedence, and rust-analyzer names its function after binding power.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Unary minus is where languages disagree. Python reads `-2 ** 2` as `-(2 ** 2)`. JavaScript refuses to guess and makes it a syntax error. Choose a prefix power on purpose, and test it.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="pratt-parsing" />
+
+### The table for this rule language
+
+| Operators | Power | Associativity |
+|---|---|---|
+| `or` | 1 | left |
+| `and` | 2 | left |
+| `not` (prefix) | 3 | n/a |
+| `== != < <= > >=` | 4 | left |
+| `+ -` | 5 | left |
+| `* /` | 6 | left |
+| `-` (prefix) | 7 | n/a |
+
+Leave gaps between the numbers in a real language, for example 10, 20, 30, so a new level can go in between without renumbering.
