@@ -1,0 +1,12 @@
+- id: lazy-evaluation
+  term: Lazy evaluation
+  short: Doing work only when its result is asked for. A lazy iterator fetches or computes the next element when the loop requests it, not before.
+- id: cursor-pagination
+  term: Cursor pagination
+  short: Asking an API for the rows after a marker (the last row seen) instead of skipping a number of rows, so pages stay correct when rows are added or removed.
+- id: generator
+  term: Generator
+  short: A function that can pause at each yield, hand a value to its caller and resume where it stopped on the next request. It is the shortest way to write an iterator.
+- id: push-pull-iterator
+  term: Push and pull iterators
+  short: A pull iterator is asked for each next element by the loop (next()). A push iterator calls the loop body for each element itself (yield), and stops when told to.

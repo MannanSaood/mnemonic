@@ -1,0 +1,557 @@
+---
+title: Iterator
+track: design-patterns
+group: Behavioral
+order: 43
+summary: Give callers a way to walk a collection one element at a time, without showing them how it is stored or fetched.
+intent: The code that loops over a collection should not care whether the elements are in memory, in pages behind an API, or rows in a database.
+changeRequest: The dashboard needs only the 20 newest invoices, and the nightly export must cope with 2 million of them.
+languages: [go, python, typescript, rust]
+glossary: [lazy-evaluation, generator, push-pull-iterator, cursor-pagination, interface]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: iterator
+  scenarios:
+    - try: "Find the first invoice over $5,000 in 20,000, and run it both ways."
+      notice: "Load-all makes 200 API calls before the loop sees anything. The iterator makes 3 and stops, because the loop stopped."
+    - try: "Export 200,000 invoices."
+      notice: "Load-all runs out of memory before processing a single invoice. The iterator holds one page at a time and finishes."
+    - try: "Tick API fails on page 5 and export again."
+      notice: "Load-all loses everything. The iterator has already processed 400 invoices and knows where to resume."
+    - try: "Let new invoices arrive while walking, first with offset paging, then with cursor paging."
+      notice: "Offset paging repeats rows as new ones push the list down. The loop cannot fix that; the iterator must page by cursor."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: export, sub: loops a slice }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: export, sub: loops the iterator }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: listAll, sub: builds the full list }
+      after:  { x: 168, y: 30, w: 150, h: 56, title: Client, sub: invoices() }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 30, w: 180, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 180, h: 56, title: Iterator, sub: { go: "iter.Seq2[Invoice, error]", python: "Iterator[Invoice]", typescript: "AsyncGenerator<Invoice>", rust: "impl Iterator" } }
+    - id: page
+      kind: concrete
+      before: { x: 188, y: 70, w: 222, h: 32, title: fetch page }
+      after:  { x: 196, y: 204, w: 80, h: 40, title: Page }
+    - id: buffer
+      kind: concrete
+      before: { x: 188, y: 115, w: 222, h: 32, title: append to all }
+      after:  { x: 284, y: 204, w: 80, h: 40, title: One page }
+    - id: cursor
+      kind: concrete
+      before: { x: 188, y: 160, w: 222, h: 32, title: next token }
+      after:  { x: 372, y: 204, w: 80, h: 40, title: Cursor }
+    - id: dashboard
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 210, w: 222, h: 32, title: limit parameter }
+      after:  { x: 460, y: 204, w: 92, h: 40, title: Dashboard }
+  edges:
+    - { from: client, to: context, label: asks }
+    - { from: context, to: strategy, label: returns }
+    - { from: page, to: strategy, label: fills }
+    - { from: buffer, to: strategy }
+    - { from: cursor, to: strategy }
+    - { from: dashboard, to: strategy, label: breaks }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: invoices.go · export.go
+      source: |
+        // invoices.go
+        func (c *Client) ListAll(ctx context.Context) ([]Invoice, error) {
+            var all []Invoice
+            token := ""
+            for {
+                page, err := c.listPage(ctx, token, 100)
+                if err != nil {
+                    return nil, err
+                }
+                all = append(all, page.Items...)
+                if page.Next == "" {
+                    return all, nil
+                }
+                token = page.Next
+            }
+        }
+
+        // export.go
+        invoices, err := client.ListAll(ctx)
+        if err != nil {
+            return err
+        }
+        for _, inv := range invoices {
+            csv.Write(inv.Row())
+        }
+      roles: { context: [2, 16], page: [6, 6], buffer: [10, 10], cursor: [14, 14], client: [18, 25] }
+      change:
+        - { line: 2, replace: 'func (c *Client) ListAll(ctx context.Context, limit int) ([]Invoice, error) {' }
+        - { after: 10, add: ['        if limit > 0 && len(all) >= limit {', '            return all[:limit], nil', '        }'] }
+        - { line: 19, replace: 'invoices, err := client.ListAll(ctx, 0) // still every invoice in memory' }
+    after:
+      file: invoices.go · export.go
+      source: |
+        func (c *Client) Invoices(ctx context.Context) iter.Seq2[Invoice, error] {
+            return func(yield func(Invoice, error) bool) {
+                token := ""
+                for {
+                    page, err := c.listPage(ctx, token, 100)
+                    if err != nil {
+                        yield(Invoice{}, err)
+                        return
+                    }
+                    for _, inv := range page.Items {
+                        if !yield(inv, nil) {
+                            return // the loop stopped: fetch nothing more
+                        }
+                    }
+                    if page.Next == "" {
+                        return
+                    }
+                    token = page.Next
+                }
+            }
+        }
+
+        // export.go
+        for inv, err := range client.Invoices(ctx) {
+            if err != nil {
+                return err
+            }
+            csv.Write(inv.Row())
+        }
+      roles: { strategy: [1, 2], context: [1, 21], page: [5, 5], buffer: [10, 14], cursor: [18, 18], client: [23, 29], loop: [24, 24], fetch: [5, 9], yield: [10, 11], stop: [11, 12] }
+    again:
+      file: dashboard.go
+      source: |
+        // dashboard.go: stop after 20; page 2 is never fetched
+        latest := make([]Invoice, 0, 20)
+        for inv, err := range client.Invoices(ctx) {
+            if err != nil {
+                return nil, err
+            }
+            if latest = append(latest, inv); len(latest) == 20 {
+                break // yield returns false and the iterator returns
+            }
+        }
+    cost:
+      before: { text: 5 lines · still loads 2M, value: 0.75 }
+      after: { text: 1 new loop · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Since Go 1.23, `for … range` accepts a function: `iter.Seq[V]` is `func(yield func(V) bool)`, and `Seq2` yields pairs, here an invoice and an error. These are push iterators. The iterator must stop as soon as `yield` returns false; calling it again panics. `iter.Pull` turns one into a pull-style `next()`.'
+      seenIn: '`slices.All`, `slices.Values` and `maps.Keys` return iterators (Go 1.23). Before that, the pull style: `bufio.Scanner` with `Scan` and `Text`, and `sql.Rows` with `Next`, `Scan` and `Close`.'
+
+  python:
+    before:
+      file: invoices.py · export.py
+      source: |
+        # invoices.py
+        def list_all(client: Client) -> list[Invoice]:
+            invoices: list[Invoice] = []
+            token = None
+            while True:
+                page = client.list_page(token, limit=100)
+                invoices.extend(page.items)
+                if page.next is None:
+                    return invoices
+                token = page.next
+
+        # export.py
+        for invoice in list_all(client):
+            writer.writerow(invoice.row())
+      roles: { context: [2, 10], page: [6, 6], buffer: [7, 7], cursor: [10, 10], client: [12, 14] }
+      change:
+        - { line: 2, replace: 'def list_all(client: Client, limit: int | None = None) -> list[Invoice]:' }
+        - { after: 7, add: ['        if limit is not None and len(invoices) >= limit:', '            return invoices[:limit]'] }
+        - { line: 13, replace: 'for invoice in list_all(client):  # still every invoice in memory' }
+    after:
+      file: invoices.py · export.py
+      source: |
+        from collections.abc import Iterator
+
+        def invoices(client: Client) -> Iterator[Invoice]:
+            token = None
+            while True:
+                page = client.list_page(token, limit=100)
+                yield from page.items
+                if page.next is None:
+                    return
+                token = page.next
+
+        # export.py
+        for invoice in invoices(client):
+            writer.writerow(invoice.row())
+      roles: { strategy: [3, 3], context: [3, 10], page: [6, 6], buffer: [7, 7], cursor: [10, 10], client: [12, 14], loop: [13, 13], fetch: [6, 6], yield: [7, 7], stop: [7, 7] }
+    again:
+      file: dashboard.py
+      source: |
+        # dashboard.py: stop after 20; page 2 is never fetched
+        from itertools import islice
+
+        latest = list(islice(invoices(client), 20))
+    cost:
+      before: { text: 4 lines · still loads 2M, value: 0.75 }
+      after: { text: 1 new line · 0 edits, value: 0.1 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Any function with `yield` is a generator, and a generator is an iterator. `yield from` hands out each item of a page in turn. `itertools` gives you `islice`, `takewhile` and `chain` to combine iterators without loading them. Write a class with `__iter__` and `__next__` only when the iterator needs methods of its own.'
+      seenIn: 'File objects yield one line at a time. `csv.reader`. `range` and `dict.items()` are lazy views. boto3 paginators: `client.get_paginator("list_objects_v2").paginate(...)`.'
+
+  typescript:
+    before:
+      file: invoices.ts · export.ts
+      source: |
+        // invoices.ts
+        export async function listAll(client: Client): Promise<Invoice[]> {
+          const all: Invoice[] = [];
+          let token: string | undefined;
+          do {
+            const page = await client.listPage({ after: token, limit: 100 });
+            all.push(...page.items);
+            token = page.next;
+          } while (token);
+          return all;
+        }
+
+        // export.ts
+        for (const inv of await listAll(client)) {
+          csv.write(inv.row());
+        }
+      roles: { context: [2, 11], page: [6, 6], buffer: [7, 7], cursor: [8, 8], client: [13, 16] }
+      change:
+        - { line: 2, replace: 'export async function listAll(client: Client, limit = Infinity): Promise<Invoice[]> {' }
+        - { line: 9, replace: '  } while (token && all.length < limit);' }
+        - { line: 10, replace: '  return all.slice(0, limit);' }
+        - { line: 14, replace: 'for (const inv of await listAll(client)) { // still every invoice in memory' }
+    after:
+      file: invoices.ts · export.ts
+      source: |
+        export async function* invoices(client: Client): AsyncGenerator<Invoice> {
+          let token: string | undefined;
+          do {
+            const page = await client.listPage({ after: token, limit: 100 });
+            yield* page.items;
+            token = page.next;
+          } while (token);
+        }
+
+        // export.ts
+        for await (const inv of invoices(client)) {
+          csv.write(inv.row());
+        }
+      roles: { strategy: [1, 1], context: [1, 8], page: [4, 4], buffer: [5, 5], cursor: [6, 6], client: [10, 13], loop: [11, 11], fetch: [4, 4], yield: [5, 5], stop: [5, 5] }
+    again:
+      file: dashboard.ts
+      source: |
+        // dashboard.ts: stop after 20; page 2 is never fetched
+        const latest: Invoice[] = [];
+        for await (const inv of invoices(client)) {
+          latest.push(inv);
+          if (latest.length === 20) break; // calls the generator's return()
+        }
+    cost:
+      before: { text: 4 lines · still loads 2M, value: 0.75 }
+      after: { text: 1 new loop · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'An `async function*` is the iterator, and `for await` is the loop. Breaking out of the loop calls the generator''s `return()`, so it stops at the paused `yield` and any `finally` block runs. Synchronous `function*` generators cover in-memory traversals such as trees.'
+      seenIn: 'Stripe''s Node library auto-paginates list calls with `for await`. AWS SDK v3 paginators such as `paginateListObjectsV2`. Node''s `readline` interface and readable streams are async iterables.'
+
+  rust:
+    before:
+      file: invoices.rs · export.rs
+      source: |
+        // invoices.rs
+        pub fn list_all(client: &Client) -> Result<Vec<Invoice>, ApiError> {
+            let mut all = Vec::new();
+            let mut token = None;
+            loop {
+                let page = client.list_page(token.as_deref(), 100)?;
+                all.extend(page.items);
+                match page.next {
+                    Some(next) => token = Some(next),
+                    None => return Ok(all),
+                }
+            }
+        }
+
+        // export.rs
+        for inv in list_all(&client)? {
+            csv.serialize(inv.row())?;
+        }
+      roles: { context: [2, 13], page: [6, 6], buffer: [7, 7], cursor: [9, 9], client: [15, 18] }
+      change:
+        - { line: 2, replace: 'pub fn list_all(client: &Client, limit: Option<usize>) -> Result<Vec<Invoice>, ApiError> {' }
+        - { after: 7, add: ['        if let Some(n) = limit.filter(|&n| all.len() >= n) {', '            all.truncate(n);', '            return Ok(all);', '        }'] }
+        - { line: 16, replace: 'for inv in list_all(&client, None)? { // still every invoice in memory' }
+    after:
+      file: invoices.rs · export.rs
+      source: |
+        pub struct Invoices<'a> {
+            client: &'a Client,
+            page: std::vec::IntoIter<Invoice>,
+            next: Option<String>,
+            started: bool,
+        }
+
+        impl Iterator for Invoices<'_> {
+            type Item = Result<Invoice, ApiError>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                loop {
+                    if let Some(inv) = self.page.next() {
+                        return Some(Ok(inv));
+                    }
+                    if self.started && self.next.is_none() {
+                        return None;
+                    }
+                    self.started = true;
+                    match self.client.list_page(self.next.as_deref(), 100) {
+                        Ok(p) => { self.page = p.items.into_iter(); self.next = p.next; }
+                        Err(e) => { self.next = None; return Some(Err(e)); }
+                    }
+                }
+            }
+        }
+
+        // export.rs
+        for inv in client.invoices() {
+            csv.serialize(inv?.row())?;
+        }
+      roles: { strategy: [8, 9], context: [1, 26], page: [20, 22], buffer: [13, 15], cursor: [16, 18], client: [28, 31], loop: [29, 29], fetch: [19, 22], yield: [13, 15], stop: [29, 29] }
+    again:
+      file: dashboard.rs
+      source: |
+        // dashboard.rs: take(20) stops calling next(), so page 2 is never fetched
+        let latest: Vec<Invoice> = client.invoices().take(20).collect::<Result<_, _>>()?;
+    cost:
+      before: { text: 5 lines · still loads 2M, value: 0.75 }
+      after: { text: 1 new line · 0 edits, value: 0.1 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Implement `Iterator` with one method, `next`, and every adapter comes free: `take`, `filter`, `map`, `collect`. Adapters are lazy and nothing runs until something consumes the iterator. A paging API is easier as an async `Stream` from the `futures` crate when the client is async.'
+      seenIn: '`BufRead::lines()`. `std::fs::read_dir`. `Iterator::take` and `collect::<Result<Vec<_>, _>>()`. The AWS Rust SDK''s `into_paginator().send()`, which returns a stream of pages.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'The export ranges over `client.Invoices(ctx)`. Go calls the iterator function with the loop body wrapped as `yield`. Nothing has been fetched yet.', python: 'The export loops over `invoices(client)`. Calling a generator function runs none of its body; it returns a paused generator.', typescript: 'The export runs `for await` over `invoices(client)`. Calling an async generator runs none of its body; it returns a paused generator.', rust: 'The export loops over `client.invoices()`, which only builds the struct. Nothing has been fetched yet.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: loop
+  - text: The loop asks for the first invoice, so the iterator fetches page 1. The API is called only now, and only for one page.
+    nodes: [context, strategy, page]
+    edges: [context>strategy, page>strategy]
+    role: fetch
+  - text: { go: 'Each invoice is handed to the loop body through `yield`. The body runs, then control comes back for the next one. Only this page is in memory.', python: 'Each invoice is handed out by `yield from`. The generator pauses until the loop asks again. Only this page is in memory.', typescript: 'Each invoice is handed out by `yield*`. The generator pauses until the loop asks again. Only this page is in memory.', rust: 'Each call to `next` takes one invoice from the current page. Only this page is in memory.' }
+    nodes: [strategy, buffer]
+    edges: [buffer>strategy]
+    role: yield
+  - text: { go: 'If the body breaks, `yield` returns false and the iterator returns. The next page is never requested.', python: 'If the loop breaks, the generator stays paused and is closed later. The next page is never requested.', typescript: 'If the loop breaks, `for await` calls the generator''s `return()`. The next page is never requested.', rust: 'If the loop stops, nobody calls `next` again, so no more pages are requested. Nothing else needs to happen.' }
+    nodes: [strategy, cursor]
+    edges: [cursor>strategy]
+    role: stop
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these shows the Iterator pattern doing its job?
+    options:
+      - text: A loop walks every row of a large query while the database driver fetches rows in batches behind the scenes, as the loop asks for them.
+        correct: true
+        why: Right. The loop sees one row at a time and never learns how rows are stored or fetched.
+      - text: A report loads all 2 million rows into a list, then loops over the list.
+        why: The loop works, but the whole collection must exist in memory first. That is the problem an iterator removes.
+      - text: When a row is inserted, every open dashboard is told about it.
+        why: That is Observer. The source pushes changes to subscribers. An iterator hands out existing elements when the loop asks.
+  engineer:
+    question: A dashboard loop breaks after 20 invoices from a paging iterator with 100 per page. What happens to the remaining pages?
+    options:
+      - text: They are never requested. The iterator fetches a page only when the loop asks for an invoice on it.
+        correct: true
+        why: Right. Laziness means the loop's early exit stops the fetching too. One API call answered the dashboard.
+      - text: The iterator keeps fetching them in the background so the next loop is faster.
+        why: A plain iterator does no work it was not asked for. Prefetching is something you would add on purpose, and pay for.
+      - text: They are fetched and thrown away when the iterator is cleaned up.
+        why: Cleanup runs a `finally` block or a drop, but it does not fetch anything. Nothing past page 1 is requested.
+  deep:
+    question: Your iterator pages with ?offset= while new invoices keep arriving at the top of the list. What goes wrong?
+    options:
+      - text: The rows shift between requests, so the next page starts with rows already seen. Page by cursor instead, asking for rows after the last one seen.
+        correct: true
+        why: Right. The catalogue calls this the robustness of an iterator when the collection changes during traversal. A cursor gives each request a fixed starting point.
+      - text: Nothing. An offset always points at the same rows.
+        why: An offset counts rows from the top. Three new rows on top push every row down by three, so the window moves.
+      - text: The API rejects the request because the data changed.
+        why: Most APIs accept it and return the shifted page. That is why the bug is silent.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Iterator
+      example: { go: "iter.Seq2[Invoice, error]", python: "Iterator[Invoice] (a generator)", typescript: "AsyncGenerator<Invoice>", rust: "Iterator<Item = Result<Invoice, ApiError>>" }
+      job: Hands out the next element when asked, and says when there are no more.
+    - role: Concrete iterator
+      example: "The invoices() generator or struct"
+      job: Keeps the traversal state, here the current page and the cursor for the next one.
+    - role: Aggregate
+      example: Client (the billing API)
+      job: Owns the elements and creates iterators over them.
+    - role: Client
+      example: export, dashboard
+      job: Loops, and decides when to stop.
+  useWhen:
+    - The collection is large, remote or endless, and loading it all is slow or impossible.
+    - Callers often stop early, or only need some elements.
+    - You want callers to stay the same when the storage changes, from a slice to pages to a database cursor.
+  avoidWhen:
+    - The data is small and already in memory. A slice or list is simpler and lets callers index and count.
+    - Callers need random access, a length, or several passes. Most iterators are single pass.
+  tradeoffs:
+    - Most iterators run once. A second loop means a second fetch.
+    - Errors and slow calls arrive in the middle of the loop, not before it.
+    - Resources such as connections stay open until the loop ends or the iterator is closed.
+    - Each step may hide a network call, which is easy to forget when reading the loop.
+  lookalikes:
+    - name: Composite
+      how: A tree of objects. Iterators are often used to walk one, in pre-order or post-order.
+    - name: Visitor
+      how: Runs an operation on each element of a structure. An iterator only hands the elements out; the loop decides what to do.
+    - name: Observer
+      how: The source pushes each new event to subscribers as it happens. An iterator hands out elements when the consumer asks.
+---
+
+## [concept] Iterator
+
+**Give callers a way to walk a collection one element at a time, without showing them how it is stored or fetched.**
+
+The loop asks for the next element. Whether it comes from memory, from the next page of an API or from a database cursor is the iterator's business.
+
+<Depth level={2}>
+Four roles. The **iterator** answers one question: what is the next element, if any. The **concrete iterator** keeps the position, here the current page and the token for the next one. The **aggregate** (the API client) creates iterators. The **client** loops and decides when to stop. Because the iterator only does work when asked, it is <Term id="lazy-evaluation">lazy</Term>: a loop that stops early stops the fetching too.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue also calls it Cursor. Its consequences are that the same collection can be walked in different ways, that the collection's own interface stays small, and that several traversals can be in progress at once because each iterator keeps its own state. It separates external iterators, where the client asks for each element, from internal ones, where the iterator calls the client's code for each element. Today these are called pull and push iterators (<Term id="push-pull-iterator">push and pull</Term>).
+</Depth>
+
+## [problem] A client that loads every invoice
+
+The billing API returns invoices 100 at a time, with a token for the next page. The client hides the paging: `ListAll` fetches every page into one list and returns it. The export loops over the list.
+
+Read it once. For a few thousand invoices it is fine, and the callers never see a page token.
+
+<Depth level={2}>
+Every caller pays for every page, whether it needs them or not. The loop cannot start until the last page has arrived, and the whole list sits in memory while it runs.
+</Depth>
+
+<Depth level={3}>
+An error on the last page throws away the work of every page before it. The function returns nothing but the error, so a caller cannot even keep what was fetched.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the dashboard needs only the 20 newest invoices, and the nightly export must cope with 2 million of them.
+
+The marked lines add a `limit` parameter for the dashboard. The export still holds 2 million invoices in memory, and fixing that needs a second function with a callback or a page loop in every caller.
+
+<Depth level={2}>
+Each new kind of caller asks for its own variant: stop after n, stop at the first match, stop on the first error, skip drafts. The list-returning function grows a parameter per caller, or the paging logic gets copied out to all of them.
+</Depth>
+
+<Depth level={3}>
+At 2 KB an invoice, 2 million invoices are about 4 GB before the export writes a line. On a worker with a memory limit, the job is killed partway through and retried, and killed again.
+</Depth>
+
+## [morph] Turn the list into an iterator
+
+Drag the slider. The list disappears. The client returns an iterator that keeps one page and a cursor, and fetches the next page only when the loop reaches the end of the current one.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The callers keep their loops; only what they loop over changes. Each caller stops when it has what it needs, and the iterator stops with it. Memory holds one page whatever the total. An error arrives in the loop at the point where it happened, after the earlier invoices were processed.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go's range-over-func turns the loop body into the `yield` function. The compiler rewrites `break` and `return` inside the body so that `yield` returns false, and the iterator must return when it does. That is why the inner loop checks `!yield(...)`.</Lang>
+<Lang only="python">A <Term id="generator">generator</Term> keeps its local variables, `token` and `page`, in a suspended frame between calls to `next()`. That frame is the concrete iterator, written for you by the language.</Lang>
+<Lang only="typescript">An async generator keeps its local variables in a suspended frame between calls to `next()`, and each `next()` returns a promise. `yield*` delegates to the page array one element at a time.</Lang>
+<Lang only="rust">The struct is the concrete iterator, written out by hand: the current page as a `vec::IntoIter`, and the cursor. It borrows the client for `'a`, so the borrow checker stops the client from being dropped while an iteration is in progress.</Lang>
+</Depth>
+
+## [walk] Follow one loop
+
+One export loop from start to the first invoice, and what happens when it stops. Step through it with the numbered buttons.
+
+<Depth level={2}>
+Iterators make each loop step potentially slow, because it may be a network call. When throughput matters, fetch the next page while the loop works on the current one. Do it inside the iterator, so callers still see one invoice at a time.
+</Depth>
+
+<Depth level={3}>
+The iterator must page correctly when data changes underneath it. With newest-first ordering, new invoices push every row down, so `?offset=200` returns rows that were on the previous page. <Term id="cursor-pagination">Cursor pagination</Term> asks for rows after the last one seen, and stays correct. The catalogue calls this the robustness of an iterator.
+</Depth>
+
+## [again] The dashboard and the export, the second time
+
+The same request after the refactor. The dashboard takes 20 invoices and stops; the iterator fetched one page. The export walks all 2 million invoices holding one page at a time. Nothing in the client changed.
+
+<Depth level={2}>
+Combinators replace the `limit` parameter. Taking the first n, filtering, and stopping at the first match are loop logic or library functions over any iterator, so the client does not need to know about any of them.
+</Depth>
+
+<Depth level={3}>
+An iterator that holds a resource must release it when the loop ends early. A Go push iterator does it naturally, with `defer` inside the function. Python generators run their `finally` blocks when closed, JavaScript generators when `return()` is called, and Rust iterators when dropped. Go's `iter.Pull` is the exception: you must call `stop`.
+</Depth>
+
+## [play] Walk the invoices
+
+The same jobs run two ways side by side: load every page into a list and loop, or loop over an iterator. You choose the job, the number of invoices and the page size, and you can break the API.
+
+Then drive the iterator by hand, one `next()` at a time, and watch when it actually calls the API.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. How much ceremony it needs is not.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="iterator" />
+
+### Push or pull
+
+There are two ways to hand out elements. A pull iterator waits to be asked: Python's `next()`, JavaScript's `next()`, Rust's `Iterator::next`, Go's `bufio.Scanner`. A push iterator calls your code for each element: Go 1.23's `iter.Seq` and the old `forEach` callbacks. Pull iterators are easier to combine, for example to walk two sequences in step. Push iterators are easier to write, because the traversal is ordinary code with its own local variables and `defer`. Go's `iter.Pull` converts a push iterator to a pull one when you need both.
