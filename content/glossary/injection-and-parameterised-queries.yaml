@@ -1,0 +1,22 @@
+# Terms introduced by the injection lesson.
+- id: sql-injection
+  term: SQL injection
+  short: A bug where input pasted into SQL text changes the query's structure, so the attacker writes part of the query.
+- id: parameterised-query
+  term: Parameterised query
+  short: A query whose text has placeholders such as $1 or %s, with the values passed separately. The database parses the text first, so a value can never become syntax.
+- id: extended-query-protocol
+  term: Extended query protocol
+  short: PostgreSQL's Parse, Bind, Execute message sequence. The statement is parsed in one message and the parameter values arrive in another.
+- id: allow-list
+  term: Allow-list
+  short: A fixed set of accepted values, such as the column names a sort may use. Anything not on the list is rejected rather than cleaned.
+- id: second-order-injection
+  term: Second-order injection
+  short: Input stored safely now and pasted into SQL text later, by a different piece of code that trusts what came from its own database.
+- id: stacked-queries
+  term: Stacked queries
+  short: Several statements separated by semicolons in one query string. Some drivers send unparameterised text in a way that runs them all.
+- id: row-level-security
+  term: Row-level security
+  short: A database feature (in PostgreSQL, policies on a table) that filters rows for the current role or session, a second guard behind the WHERE clause.

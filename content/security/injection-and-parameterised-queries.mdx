@@ -1,0 +1,482 @@
+---
+title: Injection and parameterised queries
+track: security
+group: Web attacks
+order: 16
+summary: Injection happens when input is pasted into code for an interpreter. Send values as parameters, which the database receives after it has parsed the statement, and pick identifiers from an allow-list.
+intent: See exactly where input crosses from data into SQL syntax, why escaping is not the fix, and how a parameter stays a value whatever it contains.
+changeRequest: Tenant admins now get the customer search too, not just our support staff.
+languages: [go, python, typescript, rust]
+glossary: [sql-injection, parameterised-query, extended-query-protocol, allow-list, second-order-injection, stacked-queries, row-level-security]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [security/security-mindset-and-threat-models]
+skills: [appsec]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: injection-and-parameterised-queries
+  scenarios:
+    - try: "With String concatenation, click the O'Brien probe and send it."
+      notice: "A real customer's name breaks the query with a syntax error, and the database's message goes back to the client. The first sign of injection is usually a bug report like this."
+    - try: "Send ' OR 1=1 -- , then the UNION probe, in the concatenating build."
+      notice: "Red characters are your input read as SQL. The first returns three other companies' customers; the second reads the users table, which the endpoint never queries."
+    - try: "Switch to Concatenation + escaped quotes, then click the sort probe and send."
+      notice: "Every quote probe is now harmless, but the sort column drops the customers table: it is not inside a string, so there is no quote to escape."
+    - try: "Switch to Parameters + allow-list and send every probe."
+      notice: "The input never appears in the SQL text. The quote probes search for a customer with that odd name and find nobody; the sort probe gets a 400."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: ui
+      kind: client
+      before: { x: 12, y: 106, w: 104, h: 56, title: search box, sub: "?q= &sort=" }
+      after:  { x: 12, y: 106, w: 104, h: 56, title: search box, sub: "?q= &sort=" }
+    - id: handler
+      kind: context
+      before: { x: 144, y: 24, w: 264, h: 226, title: search handler, sub: "what you assumed: input is just text" }
+      after:  { x: 144, y: 106, w: 122, h: 56, title: search handler, sub: fixed SQL text }
+    - id: params
+      kind: strategy
+      appears: after
+      before: { x: 144, y: 206, w: 122, h: 52, title: "" }
+      after:  { x: 144, y: 206, w: 122, h: 52, title: parameters, sub: "$1 $2 · sort allow-list" }
+    - id: sqltext
+      kind: concrete
+      before: { x: 164, y: 112, w: 224, h: 48, title: SQL + input, sub: glued into one string }
+      after:  { x: 292, y: 106, w: 116, h: 56, title: parse first, sub: values bound later }
+    - id: db
+      kind: concrete
+      before: { x: 436, y: 106, w: 112, h: 56, title: postgres, sub: parses · runs }
+      after:  { x: 436, y: 106, w: 112, h: 56, title: postgres, sub: parses · runs }
+  edges:
+    - { from: ui, to: handler, label: GET }
+    - { from: handler, to: sqltext }
+    - { from: sqltext, to: db, label: query }
+    - { from: params, to: handler, kind: implements, label: binds }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: customers.go
+      source: |
+        // customers.go
+        func (s *Server) searchCustomers(w http.ResponseWriter, r *http.Request) {
+            q := r.URL.Query().Get("q")
+            sort := r.URL.Query().Get("sort")
+            query := fmt.Sprintf(
+                "SELECT id, name, email FROM customers WHERE tenant_id = %d AND name ILIKE '%%%s%%' ORDER BY %s",
+                tenantID(r.Context()), q, sort)
+            rows, err := s.db.QueryContext(r.Context(), query)
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            defer rows.Close()
+            writeJSON(w, scanCustomers(rows))
+        }
+      roles: { ui: [3, 4], handler: [2, 15], params: [7, 7], sqltext: [5, 7], db: [8, 8] }
+      change:
+        - { after: 4, add: ['    // now reachable by every tenant admin, not just our support staff'] }
+        - { line: 10, replace: '        http.Error(w, err.Error(), http.StatusInternalServerError) // database errors go to the client' }
+    after:
+      file: customers.go
+      source: |
+        // customers.go
+        // Values travel as parameters. The one identifier comes from a fixed map.
+        var sortColumns = map[string]string{"name": "name", "email": "email", "created": "created_at"}
+
+        func (s *Server) searchCustomers(w http.ResponseWriter, r *http.Request) {
+            orderBy, ok := sortColumns[r.URL.Query().Get("sort")]
+            if !ok {
+                http.Error(w, "unknown sort", http.StatusBadRequest)
+                return
+            }
+            rows, err := s.db.QueryContext(r.Context(),
+                "SELECT id, name, email FROM customers WHERE tenant_id = $1 AND name ILIKE '%' || $2 || '%' ORDER BY "+orderBy,
+                tenantID(r.Context()), r.URL.Query().Get("q"))
+            if err != nil {
+                log.Printf("search customers: %v", err) // details in the log, not in the response
+                http.Error(w, "search failed", http.StatusInternalServerError)
+                return
+            }
+            defer rows.Close()
+            writeJSON(w, scanCustomers(rows))
+        }
+      roles: { ui: [6, 6], handler: [5, 21], params: [13, 13], sqltext: [11, 12], db: [11, 11], request: [5, 6], allow: [3, 10], parse: [11, 12], bind: [13, 13] }
+    again:
+      file: access.log
+      source: |
+        GET /api/customers?q=' OR 1=1 --&sort=name                 200  0 rows
+        GET /api/customers?q=' UNION SELECT id, email, …--&sort=name  200  0 rows
+        GET /api/customers?q=O'Brien&sort=name                     200  1 row
+        GET /api/customers?q=&sort=name; DROP TABLE customers --    400  unknown sort
+    cost:
+      before: { text: 3 tenants' rows leaked · password hashes read · table wiped, value: 0.95 }
+      after: { text: 0 characters of input parsed as SQL, value: 0.04 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: '`database/sql` passes the arguments after the query string to the driver, which with pgx or lib/pq sends them as protocol parameters. The trap is `fmt.Sprintf` building the query string first: it compiles and looks the same. Identifiers cannot be parameters, so map them, or quote a fixed name with `pgx.Identifier{name}.Sanitize()`. Linters such as gosec flag SQL built with string formatting.'
+      seenIn: '`db.QueryContext(ctx, sql, args...)`. pgx `conn.Query(ctx, sql, args...)` and `pgx.Identifier`. `sqlc`, which generates typed Go from fixed SQL. gosec rules G201 and G202.'
+
+  python:
+    before:
+      file: customers.py
+      source: |
+        # customers.py
+        def search_customers(conn, tenant_id: int, q: str, sort: str) -> list[tuple]:
+            query = (
+                "SELECT id, name, email FROM customers "
+                f"WHERE tenant_id = {tenant_id} AND name ILIKE '%{q}%' "
+                f"ORDER BY {sort}"
+            )
+            return conn.execute(query).fetchall()
+      roles: { ui: [2, 2], handler: [2, 8], params: [5, 6], sqltext: [3, 7], db: [8, 8] }
+      change:
+        - { line: 5, replace: '        f"WHERE tenant_id = {tenant_id} AND name ILIKE ''%{q}%'' "  # q now from any tenant admin' }
+    after:
+      file: customers.py
+      source: |
+        # customers.py
+        from psycopg import sql
+
+        SORT_COLUMNS = {"name": "name", "email": "email", "created": "created_at"}
+
+        def search_customers(conn, tenant_id: int, q: str, sort: str) -> list[tuple]:
+            column = SORT_COLUMNS.get(sort)
+            if column is None:
+                raise BadRequest("unknown sort")
+            query = sql.SQL(
+                "SELECT id, name, email FROM customers "
+                "WHERE tenant_id = %s AND name ILIKE '%%' || %s || '%%' ORDER BY {}"
+            ).format(sql.Identifier(column))
+            return conn.execute(query, (tenant_id, q)).fetchall()
+      roles: { ui: [6, 6], handler: [6, 14], params: [14, 14], sqltext: [10, 13], db: [14, 14], request: [6, 6], allow: [4, 9], parse: [10, 13], bind: [14, 14] }
+    again:
+      file: access.log
+      source: |
+        GET /api/customers?q=' OR 1=1 --&sort=name                 200  0 rows
+        GET /api/customers?q=' UNION SELECT id, email, …--&sort=name  200  0 rows
+        GET /api/customers?q=O'Brien&sort=name                     200  1 row
+        GET /api/customers?q=&sort=name; DROP TABLE customers --    400  unknown sort
+    cost:
+      before: { text: 3 tenants' rows leaked · password hashes read · table wiped, value: 0.95 }
+      after: { text: 0 characters of input parsed as SQL, value: 0.04 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'DB-API drivers take values as the second argument to `execute`: `%s` placeholders in psycopg, `?` in sqlite3. psycopg 3 sends them to the server separately; psycopg 2 merges them into the text on the client with correct quoting. The trap is the f-string: `execute(f"... {q}")` looks like a parameterised call. psycopg 3 types the query as `LiteralString`, so pyright or mypy can flag a query built from runtime strings.'
+      seenIn: '`cursor.execute(sql, params)`. `psycopg.sql.SQL`, `sql.Identifier`, `sql.Literal`. SQLAlchemy `text("... :q").bindparams(q=q)`. Django querysets, and `raw(sql, params)`.'
+
+  typescript:
+    before:
+      file: customers.ts
+      source: |
+        // customers.ts
+        export async function searchCustomers(db: Pool, tenantId: number, q: string, sort: string) {
+          const { rows } = await db.query(
+            `SELECT id, name, email FROM customers
+             WHERE tenant_id = ${tenantId} AND name ILIKE '%${q}%'
+             ORDER BY ${sort}`,
+          );
+          return rows;
+        }
+      roles: { ui: [2, 2], handler: [2, 9], params: [5, 6], sqltext: [4, 6], db: [3, 3] }
+      change:
+        - { after: 1, add: ['// now called with q and sort straight from every tenant admin''s request'] }
+    after:
+      file: customers.ts
+      source: |
+        // customers.ts
+        const SORT_COLUMNS = new Map([["name", "name"], ["email", "email"], ["created", "created_at"]]);
+
+        export async function searchCustomers(db: Pool, tenantId: number, q: string, sort: string) {
+          const column = SORT_COLUMNS.get(sort);
+          if (!column) throw new BadRequest("unknown sort");
+          const { rows } = await db.query(
+            `SELECT id, name, email FROM customers
+             WHERE tenant_id = $1 AND name ILIKE '%' || $2 || '%'
+             ORDER BY ${column}`, // from the map above, never from the request
+            [tenantId, q],
+          );
+          return rows;
+        }
+      roles: { ui: [4, 4], handler: [4, 14], params: [11, 11], sqltext: [7, 10], db: [7, 7], request: [4, 4], allow: [2, 6], parse: [7, 10], bind: [11, 11] }
+    again:
+      file: access.log
+      source: |
+        GET /api/customers?q=' OR 1=1 --&sort=name                 200  0 rows
+        GET /api/customers?q=' UNION SELECT id, email, …--&sort=name  200  0 rows
+        GET /api/customers?q=O'Brien&sort=name                     200  1 row
+        GET /api/customers?q=&sort=name; DROP TABLE customers --    400  unknown sort
+    cost:
+      before: { text: 3 tenants' rows leaked · password hashes read · table wiped, value: 0.95 }
+      after: { text: 0 characters of input parsed as SQL, value: 0.04 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'node-postgres takes `$1`-style text plus a values array and sends the values as parameters; with no values it sends plain text, which may hold several statements. A tagged template, such as postgres.js''s `sql` tag or Prisma''s `$queryRaw`, turns each `${q}` into a parameter; an untagged template string looks almost the same and pastes it in. Use a `Map` or `Object.hasOwn` for allow-lists, since a plain object also answers to `constructor`.'
+      seenIn: '`pool.query(text, values)`. postgres.js `sql` tagged templates and `sql(identifier)`. Prisma `$queryRaw` (safe) and `$queryRawUnsafe`. `pg-format` `%I` and `%L`, and `client.escapeIdentifier`.'
+
+  rust:
+    before:
+      file: customers.rs
+      source: |
+        // customers.rs
+        pub async fn search_customers(db: &PgPool, tenant_id: i64, q: &str, sort: &str) -> sqlx::Result<Vec<Customer>> {
+            let sql = format!(
+                "SELECT id, name, email FROM customers \
+                 WHERE tenant_id = {tenant_id} AND name ILIKE '%{q}%' ORDER BY {sort}"
+            );
+            // sqlx 0.9 makes you wrap a runtime string in AssertSqlSafe; review waved it through.
+            sqlx::query_as::<_, Customer>(AssertSqlSafe(sql)).fetch_all(db).await
+        }
+      roles: { ui: [2, 2], handler: [2, 9], params: [5, 5], sqltext: [3, 6], db: [8, 8] }
+      change:
+        - { after: 1, add: ['// now called with q and sort straight from every tenant admin''s request'] }
+    after:
+      file: customers.rs
+      source: |
+        // customers.rs
+        // Every query string is a &'static str, which sqlx accepts without AssertSqlSafe.
+        macro_rules! search_sql {
+            ($order:literal) => {
+                concat!("SELECT id, name, email FROM customers ",
+                        "WHERE tenant_id = $1 AND name ILIKE '%' || $2 || '%' ORDER BY ", $order)
+            };
+        }
+
+        pub async fn search_customers(db: &PgPool, tenant_id: i64, q: &str, sort: &str) -> Result<Vec<Customer>, SearchError> {
+            let sql = match sort {
+                "name" => search_sql!("name"),
+                "email" => search_sql!("email"),
+                "created" => search_sql!("created_at"),
+                _ => return Err(SearchError::UnknownSort), // a 400, not a guess
+            };
+            Ok(sqlx::query_as::<_, Customer>(sql)
+                .bind(tenant_id) // $1
+                .bind(q)         // $2: sent separately, never parsed as SQL
+                .fetch_all(db)
+                .await?)
+        }
+      roles: { ui: [10, 10], handler: [10, 22], params: [18, 19], sqltext: [3, 8], db: [20, 20], request: [10, 10], allow: [11, 16], parse: [3, 8], bind: [17, 19] }
+    again:
+      file: access.log
+      source: |
+        GET /api/customers?q=' OR 1=1 --&sort=name                 200  0 rows
+        GET /api/customers?q=' UNION SELECT id, email, …--&sort=name  200  0 rows
+        GET /api/customers?q=O'Brien&sort=name                     200  1 row
+        GET /api/customers?q=&sort=name; DROP TABLE customers --    400  unknown sort
+    cost:
+      before: { text: 3 tenants' rows leaked · password hashes read · table wiped, value: 0.95 }
+      after: { text: 0 characters of input parsed as SQL, value: 0.04 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'sqlx binds with `.bind()` and checks `query!` macros against a live schema at compile time. Since 0.9 the query functions take `impl SqlSafeStr`: a `&''static str` passes, and a runtime `String` needs an explicit `AssertSqlSafe(...)`, which makes the risky path visible in review. For dynamic shapes, `QueryBuilder::push_bind` adds parameters while you build the text.'
+      seenIn: '`sqlx::query(...).bind(...)`, `query!` and `query_as!`. `sqlx::QueryBuilder` with `push_bind`. `AssertSqlSafe`. diesel''s query DSL. tokio-postgres `client.query(sql, &[&q])`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A tenant admin's request arrives with q and sort. Both are untrusted text, whoever sent them, and the handler never pastes either into SQL.
+    nodes: [ui, handler]
+    edges: [ui>handler]
+    role: request
+  - text: The sort value is looked up in a fixed map of column names. An unknown value gets a 400 before any SQL exists. The column name that reaches the query was written by the developer.
+    nodes: [handler, params]
+    edges: [params>handler]
+    role: allow
+  - text: The driver sends the statement text with placeholders. The database parses it and fixes its shape, one SELECT with two values still to come, before it has seen any input.
+    nodes: [handler, sqltext, db]
+    edges: [handler>sqltext, sqltext>db]
+    role: parse
+  - text: The values follow in a separate message. A q of ' OR 1=1 -- is now only a name to compare with, and no customer has it, so the search returns nothing.
+    nodes: [params, sqltext, db]
+    edges: [params>handler, sqltext>db]
+    role: bind
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: What is the root cause of SQL injection?
+    options:
+      - text: Untrusted input is pasted into the SQL text, so the database parses part of it as SQL.
+        correct: true
+        why: Right. The fix follows from it. Keep input out of the SQL text and pass it as a value.
+      - text: The input contains dangerous characters such as quotes and semicolons.
+        why: O'Brien contains a quote and is a real name. The characters are fine as data; the bug is treating them as code.
+      - text: The database account has too many privileges.
+        why: Least privilege limits the damage, but the injection still happens, and the attacker still reads whatever that account can read.
+  engineer:
+    question: The search sorts by a column the client names. Why not pass the column as a placeholder like $3?
+    options:
+      - text: Placeholders carry values, not identifiers. ORDER BY $3 sorts by a constant. Map the client's choice to a fixed column name instead.
+        correct: true
+        why: Right. Structure cannot be bound as data, so it comes from an allow-list the developer wrote.
+      - text: It works, but it is slower because the plan cannot be cached.
+        why: It does not do what you want. The database sees ORDER BY a constant value, so it does not sort by the column at all.
+      - text: Escape the column name with the same function you use for quotes.
+        why: The column is not inside quotes, so quote escaping does nothing. That is exactly how the escaped build in the playground dropped a table.
+  deep:
+    question: A driver sends a parameterised query with PostgreSQL's extended protocol. Why can a value of '; DELETE FROM customers -- not run a DELETE?
+    options:
+      - text: The statement is parsed in the Parse message before the value arrives in the Bind message, so the value never reaches the SQL parser.
+        correct: true
+        why: Right. The value is a datum for an already parsed plan, and a prepared statement may hold only one command anyway.
+      - text: The driver escapes the quote and semicolon before sending.
+        why: With the extended protocol nothing is escaped. The value travels as bytes in its own field; there is nothing to escape it from.
+      - text: PostgreSQL strips SQL comments from parameter values.
+        why: The value is never parsed, so -- inside it is just two characters of a string.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Statement text
+      example: "SELECT … WHERE tenant_id = $1 AND name ILIKE '%' || $2 || '%'"
+      job: Written by the developer, fixed, parsed before any input.
+    - role: Parameters
+      example: "$1 = 42, $2 = the search text"
+      job: Carry every value, sent separately and never parsed.
+    - role: Allow-list
+      example: "{name, email, created}"
+      job: Picks the parts that cannot be parameters, such as column names and sort direction.
+    - role: Database role
+      example: an app role with SELECT, INSERT, UPDATE on its own tables
+      job: Limits the damage if something gets through.
+  useWhen:
+    - Any query with a value from outside the code, including values read back from your own database.
+    - Shell commands, LDAP filters, file paths and templates. The same rule applies; use the argument-array or API form instead of building a string.
+    - Dynamic filters and sorts. Build the text from fixed fragments and bind the values with the query builder.
+  avoidWhen:
+    - Do not escape or strip characters by hand as the defence. It covers one context, breaks names like O'Brien, and misses the others.
+    - Do not rely on input validation alone. Validate for correctness, and still pass values as parameters.
+    - Do not return database error messages to clients; log them.
+  tradeoffs:
+    - Parameters and allow-lists cost nothing at runtime and make the plan cacheable.
+    - ORMs parameterise for you, except in their raw-SQL escape hatches, which need the same care.
+    - Least privilege and row-level security reduce the blast radius but do not stop reading what the role may read.
+  lookalikes:
+    - name: Cross-site scripting
+      how: The same bug with HTML as the interpreter and the browser as the parser. The fix is context-aware output encoding.
+    - name: Command injection
+      how: Input pasted into a shell command line. Pass an argument array to the process API and skip the shell.
+    - name: Input validation
+      how: Checks that input makes sense for the business. Useful, but a valid surname can still contain a quote.
+---
+
+## [concept] Injection and parameterised queries
+
+**Injection happens when input is pasted into text that an interpreter parses, so part of the input is read as code. Keep the code fixed and send the input as values the interpreter never parses.**
+
+For SQL, that means a <Term id="parameterised-query">parameterised query</Term>: the statement has placeholders, and the values travel separately. Whatever the values contain, they can only be compared, stored or returned.
+
+<Depth level={2}>
+<Term id="sql-injection">SQL injection</Term> is one member of a family. Shell commands, LDAP filters, file paths, HTML and templates all have a parser on the other side, and each goes wrong the same way. The fix has the same shape everywhere: an API that takes structure and data separately. For the parts of a query that cannot be parameters, such as a column name, use an <Term id="allow-list">allow-list</Term> of values you wrote.
+</Depth>
+
+<Depth level={3}>
+In PostgreSQL's <Term id="extended-query-protocol">extended query protocol</Term>, the client sends Parse with the statement text, then Bind with the parameter values, then Execute. The parser has finished before any value arrives, so a value cannot change the plan. Some drivers instead interpolate on the client (psycopg 2, or any driver when you pass no parameters), quoting each value correctly for its type. That is also safe, as long as the driver does the quoting and you do not.
+</Depth>
+
+## [problem] A customer search built with string formatting
+
+The support tool has a customer search. The handler formats the search text and the sort column into the SQL string and runs it, scoped to the caller's tenant. Only the support team uses it.
+
+It works. Searches return the right customers, sorting by any column works, and nobody types anything strange.
+
+<Depth level={2}>
+The mental model behind it: q is a name and sort is a column, because that is what the UI sends. But the database does not see a name and a column. It sees one string of SQL and parses all of it. Whoever controls part of that string controls part of the query.
+</Depth>
+
+<Depth level={3}>
+The handler also returns the database's error message to the client. That makes debugging easy for the support team, and probing easy for anyone else: a syntax error near the input confirms that the input is being parsed.
+</Depth>
+
+## [pain] Then tenant admins get the search too
+
+**Change request:** tenant admins now get the customer search too, not just our support staff.
+
+The first ticket is from a customer: searching for their colleague Siobhan O'Brien returns an error that mentions an unterminated quoted string. Two weeks later another tenant's admin searches for `' OR 1=1 --` and gets three other companies' customers. A UNION in the search box returns the users table with its password hashes. A semicolon starts a second statement that deletes every customer.
+
+<Depth level={2}>
+Each attack only rearranges the query. The quote ends the string literal, `OR 1=1` joins the WHERE clause and defeats the tenant check, and `--` comments out the rest of the template so the leftover quote cannot cause an error. UNION adds a second SELECT over any table the database role can read. Whether the stacked DELETE runs depends on the driver: when no parameters are given, many drivers send the text in a way that allows several statements.
+</Depth>
+
+<Depth level={3}>
+Escaping quotes would have stopped the first three and not the last one. The sort column is not inside a string literal, so `name; DROP TABLE customers --` needs no quote at all. Numeric fields have the same problem, which is why escaping is the wrong idea: it protects one parser context, and a query has several.
+</Depth>
+
+## [morph] From one glued string to statement plus values
+
+Drag the slider. The single box where SQL and input were glued together splits into a fixed statement, a set of parameters bound after parsing, and an allow-list for the column name.
+
+The code keeps the same query and changes how it is assembled. Placeholders replace the pasted values, and the sort column comes from a map.
+
+<Depth level={2}>
+Tenant isolation deserves a second guard too. PostgreSQL <Term id="row-level-security">row-level security</Term> can filter customers by a tenant setting on the session, so a missing WHERE clause or an injected OR cannot cross tenants. Give the application role only the privileges it needs; it should not be able to drop tables.
+</Depth>
+
+<Depth level={3}>
+With parameters, PostgreSQL rejects <Term id="stacked-queries">stacked queries</Term> outright: a prepared statement may hold only one command, and the server says "cannot insert multiple commands into a prepared statement". Parameterised code therefore cannot run a second statement even when it has a different bug.
+</Depth>
+
+## [walk] Follow one search
+
+The same request, `q=' OR 1=1 --`, through the fixed handler.
+
+<Depth level={3}>
+<Term id="second-order-injection">Second-order injection</Term> is the version that gets past reviews. A display name is stored safely through a parameterised INSERT, and months later a reporting job builds SQL from names it reads back out of its own table. Treat data from your own database as untrusted when it builds SQL text; the rule is about where text goes, not where it came from.
+</Depth>
+
+## [again] The same probes, the second time
+
+The same admin, the same probes, against the fixed handler. `' OR 1=1 --` is a name nobody has, so the search returns no rows. The UNION text is also just a strange name. O'Brien is found. The DROP in the sort parameter gets a 400 before any SQL is built. The access log shows four odd requests and no damage.
+
+<Depth level={2}>
+Nothing in the fix inspects the input for danger, which is why it holds up against inputs nobody has thought of yet. It does not need to recognise an attack, because input never gets the chance to be code.
+</Depth>
+
+## [play] Inject into a fake database
+
+The endpoint `GET /api/customers` in three builds, over a fake database with two tenants and a users table. Type q and sort, or click a textbook probe, and send. The SQL panel colours each character you typed by how the parser read it: as data or as SQL. The row underneath sends the same text to all three builds as a dry run.
+
+Everything runs in your browser on made-up data.
+
+## [lens] How each language passes parameters
+
+Every driver takes the query text and the values separately. The danger in each language is the string feature that looks like a parameter but is not: `fmt.Sprintf`, the f-string, the untagged template literal, `format!`.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Placeholder syntax differs by driver: `$1` for PostgreSQL drivers in Go, Node and Rust, `%s` for psycopg, `?` for sqlite3 and MySQL drivers. Only values can be placeholders. Table names, column names and sort directions come from allow-lists, or from an identifier-quoting helper applied to a fixed name.
+</Depth>
+
+<Depth level={3}>
+Type systems can help. psycopg 3 annotates queries as `LiteralString` (PEP 675), so a type checker flags an f-string query; sqlx 0.9 accepts only `&'static str` without `AssertSqlSafe`; tagged-template libraries in TypeScript turn every interpolation into a parameter. Go has no type-level guard, so linting and code review carry it.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="injection-and-parameterised-queries" />
+
+### Where each kind of input goes
+
+| Part of the query | Example | How to pass it |
+|---|---|---|
+| A value | a name, an id, a date | A parameter: `$1`, `%s`, `?` |
+| A list of values | ids for `IN (...)` | One array parameter (`= ANY($1)` in PostgreSQL), or one placeholder per item |
+| An identifier | a sort column, a table | An allow-list of names you wrote |
+| A keyword | `ASC` or `DESC` | Map the choice to one of the two literals |
