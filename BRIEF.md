@@ -192,3 +192,7 @@ Like roadmap.sh (https://roadmap.sh), but tailored to a goal and with depth.
 - 2026-11-21: visual direction chosen: Schematic look with Newsreader for reading text, and
   Graphite for dark mode (`design/directions.html`, option D). Platform scaffolded; Strategy
   built end to end; playground kit, lesson metadata and roadmap data format added.
+- 2026-11-21 (evening): published at https://mannansaood.github.io/mnemonic/ (public repo,
+  GitHub Pages via Actions). 114 lessons live across all 23 tracks: the full design track
+  (30), and 3-9 lessons in every other track, each with its own researched playground.
+  Remaining planned lessons are listed on each track page as coming soon.

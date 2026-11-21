@@ -6,6 +6,24 @@ walks one call through it. Code is shown in Go, Python, TypeScript and Rust, at 
 
 No accounts, no tracking. Progress and settings stay in the reader's browser (localStorage).
 
+Live at https://mannansaood.github.io/mnemonic/
+
+## What is in it
+
+114 lessons across all 23 tracks, each with its own hands-on playground:
+
+| Track | Lessons |
+|---|---|
+| Software design and design patterns (7 principles, all 23 patterns) | 30 |
+| Go internals | 9 |
+| Distributed systems | 9 |
+| Linux, Networking | 6 each |
+| Concurrency, Operating systems, Databases, System design, Software architecture, Kubernetes, Performance, Reliability, Testing, Code craft, Security, Algorithms, Math for CS, Computer architecture, Compilers, Python, TypeScript, Rust | 3 each |
+
+Every track page also lists its full planned outline (coming soon), and `/roadmaps` turns a
+goal (for example "Go backend engineer") into an ordered path through written and planned
+lessons.
+
 ## Run it
 
 ```bash
@@ -47,7 +65,11 @@ Tracks are listed in `content/tracks.yaml`; a track goes live when it has a topi
 Roadmap goal profiles are in `content/roadmaps/`; `src/lib/roadmap.ts` turns a profile into an
 ordered path (the roadmap pages come later).
 
-`npm test` runs the playground model and roadmap tests (no browser needed).
+`npm test` runs the playground model and roadmap tests (no browser needed). `npm run check`
+validates every lesson without a full build.
+
+The full authoring guide, including the playground standard every lesson must meet, is in
+[docs/AUTHORING.md](docs/AUTHORING.md).
 
 ## Layout
 
