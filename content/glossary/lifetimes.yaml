@@ -1,0 +1,13 @@
+# Terms introduced by the rust/lifetimes lesson.
+- id: lifetime
+  term: Lifetime
+  short: In Rust, the region of code where a reference must stay valid. Written 'a in signatures, checked at compile time and erased before the program runs.
+- id: lifetime-elision
+  term: Lifetime elision
+  short: Rules that let the Rust compiler fill in lifetimes in common signatures, such as giving a function's only input lifetime to its output.
+- id: dangling-reference
+  term: Dangling reference
+  short: A reference to memory that has been freed or reused. Using it reads or writes data that no longer belongs to it.
+- id: static-lifetime
+  term: "'static"
+  short: The lifetime of the whole program. String literals have it; a T 'static bound means T holds no borrowed data that could expire.

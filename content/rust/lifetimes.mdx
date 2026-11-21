@@ -1,0 +1,534 @@
+---
+title: Lifetimes
+track: rust
+group: Ownership
+order: 11
+summary: A lifetime names the region of code where a reference must stay valid. Annotations say which inputs a returned reference may borrow from, so the compiler can check every caller against the shortest of them.
+intent: For any function that returns a reference, know which argument it borrows from, and so how long the caller may keep the result.
+changeRequest: The rate limiter's memory grew to 3.4 GB for 2.5 MB of tenant keys, and the service was OOM-killed every few days.
+languages: [go, python, typescript, rust]
+glossary: [lifetime, lifetime-elision, dangling-reference, static-lifetime, borrow]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [rust/borrowing]
+skills: [rust, memory]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: lifetimes
+  scenarios:
+    - try: "Keep the signature with one 'a. The request has no X-Tenant header. Predict, then read the verdict."
+      notice: "Rejected, although at runtime the function returns the config default, which lives all along. The signature says the result may borrow from head, so the compiler checks every caller against head's region."
+    - try: "Drag drop(head) down past the last use of key, or pull the last use of key above drop(head)."
+      notice: "It compiles. Lifetimes did not change how long anything lives; you moved the code so that key's uses fit inside 'a."
+    - try: "Turn on the X-Tenant header and run the rejected layout without the checker."
+      notice: "key points into head's 16 KiB, which drop(head) freed. The later uses read freed memory. Without the header the same code would have worked, which is why tests miss it."
+    - try: "Try the other signatures: no annotations, tied to default_tenant only, and an owned String."
+      notice: "No annotations is E0106. Tying the result to default_tenant moves the error into the function body. A String always compiles and costs one small copy per request."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: serve
+      kind: client
+      before: { x: 12, y: 108, w: 100, h: 52, title: serve, sub: per request }
+      after:  { x: 12, y: 108, w: 100, h: 52, title: serve, sub: per request }
+    - id: key
+      kind: context
+      before: { x: 140, y: 24, w: 260, h: 222, title: tenant key, sub: "you think: a string of its own" }
+      after:  { x: 140, y: 108, w: 140, h: 52, title: { go: key string, python: key memoryview, typescript: key string, rust: "key: &'a str" }, sub: a borrow }
+    - id: region
+      kind: strategy
+      appears: after
+      before: { x: 310, y: 108, w: 240, h: 52, title: "" }
+      after:  { x: 310, y: 108, w: 240, h: 52, title: { go: kept alive by GC, python: kept alive by refcount, typescript: kept alive by GC, rust: "'a" }, sub: { go: "head lives while key does", python: "the view pins head", typescript: "a slice may pin head", rust: "the shorter of head and config" } }
+    - id: head
+      kind: concrete
+      before: { x: 430, y: 40, w: 120, h: 48, title: head, sub: 16 KiB }
+      after:  { x: 310, y: 24, w: 240, h: 52, title: head, sub: "16 KiB, one request" }
+    - id: cfg
+      kind: concrete
+      before: { x: 430, y: 120, w: 120, h: 48, title: config }
+      after:  { x: 310, y: 194, w: 240, h: 52, title: config, sub: lives as long as the server }
+    - id: limiter
+      kind: concrete
+      before: { x: 430, y: 196, w: 120, h: 48, title: limiter, sub: map of keys }
+      after:  { x: 140, y: 194, w: 140, h: 52, title: limiter, sub: owns its keys }
+  edges:
+    - { from: serve, to: key, label: calls }
+    - { from: key, to: region, label: valid for }
+    - { from: region, to: head }
+    - { from: region, to: cfg }
+    - { from: key, to: limiter, label: copied into }
+
+# ---------------------------------------------------------------- code
+code:
+  rust:
+    before:
+      file: limiter.rs
+      source: |
+        // limiter.rs
+        fn tenant_key<'a>(head: &'a str, default_tenant: &'a str) -> &'a str {
+            header(head, "x-tenant").unwrap_or(default_tenant)
+        }
+
+        struct Limiter<'k> { buckets: HashMap<&'k str, Bucket> }
+
+        async fn serve(conn: &mut Conn, cfg: &Config, limiter: &mut Limiter<'_>) -> Result<(), Error> {
+            let head = conn.read_head().await?; // a String, about 16 KiB
+            let key = tenant_key(&head, &cfg.default_tenant);
+            limiter.buckets.entry(key).or_default().take(1)?;
+            respond(conn, &head).await
+        }
+      roles: { region: [2, 2], key: [10, 10], limiter: [6, 6], serve: [8, 13], head: [9, 9], cfg: [10, 10] }
+      change:
+        - { line: 10, replace: "    let key = tenant_key(&head, &cfg.default_tenant); // error[E0597]: `head` does not live long enough" }
+        - { line: 13, replace: "} // head is dropped here, while the limiter still holds key" }
+    after:
+      file: limiter.rs
+      source: |
+        // limiter.rs
+        // The result borrows from head or from default_tenant, so it is valid while both are.
+        fn tenant_key<'a>(head: &'a str, default_tenant: &'a str) -> &'a str {
+            header(head, "x-tenant").unwrap_or(default_tenant)
+        }
+
+        struct Limiter { buckets: HashMap<Box<str>, Bucket> } // owns its keys
+
+        impl Limiter {
+            fn take(&mut self, key: &str, n: u32) -> Result<(), RateLimited> {
+                if let Some(b) = self.buckets.get_mut(key) {
+                    return b.take(n); // lookup by &str: no allocation
+                }
+                self.buckets.entry(key.into()).or_default().take(n) // copy the few key bytes once
+            }
+        }
+
+        async fn serve(conn: &mut Conn, cfg: &Config, limiter: &mut Limiter) -> Result<(), Error> {
+            let head = conn.read_head().await?;
+            let key = tenant_key(&head, &cfg.default_tenant);
+            limiter.take(key, 1)?;
+            respond(conn, &head).await
+        } // head is dropped here; nothing borrows from it any more
+      roles: { sig: [2, 3], region: [3, 3], key: [20, 20], borrow: [20, 21], copy: [14, 14], limiter: [7, 16], serve: [18, 23], head: [19, 19], cfg: [20, 20], drop: [23, 23] }
+    again:
+      file: a week of traffic
+      source: |
+        // 210,000 distinct tenants in a week
+        // limiter keys     210,000 × about 12 bytes = 2.5 MB, plus map overhead
+        // request heads    freed at the end of each request
+        // heap             steady at about 180 MB
+    cost:
+      before: { text: "1 compile error · 0 bytes pinned", value: 0.25 }
+      after: { text: "2.5 MB of keys · heads freed per request", value: 0.08 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: "A lifetime parameter names a region of code where a reference must stay valid. `fn f<'a>(x: &'a str, y: &'a str) -> &'a str` says the result may borrow from either input, so the caller may use it only while both are alive. Annotations never make data live longer. They let the compiler check the caller and the body separately, against one signature."
+      seenIn: "`str::split` and `str::lines` return iterators that borrow the input. serde can deserialise `&'a str` fields straight out of the input buffer. `Cow<'a, str>` borrows when it can and owns when it must."
+
+  go:
+    before:
+      file: limiter.go
+      source: |
+        // limiter.go
+        func tenantKey(head string, defaultTenant string) string {
+            if t := header(head, "X-Tenant"); t != "" {
+                return t // a substring of head: no copy
+            }
+            return defaultTenant
+        }
+
+        func (s *Server) serve(conn *Conn) error {
+            head, err := conn.ReadHead() // a string, about 16 KiB
+            if err != nil {
+                return err
+            }
+            key := tenantKey(head, s.cfg.DefaultTenant)
+            if !s.limiter.Take(key, 1) { // stores key in a map the first time it sees it
+                return errRateLimited
+            }
+            return s.respond(conn, head)
+        }
+      roles: { region: [2, 7], key: [14, 14], limiter: [15, 15], serve: [9, 19], head: [10, 10], cfg: [14, 14] }
+      change:
+        - { line: 4, replace: "        return t // shares head's 16 KiB of memory" }
+        - { line: 15, replace: "    if !s.limiter.Take(key, 1) { // the map key keeps all of head alive" }
+    after:
+      file: limiter.go
+      source: |
+        // limiter.go
+        func tenantKey(head string, defaultTenant string) string {
+            if t := header(head, "X-Tenant"); t != "" {
+                return t // still a substring of head: fine for this request
+            }
+            return defaultTenant
+        }
+
+        func (l *Limiter) Take(key string, n int) bool {
+            b, ok := l.buckets[key] // lookup with the substring: no copy
+            if !ok {
+                b = newBucket(l.rate)
+                l.buckets[strings.Clone(key)] = b // copy the few key bytes once, so head can be freed
+            }
+            return b.take(n)
+        }
+
+        func (s *Server) serve(conn *Conn) error {
+            head, err := conn.ReadHead()
+            if err != nil {
+                return err
+            }
+            if !s.limiter.Take(tenantKey(head, s.cfg.DefaultTenant), 1) {
+                return errRateLimited
+            }
+            return s.respond(conn, head) // head becomes garbage once nothing points into it
+        }
+      roles: { sig: [2, 7], region: [4, 4], key: [23, 23], borrow: [23, 23], copy: [13, 13], limiter: [9, 16], serve: [18, 27], head: [19, 19], cfg: [23, 23], drop: [26, 26] }
+    again:
+      file: a week of traffic
+      source: |
+        // 210,000 distinct tenants in a week
+        // limiter keys     210,000 × about 12 bytes = 2.5 MB, plus map overhead
+        // request heads    garbage after each request, collected
+        // heap             steady at about 180 MB
+    cost:
+      before: { text: "3.4 GB held for 2.5 MB of keys", value: 0.9 }
+      after: { text: "2.5 MB of keys · heads collected", value: 0.08 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: "The garbage collector keeps anything alive while something points into it, so a reference cannot dangle. The opposite can bite: a substring or a subslice shares its parent's memory and keeps all of it alive. `strings.Clone` (Go 1.18) and `bytes.Clone` (Go 1.20) copy just the part you keep."
+      seenIn: "`unique.Make` (Go 1.23) interns values such as repeated keys. `bufio.Scanner.Bytes` returns a slice that the next `Scan` may overwrite."
+
+  python:
+    before:
+      file: limiter.py
+      source: |
+        # limiter.py
+        def tenant_key(head: memoryview, default_tenant: bytes) -> memoryview | bytes:
+            t = header(head, b"x-tenant")  # a slice of head: no copy
+            return t if t is not None else default_tenant
+
+        async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            head = memoryview(await read_head(reader)).toreadonly()  # about 16 KiB
+            key = tenant_key(head, config.default_tenant)
+            if not limiter.take(key, 1):  # stores key in a dict the first time it sees it
+                raise RateLimited()
+            await respond(writer, head)
+      roles: { region: [2, 4], key: [8, 8], limiter: [9, 9], serve: [6, 11], head: [7, 7], cfg: [8, 8] }
+      change:
+        - { line: 3, replace: "    t = header(head, b\"x-tenant\")  # a view into head: keeps all 16 KiB alive" }
+        - { line: 9, replace: "    if not limiter.take(key, 1):  # the dict key pins head's buffer" }
+    after:
+      file: limiter.py
+      source: |
+        # limiter.py
+        def tenant_key(head: memoryview, default_tenant: bytes) -> memoryview | bytes:
+            t = header(head, b"x-tenant")  # still a view into head: fine for this request
+            return t if t is not None else default_tenant
+
+        class Limiter:
+            def take(self, key: memoryview | bytes, n: int) -> bool:
+                b = self.buckets.get(key)  # lookup with the view: no copy
+                if b is None:
+                    b = self.buckets[bytes(key)] = Bucket(self.rate)  # copy the few key bytes once
+                return b.take(n)
+
+        async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            head = memoryview(await read_head(reader)).toreadonly()
+            if not limiter.take(tenant_key(head, config.default_tenant), 1):
+                raise RateLimited()
+            await respond(writer, head)  # head's buffer is freed when the last view goes
+      roles: { sig: [2, 4], region: [3, 3], key: [15, 15], borrow: [15, 15], copy: [10, 10], limiter: [6, 11], serve: [13, 17], head: [14, 14], cfg: [15, 15], drop: [17, 17] }
+    again:
+      file: a week of traffic
+      source: |
+        # 210,000 distinct tenants in a week
+        # limiter keys     210,000 × about 12 bytes = 2.5 MB, plus dict overhead
+        # request heads    freed when the request's last view goes
+        # heap             steady at about 180 MB
+    cost:
+      before: { text: "3.4 GB held for 2.5 MB of keys", value: 0.9 }
+      after: { text: "2.5 MB of keys · heads freed per request", value: 0.08 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: "Slicing `bytes` or `str` copies, so ordinary Python code cannot pin a parent buffer this way. A `memoryview` slice does: it holds a reference to the whole underlying object, which lives until the last view is released. Call `bytes(view)` for anything you keep."
+      seenIn: "`memoryview.release()` and `with memoryview(buf) as m:` end a view early. A read-only `memoryview` with a byte format is hashable and compares equal to the same `bytes`."
+
+  typescript:
+    before:
+      file: limiter.ts
+      source: |
+        // limiter.ts
+        function tenantKey(head: string, defaultTenant: string): string {
+          return header(head, "x-tenant") ?? defaultTenant; // a substring of head
+        }
+
+        export async function serve(conn: Conn): Promise<void> {
+          const head = await conn.readHead(); // a string, about 16 KiB
+          const key = tenantKey(head, config.defaultTenant);
+          if (!limiter.take(key, 1)) throw new RateLimited(); // stores key in a Map the first time
+          await respond(conn, head);
+        }
+      roles: { region: [2, 4], key: [8, 8], limiter: [9, 9], serve: [6, 11], head: [7, 7], cfg: [8, 8] }
+      change:
+        - { line: 3, replace: "  return header(head, \"x-tenant\") ?? defaultTenant; // V8 may keep this as a slice of head" }
+        - { line: 9, replace: "  if (!limiter.take(key, 1)) throw new RateLimited(); // the Map key may pin all of head" }
+    after:
+      file: limiter.ts
+      source: |
+        // limiter.ts
+        function tenantKey(head: string, defaultTenant: string): string {
+          return header(head, "x-tenant") ?? defaultTenant; // fine for this request
+        }
+
+        class Limiter {
+          private buckets = new Map<string, Bucket>();
+          constructor(private rate: number) {}
+          take(key: string, n: number): boolean {
+            let b = this.buckets.get(key); // lookup with the substring: nothing kept
+            if (!b) {
+              b = new Bucket(this.rate);
+              this.buckets.set(Buffer.from(key).toString(), b); // a fresh string, unlinked from head
+            }
+            return b.take(n);
+          }
+        }
+
+        export async function serve(conn: Conn): Promise<void> {
+          const head = await conn.readHead();
+          if (!limiter.take(tenantKey(head, config.defaultTenant), 1)) throw new RateLimited();
+          await respond(conn, head); // head becomes garbage once nothing points into it
+        }
+      roles: { sig: [2, 4], region: [3, 3], key: [21, 21], borrow: [21, 21], copy: [13, 13], limiter: [6, 17], serve: [19, 23], head: [20, 20], cfg: [21, 21], drop: [22, 22] }
+    again:
+      file: a week of traffic
+      source: |
+        // 210,000 distinct tenants in a week
+        // limiter keys     210,000 × about 12 bytes = 2.5 MB, plus Map overhead
+        // request heads    garbage after each request, collected
+        // heap             steady at about 180 MB
+    cost:
+      before: { text: "3.4 GB held for 2.5 MB of keys", value: 0.9 }
+      after: { text: "2.5 MB of keys · heads collected", value: 0.08 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: "The engine frees what is unreachable, so nothing dangles. V8 may represent a substring of 13 or more characters as a slice that points into its parent string, and `Buffer.subarray` always shares memory with its parent. Either can keep a large parent alive behind a small value, and nothing in the language shows it."
+      seenIn: "`Buffer.from(buf)` copies a Buffer. `WeakRef` and `FinalizationRegistry` hold values without keeping them alive. Heap snapshots in DevTools show a sliced string's parent."
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { rust: "The signature ties the result to `'a`, and both inputs carry `'a`. A caller may keep `key` only while both `head` and the config are alive, so the region is the shorter of the two: one request.", go: "Go has no way to say what a returned string borrows from. The substring shares head's memory, and the garbage collector will keep head alive for as long as anything points into it.", python: "The returned view holds a reference to head's whole buffer. Reference counting keeps that buffer alive for as long as the view exists.", typescript: "The returned string may be a slice of head inside V8. If it is, head stays alive for as long as the slice does." }
+    nodes: [key, region, head, cfg]
+    edges: [key>region, region>head, region>cfg]
+    role: sig
+  - text: { rust: "`serve` uses `key` for one lookup, inside the request. Every use falls inside `'a`, so the borrow checker accepts it.", go: "`serve` passes the substring to `Take` for one lookup. Using it inside the request is fine.", python: "`serve` passes the view to `take` for one lookup. Using it inside the request is fine.", typescript: "`serve` passes the string to `take` for one lookup. Using it inside the request is fine." }
+    nodes: [serve, key]
+    edges: [serve>key]
+    role: borrow
+  - text: { rust: "The limiter must outlive the request, so it cannot hold a `&'a str`. It owns `Box<str>` keys and copies the few bytes of a key the first time it sees it. Lookups borrow, inserts own.", go: "`strings.Clone` copies the dozen bytes of a new key into their own allocation. The map no longer points into head.", python: "`bytes(key)` copies the dozen bytes of a new key. The dict no longer holds a view of head.", typescript: "`Buffer.from(key).toString()` builds a fresh string from the key's bytes. The Map no longer points into head." }
+    nodes: [key, limiter]
+    edges: [key>limiter]
+    role: copy
+  - text: { rust: "At the end of `serve`, `head` is dropped and its 16 KiB are freed. Nothing borrows from it any more, which the compiler has proved.", go: "When `serve` returns, nothing points into head, and the next collection frees its 16 KiB.", python: "When the last view of head goes, its reference count reaches zero and the buffer is freed at once.", typescript: "When `serve` returns, nothing points into head, and a later collection frees it." }
+    nodes: [region, head]
+    edges: [region>head]
+    role: drop
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: "You add `'a` annotations to a function's signature. What happens to how long the arguments live?"
+    options:
+      - text: Nothing. Annotations describe how the references relate, and the compiler checks callers against that description.
+        correct: true
+        why: Right. The Rust Book is explicit that annotations do not extend or shorten any value's life. They only decide which programs the borrow checker rejects.
+      - text: They live as long as `'a`, which the compiler extends to cover every use.
+        why: The compiler never keeps a value alive longer to satisfy a reference. If a use falls outside the value's life, it rejects the program.
+      - text: They are moved to the heap, so references to them stay valid.
+        why: Lifetimes do not change where values live. Rust has no escape analysis that moves values to the heap behind your back.
+  engineer:
+    question: "`fn pick<'a>(a: &'a str, b: &'a str) -> &'a str` gets `cfg_name` (lives all of main) and `header` (dropped in an inner block). The result is used after the block. At runtime `pick` happens to return `cfg_name`. Does it compile?"
+    options:
+      - text: No. The signature says the result may borrow from either argument, so it is only valid while both are alive.
+        correct: true
+        why: Right. The compiler checks the call against the signature, not against what the body returns at runtime. Return a `String`, or give `b` its own lifetime and stop returning it.
+      - text: Yes, because the value returned at runtime lives long enough.
+        why: The borrow checker never looks at runtime values. Another request could take the other branch.
+      - text: Yes, but only in a release build, where the inner block is optimised away.
+        why: Borrow checking runs before optimisation and is identical in debug and release builds.
+  deep:
+    question: "Which of these signatures compiles without any lifetime annotations?"
+    options:
+      - text: "`fn tenant(head: &str) -> &str`"
+        correct: true
+        why: "Right. One input lifetime is assigned to every output lifetime: that is the second elision rule. A method with `&self` gets the third rule, where `self`'s lifetime goes to the outputs."
+      - text: "`fn pick(a: &str, b: &str) -> &str`"
+        why: Two input lifetimes and no `self`, so elision cannot decide which one the result borrows from. This is E0106, missing lifetime specifier.
+      - text: "`fn default_tenant() -> &str`"
+        why: No input lifetime at all, so there is nothing to borrow from. The compiler asks for a lifetime and suggests `'static`, which only fits if the data really is static.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Lifetime parameter
+      example: "'a in tenant_key<'a>"
+      job: Names a region of code. Every reference marked `'a` must be valid throughout it.
+    - role: Signature
+      example: "(&'a str, &'a str) -> &'a str"
+      job: The contract. The body may only return what the inputs allow, and callers may only keep the result as long as the inputs live.
+    - role: Owned value
+      example: "Box<str> keys in the limiter"
+      job: The way out when data must outlive what it came from. It costs a copy.
+    - role: "'static"
+      example: "string literals"
+      job: Valid for the whole program. Often suggested by the compiler, and usually the wrong fix.
+  useWhen:
+    - A function returns a reference into one of its arguments, such as a parser returning slices of its input.
+    - A struct holds a reference, such as a request view that borrows the read buffer.
+    - Zero-copy processing where the borrowed data clearly outlives the work, within one request or one batch.
+  avoidWhen:
+    - The result must be stored beyond the input's life, such as in a cache, a map or a background task. Return or store owned data.
+    - The lifetimes start spreading through many structs and signatures. Owning a small copy is often simpler and cheap.
+  tradeoffs:
+    - References avoid copies, but tie the result's life to the input's. The compiler checks the tie, and you design around it.
+    - Annotations are only needed where elision cannot decide, but when needed they are part of the public API.
+    - In garbage-collected languages the same shape never dangles, and instead can keep a large parent alive behind a small slice.
+  lookalikes:
+    - name: Garbage collection
+      how: Keeps data alive while anything points at it. No dangling, but unbounded retention is possible.
+    - name: Rc and Arc
+      how: Shared ownership with a count. The data lives as long as any owner, checked at runtime.
+    - name: Cow
+      how: Borrows when the data outlives the use, and owns a copy when it does not.
+---
+
+## [concept] Lifetimes
+
+**A lifetime names the region of code where a reference must stay valid. Annotations say which inputs a returned reference may borrow from, so the compiler can check every caller against the shortest of them.**
+
+Lifetimes do not change how long anything lives. They describe relationships between references, and the compiler rejects programs that break them.
+
+<Depth level={2}>
+A <Term id="lifetime">lifetime</Term> is a region of code. `fn tenant_key<'a>(head: &'a str, default_tenant: &'a str) -> &'a str` says the result is valid only where both inputs are, so it is a <Term id="borrow">borrow</Term> of the shorter one. Most signatures need no annotation, because <Term id="lifetime-elision">lifetime elision</Term> fills them in. They are needed when a function takes two references and returns one, because the compiler cannot guess which input the result borrows from.
+</Depth>
+
+<Depth level={3}>
+The borrow checker treats each lifetime as a set of points in the function's control-flow graph and collects constraints such as "`'head` must outlive `'a`" from every call and assignment. It then checks that every use of a reference lies inside its region. Lifetimes are erased before code generation, so they cost nothing at runtime and cannot be inspected.
+</Depth>
+
+## [problem] Rate limit by tenant
+
+An API gateway rate-limits each tenant. For every request it reads the request head, about 16 KiB of headers, finds the tenant in the `X-Tenant` header, falls back to a default from the config, and takes a token from that tenant's bucket. Buckets live in a map for as long as the server runs.
+
+The tenant lookup avoids copying: it returns a slice of the request head. In load tests memory is flat, and every test passes.
+
+<Depth level={2}>
+The mental model behind the code is that the tenant key is a small string of its own. It is in fact a window into the request head. Whether that is fine depends on how long the window is kept, and the limiter keeps it for good.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">In Go a substring shares memory with its parent. `head[a:b]` is a pointer into head's bytes plus a length, so a map key made that way keeps all 16 KiB reachable.</Lang>
+<Lang only="python">A slice of a `memoryview` is another view on the same buffer. Using it as a dict key keeps a reference to the whole request head.</Lang>
+<Lang only="typescript">V8 may represent a substring as a slice of its parent string. Using such a string as a Map key can keep the whole request head alive.</Lang>
+<Lang only="rust">The Rust version does not compile. The limiter is declared to hold `&str` keys for its own lifetime, and the key borrows from `head`, which is dropped at the end of `serve`.</Lang>
+</Depth>
+
+## [pain] A week in production
+
+**What happened:** the rate limiter's memory grew to 3.4 GB for 2.5 MB of tenant keys, and the service was OOM-killed every few days.
+
+The marked lines are the whole story. Each new tenant key is about 12 bytes, but it points into a 16 KiB request head. 210,000 tenants in a week keep 210,000 request heads alive, about 3.4 GB. Load tests used a few hundred tenants, so they never saw it.
+
+<Depth level={2}>
+Nothing dangles in a garbage-collected language: the collector keeps referenced data alive, as promised. The cost is the mirror image of a <Term id="dangling-reference">dangling reference</Term>. A reference that outlives the purpose of its data keeps that data alive, and a small key can hold a large buffer.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">The compiler reports E0597: `head` does not live long enough. Its notes point at `&head` as the borrow, at the `entry(key)` line as the use that needs the borrow to last as long as the limiter, and at the closing brace where `head` is dropped while still borrowed. Nothing ships, so the cost meter shows one compile error.</Lang>
+<Lang only="go">A heap profile shows it if you know where to look: the retained bytes are attributed to `ReadHead`, the allocation site of the heads, not to the limiter that keeps them.</Lang>
+<Lang only="python">`tracemalloc` attributes the memory to `read_head`, where the buffers were allocated. The dict that pins them is small and looks innocent.</Lang>
+<Lang only="typescript">A heap snapshot shows thousands of sliced strings whose parent is a 16 KiB head. Nothing in the source code says they are slices.</Lang>
+</Depth>
+
+## [morph] From a string of its own to a borrow with a region
+
+Drag the slider. The tenant key that looked like a value of its own becomes a reference with a region, `'a`, bounded by the request head and the config. The limiter, which outlives every request, stores its own copies.
+
+The code changes in one way. Lookups keep borrowing, and the limiter copies the few bytes of a key when it inserts it.
+
+<Depth level={2}>
+<Lang only="rust">`tenant_key` keeps its signature: borrowing is right inside a request. The limiter's map now owns `Box<str>` keys. `get_mut(key)` looks up with a `&str` without allocating, because `Box<str>` implements `Borrow<str>`, and only a new tenant costs an allocation.</Lang>
+<Lang only="go">`strings.Clone` exists for exactly this: keep a small part of a large string without keeping the large string. The lookup still uses the substring, so only new tenants cost an allocation.</Lang>
+<Lang only="python">`bytes(key)` makes an independent copy for the dict. Lookups keep using the view, which hashes and compares equal to the same bytes.</Lang>
+<Lang only="typescript">`Buffer.from(key).toString()` builds a fresh string from the key's bytes, so it cannot be a slice of head. Lookups keep using the original string.</Lang>
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">With a single input, `fn tenant(head: &str) -> &str` would need no annotation at all: elision gives the output the input's lifetime. The `'a` is needed here only because there are two reference inputs and the result may come from either.</Lang>
+<Lang only="go">`unique.Make` (Go 1.23) is the other option for keys that repeat: it interns the value, so equal keys share one canonical copy.</Lang>
+<Lang only="python">A dict keeps the first key object it was given for each key, so the copy made on insert is the one that stays.</Lang>
+<Lang only="typescript">Map keys are compared by value for strings, so the fresh copy and the substring find the same entry.</Lang>
+</Depth>
+
+## [walk] Follow one request
+
+One request from reading its head to dropping it. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="rust">The checker sees three constraints: `&head` must live at least `'a`, `&cfg.default_tenant` must live at least `'a`, and `key: &'a str` is used up to the `take` call. `head` lives until the closing brace, after the last use, so the constraints are satisfiable. In the old code a fourth constraint came from the limiter, `'a` must outlive `'k`, and `'k` outlives the whole function.</Lang>
+<Lang only="go">Escape analysis has already put head on the heap, because the substring escapes into the map. Once the map holds a clone instead, nothing escapes from head beyond the request, and the collector frees it after the request.</Lang>
+<Lang only="python">The view keeps one reference to the underlying bytes object. When the request's last view is released, the count reaches zero and the 16 KiB are freed at once.</Lang>
+<Lang only="typescript">Whether V8 slices or copies a substring is an engine decision that can change between versions. Copying on insert makes the limiter correct whichever it does.</Lang>
+</Depth>
+
+## [again] The same week, again
+
+210,000 tenants in a week, as before. The limiter holds 2.5 MB of keys plus map overhead, every request head is freed at the end of its request, and the heap stays flat.
+
+<Depth level={2}>
+The copy costs one small allocation per new tenant, not per request, because lookups still borrow. That is the usual shape: borrow on the hot path, own at the boundary where data is kept.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">If the compiler suggests adding `'static` to make the error go away, read it as a sign that a reference is being kept beyond its data. A `&'static str` key would only accept string literals and leaked memory.</Lang>
+<Lang only="go">A regression test can call `Take` with substrings of large strings, force a GC, and assert with `runtime.ReadMemStats` that the heap does not grow with the number of tenants.</Lang>
+<Lang only="python">A regression test can insert keys taken from large buffers, delete the buffers, and assert that `tracemalloc` shows the memory released.</Lang>
+<Lang only="typescript">A regression test can insert keys from large strings and check a heap snapshot for retained parents.</Lang>
+</Depth>
+
+## [play] Drag the regions
+
+The playground draws `serve` as a timeline. The request head, the config and the tenant key each get a bar, and `'a` is drawn as the region where both inputs are alive. Drag `drop(head)` and the last use of `key`, switch the signature, and see where the compiler draws the line.
+
+Predict first. Then run a rejected layout without the checker and see what the reference would read.
+
+## [lens] How each language meets it
+
+Rust makes the region of every reference part of the type and checks it. Go, Python and TypeScript keep referenced data alive instead, so the same code never dangles and can quietly retain memory.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+The design question is the same in all four: is this value a view into something else, and does it outlive that thing? Rust forces the answer in the signature. Elsewhere you answer it by knowing which operations share memory: substrings in Go, memoryviews in Python, Buffer views and some substrings in Node.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="lifetimes" />
+
+### Elision and 'static
+
+The compiler fills in lifetimes with three rules. Each reference parameter gets its own lifetime. If there is exactly one input lifetime, it is given to every output. If one input is `&self` or `&mut self`, its lifetime is given to every output. If the output is still ambiguous, you must annotate. The <Term id="static-lifetime">`'static`</Term> lifetime means valid for the whole program; string literals have it. A bound `T: 'static` is different: it means `T` holds no borrowed data with a shorter life, so an owned `String` satisfies it.
