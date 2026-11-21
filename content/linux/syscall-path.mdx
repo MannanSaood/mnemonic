@@ -1,0 +1,533 @@
+---
+title: The syscall path
+track: linux
+group: Syscalls
+order: 2
+summary: What happens between a program's read() and the kernel's handler, and back, and why each trip costs the same whether it carries 4 bytes or 64 KiB.
+intent: A system call is a trip into the kernel with a fixed price, so make fewer trips that each carry more.
+changeRequest: Startup replays a 100 MB write-ahead log that is already in the page cache, and restarts are too slow.
+languages: [go, python, typescript, rust]
+glossary: [system-call, mode-switch, vdso, kpti, copy-to-user, page-cache]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [linux/linux-big-picture, operating-systems/kernel-boundary-and-system-calls]
+skills: [linux, os]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: syscall-path
+  scenarios:
+    - try: "With no buffer, trace three reads, then replay the whole log."
+      notice: "Every read your loop makes goes all the way into the kernel and back: 2,000,001 syscalls for 1,000,000 records."
+    - try: "Pick a 64 KiB buffer, trace a few reads, then replay again."
+      notice: "The first read crosses into the kernel for 65,536 bytes. The next ones stay in user space. 1,527 syscalls, and the replay is over ten times faster."
+    - try: "Attach strace and replay with no buffer, then with the 64 KiB buffer."
+      notice: "strace stops the task on every entry and exit. Unbuffered, the replay goes from under half a second to about 50 seconds; buffered, it barely changes."
+    - try: "Trace clock_gettime()."
+      notice: "It never reaches the boundary. The vDSO answers it in user space, which is why strace does not show it."
+
+# ---------------------------------------------------------------- diagram
+# before: read() as we imagine it, a call into the file. after: the real path, user space on top, kernel below.
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 8, y: 60, w: 120, h: 56, title: Replay loop, sub: { go: "io.ReadFull(f, …)", python: "f.read(4)", typescript: "readSync(fd, …)", rust: "f.read_exact(…)" } }
+      after:  { x: 8, y: 40, w: 110, h: 50, title: Replay loop, sub: user code }
+    - id: buf
+      kind: strategy
+      appears: after
+      before: { x: 150, y: 40, w: 96, h: 50, title: "" }
+      after:  { x: 150, y: 40, w: 96, h: 50, title: Buffer, sub: { go: bufio.Reader, python: BufferedReader, typescript: BufReader, rust: BufReader } }
+    - id: kernel
+      kind: context
+      before: { x: 150, y: 18, w: 400, h: 236, title: "read()", sub: "a call into the file?" }
+      after:  { x: 266, y: 170, w: 92, h: 50, title: Entry, sub: syscall · sysret }
+    - id: handler
+      kind: concrete
+      before: { x: 170, y: 84, w: 360, h: 48, title: copy 4 bytes, sub: from the file }
+      after:  { x: 376, y: 170, w: 84, h: 50, title: vfs_read, sub: ksys_read }
+    - id: cache
+      kind: concrete
+      before: { x: 170, y: 156, w: 360, h: 48, title: the file }
+      after:  { x: 476, y: 170, w: 78, h: 50, title: Page cache, sub: in RAM }
+  edges:
+    - { from: app, to: buf, label: 4 B }
+    - { from: buf, to: kernel, label: 64 KiB }
+    - { from: kernel, to: handler }
+    - { from: handler, to: cache }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: replay.go
+      source: |
+        // replay.go: rebuild the index from the WAL at startup
+        func Replay(path string, idx *Index) error {
+            f, err := os.Open(path)
+            if err != nil {
+                return err
+            }
+            defer f.Close()
+            var hdr [4]byte
+            buf := make([]byte, maxRecord) // the writer caps records
+            for {
+                if _, err := io.ReadFull(f, hdr[:]); err == io.EOF {
+                    return nil
+                } else if err != nil {
+                    return err
+                }
+                n := binary.LittleEndian.Uint32(hdr[:])
+                if _, err := io.ReadFull(f, buf[:n]); err != nil {
+                    return err
+                }
+                idx.Apply(buf[:n])
+            }
+        }
+      roles: { app: [10, 21], kernel: [11, 11], handler: [17, 17], cache: [3, 3] }
+      change:
+        - { after: 11, add: ['            // strace: read(3, ..., 4) = 4      x 1,000,000'] }
+        - { after: 17, add: ['            // strace: read(3, ..., 96) = 96    x 1,000,000'] }
+    after:
+      file: replay.go
+      source: |
+        func Replay(path string, idx *Index) error {
+            f, err := os.Open(path)
+            if err != nil {
+                return err
+            }
+            defer f.Close()
+            r := bufio.NewReaderSize(f, 64<<10) // one read(2) per 64 KiB
+            var hdr [4]byte
+            buf := make([]byte, maxRecord)
+            for {
+                if _, err := io.ReadFull(r, hdr[:]); err == io.EOF {
+                    return nil
+                } else if err != nil {
+                    return err
+                }
+                n := binary.LittleEndian.Uint32(hdr[:])
+                if _, err := io.ReadFull(r, buf[:n]); err != nil {
+                    return err
+                }
+                idx.Apply(buf[:n])
+            }
+        }
+      roles: { app: [10, 21], buf: [7, 7], kernel: [7, 7], handler: [7, 7], cache: [2, 2], call: [11, 11], trap: [7, 7], dispatch: [7, 7], copy: [7, 7], hits: [16, 20] }
+    again:
+      file: strace.txt
+      source: |
+        // $ strace -c -e trace=read ./server --replay-only
+        //   calls  syscall
+        //    1527  read      (was 2000001)
+    cost:
+      before: { text: "2,000,001 syscalls · 0.45 s", value: 0.9 }
+      after: { text: "1,527 syscalls · 0.03 s", value: 0.07 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`*os.File` has no buffer. Every `Read` is a `read(2)`, and every `fmt.Fprintf` to an `*os.File` (`os.Stdout` included) is a `write(2)`. Wrap files in `bufio.Reader` or `bufio.Writer`: 4 KiB by default, any size with `NewReaderSize`. On Linux the Go runtime issues syscalls itself, without libc.'
+      seenIn: '`bufio.Scanner` reads in chunks and splits lines out of them. `os.ReadFile` sizes one buffer from the file size. `strace -c` and `perf trace` count the calls.'
+
+  python:
+    before:
+      file: replay.py
+      source: |
+        # replay.py: rebuild the index from the WAL at startup
+        def replay(path: str, idx: Index) -> None:
+            # unbuffered, so f.tell() always matches what we parsed
+            with open(path, "rb", buffering=0) as f:
+                while True:
+                    hdr = f.read(4)
+                    if not hdr:
+                        return
+                    (n,) = struct.unpack("<I", hdr)
+                    body = f.read(n)
+                    idx.apply(body)
+      roles: { app: [5, 11], kernel: [6, 6], handler: [10, 10], cache: [4, 4] }
+      change:
+        - { after: 6, add: ['            # strace: read(3, ..., 4) = 4      x 1,000,000'] }
+        - { after: 10, add: ['            # strace: read(3, ..., 96) = 96    x 1,000,000'] }
+    after:
+      file: replay.py
+      source: |
+        def replay(path: str, idx: Index) -> None:
+            # a BufferedReader: one read(2) per 64 KiB
+            with open(path, "rb", buffering=64 * 1024) as f:
+                while True:
+                    hdr = f.read(4)
+                    if not hdr:
+                        return
+                    (n,) = struct.unpack("<I", hdr)
+                    body = f.read(n)
+                    idx.apply(body)
+      roles: { app: [4, 10], buf: [2, 3], kernel: [3, 3], handler: [3, 3], cache: [3, 3], call: [5, 5], trap: [3, 3], dispatch: [3, 3], copy: [3, 3], hits: [8, 10] }
+    again:
+      file: strace.txt
+      source: |
+        # $ strace -c -e trace=read python -m server --replay-only
+        #   calls  syscall
+        #    1527  read      (was 2000001)
+    cost:
+      before: { text: "2,000,001 syscalls · 0.45 s", value: 0.9 }
+      after: { text: "1,527 syscalls · 0.03 s", value: 0.07 }
+    lens:
+      need: 1
+      needLabel: Rare
+      note: '`open()` returns a `BufferedReader` unless you pass `buffering=0`, so `f.read(4)` usually costs no syscall. The buffer size comes from the file''s block size, a few KiB in Python 3.12 and larger in newer releases. You pay one syscall per call with `buffering=0`, `os.read` and `socket.recv`.'
+      seenIn: '`io.BufferedReader` and `io.BufferedWriter`. `sys.stdout` is line-buffered on a terminal and block-buffered into a pipe or file. `os.read(fd, n)` is one `read(2)`.'
+
+  typescript:
+    before:
+      file: replay.ts
+      source: |
+        // replay.ts: rebuild the index from the WAL at startup
+        import { openSync, readSync, closeSync } from "node:fs";
+
+        export function replay(path: string, idx: Index): void {
+          const fd = openSync(path, "r");
+          const hdr = Buffer.alloc(4);
+          const body = Buffer.alloc(MAX_RECORD);
+          try {
+            while (readSync(fd, hdr, 0, 4, null) === 4) {
+              const n = hdr.readUInt32LE(0);
+              readSync(fd, body, 0, n, null);
+              idx.apply(body.subarray(0, n));
+            }
+          } finally {
+            closeSync(fd);
+          }
+        }
+      roles: { app: [9, 13], kernel: [9, 9], handler: [11, 11], cache: [5, 5] }
+      change:
+        - { after: 9, add: ['      // strace: read(3, ..., 4) = 4      x 1,000,000'] }
+        - { after: 11, add: ['      // strace: read(3, ..., 96) = 96    x 1,000,000'] }
+    after:
+      file: replay.ts
+      source: |
+        import { openSync, readSync, closeSync } from "node:fs";
+
+        // A small buffered reader: one read(2) per 64 KiB.
+        class BufReader {
+          private buf = Buffer.alloc(64 * 1024);
+          private start = 0;
+          private end = 0;
+          constructor(private readonly fd: number) {}
+
+          read(dst: Buffer, n: number): boolean {
+            let got = 0;
+            while (got < n) {
+              if (this.start === this.end) {
+                this.end = readSync(this.fd, this.buf, 0, this.buf.length, null);
+                this.start = 0;
+                if (this.end === 0) return false;
+              }
+              const k = Math.min(n - got, this.end - this.start);
+              this.buf.copy(dst, got, this.start, this.start + k);
+              this.start += k;
+              got += k;
+            }
+            return true;
+          }
+        }
+
+        export function replay(path: string, idx: Index): void {
+          const fd = openSync(path, "r");
+          const r = new BufReader(fd);
+          const hdr = Buffer.alloc(4);
+          const body = Buffer.alloc(MAX_RECORD);
+          try {
+            while (r.read(hdr, 4)) {
+              const n = hdr.readUInt32LE(0);
+              r.read(body, n);
+              idx.apply(body.subarray(0, n));
+            }
+          } finally {
+            closeSync(fd);
+          }
+        }
+      roles: { app: [33, 37], buf: [4, 25], kernel: [14, 14], handler: [14, 14], cache: [28, 28], call: [33, 33], trap: [14, 14], dispatch: [14, 14], copy: [14, 14], hits: [18, 21] }
+    again:
+      file: strace.txt
+      source: |
+        // $ strace -c -f -e trace=read node replay.js
+        //   calls  syscall
+        //    1527  read      (was 2000001)
+    cost:
+      before: { text: "2,000,001 syscalls · 0.45 s", value: 0.9 }
+      after: { text: "1,527 syscalls · 0.03 s", value: 0.07 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`fs.readSync` and `fs.read` are one `read(2)` per call, and the async form also hops through the libuv thread pool. Streams batch for you: `fs.createReadStream` reads 64 KiB chunks by default (`highWaterMark`). For a record format, read big chunks and parse records out of them, as `BufReader` does here.'
+      seenIn: '`fs.createReadStream(path, { highWaterMark })`. `readline.createInterface` over a stream. `fs.readFileSync` for small files: one buffer, few calls.'
+
+  rust:
+    before:
+      file: replay.rs
+      source: |
+        // replay.rs: rebuild the index from the WAL at startup
+        fn replay(path: &Path, idx: &mut Index) -> io::Result<()> {
+            let mut f = File::open(path)?;
+            let mut hdr = [0u8; 4];
+            let mut body = vec![0u8; MAX_RECORD];
+            loop {
+                match f.read_exact(&mut hdr) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+                let n = u32::from_le_bytes(hdr) as usize;
+                f.read_exact(&mut body[..n])?;
+                idx.apply(&body[..n]);
+            }
+        }
+      roles: { app: [6, 15], kernel: [7, 7], handler: [13, 13], cache: [3, 3] }
+      change:
+        - { after: 7, add: ['            // strace: read(3, ..., 4) = 4      x 1,000,000'] }
+        - { after: 13, add: ['        // strace: read(3, ..., 96) = 96    x 1,000,000'] }
+    after:
+      file: replay.rs
+      source: |
+        fn replay(path: &Path, idx: &mut Index) -> io::Result<()> {
+            // one read(2) per 64 KiB; BufReader::new would use 8 KiB
+            let mut f = BufReader::with_capacity(64 * 1024, File::open(path)?);
+            let mut hdr = [0u8; 4];
+            let mut body = vec![0u8; MAX_RECORD];
+            loop {
+                match f.read_exact(&mut hdr) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+                let n = u32::from_le_bytes(hdr) as usize;
+                f.read_exact(&mut body[..n])?;
+                idx.apply(&body[..n]);
+            }
+        }
+      roles: { app: [6, 15], buf: [2, 3], kernel: [3, 3], handler: [3, 3], cache: [3, 3], call: [7, 7], trap: [3, 3], dispatch: [3, 3], copy: [3, 3], hits: [12, 14] }
+    again:
+      file: strace.txt
+      source: |
+        // $ strace -c -e trace=read ./server --replay-only
+        //   calls  syscall
+        //    1527  read      (was 2000001)
+    cost:
+      before: { text: "2,000,001 syscalls · 0.45 s", value: 0.9 }
+      after: { text: "1,527 syscalls · 0.03 s", value: 0.07 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: '`File` has no buffer, so `read_exact`, `bytes()` and `write!` on it each become syscalls, sometimes several. Wrap it in `BufReader` (8 KiB by default) or `BufWriter`, and flush a `BufWriter` before you rely on the data. `std` calls libc''s `read`, which executes the `syscall` instruction.'
+      seenIn: '`BufReader::lines()`. `io::stdout()` is line-buffered and flushes on each newline; wrap `stdout().lock()` in a `BufWriter` for bulk output. The `rustix` and `libc` crates for raw calls.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Your loop asks for a 4-byte header. The buffer is empty, so it asks the kernel for 64 KiB in one `read`.
+    nodes: [app, buf]
+    edges: [app>buf]
+    role: call
+  - text: { go: 'The Go runtime puts 0 (the number of `read`) in `rax`, the fd in `rdi`, the buffer address in `rsi` and 65536 in `rdx`, then executes `syscall`. On Linux, Go does this itself, without libc.', python: 'CPython calls libc''s `read`, which puts 0 (the number of `read`) in `rax`, the fd in `rdi`, the buffer address in `rsi` and 65536 in `rdx`, then executes `syscall`.', typescript: '`readSync` goes through libuv to libc''s `read`, which puts 0 (the number of `read`) in `rax`, the fd in `rdi`, the buffer address in `rsi` and 65536 in `rdx`, then executes `syscall`.', rust: '`std` calls libc''s `read`, which puts 0 (the number of `read`) in `rax`, the fd in `rdi`, the buffer address in `rsi` and 65536 in `rdx`, then executes `syscall`.' }
+    nodes: [buf, kernel]
+    edges: [buf>kernel]
+    role: trap
+  - text: The CPU switches to kernel mode and jumps to `entry_SYSCALL_64`, which saves your registers on the task's kernel stack. The dispatcher maps 0 to `sys_read`, and `ksys_read` looks up fd 3 and calls `vfs_read`.
+    nodes: [kernel, handler]
+    edges: [kernel>handler]
+    role: dispatch
+  - text: The file system finds the pages in the page cache and copies 64 KiB into your buffer with a checked copy. `sysret` returns to user mode with 65536 in `rax`.
+    nodes: [handler, cache]
+    edges: [handler>cache]
+    role: copy
+  - text: The next 1,300 or so reads come straight out of the buffer. Each is a memory copy, with no trip into the kernel.
+    nodes: [app, buf]
+    edges: [app>buf]
+    role: hits
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A program calls read() on a file whose pages are already in the page cache. What happens?
+    options:
+      - text: The CPU switches into kernel mode, the kernel copies the bytes from the page cache into the program's buffer, and the CPU switches back.
+        correct: true
+        why: Right. The page cache is kernel memory, so even a cached read is a trip into the kernel and a copy. No disk is involved.
+      - text: The program reads the page cache directly, the way it calls a function in a shared library.
+        why: No. The page cache lives in kernel memory, which user code cannot touch. Only the kernel can copy it out.
+      - text: The kernel switches to another process while it fetches the bytes.
+        why: No. The bytes are in RAM, so nothing waits. A system call changes mode inside the same task; it is not a context switch.
+  engineer:
+    question: "strace -c on a slow startup shows 2,000,001 read calls of 4 and 96 bytes. The file is in the page cache. What is the cheapest fix?"
+    options:
+      - text: Read through a user-space buffer, such as a 64 KiB bufio.Reader or BufReader, so one read(2) serves hundreds of records.
+        correct: true
+        why: Right. The time goes on two million trips into the kernel. A buffer turns them into about 1,500 trips carrying the same bytes.
+      - text: Move the log to a faster SSD.
+        why: The pages are already in RAM, so the disk is never touched. A faster disk changes nothing here.
+      - text: Split the file and read the parts from several threads.
+        why: Each thread still makes two syscalls per record. You spread the overhead over more cores instead of removing it.
+  deep:
+    question: A service reads the clock on every request, yet strace shows no clock_gettime calls. Why?
+    options:
+      - text: clock_gettime runs in the vDSO, code the kernel maps into the process, which reads kernel-maintained clock data without a system call.
+        correct: true
+        why: Right. There is no syscall instruction to trace. The kernel keeps the clock data in a page it shares with every process.
+      - text: strace leaves out calls that finish in under a microsecond.
+        why: No. strace reports every system call it is asked to trace, however short. This one never enters the kernel.
+      - text: The language runtime caches the time and refreshes it once a second.
+        why: Runtimes call clock_gettime for each reading. It is cheap because of the vDSO, not because of a cache.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: User code
+      example: the replay loop
+      job: Asks for bytes, often in small pieces.
+    - role: Buffer
+      example: { go: bufio.Reader, python: io.BufferedReader, typescript: "BufReader over fs.readSync", rust: std::io::BufReader }
+      job: Turns many small reads into a few large read(2) calls.
+    - role: Wrapper
+      example: { go: the Go runtime's syscall package, python: libc read(), typescript: "libuv, then libc read()", rust: libc read() }
+      job: Loads the call number and arguments into registers and executes syscall.
+    - role: Entry and dispatch
+      example: "entry_SYSCALL_64, x64_sys_call"
+      job: Save the user registers on the kernel stack and pick the handler by number.
+    - role: Handler
+      example: "ksys_read, vfs_read"
+      job: Does the work and copies the result to user space with checks.
+  useWhen:
+    - Reads or writes smaller than a few KiB in a loop. Buffer them in user space.
+    - strace -c or perf trace shows hundreds of thousands of calls a second for small sizes.
+    - A hot path reads the time or the CPU number. These go through the vDSO and are cheap; most other calls are not.
+  avoidWhen:
+    - Each read is already large (hundreds of KiB or more). A buffer only adds a second copy.
+    - Data must reach the kernel now, such as a log line before a crash. Flush buffered writers at those points.
+  tradeoffs:
+    - A user-space buffer copies every byte one more time, from the buffer to your variable.
+    - Buffered writes sit in your process until flushed, and are lost if it crashes first.
+    - A buffered reader on a socket or pipe may read past the bytes you asked for, so hand the reader on, not the raw descriptor.
+    - Each crossing costs more on CPUs that need KPTI and other speculation mitigations.
+  lookalikes:
+    - name: Context switch
+      how: Changes which task runs on the CPU. A system call changes mode within one task, which keeps running.
+    - name: Library call
+      how: memcpy, strlen and qsort run entirely in user space. Not every libc function is a system call.
+    - name: vDSO call
+      how: Looks like a system call from your code, but runs in user space with no mode switch.
+    - name: Interrupt
+      how: Enters the kernel too, but started by hardware, not by the program asking.
+---
+
+## [concept] The syscall path
+
+**A <Term id="system-call">system call</Term> is a trip into the kernel with a fixed price: load registers, switch mode, dispatch, do the work, switch back.**
+
+That price is the same whether the trip carries 4 bytes or 64 KiB. Make fewer trips that each carry more.
+
+<Depth level={2}>
+Five parts do the work. Your code asks for bytes. A buffer, if you have one, answers from memory when it can. The wrapper (libc, or the Go runtime) puts the call number and arguments in registers and executes `syscall`. The kernel's entry code saves your registers and dispatches on the number. The handler, here `vfs_read`, does the work and copies the result back to you.
+</Depth>
+
+<Depth level={3}>
+On x86-64 the call number goes in `rax` and up to six arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8` and `r9`. The result comes back in `rax`. A value between -4095 and -1 is a negated error number, which libc turns into a return of -1 and a value in `errno`. The `syscall` instruction jumps to an address the kernel wrote into a model-specific register at boot, and the kernel never trusts a pointer you pass: it copies in and out with checked copies.
+</Depth>
+
+## [problem] A startup that reads a log one record at a time
+
+A service keeps an index in memory and logs every change to a write-ahead log. At startup it replays the log: a 4-byte length, then the record body, until the end of the file.
+
+The code is short and obviously correct. In tests the log has a few hundred records and startup is instant.
+
+<Depth level={2}>
+The author pictured `read` as a function that fetches bytes from the file. With that picture, asking for 4 bytes is cheaper than asking for 64 KiB, and reading exactly what you need is the tidy choice.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">An `*os.File` has no buffer, so each `io.ReadFull(f, …)` is one `read(2)` for a regular file.</Lang>
+<Lang only="python">`buffering=0` gives a raw `FileIO`, so each `f.read(n)` is one `read(2)`. The comment's reason is a myth: a buffered file's `tell()` already reports the position you have read up to.</Lang>
+<Lang only="typescript">`readSync` is a thin layer over libuv and libc: one call, one `read(2)`.</Lang>
+<Lang only="rust">`File` implements `Read` directly over the descriptor, so each `read_exact` is at least one `read(2)`.</Lang>
+</Depth>
+
+## [pain] Restarts take seconds
+
+In production the log is 100 MB: a million records of 100 bytes. The file is hot in the <Term id="page-cache">page cache</Term>, so no disk is involved, and still the replay burns half a second of CPU, most of it in the kernel. Under strace it takes almost a minute.
+
+`strace -c` gives the reason: two million `read` calls, one per marked line per record.
+
+<Depth level={2}>
+A profiler shows the time in the syscall entry and exit code and in `vfs_read`, not in your parsing. Each call moves only a few bytes, so the fixed cost of the trip dominates. A faster disk would not help: there is no disk I/O.
+</Depth>
+
+<Depth level={3}>
+The fixed cost is roughly a tenth of a microsecond for the crossing and as much again for the file lookup and checks. On CPUs that need <Term id="kpti">KPTI</Term> each crossing also switches page tables, which can make it several times dearer. strace adds a ptrace stop at every entry and exit, each a round trip to the tracer process: tens of microseconds per call.
+</Depth>
+
+## [morph] From a function call to a trip across the boundary
+
+Drag the slider. The imagined call into the file splits into the real path: user code and a buffer on top, the kernel's entry, handler and page cache below.
+
+Hover a box to see its code.
+
+<Depth level={2}>
+The fix adds one line: a buffer between your loop and the file. Your loop still asks for 4 and 96 bytes. The buffer asks the kernel for 64 KiB at a time, so one trip serves about 650 records.
+</Depth>
+
+<Depth level={3}>
+A <Term id="mode-switch">mode switch</Term> is not a context switch. The same task keeps running, on its own kernel stack, and returns to the next instruction. A context switch happens only if the call has to wait, for a disk or a socket, and the scheduler runs something else meanwhile.
+</Depth>
+
+## [walk] Follow one read
+
+One `read` from the buffered loop, from your code to the page cache and back. Step through it with the numbered buttons.
+
+<Depth level={3}>
+Since 2024, x86-64 kernels dispatch through a switch statement in `x64_sys_call` instead of an indirect call through `sys_call_table`, a hardening against branch-target speculation. The table still exists, for tracing. The copy back uses <Term id="copy-to-user">copy_to_user</Term>-style helpers that check the destination is a user address and recover from a fault on a bad pointer by returning an error.
+</Depth>
+
+## [again] The same log, buffered
+
+The same replay, after the one-line change. `strace -c` now counts 1,527 calls instead of 2,000,001, and the replay takes about 30 ms instead of 450.
+
+<Depth level={2}>
+Past 64 KiB, bigger buffers barely help: the remaining cost is copying 100 MB, twice (kernel to buffer, buffer to record). To remove the second copy, parse records in place out of the buffer, or map the file with `mmap`.
+</Depth>
+
+<Depth level={3}>
+Writes have the same shape and one extra risk. A buffered writer holds data in your process until it fills or you flush it, so a crash loses it. Flush at the points where the data must be in the kernel, and call `fsync` where it must be on disk.
+</Depth>
+
+## [play] Trace reads through the kernel
+
+Trace single reads and watch which ones cross the boundary. Then replay the whole log with different buffers, attach strace, and compare.
+
+## [lens] How each language reads a file
+
+Every language ends in the same `read(2)`. What differs is whether you get a buffer without asking.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={3}>
+<Lang only="go">The Go runtime makes raw syscalls on Linux. When a goroutine's call blocks, for example on a slow disk, the scheduler hands the thread's P to another thread so other goroutines keep running. A `read` from the page cache returns too fast for that to matter.</Lang>
+<Lang only="python">CPython releases the GIL around the `read(2)` in `FileIO.readinto`, so other threads can run while one waits on a slow file.</Lang>
+<Lang only="typescript">The async `fs` functions run each `read(2)` on a libuv thread-pool thread, four by default, and post the result back to the event loop. That adds a thread hop to every call, so small async reads are even dearer than small sync ones.</Lang>
+<Lang only="rust">`std::fs::File::read` calls libc's `read`. Async runtimes such as tokio run file reads on a blocking thread pool, so `tokio::io::BufReader` matters there for the same reason.</Lang>
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="syscall-path" />
+
+### Calls that never reach the kernel
+
+`clock_gettime`, `gettimeofday`, `time` and `getcpu` run in the <Term id="vdso">vDSO</Term> on x86-64: a small library the kernel maps into every process, reading data the kernel keeps current. They cost about as much as a function call, and strace does not see them. Every other call pays the full trip, so count them with `strace -c` (slow, fine for a test run) or `perf trace -s` (cheap enough for production).

@@ -1,0 +1,19 @@
+# Terms introduced by the syscall path lesson.
+- id: system-call
+  term: System call
+  short: A request from a program to the kernel, made by putting a call number and arguments in registers and executing a special instruction (syscall on x86-64). The kernel runs the handler and returns a result.
+- id: mode-switch
+  term: Mode switch
+  short: The CPU moving from user mode to kernel mode and back, as on every system call. The same task keeps running; no other process is scheduled.
+- id: vdso
+  term: vDSO
+  short: A small shared library the kernel maps into every process. Calls like clock_gettime run there, in user space, reading data the kernel keeps up to date, so they need no system call.
+- id: kpti
+  term: KPTI
+  short: Kernel page-table isolation. On CPUs affected by Meltdown, the kernel switches page tables on every entry and exit, which makes each system call dearer.
+- id: copy-to-user
+  term: copy_to_user
+  short: The kernel's checked copy into a user-space buffer. It verifies the address belongs to user space and handles a fault on a bad pointer instead of crashing.
+- id: page-cache
+  term: Page cache
+  short: The kernel's cache of file contents in RAM, in 4 KiB pages. read() and write() go through it, and a cached page costs a memory copy instead of a disk wait.
