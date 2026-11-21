@@ -1,0 +1,22 @@
+# Terms introduced by the reliable transfer lesson.
+- id: sequence-number
+  term: Sequence number
+  short: A number the sender puts on each packet so the receiver can put packets in order, spot a copy it has already seen and notice a gap.
+- id: acknowledgement
+  term: Acknowledgement (ACK)
+  short: A small message from the receiver saying which data arrived. It proves delivery to the receiving protocol, not that the application has acted on it.
+- id: stop-and-wait
+  term: Stop-and-wait
+  short: A reliable protocol that sends one packet and waits for its ACK before sending the next. Simple and correct, but the link sits idle for a round trip per packet.
+- id: sliding-window
+  term: Sliding window
+  short: The set of sequence numbers a sender may have unacknowledged at once. As the oldest ones are acknowledged, the window slides forward and new packets may be sent.
+- id: go-back-n
+  term: Go-back-N
+  short: A windowed protocol whose receiver accepts only the next packet in order. On a loss, the sender resends the lost packet and everything it sent after it.
+- id: selective-repeat
+  term: Selective repeat
+  short: A windowed protocol whose receiver buffers packets that arrive after a gap and ACKs each one, so the sender resends only the packets actually lost.
+- id: cumulative-ack
+  term: Cumulative ACK
+  short: An ACK that means "everything up to this number arrived". A later one covers for an earlier one that was lost. TCP's ACKs are cumulative.

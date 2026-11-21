@@ -1,0 +1,599 @@
+---
+title: Building reliability on a lossy link
+track: networking
+group: TCP
+order: 13
+summary: Number every packet, acknowledge what arrives, resend on a timer, and keep a window of packets in flight so the link never sits idle.
+intent: Sequence numbers, ACKs and a timer make delivery reliable; a window makes it fast; the receiver's rules decide how much a loss costs.
+changeRequest: The billing collector moves to another region, 80 ms away, and finance wants every usage event counted exactly once.
+languages: [go, python, typescript, rust]
+glossary: [sequence-number, acknowledgement, stop-and-wait, sliding-window, go-back-n, selective-repeat, cumulative-ack, retransmission, bdp, exactly-once-effect]
+
+prerequisites: [networking/udp]
+skills: [networking, distributed-systems]
+depths: [overview, engineer, deep]
+
+playground:
+  model: reliable-transfer-principles
+  scenarios:
+    - try: "Press Play on stop-and-wait with a clean link, then switch to go-back-N and play again."
+      notice: "Stop-and-wait needs 220 ms for 10 messages: one round trip each. With a window of 4 the same messages take 68 ms."
+    - try: "Pick Lose packet 3 and run go-back-N, then selective repeat."
+      notice: "Go-back-N resends four packets because its receiver threw away 4, 5 and 6. Selective repeat holds them and resends only packet 3."
+    - try: "Under go-back-N, pick Lose ACK 2. Then click packet 9 until it says ack lost."
+      notice: "A lost ACK in the middle costs nothing: the next cumulative ACK covers it. Losing the last ACK costs a timeout and a resend."
+    - try: "Untick the receiver's sequence check, keep an ACK lost, and run stop-and-wait."
+      notice: "The resend reaches the app as a second copy. Without numbers, a retry and a new message look the same."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: shipper
+      kind: client
+      before: { x: 12, y: 30, w: 120, h: 52, title: usage shipper, sub: send · wait · retry }
+      after:  { x: 12, y: 30, w: 120, h: 52, title: usage shipper, sub: numbers each event }
+    - id: link
+      kind: context
+      before: { x: 160, y: 14, w: 250, h: 246, title: UDP to billing, sub: thought fast and exact }
+      after:  { x: 160, y: 112, w: 250, h: 52, title: lossy link, sub: drops · delays · copies }
+    - id: window
+      kind: strategy
+      appears: after
+      before: { x: 12, y: 150, w: 130, h: 60, title: "" }
+      after:  { x: 12, y: 150, w: 130, h: 60, title: send window, sub: unacked + timers }
+    - id: ack
+      kind: concrete
+      before: { x: 180, y: 70, w: 210, h: 34, title: wait for ok · 80 ms }
+      after:  { x: 160, y: 210, w: 250, h: 40, title: acks, sub: one per sequence number }
+    - id: collector
+      kind: concrete
+      before: { x: 180, y: 118, w: 210, h: 34, title: collector bills it }
+      after:  { x: 430, y: 30, w: 118, h: 52, title: collector, sub: bills each seq once }
+    - id: dedup
+      kind: concrete
+      appears: change
+      before: { x: 180, y: 206, w: 210, h: 34, title: retry · billed twice }
+      after:  { x: 430, y: 150, w: 118, h: 60, title: seen seqs, sub: repeat → ack only }
+  edges:
+    - { from: shipper, to: link, label: event }
+    - { from: link, to: collector }
+    - { from: shipper, to: window, label: tracks }
+    - { from: window, to: link, label: seq + data }
+    - { from: link, to: dedup, label: arrives }
+    - { from: dedup, to: collector, label: new only }
+    - { from: ack, to: window, label: frees a slot }
+
+code:
+  go:
+    before:
+      file: shipper.go · collector.go
+      source: |
+        // shipper.go: send one usage event, wait for "ok", retry on timeout
+        func (s *Shipper) Send(ev []byte) error {
+            buf := make([]byte, 16)
+            for attempt := 0; attempt < 3; attempt++ {
+                if _, err := s.conn.Write(ev); err != nil {
+                    return err
+                }
+                s.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+                n, err := s.conn.Read(buf)
+                if err == nil && string(buf[:n]) == "ok" {
+                    return nil
+                }
+            }
+            return errors.New("collector unreachable")
+        }
+
+        // collector.go
+        for {
+            n, addr, _ := pc.ReadFrom(buf)
+            billing.Record(buf[:n])
+            pc.WriteTo([]byte("ok"), addr)
+        }
+      roles: { shipper: [2, 15], link: [5, 9], ack: [10, 12], collector: [18, 22] }
+      change:
+        - { after: 9, add: ['        // a lost "ok" looks exactly like a lost event'] }
+        - { after: 10, add: ['            // 80 ms per round trip: 12 events/s at most'] }
+        - { after: 20, add: ['    // the retry of an event that already arrived is billed again'] }
+    after:
+      file: shipper.go · collector.go
+      source: |
+        type Shipper struct {
+            conn    net.Conn
+            next    uint64             // sequence number of the next event
+            unacked map[uint64]pending // sent, not yet acknowledged
+            window  int                // events allowed in flight, e.g. 64
+        }
+
+        type pending struct {
+            ev     []byte
+            sentAt time.Time
+        }
+
+        func (s *Shipper) Send(ev []byte) {
+            for len(s.unacked) >= s.window {
+                s.awaitAcks() // block only when the window is full
+            }
+            seq := s.next
+            s.next++
+            s.unacked[seq] = pending{ev, time.Now()}
+            s.conn.Write(frame(seq, ev))
+        }
+
+        func (s *Shipper) awaitAcks() {
+            s.conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+            if seq, err := readAck(s.conn); err == nil {
+                delete(s.unacked, seq) // this event is safe
+            }
+            for seq, p := range s.unacked {
+                if time.Since(p.sentAt) > rto { // resend only what timed out
+                    s.conn.Write(frame(seq, p.ev))
+                    s.unacked[seq] = pending{p.ev, time.Now()}
+                }
+            }
+        }
+
+        // collector.go
+        seq, ev := parse(buf[:n])
+        if !seen[seq] {
+            seen[seq] = true
+            billing.Record(ev) // a repeat is acknowledged, never billed twice
+        }
+        pc.WriteTo(ackFrame(seq), addr)
+      roles: { shipper: [13, 21], window: [1, 11], link: [20, 20], ack: [23, 27], collector: [36, 42], dedup: [37, 41], number: [17, 19], pipeline: [14, 16], timer: [28, 33], filter: [38, 41] }
+    again:
+      file: main.go
+      source: |
+        // The collector is now 80 ms away. Nothing above changes:
+        // 64 in flight / 0.08 s = 800 events/s, and a lost ACK costs one resend.
+        s := &Shipper{conn: conn, unacked: map[uint64]pending{}, window: 64}
+    cost:
+      before: { text: 12 events/s · retries billed twice, value: 0.9 }
+      after: { text: 800 events/s · 0 double bills, value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Rarely by hand
+      note: 'Reach for TCP or QUIC first; they already do all of this. Over UDP, `SetReadDeadline` is the timer. It covers every later read until you move it, and a read past it returns an error that matches `os.ErrDeadlineExceeded` with `errors.Is`.'
+      seenIn: '`quic-go` records when each packet was sent and resends the frames of lost ones. NATS JetStream redelivers a message that is not acknowledged within the consumer''s `AckWait`.'
+
+  python:
+    before:
+      file: shipper.py · collector.py
+      source: |
+        # shipper.py: send one usage event, wait for "ok", retry on timeout
+        def send(sock: socket.socket, event: bytes) -> None:
+            sock.settimeout(0.5)
+            for attempt in range(3):
+                sock.send(event)
+                try:
+                    if sock.recv(16) == b"ok":
+                        return
+                except TimeoutError:
+                    continue
+            raise ConnectionError("collector unreachable")
+
+        # collector.py
+        while True:
+            data, addr = sock.recvfrom(2048)
+            billing.record(data)
+            sock.sendto(b"ok", addr)
+      roles: { shipper: [2, 11], link: [5, 7], ack: [7, 8], collector: [14, 17] }
+      change:
+        - { after: 7, add: ['                # 80 ms per round trip: 12 events/s at most'] }
+        - { after: 9, add: ['            # a lost "ok" looks exactly like a lost event'] }
+        - { after: 16, add: ['    # the retry of an event that already arrived is billed again'] }
+    after:
+      file: shipper.py · collector.py
+      source: |
+        class Shipper:
+            def __init__(self, sock: socket.socket, window: int = 64):
+                self.sock, self.window = sock, window
+                self.next_seq = 0  # sequence number of the next event
+                self.unacked: dict[int, tuple[bytes, float]] = {}  # sent, not yet acknowledged
+
+            def send(self, event: bytes) -> None:
+                while len(self.unacked) >= self.window:
+                    self.await_acks()  # block only when the window is full
+                seq = self.next_seq
+                self.next_seq += 1
+                self.unacked[seq] = (event, time.monotonic())
+                self.sock.send(frame(seq, event))
+
+            def await_acks(self) -> None:
+                self.sock.settimeout(0.02)
+                try:
+                    self.unacked.pop(parse_ack(self.sock.recv(16)), None)  # this event is safe
+                except TimeoutError:
+                    pass
+                now = time.monotonic()
+                for seq, (event, sent_at) in list(self.unacked.items()):
+                    if now - sent_at > RTO:  # resend only what timed out
+                        self.sock.send(frame(seq, event))
+                        self.unacked[seq] = (event, now)
+
+        # collector.py
+        seq, event = parse(data)
+        if seq not in seen:
+            seen.add(seq)
+            billing.record(event)  # a repeat is acknowledged, never billed twice
+        sock.sendto(ack_frame(seq), addr)
+      roles: { shipper: [7, 13], window: [1, 5], link: [13, 13], ack: [15, 20], collector: [27, 32], dedup: [28, 31], number: [10, 12], pipeline: [8, 9], timer: [21, 25], filter: [29, 31] }
+    again:
+      file: main.py
+      source: |
+        # The collector is now 80 ms away. Nothing above changes:
+        # 64 in flight / 0.08 s = 800 events/s, and a lost ACK costs one resend.
+        shipper = Shipper(sock, window=64)
+    cost:
+      before: { text: 12 events/s · retries billed twice, value: 0.9 }
+      after: { text: 800 events/s · 0 double bills, value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Rarely by hand
+      note: '`sock.settimeout(0.02)` makes `recv` raise `TimeoutError` (the same class as `socket.timeout` since Python 3.10). In asyncio code, wrap the receive in `asyncio.timeout()` or `asyncio.wait_for()` instead.'
+      seenIn: 'Kafka''s idempotent producer (`enable.idempotence`) numbers each batch per partition, so the broker drops a resent duplicate. Celery with `acks_late=True` acknowledges a task only after it runs, so a crashed worker''s task is delivered again.'
+
+  typescript:
+    before:
+      file: shipper.ts · collector.ts
+      source: |
+        // shipper.ts: send one usage event, wait for "ok", retry on timeout
+        async function send(sock: dgram.Socket, event: Buffer): Promise<void> {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            sock.send(event);
+            const reply = await nextMessage(sock, 500); // null after 500 ms
+            if (reply?.toString() === "ok") {
+              return;
+            }
+          }
+          throw new Error("collector unreachable");
+        }
+
+        // collector.ts
+        sock.on("message", (msg, rinfo) => {
+          billing.record(msg);
+          sock.send("ok", rinfo.port, rinfo.address);
+        });
+      roles: { shipper: [2, 11], link: [4, 5], ack: [6, 8], collector: [14, 17] }
+      change:
+        - { after: 5, add: ['    // a lost "ok" looks exactly like a lost event'] }
+        - { after: 6, add: ['      // 80 ms per round trip: 12 events/s at most'] }
+        - { after: 15, add: ['  // the retry of an event that already arrived is billed again'] }
+    after:
+      file: shipper.ts · collector.ts
+      source: |
+        class Shipper {
+          private nextSeq = 0; // sequence number of the next event
+          private unacked = new Map<number, NodeJS.Timeout>(); // in flight, one timer each
+          private waiting: (() => void)[] = [];
+
+          constructor(private sock: dgram.Socket, private window = 64) {
+            sock.on("message", (msg) => this.onAck(parseAck(msg)));
+          }
+
+          async send(event: Buffer): Promise<void> {
+            while (this.unacked.size >= this.window) {
+              await new Promise<void>((r) => this.waiting.push(r)); // block only when full
+            }
+            this.transmit(this.nextSeq++, event);
+          }
+
+          private transmit(seq: number, event: Buffer): void {
+            this.sock.send(frame(seq, event));
+            const timer = setTimeout(() => this.transmit(seq, event), RTO_MS); // resend only this one
+            this.unacked.set(seq, timer);
+          }
+
+          private onAck(seq: number): void {
+            clearTimeout(this.unacked.get(seq)); // this event is safe
+            this.unacked.delete(seq);
+            this.waiting.shift()?.();
+          }
+        }
+
+        // collector.ts
+        const { seq, event } = parse(msg);
+        if (!seen.has(seq)) {
+          seen.add(seq);
+          billing.record(event); // a repeat is acknowledged, never billed twice
+        }
+        sock.send(ackFrame(seq), rinfo.port, rinfo.address);
+      roles: { shipper: [10, 15], window: [1, 4], link: [18, 18], ack: [23, 27], collector: [30, 36], dedup: [31, 35], number: [14, 14], pipeline: [11, 13], timer: [17, 21], filter: [32, 35] }
+    again:
+      file: main.ts
+      source: |
+        // The collector is now 80 ms away. Nothing above changes:
+        // 64 in flight / 0.08 s = 800 events/s, and a lost ACK costs one resend.
+        const shipper = new Shipper(sock, 64);
+    cost:
+      before: { text: 12 events/s · retries billed twice, value: 0.9 }
+      after: { text: 800 events/s · 0 double bills, value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Rarely by hand
+      note: 'A `dgram` socket has no read timeout, so `nextMessage` above is a helper you write. The retransmit timer is a plain `setTimeout` per packet, run by the event loop. Clear it when the ACK arrives, or it fires a needless resend.'
+      seenIn: 'Amazon SQS hides a received message for its visibility timeout and delivers it again if the consumer does not delete it in time, so consumers must expect repeats. Socket.IO''s acknowledgement callbacks with `socket.timeout(ms).emitWithAck()` are the same ACK-plus-timer at the application level.'
+
+  rust:
+    before:
+      file: shipper.rs · collector.rs
+      source: |
+        // shipper.rs: send one usage event, wait for "ok", retry on timeout
+        async fn send(sock: &UdpSocket, event: &[u8]) -> io::Result<()> {
+            let mut buf = [0u8; 16];
+            for _attempt in 0..3 {
+                sock.send(event).await?;
+                let reply = timeout(Duration::from_millis(500), sock.recv(&mut buf)).await;
+                if let Ok(Ok(n)) = reply {
+                    if &buf[..n] == b"ok" {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(io::Error::new(io::ErrorKind::TimedOut, "collector unreachable"))
+        }
+
+        // collector.rs
+        loop {
+            let (n, addr) = sock.recv_from(&mut buf).await?;
+            billing.record(&buf[..n]);
+            sock.send_to(b"ok", addr).await?;
+        }
+      roles: { shipper: [2, 14], link: [5, 6], ack: [7, 11], collector: [17, 21] }
+      change:
+        - { after: 6, add: ['        // a lost "ok" looks exactly like a lost event'] }
+        - { after: 8, add: ['                // 80 ms per round trip: 12 events/s at most'] }
+        - { after: 19, add: ['    // the retry of an event that already arrived is billed again'] }
+    after:
+      file: shipper.rs · collector.rs
+      source: |
+        struct Shipper {
+            sock: UdpSocket,
+            next_seq: u64,                             // sequence number of the next event
+            unacked: HashMap<u64, (Vec<u8>, Instant)>, // sent, not yet acknowledged
+            window: usize,                             // events allowed in flight, e.g. 64
+        }
+
+        impl Shipper {
+            async fn send(&mut self, event: Vec<u8>) -> io::Result<()> {
+                while self.unacked.len() >= self.window {
+                    self.await_acks().await?; // block only when the window is full
+                }
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                self.sock.send(&frame(seq, &event)).await?;
+                self.unacked.insert(seq, (event, Instant::now()));
+                Ok(())
+            }
+
+            async fn await_acks(&mut self) -> io::Result<()> {
+                let mut buf = [0u8; 16];
+                if let Ok(Ok(n)) = timeout(Duration::from_millis(20), self.sock.recv(&mut buf)).await {
+                    self.unacked.remove(&parse_ack(&buf[..n])); // this event is safe
+                }
+                for (seq, (event, sent_at)) in self.unacked.iter_mut() {
+                    if sent_at.elapsed() > RTO { // resend only what timed out
+                        self.sock.send(&frame(*seq, event)).await?;
+                        *sent_at = Instant::now();
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        // collector.rs
+        let (seq, event) = parse(&buf[..n]);
+        if seen.insert(seq) {
+            billing.record(event); // a repeat is acknowledged, never billed twice
+        }
+        sock.send_to(&ack_frame(seq), addr).await?;
+      roles: { shipper: [9, 18], window: [1, 6], link: [15, 15], ack: [20, 24], collector: [35, 40], dedup: [36, 39], number: [13, 16], pipeline: [10, 12], timer: [25, 30], filter: [37, 39] }
+    again:
+      file: main.rs
+      source: |
+        // The collector is now 80 ms away. Nothing above changes:
+        // 64 in flight / 0.08 s = 800 events/s, and a lost ACK costs one resend.
+        let shipper = Shipper { sock, next_seq: 0, unacked: HashMap::new(), window: 64 };
+    cost:
+      before: { text: 12 events/s · retries billed twice, value: 0.9 }
+      after: { text: 800 events/s · 0 double bills, value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Rarely by hand
+      note: '`tokio::time::timeout(d, sock.recv(&mut buf))` returns `Err(Elapsed)` when the receive takes too long, and dropping the receive future cancels it cleanly. In blocking code, `std::net::UdpSocket::set_read_timeout` does the same job.'
+      seenIn: '`quinn`, a QUIC implementation, numbers every packet and declares loss from gaps in the ACKs or from a timer. `HashSet::insert` returning `false` for a repeat is the whole dedup check above.'
+
+walk:
+  - text: Each event gets the next sequence number and goes into the unacknowledged map with the time it was sent.
+    nodes: [shipper, window]
+    edges: [shipper>window]
+    role: number
+  - text: Send does not wait for an ACK. It blocks only when the window is full, so 64 events can be crossing the link at once.
+    nodes: [window, link]
+    edges: [window>link]
+    role: pipeline
+  - text: The collector bills a sequence number once. A resent copy of an event it already has is acknowledged again and not billed.
+    nodes: [link, dedup, collector]
+    edges: [link>dedup, dedup>collector]
+    role: filter
+  - text: Each ACK frees a slot. Anything still unacknowledged after the timeout is resent, and only that.
+    nodes: [ack, window]
+    edges: [ack>window]
+    role: timer
+
+checks:
+  overview:
+    question: A sender puts a number on every message. What do the numbers let the receiver do?
+    options:
+      - text: Spot a copy it has already seen, and notice a gap where a message is missing.
+        correct: true
+        why: Right. Without numbers a resent message looks new, and a missing one leaves no trace.
+      - text: Tell the sender how fast it may send.
+        why: That is flow control, which uses a window the receiver advertises. Numbers identify messages; they do not set a rate.
+      - text: Prove that the receiving application processed the message.
+        why: No. An ACK for a number proves the receiving protocol has the data. The application may still crash before it acts on it.
+  engineer:
+    question: Sending a message takes 1 ms and the round trip is 80 ms. A stop-and-wait sender manages about 12 messages a second. Which change raises throughput most and stays reliable?
+    options:
+      - text: Allow many unacknowledged messages in flight, each with its number and timer.
+        correct: true
+        why: Right. With a window of 64 the sender keeps sending while ACKs are on their way, about 800 messages a second, and loss handling still works per message.
+      - text: Cut the retransmit timer to 10 ms.
+        why: The timer only matters when something is lost. Below the round trip it fires before any ACK can arrive, so every message is sent twice and nothing gets faster.
+      - text: Stop waiting for ACKs and send every message twice.
+        why: Two copies can both be lost, and the receiver now gets duplicates on every good day. This is neither reliable nor cheaper.
+  deep:
+    question: Selective repeat with sequence numbers 0 to 3 (they wrap) and a window of 3. Packets 0, 1 and 2 arrive, and all three ACKs are lost. What goes wrong?
+    options:
+      - text: The sender resends 0, and the receiver, now expecting 3, 0 and 1, takes the old 0 for a new message.
+        correct: true
+        why: Right. The receiver's window has moved on to numbers that overlap the old ones. Selective repeat needs a window of at most half the number space; TCP avoids the problem with 32-bit numbers and timestamps.
+      - text: Nothing. Selective repeat ACKs each packet, so the sender learns what arrived.
+        why: Those ACKs were lost. The sender times out and resends 0, which the receiver cannot tell apart from the next 0.
+      - text: The receiver stops, because its buffer is full.
+        why: Its buffer is empty; it delivered 0, 1 and 2. The trouble is that the numbers it now expects include a number the sender is reusing for old data.
+
+reference:
+  roles:
+    - role: Sequence number
+      example: seq in frame(seq, ev)
+      job: Names each message so copies and gaps can be seen.
+    - role: Acknowledgement
+      example: ackFrame(seq)
+      job: Tells the sender which numbers arrived.
+    - role: Retransmit timer
+      example: sentAt plus RTO
+      job: Turns silence into a resend.
+    - role: Send window
+      example: unacked, at most 64
+      job: Lets the sender keep many messages in flight, and bounds how many.
+    - role: Receiver state
+      example: seen set, or next expected number
+      job: Drops copies and, in selective repeat, holds packets that arrived after a gap.
+  useWhen:
+    - You must deliver over a datagram transport (UDP, a radio link, a message bus) and losing or duplicating a message has a cost.
+    - You design retries for an RPC or a queue consumer. The same three parts apply: an id, an acknowledgement, a timer.
+    - The path is long. Then a window, not a faster timer, is what raises throughput.
+  avoidWhen:
+    - TCP or QUIC already carries the data. They do all of this with decades of tuning; add an application-level ACK only when you need proof that the work was done.
+    - The data is replaced by fresher data every few milliseconds, as with game state or live metrics. Resending stale data wastes the link.
+  tradeoffs:
+    - A window needs memory for every unacknowledged message at the sender, and selective repeat needs a buffer at the receiver too.
+    - Go-back-N keeps the receiver trivial but resends whole tails on every loss.
+    - A short timer resends sooner but fires needlessly when the network is merely slow.
+    - The receiver must remember which numbers it has seen for as long as copies can still arrive.
+  lookalikes:
+    - name: TCP
+      how: A working version of all of this. Cumulative ACKs like go-back-N, but the receiver keeps out-of-order data, and SACK tells the sender exactly what is missing, like selective repeat.
+    - name: At-least-once delivery in queues
+      how: Kafka, SQS and NATS redeliver until acknowledged. The consumer plays the receiver's part and must drop repeats itself.
+    - name: Idempotency keys
+      how: The application-level sequence number. A payment API recognises a retried request by its key, as the collector recognises a resent event by its number.
+---
+
+## [concept] Building reliability on a lossy link
+
+**A link that loses, delays and copies packets becomes reliable with three parts: a <Term id="sequence-number">sequence number</Term> on every packet, an <Term id="acknowledgement">acknowledgement</Term> for what arrived, and a timer that resends what was not acknowledged.**
+
+That makes delivery correct. Speed is a separate problem. If the sender waits for each ACK before sending the next packet, the link sits idle for a full round trip every time. Keeping a window of packets in flight fixes that.
+
+<Depth level={2}>
+Two windowed designs differ in what the receiver does with a packet that arrives after a gap. In <Term id="go-back-n">go-back-N</Term>, it throws the packet away and keeps asking for the missing one, so the sender resends everything from the gap onward. In <Term id="selective-repeat">selective repeat</Term>, it holds the packet and acknowledges it, so the sender resends only what was lost. TCP sits between the two.
+</Depth>
+
+<Depth level={3}>
+Kurose and Ross build the design one failure at a time: bit errors need checksums and ACKs, lost packets need a timer, a lost ACK makes the resend a duplicate and so needs numbers, and pipelining needs a window. With numbers that wrap, selective repeat also needs a window no larger than half the number space, or an old packet can look like a new one with the same number.
+</Depth>
+
+## [problem] A shipper that waits for each ok
+
+A metering service sends one UDP datagram per usage event to the billing collector. The collector records it and replies `ok`. If no `ok` comes back within 500 ms, the shipper sends the event again, up to three times.
+
+In the test environment the collector is in the same rack. The round trip is a fraction of a millisecond and nothing is ever lost, so it ships thousands of events a second and every count matches.
+
+<Depth level={2}>
+The design is <Term id="stop-and-wait">stop-and-wait</Term>: one event on the wire, then silence until the answer. It is reliable as long as answers are never lost. Its throughput is one event per round trip, whatever the link's bandwidth.
+</Depth>
+
+<Depth level={3}>
+The `ok` carries no information about which event it acknowledges. That is safe only while there is exactly one event outstanding and no `ok` is ever delayed past the timeout.
+</Depth>
+
+## [pain] The collector moves 80 ms away
+
+**Change request:** the billing collector moves to another region, 80 ms away, and finance wants every usage event counted exactly once.
+
+Two things break at once. Each event now costs a full 80 ms round trip, so the shipper tops out at about 12 events a second and falls behind. And when an `ok` is lost, the shipper cannot tell that from a lost event. It resends, and the collector bills the same usage twice.
+
+<Depth level={2}>
+Raising the timeout does not help with either. Throughput is set by the round trip, and a duplicate appears whenever the reply is lost, however long you wait for it.
+</Depth>
+
+<Depth level={3}>
+At 80 ms and 1 ms per send, the link is busy 1 ms in every 81: about 1% utilisation. Filling it needs about 80 events in flight, the link's <Term id="bdp">bandwidth-delay product</Term> measured in events.
+</Depth>
+
+## [morph] From one event in flight to a numbered window
+
+Drag the slider. The single wait becomes a window of numbered events, each with its own send time. The collector gains a set of sequence numbers it has already billed.
+
+Hover a box to see its code.
+
+<Depth level={2}>
+The sender no longer asks "did my event arrive?" It asks "which numbers are still unacknowledged, and for how long?" That question has an answer even when ACKs are lost, late or out of order.
+</Depth>
+
+<Depth level={3}>
+This version is selective repeat: one timer per event and an ACK per number. A <Term id="cumulative-ack">cumulative ACK</Term> ("everything up to 41 arrived") would let one ACK cover for a lost earlier one, at the cost of resending more when data is lost. TCP uses cumulative ACKs and adds selective acknowledgements on top.
+</Depth>
+
+## [walk] Follow one event
+
+One event, from the shipper's call to the collector's bill. Step through it with the numbered buttons.
+
+<Depth level={3}>
+The collector's set of seen numbers grows forever in this sketch. A real receiver keeps a low-water mark: every number below the oldest unacknowledged one has been seen, so it only needs to remember the numbers above it. That is exactly a receive window.
+</Depth>
+
+## [again] The same 80 ms, with a window
+
+The collector is still 80 ms away. With 64 events in flight the shipper sends about 800 a second, and a lost ACK costs one resend that the collector recognises and does not bill. That is an <Term id="exactly-once-effect">exactly-once effect</Term> built from at-least-once delivery.
+
+<Depth level={2}>
+Pick the window from the path, not by guessing: round trip times the rate you need. Too small and the link idles; much too large and a burst of loss means many resends and a large buffer.
+</Depth>
+
+<Depth level={3}>
+TCP does all of this for every connection, with a window set by the receiver and by congestion control. The lesson is still useful above TCP: an RPC retry or a queue redelivery is the same <Term id="retransmission">retransmission</Term> problem one layer up, and it needs the same answer, an id the receiver checks.
+</Depth>
+
+## [play] Break the link yourself
+
+A sender ships ten numbered messages to a receiver. You decide what happens to each packet's first trip: lost, delayed past the timer, copied by the network, or delivered with its ACK lost.
+
+Run the same trouble through stop-and-wait, go-back-N and selective repeat, and compare what each one resends and how long it takes.
+
+## [lens] How each language waits for an ACK
+
+Every language needs the same thing to build this: a receive that gives up after a while. Each spells it differently.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+In production you rarely write this layer. You meet it when you configure retries, acknowledgement timeouts and deduplication in a queue or an RPC client.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="reliable-transfer-principles" />
+
+### The numbers behind the playground
+
+Each packet takes 2 ms to send and 10 ms to cross, so a round trip is 22 ms. Stop-and-wait keeps the link busy 2 ms in every 22, about 9%. A window of W packets keeps it busy W times as long, until W × 2 ms reaches the round trip; at that point the link is full and a bigger window only adds queueing.
