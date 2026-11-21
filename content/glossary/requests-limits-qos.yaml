@@ -1,0 +1,19 @@
+# Terms introduced by the requests, limits and QoS lesson.
+- id: resource-request
+  term: Resource request
+  short: The CPU and memory a container asks for. The scheduler places pods so that requests fit a node's allocatable resources, and CPU requests set each container's weight when CPUs are contended.
+- id: resource-limit
+  term: Resource limit
+  short: The most CPU or memory a container may use, enforced by the kernel through cgroups. Above the CPU limit it is throttled; above the memory limit it is OOM-killed.
+- id: cfs-quota
+  term: CFS quota
+  short: The cgroup CPU limit, written to cpu.max as a quota of CPU time per period (100 ms by default). When a group's threads have used the quota, they wait for the next period. Counted in cpu.stat as nr_throttled.
+- id: qos-class
+  term: QoS class
+  short: Guaranteed, Burstable or BestEffort, derived from a pod's requests and limits. It sets the containers' oom_score_adj; node-pressure eviction itself ranks pods by usage above requests and priority.
+- id: node-allocatable
+  term: Node allocatable
+  short: What a node offers to pods, its capacity minus what is reserved for the system, the kubelet and the eviction threshold. The scheduler fits pods' requests into it.
+- id: node-pressure-eviction
+  term: Node-pressure eviction
+  short: The kubelet stopping pods when a node runs short of memory or disk. It picks pods whose usage exceeds their requests first, by priority and then by how far they exceed. Evicted pods fail and are not restarted on that node.

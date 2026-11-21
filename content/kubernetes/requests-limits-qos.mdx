@@ -1,0 +1,496 @@
+---
+title: Requests, limits and QoS classes
+track: kubernetes
+group: Running workloads
+order: 10
+summary: Requests are what the scheduler adds up and how CPU is shared when it is scarce. Limits are what the kernel enforces, by throttling CPU every 100 ms and by killing on memory. When a node runs short, pods above their requests go first.
+intent: Set requests to what a container really needs and limits to what the kernel should stop, and size the runtime inside the container from those numbers, not from the node.
+changeRequest: Move the pricing API from its two VMs onto the shared cluster, as ten pods with 2 CPUs and 1 GiB each.
+languages: [go, python, typescript, rust]
+glossary: [resource-request, resource-limit, cfs-quota, qos-class, node-allocatable, node-pressure-eviction, oom-killer, oom-score-adj, memory-cgroup]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [kubernetes/containers-are-processes, kubernetes/pods-and-sandbox]
+skills: [kubernetes, scheduling, os]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: requests-limits-qos
+  scenarios:
+    - try: "Run 60 s and move the cursor to 23 s."
+      notice: "The API averages about 0.4 CPU against a 1 CPU limit, yet one period a second goes red: its burst spends the quota, and its slowest requests wait about 100 ms longer."
+    - try: "Set the API's memory limit to 768Mi."
+      notice: "At the traffic spike it needs 800 Mi and is OOMKilled, exit 137, while the node has gigabytes free. Its limit is its own cgroup's memory.max."
+    - try: "Add the import pod."
+      notice: "It stays Pending with Insufficient memory, on a node that is using about half its memory. The scheduler adds requests, never usage."
+    - try: "Turn on the big report, then set the report's memory request to 4608Mi."
+      notice: "First the kubelet evicts the report, the pod furthest above its request. With an honest request, the API and the log shipper go instead, and the report finishes."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 118, h: 52, title: Pod spec, sub: 2 CPU · 1 GiB }
+      after:  { x: 12, y: 30, w: 130, h: 52, title: Pod spec, sub: requests · limits }
+    - id: context
+      kind: context
+      before: { x: 156, y: 18, w: 266, h: 236, title: Container, sub: seen as a small VM }
+      after:  { x: 350, y: 30, w: 198, h: 52, title: Node, sub: kernel + kubelet }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 160, y: 30, w: 170, h: 52, title: "" }
+      after:  { x: 160, y: 30, w: 170, h: 52, title: Scheduler, sub: adds up requests }
+    - id: cpu
+      kind: concrete
+      before: { x: 176, y: 62, w: 226, h: 36, title: 2 CPUs of its own }
+      after:  { x: 160, y: 120, w: 170, h: 52, title: cpu.max · cpu.weight, sub: throttle · share }
+    - id: mem
+      kind: concrete
+      before: { x: 176, y: 106, w: 226, h: 36, title: 1 GiB of its own }
+      after:  { x: 350, y: 120, w: 198, h: 52, title: memory.max, sub: over it · OOMKilled }
+    - id: app
+      kind: concrete
+      before: { x: 176, y: 150, w: 226, h: 36, title: runtime sees 32 cores }
+      after:  { x: 12, y: 120, w: 130, h: 52, title: Runtime, sub: sized from limits }
+    - id: change
+      kind: concrete
+      appears: change
+      before: { x: 176, y: 200, w: 226, h: 36, title: 10 pods on shared nodes }
+      after:  { x: 12, y: 206, w: 536, h: 44, title: 10 pods on shared nodes, sub: p99 as on the VMs · no OOMKills }
+  edges:
+    - { from: client, to: strategy, label: requests }
+    - { from: strategy, to: context, label: binds }
+    - { from: context, to: cpu, label: CPU limit }
+    - { from: context, to: mem, label: memory limit }
+    - { from: app, to: cpu, label: reads }
+    - { from: change, to: client }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: main.go
+      source: |
+        // main.go: the pricing API
+        func main() {
+            workers := runtime.NumCPU() // the node's 32 cores
+            pool := worker.NewPool(workers)
+            cache := lru.New[string, Quote](5_000_000) // sized for the old VM
+            srv := newServer(pool, cache)
+            log.Fatal(srv.ListenAndServe())
+        }
+      roles: { client: [3, 5], context: [2, 8], cpu: [3, 4], mem: [5, 5], app: [3, 5], change: [3, 3] }
+      change:
+        - { after: 5, add: ['    // moved to the shared cluster: resources: {cpu: 2, memory: 1Gi}'] }
+    after:
+      file: main.go
+      source: |
+        // main.go: the pricing API, sized from its cgroup
+        // Pod spec: requests cpu 1, memory 1Gi (what the scheduler reserves);
+        //           limits   cpu 2, memory 1Gi (cpu.max and memory.max); env GOMEMLIMIT=900MiB
+        func main() {
+            workers := runtime.GOMAXPROCS(0) // Go 1.25+: 2 from the CPU limit, not the node's 32 cores
+            pool := worker.NewPool(workers)
+            budget := debug.SetMemoryLimit(-1) // reads GOMEMLIMIT without changing it
+            if budget == math.MaxInt64 {
+                budget = 512 << 20 // no limit set: assume a small budget
+            }
+            cache := lru.New[string, Quote](int(budget / 4 / quoteSize)) // a quarter of the budget
+            srv := newServer(pool, cache)
+            log.Fatal(srv.ListenAndServe())
+        }
+      roles: { client: [2, 3], strategy: [2, 2], context: [4, 14], cpu: [5, 6], mem: [7, 11], app: [5, 11], change: [5, 5], schedule: [2, 2], limits: [3, 3], throttle: [5, 6], memory: [7, 11], eviction: [2, 3] }
+    again:
+      file: throttle.go
+      source: |
+        // throttle.go: export the kernel's throttling counters next to latency
+        func cpuStat() (periods, throttled int64, err error) {
+            b, err := os.ReadFile("/sys/fs/cgroup/cpu.stat")
+            if err != nil {
+                return 0, 0, err
+            }
+            for _, line := range strings.Split(string(b), "\n") {
+                var k string
+                var v int64
+                fmt.Sscan(line, &k, &v)
+                switch k {
+                case "nr_periods":
+                    periods = v
+                case "nr_throttled":
+                    throttled = v
+                }
+            }
+            return periods, throttled, nil // the same peak: 0.4% of periods throttled, not 12%
+        }
+    cost:
+      before: { text: p99 410 ms · 3 OOMKills a day, value: 0.8 }
+      after: { text: p99 95 ms · no OOMKills, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Mostly handled
+      note: 'Since Go 1.25 the runtime sets GOMAXPROCS from the cgroup CPU limit and updates it if the limit changes; before that, `go.uber.org/automaxprocs` did the same. `runtime.NumCPU` still reports the node''s CPUs. Memory needs `GOMEMLIMIT`, a soft limit that makes the GC work harder before the kernel''s hard one.'
+      seenIn: 'Go 1.25 container-aware GOMAXPROCS. `GOMEMLIMIT` and `debug.SetMemoryLimit` (Go 1.19+). `automaxprocs` in older services.'
+
+  python:
+    before:
+      file: gunicorn.conf.py
+      source: |
+        # gunicorn.conf.py: the pricing API's server settings
+        import multiprocessing
+
+        bind = "0.0.0.0:8080"
+        worker_class = "uvicorn.workers.UvicornWorker"
+        workers = multiprocessing.cpu_count() * 2 + 1  # the node's 32 cores: 65 workers
+        # each worker loads the 40 MB price table and builds its own quote cache
+      roles: { client: [4, 5], context: [1, 7], cpu: [6, 6], mem: [7, 7], app: [6, 7], change: [6, 6] }
+      change:
+        - { after: 7, add: ['# moved to the shared cluster: resources: {cpu: 2, memory: 1Gi}'] }
+    after:
+      file: gunicorn.conf.py
+      source: |
+        # gunicorn.conf.py: the pricing API, sized from its pod spec
+        import os
+
+        # The downward API puts the limits in the environment:
+        #   CPU_LIMIT from limits.cpu (rounded up), MEMORY_LIMIT from limits.memory, in bytes
+        cpus = int(os.environ.get("CPU_LIMIT", "1"))
+        memory = int(os.environ.get("MEMORY_LIMIT", str(512 * 2**20)))
+
+        bind = "0.0.0.0:8080"
+        worker_class = "uvicorn.workers.UvicornWorker"
+        workers = cpus  # 2 with a 2-CPU limit: one busy interpreter per CPU of quota
+        max_requests = 20_000  # recycle workers before slow growth reaches memory.max
+        raw_env = [f"QUOTE_CACHE_BYTES={memory // (4 * workers)}"]  # a quarter of each worker's share
+      roles: { client: [4, 7], strategy: [4, 5], context: [1, 13], cpu: [11, 11], mem: [12, 13], app: [6, 13], change: [11, 13], schedule: [4, 5], limits: [6, 7], throttle: [11, 11], memory: [12, 13], eviction: [4, 5] }
+    again:
+      file: throttle.py
+      source: |
+        # throttle.py: export the kernel's throttling counters next to latency
+        def cpu_stat() -> dict[str, int]:
+            with open("/sys/fs/cgroup/cpu.stat") as f:
+                return {k: int(v) for k, v in (line.split() for line in f)}
+
+        s = cpu_stat()
+        THROTTLED.set(s["nr_throttled"] / max(1, s["nr_periods"]))  # the same peak: 0.4% of periods, not 12%
+    cost:
+      before: { text: p99 410 ms · 3 OOMKills a day, value: 0.8 }
+      after: { text: p99 95 ms · no OOMKills, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: You set it
+      note: '`os.cpu_count()` and `multiprocessing.cpu_count()` report the node''s CPUs, not the quota, so worker counts sized from them oversubscribe a CPU limit and multiply memory. Pass the limits in through the downward API and size workers and caches from them.'
+      seenIn: 'gunicorn `workers` and `max_requests`. The downward API''s `resourceFieldRef` with `limits.cpu` and `limits.memory`.'
+
+  typescript:
+    before:
+      file: server.ts
+      source: |
+        // server.ts: the pricing API, one process per core
+        import cluster from "node:cluster";
+        import os from "node:os";
+
+        if (cluster.isPrimary) {
+          for (const _ of os.cpus()) cluster.fork(); // the node's 32 cores: 32 workers
+        } else {
+          startServer({ cache: new LRUCache<string, Quote>({ max: 5_000_000 }) }); // sized for the old VM
+        }
+      roles: { client: [5, 9], context: [1, 9], cpu: [6, 6], mem: [8, 8], app: [5, 9], change: [6, 6] }
+      change:
+        - { after: 9, add: ['// moved to the shared cluster: resources: { cpu: 2, memory: 1Gi }'] }
+    after:
+      file: server.ts
+      source: |
+        // server.ts: the pricing API, sized from its pod spec
+        import cluster from "node:cluster";
+
+        // The downward API puts the limits in the environment:
+        //   CPU_LIMIT from limits.cpu (rounded up), MEMORY_LIMIT from limits.memory, in bytes
+        const cpus = Number(process.env.CPU_LIMIT ?? 1);
+        const memory = Number(process.env.MEMORY_LIMIT ?? 512 * 2 ** 20);
+
+        if (cluster.isPrimary) {
+          for (let i = 0; i < cpus; i++) cluster.fork(); // 2 workers with a 2-CPU limit
+        } else {
+          const share = memory / cpus; // this worker's part of memory.max
+          startServer({ cache: new LRUCache<string, Quote>({ maxSize: share / 4, sizeCalculation: quoteBytes }) });
+        }
+        // the start script sets --max-old-space-size below each worker's share, in MiB
+      roles: { client: [4, 7], strategy: [4, 5], context: [1, 15], cpu: [9, 10], mem: [11, 15], app: [6, 13], change: [10, 13], schedule: [4, 5], limits: [6, 7], throttle: [9, 10], memory: [12, 15], eviction: [4, 5] }
+    again:
+      file: throttle.ts
+      source: |
+        // throttle.ts: export the kernel's throttling counters next to latency
+        const stat = Object.fromEntries(
+          readFileSync("/sys/fs/cgroup/cpu.stat", "utf8").trim().split("\n").map((l) => l.split(" ")),
+        );
+        throttledRatio.set(Number(stat.nr_throttled) / Math.max(1, Number(stat.nr_periods))); // the same peak: 0.4%, not 12%
+    cost:
+      before: { text: p99 410 ms · 3 OOMKills a day, value: 0.8 }
+      after: { text: p99 95 ms · no OOMKills, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: You set it
+      note: 'One Node process runs JavaScript on one thread, but `os.cpus()` lists the node''s cores, so a process per core oversubscribes the quota. Recent Node versions size the V8 heap from the container''s memory limit; with several workers per pod, each needs an explicit `--max-old-space-size` below its share.'
+      seenIn: '`node:cluster` and PM2 cluster mode. `lru-cache` `maxSize` with `sizeCalculation`. `--max-old-space-size`.'
+
+  rust:
+    before:
+      file: main.rs
+      source: |
+        // main.rs: the pricing API
+        fn main() -> anyhow::Result<()> {
+            let threads = num_cpus::get_physical(); // the node's 32 cores
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .enable_all()
+                .build()?;
+            let cache: Cache<String, Quote> = Cache::new(5_000_000); // sized for the old VM
+            rt.block_on(serve(cache))
+        }
+      roles: { client: [3, 7], context: [2, 10], cpu: [3, 5], mem: [8, 8], app: [3, 8], change: [3, 3] }
+      change:
+        - { after: 8, add: ['    // moved to the shared cluster: resources: {cpu: 2, memory: 1Gi}'] }
+    after:
+      file: main.rs
+      source: |
+        // main.rs: the pricing API, sized from its cgroup
+        fn main() -> anyhow::Result<()> {
+            // On Linux this reads the cgroup CPU quota: 2 with a 2-CPU limit, not the node's 32 cores
+            let threads = std::thread::available_parallelism()?.get();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .enable_all()
+                .build()?;
+            // The downward API puts limits.memory in the environment, in bytes
+            let budget: u64 = std::env::var("MEMORY_LIMIT")?.parse()?;
+            let cache: Cache<String, Quote> = Cache::builder()
+                .weigher(|_k, q: &Quote| q.size_bytes())
+                .max_capacity(budget / 4) // a quarter of memory.max, counted in bytes
+                .build();
+            rt.block_on(serve(cache))
+        }
+      roles: { client: [9, 10], strategy: [9, 9], context: [2, 16], cpu: [3, 8], mem: [9, 14], app: [3, 14], change: [3, 4], schedule: [9, 9], limits: [3, 4], throttle: [5, 8], memory: [10, 14], eviction: [9, 10] }
+    again:
+      file: throttle.rs
+      source: |
+        // throttle.rs: export the kernel's throttling counters next to latency
+        let stat = std::fs::read_to_string("/sys/fs/cgroup/cpu.stat")?;
+        let get = |k: &str| stat.lines().find_map(|l| l.strip_prefix(k)?.trim().parse::<f64>().ok()).unwrap_or(0.0);
+        THROTTLED.set(get("nr_throttled ") / get("nr_periods ").max(1.0)); // the same peak: 0.4%, not 12%
+    cost:
+      before: { text: p99 410 ms · 3 OOMKills a day, value: 0.8 }
+      after: { text: p99 95 ms · no OOMKills, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`std::thread::available_parallelism` takes the cgroup CPU quota into account on Linux, while `num_cpus::get_physical` counts the machine''s cores. With no garbage collector there is nothing to slow down near the memory limit, so caches and buffers need an explicit budget.'
+      seenIn: '`std::thread::available_parallelism`. tokio''s `Builder::worker_threads`. `moka` caches with a weigher and `max_capacity`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The scheduler adds this pod's requests, 1 CPU and 1 GiB, to what the node has already promised. They fit in its allocatable 4 CPU and 8 GiB, so the pod is bound there. What the node is actually using does not enter into it.
+    nodes: [client, strategy]
+    edges: [client>strategy]
+    role: schedule
+  - text: The kubelet creates the container's cgroup. The CPU request becomes cpu.weight, the CPU limit becomes cpu.max of 200 ms per 100 ms, and the memory limit becomes memory.max. Requests below limits make the pod Burstable.
+    nodes: [strategy, context]
+    edges: [strategy>context]
+    role: limits
+  - text: The Go runtime reads the quota and runs on 2 threads, not 32. A burst now spends the 200 ms quota over most of a period instead of in 6 ms, so throttling is rare and short.
+    nodes: [context, cpu, app]
+    edges: [context>cpu, app>cpu]
+    role: throttle
+  - text: GOMEMLIMIT at 900 MiB makes the garbage collector work harder as the heap nears the limit, and the cache is sized from the same budget. memory.max at 1 GiB is now a backstop for real leaks, not a nightly event.
+    nodes: [context, mem]
+    edges: [context>mem]
+    role: memory
+  - text: One evening a neighbour leaks and the node runs short of memory. The kubelet evicts pods using more than they requested first. This pod's memory request equals its usage ceiling, so it is among the last to go.
+    nodes: [context, mem]
+    edges: [context>mem]
+    role: eviction
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: Which numbers does the scheduler add up to decide whether a pod fits on a node?
+    options:
+      - text: The requests of the pods already on the node, plus this pod's requests.
+        correct: true
+        why: Right. Requests are a reservation. Actual usage and limits are not part of the fit check.
+      - text: The limits of every pod.
+        why: Limits are enforced on the node by the kernel. The sum of limits on a node can exceed its capacity; that is overcommitment.
+      - text: The node's current CPU and memory usage.
+        why: Usage changes from second to second. The scheduler works from reservations so that a quiet moment does not overfill a node.
+  engineer:
+    question: An API's p99 latency rises at peak. Its CPU graph shows 40% of its 1 CPU limit, and the node has idle CPUs. What is the most likely cause?
+    options:
+      - text: CFS throttling. Bursts on several threads spend the 100 ms of quota early in a period, and every thread waits for the next period.
+        correct: true
+        why: Right. The quota is checked per 100 ms period, and averages hide it. cpu.stat's nr_throttled and throttled_usec show it; raising or removing the limit, or using fewer threads, fixes it.
+      - text: The node is overcommitted and other pods take its CPU.
+        why: With idle CPUs there is no contention, so requests and weights do not come into play. Only the limit can slow it here.
+      - text: The container is near its memory limit and is swapping.
+        why: Kubernetes nodes usually run without swap for containers, and memory pressure shows as OOM kills and reclaim, not as a CPU graph at 40%.
+  deep:
+    question: A node runs short of memory. Pod A is BestEffort using 200 Mi. Pod B requests 1 GiB and uses 3 GiB. Pod C is Guaranteed with 2 GiB and uses 1.9 GiB. All have the same priority. Which does the kubelet evict first?
+    options:
+      - text: B, because it exceeds its request by the most.
+        correct: true
+        why: Right. Pods above their requests come first, A and B here, ranked by priority and then by how far usage exceeds the request. B exceeds by 2 GiB, A by 200 Mi. The kubelet does not rank by QoS class itself.
+      - text: A, because BestEffort pods are always evicted first.
+        why: A BestEffort pod is always above its zero request, so it is usually among the first candidates, but B exceeds its request by much more.
+      - text: C, because it uses the most memory relative to its limit.
+        why: C is below its request, so it is among the last candidates. Its limit plays no part in eviction ranking.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: CPU request
+      example: "cpu: 1"
+      job: Reserved by the scheduler; becomes cpu.weight, which decides shares only when CPUs are contended.
+    - role: CPU limit
+      example: "cpu: 2"
+      job: Becomes cpu.max, a quota per 100 ms period. Above it the container's threads wait, even on an idle node.
+    - role: Memory request
+      example: "memory: 1Gi"
+      job: Reserved by the scheduler; decides eviction order and the Burstable oom_score_adj. Guarantees nothing in the kernel by default.
+    - role: Memory limit
+      example: "memory: 1Gi"
+      job: Becomes memory.max. Above it the kernel reclaims, then kills the container, which shows as OOMKilled with exit code 137.
+    - role: QoS class
+      example: Burstable
+      job: A summary of the above. Guaranteed when every request equals its limit, BestEffort when nothing is set. It sets oom_score_adj.
+  useWhen:
+    - Set requests on every container, from measured usage at a normal peak, so that scheduling and eviction reflect reality.
+    - Set a memory limit equal to the memory request for services that must not be evicted or surprise the node; memory is not compressible.
+    - Use a CPU limit for batch work you want to cap, or where your platform requires it.
+  avoidWhen:
+    - Avoid tight CPU limits on latency-sensitive, multi-threaded services. They throttle bursts on idle nodes; many teams set only a CPU request for such services.
+    - Avoid sizing thread pools, worker counts and caches from the node's CPU and memory. The container sees the node's numbers unless the runtime reads its cgroup.
+  tradeoffs:
+    - Requests above real usage waste capacity, because the scheduler reserves them all the time. Requests below it overcommit the node, and the risk arrives together with the peak.
+    - Guaranteed pods are the safest from eviction and the most expensive in reserved capacity.
+    - A CPU limit gives predictable performance and caps noisy neighbours, at the cost of throttling when a pod could have used idle CPU.
+  lookalikes:
+    - name: ResourceQuota
+      how: Caps the total requests and limits in a namespace. It limits what teams can ask for, not what containers use.
+    - name: LimitRange
+      how: Sets default requests and limits, and minimums and maximums, for containers in a namespace that do not set their own.
+    - name: VM sizing
+      how: A VM's CPUs and memory are its own. A container's are a cgroup's share of a node it shares with other pods, which the runtime cannot see unless it reads the cgroup.
+---
+
+## [concept] Requests, limits and QoS classes
+
+**A <Term id="resource-request">request</Term> is what the scheduler reserves for a container. A <Term id="resource-limit">limit</Term> is what the kernel enforces. Over its CPU limit a container is slowed; over its memory limit it is killed. When the whole node runs short of memory, the kubelet evicts pods that use more than they requested first.**
+
+The scheduler fits pods by adding up requests against each node's <Term id="node-allocatable">allocatable</Term> resources. It never looks at usage. Limits are written into the container's cgroup, and the kernel acts on them whatever the scheduler thought.
+
+<Depth level={2}>
+The two resources behave differently because CPU can be taken back and memory cannot. A CPU limit becomes a <Term id="cfs-quota">CFS quota</Term>: so much CPU time per 100 ms period, after which every thread in the container waits. A memory limit becomes the cgroup's memory.max, and a container above it is OOM-killed. The pod's <Term id="qos-class">QoS class</Term> is derived from these numbers: Guaranteed, Burstable or BestEffort.
+</Depth>
+
+<Depth level={3}>
+On cgroup v2 the CPU request becomes cpu.weight, which only matters when CPUs are contended: then each busy container gets time in proportion to its weight. The CPU limit becomes cpu.max, a quota and a period. The memory request reserves nothing in the kernel by default; it shapes scheduling, eviction order and oom_score_adj. The memory limit becomes memory.max of the container's <Term id="memory-cgroup">memory cgroup</Term>.
+</Depth>
+
+## [problem] A service sized for its VM
+
+The pricing API ran on two 32-core VMs for years. Its startup code sizes everything from the machine: one worker per core, and a quote cache of five million entries, because there was memory to spare. It is fast and stable.
+
+<Depth level={2}>
+Nothing in the code is wrong for a VM. The assumption is that the CPUs and memory the process can see are its own. Inside a container, the process still sees the whole node.
+</Depth>
+
+<Depth level={3}>
+`/proc/cpuinfo`, `nproc` without a quota-aware runtime, and the CPU counts most standard libraries report come from the node or from CPU affinity, not from cpu.max. A container limited to 2 CPUs on a 32-core node sees 32.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** move the pricing API from its two VMs onto the shared cluster, as ten pods with 2 CPUs and 1 GiB each.
+
+The pods start, and the dashboards look calm: CPU at about 35% of the limit. But p99 latency is 410 ms where it used to be 90 ms, and in the evening, at the traffic peak, pods restart with exit code 137 and the reason OOMKilled. The nodes have plenty of free memory.
+
+<Depth level={2}>
+Thirty-two threads share a quota of 200 ms per 100 ms period. A burst on all of them spends it in about 6 ms, and then every thread waits more than 90 ms for the next period. The average stays low because most periods are quiet. Memory is simpler: a cache sized for a VM grows past 1 GiB, and the cgroup's memory.max kills the container, whatever the node has free.
+</Depth>
+
+<Depth level={3}>
+The evidence is in the cgroup. cpu.stat shows nr_throttled rising with each burst, and throttled_usec adds up the waiting. memory.events shows oom_kill, and the pod's last state shows OOMKilled with exit code 137, which is 128 plus SIGKILL's 9.
+</Depth>
+
+## [morph] Size from the cgroup, set honest numbers
+
+Drag the slider. The pod spec splits into requests for the scheduler and limits for the kernel, and the runtime reads its limits instead of the node.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The pod spec becomes requests of 1 CPU and 1 GiB, and limits of 2 CPUs and 1 GiB. The CPU request is what the service needs at a normal peak; the higher CPU limit leaves room for bursts. Memory request and limit are equal, because memory cannot be taken back: a pod that requests what it can use is evicted last, and the node is never surprised.
+</Depth>
+
+<Depth level={3}>
+Some teams drop CPU limits altogether for latency-sensitive services and rely on requests, which still guarantee each container its share under contention. Others must keep them for cost control or because a namespace's LimitRange sets them. Either way, the runtime has to see the same numbers as the kernel.
+</Depth>
+
+## [walk] Follow one pod onto a node
+
+One pricing pod, from the scheduler's decision to a bad evening on its node. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Go 1.25 reads cpu.max at startup and again periodically, so GOMAXPROCS follows the limit if it changes. GOMEMLIMIT is a soft limit for the garbage collector only; the cgroup's memory.max stays the hard one.</Lang>
+<Lang only="python">The downward API's `limits.cpu` with the default divisor of 1 is rounded up to a whole number, so a 1.5 CPU limit gives `CPU_LIMIT=2`. Each gunicorn worker is a separate interpreter with its own memory, so memory budgets divide by the worker count.</Lang>
+<Lang only="typescript">With `node:cluster`, each worker is a full process with its own V8 heap. V8's heap limit is per process, so the start script divides the memory limit by the number of workers.</Lang>
+<Lang only="rust">`available_parallelism` returns the smaller of the CPU affinity count and what the cgroup quota allows. A tokio runtime sized from it keeps its worker threads within what the kernel will run.</Lang>
+</Depth>
+
+## [again] The same peak, with honest numbers
+
+The same evening peak. Two threads share the 200 ms quota, and a burst is spread over the period instead of crammed into its first few milliseconds: nr_throttled rises in a handful of periods, and p99 is back at 95 ms. The cache is sized from the memory budget, the garbage collector works harder near GOMEMLIMIT, and nothing is OOMKilled.
+
+<Depth level={2}>
+Watch nr_throttled divided by nr_periods next to latency, not CPU averages. A few percent of throttled periods during a peak is normal; a steady double-digit share means the limit is too low for how the service bursts.
+</Depth>
+
+<Depth level={3}>
+If the node runs short of memory anyway, the order is fixed by the requests. The kubelet checks memory.available periodically and evicts pods above their requests first. If memory runs out faster than it checks, the kernel's <Term id="oom-killer">OOM killer</Term> acts first, choosing by usage plus <Term id="oom-score-adj">oom_score_adj</Term>: -997 for Guaranteed, 1000 for BestEffort, and in between for Burstable, lower for larger memory requests. That is <Term id="node-pressure-eviction">node-pressure eviction</Term> and the OOM killer working as a pair.
+</Depth>
+
+## [play] Fill a node
+
+One node, five pods. Set each pod's requests and limits, run a minute with a traffic spike in the middle, and watch the scheduler, the CFS quota, the memory limits and the kubelet each do their part.
+
+## [lens] How each language does it
+
+Go now reads its CPU limit by itself, and has GOMEMLIMIT for memory. Rust's `available_parallelism` reads the CPU quota, but memory budgets are yours. Python and Node.js count the node's CPUs, so worker counts and per-worker memory must come from the pod spec, usually through the downward API.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whatever the runtime, check three numbers inside a running container: how many threads or workers it started, what heap or cache budget it chose, and what `/sys/fs/cgroup/cpu.max` and `memory.max` say. When they disagree, the kernel wins.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="requests-limits-qos" />
+
+### Where the numbers go on cgroup v2
+
+| Pod spec | cgroup file | Effect |
+|---|---|---|
+| CPU request | cpu.weight | Share of CPU time when CPUs are contended |
+| CPU limit | cpu.max | Quota per 100 ms period; throttled beyond it |
+| Memory request | none by default | Scheduling, eviction order, oom_score_adj |
+| Memory limit | memory.max | Reclaim, then OOM kill of the container |
