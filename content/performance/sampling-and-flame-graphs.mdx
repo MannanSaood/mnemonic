@@ -1,0 +1,565 @@
+---
+title: Sampling profilers and flame graphs
+track: performance
+group: Profiling
+order: 14
+summary: Sample the call stack at a fixed rate, count identical stacks, and draw each function as wide as its share. Then remember what an on-CPU profile cannot see.
+intent: Profile a running service instead of guessing with timers, read a flame graph by width, and know when the time is off-CPU and needs a different profile.
+changeRequest: Large customers want a full year of orders in one export. Raise the export limit from 100 orders to 2,000.
+languages: [go, python, typescript, rust]
+glossary: [sampling-profiler, flame-graph, folded-stack, off-cpu-time, frame-pointer]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [performance/counters-tracing-profiling]
+skills: [observability, debugging]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: sampling-and-flame-graphs
+  scenarios:
+    - try: "Press Take 1 a few times, then Take all, at 99 Hz on-CPU."
+      notice: "Each tick that finds the thread running adds its stack. Most ticks find it waiting and record nothing. currencySymbol ends up about 70% wide."
+    - try: "Click currencySymbol and make it free."
+      notice: "CPU time drops from 1.1 s to 0.26 s, but the export only goes from 3.1 s to 2.3 s."
+    - try: "Switch to Wall clock, take all samples and click the widest frame."
+      notice: "file.Sync, invisible before, is about 64% of the request: one fsync per order. Make it free too and the export takes under 0.2 s."
+    - try: "Switch the rate to 100 Hz."
+      notice: "Every tick lands inside the 10 ms metrics timer, so the graph shows nothing but metrics.flush, which really runs 5% of the time."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 52, title: Export API, sub: big customer }
+      after:  { x: 12, y: 30, w: 112, h: 52, title: Export API, sub: big customer }
+    - id: context
+      kind: context
+      before: { x: 150, y: 18, w: 270, h: 236, title: Export handler, sub: timers we guessed }
+      after:  { x: 150, y: 30, w: 140, h: 56, title: Export handler, sub: sampled, not timed }
+    - id: timers
+      kind: concrete
+      before: { x: 170, y: 64, w: 230, h: 36, title: "log: db took 44 ms" }
+      after:  { x: 12, y: 200, w: 112, h: 44, title: sampler, sub: 99 Hz stacks }
+    - id: load
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 112, w: 230, h: 36, title: 100 → 2,000 orders }
+      after:  { x: 150, y: 200, w: 140, h: 44, title: 2,000 orders }
+    - id: hot
+      kind: concrete
+      before: { x: 170, y: 160, w: 230, h: 36, title: "total 3.1 s: where?" }
+      after:  { x: 320, y: 200, w: 120, h: 44, title: currencySymbol, sub: 73% of CPU }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 320, y: 30, w: 130, h: 56, title: "" }
+      after:  { x: 320, y: 30, w: 130, h: 56, title: Flame graph, sub: fold · read width }
+    - id: wait
+      kind: concrete
+      appears: after
+      before: { x: 460, y: 110, w: 90, h: 56, title: "" }
+      after:  { x: 460, y: 110, w: 90, h: 56, title: file.Sync, sub: off-CPU 64% }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: load, to: context }
+    - { from: timers, to: context, label: samples }
+    - { from: context, to: strategy, label: folded into }
+    - { from: strategy, to: hot, label: on-CPU }
+    - { from: strategy, to: wait, label: off-CPU }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: export.go
+      source: |
+        // export.go
+        func (h *Handler) Export(w http.ResponseWriter, r *http.Request) {
+            start := time.Now()
+            orders, err := h.db.OrdersFor(r.Context(), customerID(r), 100)
+            log.Printf("export: db took %v", time.Since(start)) // timers where we guessed
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            rows := make([]Row, 0, len(orders))
+            for _, o := range orders {
+                rows = append(rows, formatRow(o, currencySymbol(o.Currency)))
+                h.audit.Record(o.ID) // compliance: every exported order is logged, durably
+            }
+            json.NewEncoder(w).Encode(rows)
+            log.Printf("export: total %v", time.Since(start))
+        }
+
+        func currencySymbol(code string) string {
+            var table map[string]Currency
+            json.Unmarshal(currenciesJSON, &table) // the embedded ISO 4217 table
+            return table[code].Symbol
+        }
+      roles: { client: [2, 2], context: [2, 17], timers: [3, 5], load: [4, 4], wait: [13, 13], hot: [19, 23] }
+      change:
+        - { line: 4, replace: "    orders, err := h.db.OrdersFor(r.Context(), customerID(r), 2000) // a full year" }
+    after:
+      file: main.go · export.go
+      source: |
+        // main.go: profiling endpoints on an internal port
+        import (
+            _ "net/http/pprof" // /debug/pprof/profile: on-CPU samples at 100 Hz
+
+            "github.com/felixge/fgprof"
+        )
+
+        func serveProfiles() {
+            http.DefaultServeMux.Handle("/debug/fgprof", fgprof.Handler()) // wall clock: on + off CPU
+            log.Println(http.ListenAndServe("localhost:6060", nil))
+        }
+        // go tool pprof -http=: 'http://localhost:6060/debug/pprof/profile?seconds=30'
+
+        // export.go: what the two flame graphs pointed at
+        var currencies = sync.OnceValue(func() map[string]Currency { // was: parsed on every row
+            var t map[string]Currency
+            must(json.Unmarshal(currenciesJSON, &t))
+            return t
+        })
+
+        func (h *Handler) Export(w http.ResponseWriter, r *http.Request) {
+            orders, err := h.db.OrdersFor(r.Context(), customerID(r), 2000)
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            rows := make([]Row, 0, len(orders))
+            ids := make([]string, 0, len(orders))
+            for _, o := range orders {
+                rows = append(rows, formatRow(o, currencies()[o.Currency].Symbol))
+                ids = append(ids, o.ID)
+            }
+            if err := h.audit.RecordAll(ids); err != nil { // one write, one fsync per export
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            json.NewEncoder(w).Encode(rows)
+        }
+      roles: { timers: [1, 11], sample: [3, 3], hidden: [9, 9], strategy: [12, 12], fold: [12, 12], read: [12, 12], hot: [15, 19], context: [21, 38], client: [21, 21], load: [22, 22], fix: [29, 33], wait: [33, 33] }
+    again:
+      file: export_test.go
+      source: |
+        // export_test.go: 2,000 orders, with the audit log on a real temp file
+        func TestExportYear(t *testing.T) {
+            h := newHandler(t, fakeOrders(2000), audit.Open(t.TempDir()))
+            rec := httptest.NewRecorder()
+            start := time.Now()
+            h.Export(rec, httptest.NewRequest("GET", "/orders/export?customer=c-42", nil))
+            if d := time.Since(start); rec.Code != http.StatusOK || d > 300*time.Millisecond {
+                t.Fatalf("status %d after %v", rec.Code, d)
+            }
+        }
+    cost:
+      before: { text: 3.1 s per export · 64% waiting, value: 0.9 }
+      after: { text: ~0.2 s per export, value: 0.1 }
+    lens:
+      need: 4
+      needLabel: Built in
+      note: '`runtime/pprof` samples on-CPU stacks at 100 Hz, `net/http/pprof` serves the profiles, and `go tool pprof -http` draws the flame graph. Go keeps frame pointers on amd64 and arm64, so Linux `perf` can walk Go stacks too. For waits, the block and mutex profiles show channel and lock waits, and `fgprof` samples every goroutine whatever it is doing.'
+      seenIn: '`go tool pprof -http=:`. `runtime.SetBlockProfileRate` and `runtime.SetMutexProfileFraction`. `felixge/fgprof`. `go tool trace` for a per-goroutine timeline. Profile-guided optimisation (`default.pgo`) reuses the same CPU profiles.'
+
+  python:
+    before:
+      file: export.py
+      source: |
+        # export.py
+        def export_orders(customer_id: str) -> list[dict]:
+            start = time.perf_counter()
+            orders = db.orders_for(customer_id, limit=100)
+            log.info("export: db took %.3fs", time.perf_counter() - start)  # timers where we guessed
+            rows = []
+            for o in orders:
+                rows.append(format_row(o, currency_symbol(o.currency)))
+                audit.record(o.id)  # compliance: every exported order is logged, durably
+            log.info("export: total %.3fs", time.perf_counter() - start)
+            return rows
+
+        def currency_symbol(code: str) -> str:
+            table = json.loads(CURRENCIES_JSON)  # the ISO 4217 table, shipped with the app
+            return table[code]["symbol"]
+      roles: { client: [2, 2], context: [2, 11], timers: [3, 5], load: [4, 4], wait: [9, 9], hot: [13, 15] }
+      change:
+        - { line: 4, replace: "    orders = db.orders_for(customer_id, limit=2000)  # a full year" }
+    after:
+      file: export.py
+      source: |
+        # profile the running service, no restart, no code change:
+        #   py-spy record --rate 99 -o cpu.svg --pid $PID           (running threads)
+        #   py-spy record --rate 99 --idle -o wall.svg --pid $PID   (adds waiting threads)
+
+        # export.py: what the two flame graphs pointed at
+        @functools.cache
+        def currency_table() -> dict[str, dict]:  # was: parsed on every row
+            return json.loads(CURRENCIES_JSON)
+
+        def export_orders(customer_id: str) -> list[dict]:
+            orders = db.orders_for(customer_id, limit=2000)
+            rows = [format_row(o, currency_table()[o.currency]["symbol"]) for o in orders]
+            audit.record_all([o.id for o in orders])  # one write, one fsync per export
+            return rows
+      roles: { timers: [1, 3], strategy: [1, 3], sample: [2, 2], fold: [2, 2], read: [2, 2], hidden: [3, 3], hot: [6, 8], context: [10, 14], client: [10, 10], load: [11, 11], fix: [12, 13], wait: [13, 13] }
+    again:
+      file: test_export.py
+      source: |
+        # test_export.py: 2,000 orders, with the audit log on a real temp file
+        def test_export_year(tmp_path, fake_orders):
+            audit.open(tmp_path / "audit.log")
+            fake_orders(2000)
+            start = time.perf_counter()
+            rows = export_orders("c-42")
+            assert len(rows) == 2000
+            assert time.perf_counter() - start < 0.3
+    cost:
+      before: { text: 3.1 s per export · 64% waiting, value: 0.9 }
+      after: { text: ~0.2 s per export, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Tools
+      note: '`py-spy` reads a running interpreter''s memory from outside, 100 samples a second by default, and writes a flame graph or speedscope file. By default it skips threads it thinks are idle; `--idle` keeps them, which shows the waits. `cProfile` traces every call instead, which is exact but slows the program. Since 3.12, `python -X perf` lets Linux `perf` name Python functions.'
+      seenIn: '`py-spy record`, `py-spy top`, `py-spy dump`. `--native` for C extensions, `--gil` for threads holding the GIL. `cProfile` with `snakeviz`. Scalene and Austin are other sampling profilers.'
+
+  typescript:
+    before:
+      file: export.ts
+      source: |
+        // export.ts
+        export async function exportOrders(customerId: string): Promise<Row[]> {
+          const start = performance.now();
+          const orders = await db.ordersFor(customerId, { limit: 100 });
+          log.info(`export: db took ${performance.now() - start} ms`); // timers where we guessed
+          const rows: Row[] = [];
+          for (const o of orders) {
+            rows.push(formatRow(o, currencySymbol(o.currency)));
+            await audit.record(o.id); // compliance: every exported order is logged, durably
+          }
+          log.info(`export: total ${performance.now() - start} ms`);
+          return rows;
+        }
+
+        function currencySymbol(code: string): string {
+          const table: Record<string, Currency> = JSON.parse(CURRENCIES_JSON); // the ISO 4217 table
+          return table[code].symbol;
+        }
+      roles: { client: [2, 2], context: [2, 13], timers: [3, 5], load: [4, 4], wait: [9, 9], hot: [15, 18] }
+      change:
+        - { line: 4, replace: "  const orders = await db.ordersFor(customerId, { limit: 2000 }); // a full year" }
+    after:
+      file: export.ts
+      source: |
+        // profile it:
+        //   node --cpu-prof --cpu-prof-interval 1000 server.js   (V8 sampler, writes a .cpuprofile)
+        //   npx 0x server.js                                     (the same, as a flame graph)
+        // awaited I/O shows up as (idle): the event loop is waiting, so look at trace spans
+
+        // export.ts: what the two flame graphs pointed at
+        const CURRENCIES: Record<string, Currency> = JSON.parse(CURRENCIES_JSON); // was: parsed on every row
+
+        export async function exportOrders(customerId: string): Promise<Row[]> {
+          const orders = await db.ordersFor(customerId, { limit: 2000 });
+          const rows = orders.map((o) => formatRow(o, CURRENCIES[o.currency].symbol));
+          await audit.recordAll(orders.map((o) => o.id)); // one write, one fsync per export
+          return rows;
+        }
+      roles: { timers: [1, 4], strategy: [2, 3], sample: [2, 2], fold: [3, 3], read: [3, 3], hidden: [4, 4], hot: [7, 7], context: [9, 14], client: [9, 9], load: [10, 10], fix: [11, 12], wait: [12, 12] }
+    again:
+      file: export.test.ts
+      source: |
+        // export.test.ts: 2,000 orders, with the audit log on a real temp file
+        test("export a year", async () => {
+          await audit.open(join(await mkdtemp(join(tmpdir(), "audit-")), "audit.log"));
+          fakeOrders(2000);
+          const start = performance.now();
+          const rows = await exportOrders("c-42");
+          assert.equal(rows.length, 2000);
+          assert.ok(performance.now() - start < 300);
+        });
+    cost:
+      before: { text: 3.1 s per export · 64% waiting, value: 0.9 }
+      after: { text: ~0.2 s per export, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Tools
+      note: 'V8 has a sampling profiler built in: `--cpu-prof` samples every 1000 µs by default, and Chrome DevTools, speedscope or `0x` draw the result. Time the event loop spends waiting appears as `(idle)`, so awaited I/O is invisible in it. Clinic.js, once the usual tool for this, is no longer actively maintained.'
+      seenIn: '`node --cpu-prof` and `--cpu-prof-interval`. `node --inspect` with the DevTools Performance panel. `0x`. `--perf-basic-prof` so Linux `perf` can name JIT-compiled functions.'
+
+  rust:
+    before:
+      file: export.rs
+      source: |
+        // export.rs
+        pub async fn export_orders(&self, customer: CustomerId) -> Result<Vec<Row>> {
+            let start = Instant::now();
+            let orders = self.db.orders_for(customer, 100).await?;
+            info!("export: db took {:?}", start.elapsed()); // timers where we guessed
+            let mut rows = Vec::with_capacity(orders.len());
+            for o in &orders {
+                rows.push(format_row(o, &currency_symbol(&o.currency)));
+                self.audit.record(&o.id).await?; // compliance: every exported order is logged, durably
+            }
+            info!("export: total {:?}", start.elapsed());
+            Ok(rows)
+        }
+
+        fn currency_symbol(code: &str) -> String {
+            let table: HashMap<String, Currency> = serde_json::from_str(CURRENCIES_JSON).unwrap();
+            table[code].symbol.clone()
+        }
+      roles: { client: [2, 2], context: [2, 13], timers: [3, 5], load: [4, 4], wait: [9, 9], hot: [15, 18] }
+      change:
+        - { line: 4, replace: "    let orders = self.db.orders_for(customer, 2000).await?; // a full year" }
+    after:
+      file: export.rs
+      source: |
+        // profile it:
+        //   cargo flamegraph --bin server            (perf at 997 Hz; set debug = true in [profile.release])
+        //   offcputime -df -p $(pidof server) 30     (bcc: stacks of threads while they wait)
+
+        // export.rs: what the two flame graphs pointed at
+        static CURRENCIES: LazyLock<HashMap<String, Currency>> = // was: parsed on every row
+            LazyLock::new(|| serde_json::from_str(CURRENCIES_JSON).expect("valid table"));
+
+        pub async fn export_orders(&self, customer: CustomerId) -> Result<Vec<Row>> {
+            let orders = self.db.orders_for(customer, 2000).await?;
+            let rows = orders.iter().map(|o| format_row(o, &CURRENCIES[&o.currency].symbol)).collect();
+            let ids: Vec<_> = orders.iter().map(|o| o.id.clone()).collect();
+            self.audit.record_all(&ids).await?; // one write, one fsync per export
+            Ok(rows)
+        }
+      roles: { timers: [1, 3], strategy: [2, 3], sample: [2, 2], fold: [2, 2], read: [2, 2], hidden: [3, 3], hot: [6, 7], context: [9, 15], client: [9, 9], load: [10, 10], fix: [11, 13], wait: [13, 13] }
+    again:
+      file: tests/export.rs
+      source: |
+        // tests/export.rs: 2,000 orders, with the audit log on a real temp file
+        #[tokio::test]
+        async fn export_a_year() {
+            let dir = tempfile::tempdir().unwrap();
+            let svc = Exporter::new(fake_orders(2000), Audit::open(dir.path()).await.unwrap());
+            let start = Instant::now();
+            let rows = svc.export_orders(CustomerId::from("c-42")).await.unwrap();
+            assert_eq!(rows.len(), 2000);
+            assert!(start.elapsed() < Duration::from_millis(300));
+        }
+    cost:
+      before: { text: 3.1 s per export · 64% waiting, value: 0.9 }
+      after: { text: ~0.2 s per export, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Tools
+      note: '`cargo flamegraph` runs `perf` (or DTrace on macOS) and draws the SVG; it samples at 997 Hz and unwinds with DWARF. Release builds need `debug = true` for function names. `pprof-rs` samples in-process and serves pprof files. Async waits do not burn CPU, so for them use `tokio-console`, tracing spans or an off-CPU tool.'
+      seenIn: '`cargo flamegraph`. `perf record -F 99 -g`. `pprof` crate (`pprof-rs`). `tokio-console`. `-C force-frame-pointers=yes` for cheaper stack walks.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The profiler's timer fires 99 times a second. Each time, it records the running thread's call stack, root first, for example main → http.serve → export.Handler → formatRow → currencySymbol → json.decode.
+    nodes: [timers, context]
+    edges: [timers>context]
+    role: sample
+  - text: Identical stacks are counted, one line per distinct stack with its count. Thousands of samples fold into a handful of lines.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: fold
+  - text: The flame graph draws each function as wide as the share of samples it was in, on top of its caller. currencySymbol is about 73% of the on-CPU width, because it re-parses the currency table for every row.
+    nodes: [strategy, hot]
+    edges: [strategy>hot]
+    role: read
+  - text: The on-CPU samples add up to 1.1 s of a 3.1 s export. A wall-clock or off-CPU profile also records the thread while it waits, and file.Sync, one fsync per order, takes 64% of the request.
+    nodes: [strategy, wait]
+    edges: [strategy>wait]
+    role: hidden
+  - text: Parse the table once, and write the audit records with one fsync per export. The export drops from 3.1 s to about 0.2 s. Neither profile alone found both.
+    nodes: [hot, wait, context]
+    edges: [strategy>hot, strategy>wait]
+    role: fix
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: In a CPU flame graph, what does the width of a box tell you?
+    options:
+      - text: The share of samples in which that function was on the stack, itself or through the functions it called.
+        correct: true
+        why: Right. Wide means the function, or something it called, was running in many samples. Its own work is the part not covered by boxes above it.
+      - text: How long the function ran, from its first call to its last, left to right in time.
+        why: Left to right is alphabetical, so identical stacks merge. A flame chart is the variant that keeps time on the x-axis.
+      - text: How many times the function was called.
+        why: A sampler does not count calls. A function called a million times for a nanosecond each may never be sampled; one called once for a second will be wide.
+  engineer:
+    question: An endpoint takes 2 seconds per request, but its CPU flame graph is small and flat and the process uses 15% CPU. What should you look at next?
+    options:
+      - text: Off-CPU time. Take an off-CPU or wall-clock profile, or trace the request's waits on disk, network and locks.
+        correct: true
+        why: Right. An on-CPU profiler only samples running threads. If the request spends most of its time waiting, the CPU graph cannot show where.
+      - text: Raise the sample rate until the slow function appears.
+        why: More samples sharpen the on-CPU picture. They do not add the time the thread spent waiting, which is not sampled at any rate.
+      - text: The widest box in the flame graph, since it must be the cause.
+        why: The widest box is the biggest share of a small amount of CPU time. Fixing it may save little of the 2 seconds.
+  deep:
+    question: A flame graph of a native service shows many short towers that end after two or three frames, some labelled with hex addresses. What is the likely cause?
+    options:
+      - text: The binary was built without frame pointers and without symbols, so the profiler cannot walk past the first frames or name them.
+        correct: true
+        why: Right. Rebuild with frame pointers (`-fno-omit-frame-pointer`, `-C force-frame-pointers=yes`), or let the profiler unwind with DWARF debug info, and install symbols.
+      - text: The functions are very fast, so their callers were never sampled.
+        why: Every sample captures the whole stack at that instant, callers included. Short towers mean the walk stopped early.
+      - text: The sample rate is too low.
+        why: A low rate gives fewer samples, with more noise. It does not shorten the stacks in each one.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Sampler
+      example: { go: "runtime/pprof, 100 Hz", python: "py-spy, 100 Hz", typescript: "V8 --cpu-prof, every 1 ms", rust: "perf via cargo flamegraph, 997 Hz" }
+      job: Interrupts at a fixed rate and records the stack. Cheap enough to run in production for a minute.
+    - role: Folded stacks
+      example: "main;http.serve;export.Handler;formatRow 81"
+      job: One line per distinct stack and its count. Every flame graph tool reads or writes this.
+    - role: Flame graph
+      example: widest frame currencySymbol, 73%
+      job: Shows where samples landed. Read width, and look for wide plateaus near the top.
+    - role: Off-CPU profile
+      example: { go: "fgprof, block profile", python: "py-spy --idle", typescript: "trace spans", rust: "bcc offcputime" }
+      job: Shows where threads waited. Needed whenever wall time is much larger than CPU time.
+  useWhen:
+    - Something is slow and you do not know where. Profile before you guess, and before you add timers.
+    - CPU is high and you need the code responsible, in production, without a restart.
+    - Comparing before and after a change; a differential flame graph colours what grew and shrank.
+  avoidWhen:
+    - The request is slow while the CPU is mostly idle. An on-CPU flame graph is the wrong tool; profile off-CPU time or trace the waits.
+    - You need exact call counts or ordering. Sampling estimates shares; use tracing for every event.
+  tradeoffs:
+    - Higher rates give finer detail and cost more overhead. 99 Hz on a few cores for 30 seconds is a common default.
+    - Round rates such as 100 Hz can fall into step with timers at round periods and over- or under-count them. Odd rates like 99 or 997 avoid it.
+    - Stack walking needs frame pointers or unwind info. Without them stacks are short and wrong.
+    - Off-CPU profiles count waiting threads too, including idle pool threads, so filter to the request path.
+  lookalikes:
+    - name: Flame chart
+      how: Same boxes with time on the x-axis, one request or thread at a time. Shows order; a flame graph shows totals.
+    - name: Tracing profiler
+      how: Records every call and return, like cProfile. Exact counts, much higher overhead, distorted timings.
+    - name: Icicle graph
+      how: A flame graph upside down, root at the top. Many viewers, such as speedscope and pprof, can show either.
+---
+
+## [concept] Sampling profilers and flame graphs
+
+**A <Term id="sampling-profiler">sampling profiler</Term> interrupts the program at a fixed rate and records the call stack. Count identical stacks, draw each function as wide as its share of the samples, and you have a <Term id="flame-graph">flame graph</Term>.**
+
+Wide boxes are where the samples landed. Left to right is alphabetical, not time, so the same stack from different moments merges into one box.
+
+<Depth level={2}>
+The pipeline has three steps: capture stacks (`perf record -F 99 -g`, pprof, py-spy, the V8 profiler), fold them into <Term id="folded-stack">folded stacks</Term> with a count each, and render. The profile counts only what it samples. An on-CPU profiler samples running threads, so <Term id="off-cpu-time">off-CPU time</Term>, waiting for disk, network or locks, is missing however long it is.
+</Depth>
+
+<Depth level={3}>
+Stack walking is the fragile part. Profilers follow <Term id="frame-pointer">frame pointers</Term> from frame to frame, or unwind with DWARF debug info, which is slower and copies more stack. Builds that omit frame pointers give short, broken stacks, and missing symbols give hex addresses. Sample rates are odd numbers such as 99 or 997 Hz so that the sampler cannot fall into step with work driven by timers at round periods.
+</Depth>
+
+## [problem] An export that someone timed by hand
+
+A billing service lets customers export their orders. The handler loads the orders, formats each row with its currency symbol, writes an audit record for every exported order for compliance, and encodes the result. Someone added two log lines with timers when it felt slow once: the database query, and the total.
+
+Read it with the usual mental model: if something is slow, put timers around the parts you suspect, and the numbers will point at the culprit.
+
+<Depth level={2}>
+Timers only measure what you thought to wrap. The two log lines say the query takes 44 ms. They say nothing about the 2,000 calls to `currencySymbol`, which parses the whole currency table every time, or the 2,000 audit writes, each made durable with an fsync.
+</Depth>
+
+<Depth level={3}>
+The audit log is the subtle part. Each record is small and the write is fast, but making it durable waits for the disk. That wait costs no CPU, so even a profiler can miss it.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** large customers want a full year of orders in one export. Raise the export limit from 100 orders to 2,000.
+
+The marked line is the only change. Exports for large customers now take 3.1 seconds. The log says the database took 44 ms and the total was 3.1 s, and nothing in between. The timers cannot say where the other 3 seconds went.
+
+<Depth level={2}>
+Someone runs a CPU profiler, and the flame graph is clear: `currencySymbol` and the JSON decoding under it are about 73% of the CPU samples. Caching the table cuts CPU time by three quarters. The export gets only about 27% faster, to 2.3 s, because the CPU was busy for 1.1 s of the 3.1 s.
+</Depth>
+
+<Depth level={3}>
+The remaining 2 seconds are 2,000 fsyncs of about a millisecond each. A thread in fsync is off-CPU, and an on-CPU profiler never samples it, so the flame graph shows `audit.Record` as a sliver.
+</Depth>
+
+## [morph] Sample the stacks, then look at both kinds of time
+
+Drag the slider. The hand-placed timers become a sampler, the stacks fold into a flame graph, and the graph's two views point at two different problems: one on-CPU, one off-CPU.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Profile first, with no code change: an on-CPU profile for where the CPU goes, then a wall-clock or off-CPU profile when CPU time is well below the request time. Fix the widest frame in each, and measure again.
+</Depth>
+
+<Depth level={3}>
+Off-CPU flame graphs are built the same way but weighted by time blocked, recorded when a thread is switched out and back in (bcc's `offcputime`). Wall-clock samplers such as `fgprof` and `py-spy --idle` sample waiting threads alongside running ones. Both count idle threads too, so filter to the request's threads or stacks.
+</Depth>
+
+## [walk] Follow the samples
+
+From the timer interrupt to the flame graph, and on to the wait it cannot see. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The Go runtime asks the kernel for a `SIGPROF` signal for every 10 ms of CPU a thread uses (100 Hz); the signal handler records the running goroutine's stack into a buffer that `pprof` reads. `fgprof` instead calls `runtime.GoroutineProfile` about 99 times a second, which captures every goroutine, running or not.</Lang>
+<Lang only="python">py-spy reads the interpreter's memory from another process, so the profiled program runs unmodified. It finds each thread's current frame and walks the frame chain. Because it reads memory while the program runs, it can see a stack mid-change; by default it pauses the process briefly for each sample to avoid that.</Lang>
+<Lang only="typescript">V8's profiler runs a sampling thread that interrupts the JavaScript thread on each tick and records the JS stack, with names from the JIT's own tables. When the event loop is waiting for I/O there is no JavaScript to record, and the sample is counted as `(idle)`.</Lang>
+<Lang only="rust">`perf` programs a CPU timer to interrupt at 997 Hz; the kernel records the user stack, and `cargo flamegraph` asks perf to copy a slice of it and unwind with DWARF, because Rust release builds omit frame pointers by default.</Lang>
+</Depth>
+
+## [again] A year of orders, profiled and fixed
+
+The same 2,000 orders. The currency table is parsed once, and the audit records go out in one write with one fsync per export. The export takes about 0.2 s instead of 3.1 s. The test above runs the full export against a real file and asserts it finishes within 300 ms.
+
+<Depth level={2}>
+Keep the profiling endpoints on in production, on an internal port. A 30-second profile during an incident beats any number of guesses, and continuous profilers collect the same data all the time.
+</Depth>
+
+<Depth level={3}>
+Batching the fsync keeps every record durable before the response is sent, so compliance is unchanged. What changed is that 2,000 small waits became one.
+</Depth>
+
+## [play] Build a flame graph from samples
+
+A simulated export of 2,000 orders runs on one thread while a profiler ticks. You take the samples, watch them fold into a flame graph, click a frame and make it free to see what fixing it would save.
+
+## [lens] How each language profiles
+
+Every language has a sampling profiler that can attach to a running service. They differ in what they can see: native frames, waiting threads, async tasks.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Linux `perf` works for all four, given frame pointers or unwind info and a way to name JIT-compiled or interpreted frames: `python -X perf`, `node --perf-basic-prof`.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="sampling-and-flame-graphs" />
+
+### From perf to a flame graph
+
+The classic pipeline on Linux, with Brendan Gregg's FlameGraph scripts:
+
+```
+perf record -F 99 -a -g -- sleep 30
+perf script | ./stackcollapse-perf.pl > out.folded
+./flamegraph.pl out.folded > cpu.svg
+```
+
+Each line of `out.folded` is one stack, root first, frames joined by semicolons, then a space and its sample count. Any tool that writes this format, or the pprof format, can feed any viewer.

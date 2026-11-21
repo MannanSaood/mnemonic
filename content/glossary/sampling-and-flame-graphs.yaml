@@ -1,0 +1,16 @@
+# Terms introduced by the sampling profilers and flame graphs lesson.
+- id: sampling-profiler
+  term: Sampling profiler
+  short: A profiler that interrupts the program at a fixed rate, such as 99 times a second, and records the current call stack. Cheap enough for production; it estimates where time goes rather than recording every call.
+- id: flame-graph
+  term: Flame graph
+  short: A picture of many stack samples merged. Each box is a function, as wide as the share of samples it appears in, stacked on its caller. Left to right is alphabetical, not time.
+- id: folded-stack
+  term: Folded stacks
+  short: One line per distinct call stack, frames joined by semicolons from the root, followed by how many samples had it. The input format flame graph tools read.
+- id: off-cpu-time
+  term: Off-CPU time
+  short: Time a thread spends not running, while it waits for disk, network, a lock or the scheduler. On-CPU profilers do not sample it, so a request can be slow with an empty CPU profile.
+- id: frame-pointer
+  term: Frame pointer
+  short: A register that each function sets to its own stack frame, so a profiler can walk from frame to frame to recover the call stack. Builds that omit it give profilers broken, shallow stacks.
