@@ -1,0 +1,13 @@
+# Terms introduced by the Singleton lesson.
+- id: global-state
+  term: Global state
+  short: Data that any part of a program can read or change without being handed it, such as a package-level variable or a module-level object.
+- id: hidden-dependency
+  term: Hidden dependency
+  short: Something a function needs that its signature does not show, such as a global config it reads. Callers and tests cannot see or replace it.
+- id: data-race
+  term: Data race
+  short: Two threads or goroutines access the same memory at the same time, at least one of them writing, with nothing ordering the accesses.
+- id: once-initialisation
+  term: Once-initialisation
+  short: Running an initialiser exactly once, even when many threads ask for the value at the same moment; the others wait for the first. Go's sync.Once, Rust's OnceLock.

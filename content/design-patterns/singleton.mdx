@@ -1,0 +1,535 @@
+---
+title: Singleton
+track: design-patterns
+group: Creational
+order: 24
+summary: Make sure a class has one instance and give everyone a global way to reach it. Sometimes one instance is right; the global access is usually the part to drop.
+intent: Some things should exist once per process. That does not mean every function should be able to reach them without asking.
+changeRequest: Pricing must use each tenant's own region and flags.
+languages: [go, python, typescript, rust]
+glossary: [global-state, hidden-dependency, dependency-injection, data-race, once-initialisation]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/dependency-injection]
+skills: [design, testing]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: singleton
+  scenarios:
+    - try: "Predict, then run the suite once on one worker with the global singleton."
+      notice: "A test fails although its own code is fine. The log names the test that left the setting behind, a test it never mentions."
+    - try: "Run it 10 times, then turn on Reset the global in teardown and run 10 more."
+      notice: "Without teardown the failures move around with the order. With teardown, one worker passes every time."
+    - try: "Keep teardown on and switch to 2 workers. Run it 10 times."
+      notice: "Flaky again. Two tests use the one global at the same time, and no reset can help. The usual fix is to stop running them in parallel."
+    - try: "Switch to Config passed in and run on 4 workers. Then try the cold start below with each initialisation."
+      notice: "Nothing fails, in any order. Where one instance really is right, like a connection pool, a once-guard creates exactly one; a plain nil check can create three."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: anything, sub: imports it }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: main, sub: makes one }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: global Config, sub: { go: "config.Get()", python: "config.settings", typescript: "import { config }", rust: "static CONFIG" } }
+      after:  { x: 150, y: 24, w: 150, h: 60, title: Config, sub: one instance }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 360, y: 24, w: 190, h: 60, title: "" }
+      after:  { x: 360, y: 24, w: 190, h: 60, title: constructor, sub: { go: NewPricing(cfg), python: Pricing(settings), typescript: new Pricing(config), rust: Pricing::new(cfg) } }
+    - id: pricing
+      kind: concrete
+      before: { x: 188, y: 66, w: 222, h: 36, title: pricing, sub: reads it directly }
+      after:  { x: 260, y: 204, w: 80, h: 40, title: Pricing }
+    - id: billing
+      kind: concrete
+      before: { x: 188, y: 112, w: 222, h: 36, title: billing, sub: reads it directly }
+      after:  { x: 350, y: 204, w: 80, h: 40, title: Billing }
+    - id: tests
+      kind: concrete
+      before: { x: 188, y: 158, w: 222, h: 36, title: tests, sub: write to it }
+      after:  { x: 150, y: 204, w: 100, h: 40, title: tests, sub: own Config }
+    - id: tenant
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 212, w: 222, h: 36, title: per-tenant config, sub: every caller changes }
+      after:  { x: 440, y: 204, w: 110, h: 40, title: per tenant, sub: main builds more }
+  edges:
+    - { from: client, to: context, label: creates }
+    - { from: context, to: strategy, label: passed via }
+    - { from: pricing, to: strategy, label: declares }
+    - { from: billing, to: strategy }
+    - { from: tests, to: strategy }
+    - { from: tenant, to: strategy }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: config.go · pricing.go · pricing_test.go
+      source: |
+        // config.go
+        var (
+            instance *Config
+            once     sync.Once
+        )
+
+        func Get() *Config {
+            once.Do(func() { instance = loadFromEnv() })
+            return instance
+        }
+
+        // pricing.go
+        func Quote(cart Cart) Money {
+            cfg := config.Get()
+            price := cart.Total()
+            if cfg.Flags.NewPricing {
+                price = price.Mul(0.9)
+            }
+            return price.Add(tax(cfg.Region, price))
+        }
+
+        // pricing_test.go
+        func TestNewPricing(t *testing.T) {
+            config.Get().Flags.NewPricing = true // every later test sees this
+            // …
+        }
+      roles: { context: [2, 10], pricing: [13, 20], tests: [23, 26], client: [7, 10] }
+      change:
+        - { line: 3, replace: '    instances = map[string]*Config{} // one per tenant now, plus a mutex' }
+        - { line: 7, replace: 'func Get(tenant string) *Config {' }
+        - { line: 8, replace: '    mu.Lock(); defer mu.Unlock() /* load on first use per tenant */' }
+        - { line: 14, replace: '    cfg := config.Get(cart.Tenant)' }
+        - { line: 24, replace: '    config.Get("acme").Flags.NewPricing = true // still global, now per tenant' }
+    after:
+      file: pricing.go · main.go · pricing_test.go
+      source: |
+        type Pricing struct {
+            cfg *Config
+        }
+
+        func NewPricing(cfg *Config) *Pricing { return &Pricing{cfg: cfg} }
+
+        func (p *Pricing) Quote(cart Cart) Money {
+            price := cart.Total()
+            if p.cfg.Flags.NewPricing {
+                price = price.Mul(0.9)
+            }
+            return price.Add(tax(p.cfg.Region, price))
+        }
+
+        // main.go: still exactly one Config, made once and passed down
+        cfg := loadFromEnv()
+        pricing := NewPricing(cfg)
+
+        // pricing_test.go: each test builds its own
+        p := NewPricing(&Config{Region: "eu", Flags: Flags{NewPricing: true}})
+      roles: { pricing: [1, 13], strategy: [5, 5], context: [16, 16], client: [15, 17], tests: [19, 20], create: [16, 16], pass: [17, 17], use: [7, 13], test: [20, 20] }
+    again:
+      file: main.go
+      source: |
+        // Per-tenant pricing: main builds a Pricing per tenant. Pricing itself does not change.
+        pricingFor := func(tenant string) *Pricing { return NewPricing(tenants.Config(tenant)) }
+    cost:
+      before: { text: 5 lines · every hidden caller, value: 0.9 }
+      after: { text: 1 line in main · 0 edits, value: 0.1 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A package-level variable plus `sync.Once`, or `sync.OnceValue` since Go 1.21, is the safe way to make one lazily. Keep it for things that truly are process-wide, and pass everything else as a parameter or struct field. The standard library''s own globals show the cost: importing `net/http/pprof` silently registers handlers on `http.DefaultServeMux`.'
+      seenIn: '`http.DefaultClient` and `http.DefaultServeMux`. `log.Default()`. `sync.OnceValue(func() T)` for safe lazy initialisation.'
+
+  python:
+    before:
+      file: config.py · pricing.py · test_pricing.py
+      source: |
+        # config.py: imported once, so this object is a singleton
+        settings = Settings.from_env()
+
+        # pricing.py
+        from config import settings
+
+        def quote(cart: Cart) -> Decimal:
+            price = cart.total()
+            if settings.flags.new_pricing:
+                price *= Decimal("0.9")
+            return price + tax(settings.region, price)
+
+        # test_pricing.py
+        def test_new_pricing():
+            settings.flags.new_pricing = True  # every later test sees this
+            assert quote(cart) == discounted(cart)
+      roles: { context: [1, 2], client: [5, 5], pricing: [7, 11], tests: [14, 16] }
+      change:
+        - { line: 2, replace: '_by_tenant: dict[str, Settings] = {}  # one per tenant now' }
+        - { line: 5, replace: 'from config import settings_for' }
+        - { after: 7, add: ['    settings = settings_for(cart.tenant)'] }
+        - { line: 15, replace: '    settings_for("acme").flags.new_pricing = True  # still global, now per tenant' }
+    after:
+      file: pricing.py · main.py · test_pricing.py
+      source: |
+        class Pricing:
+            def __init__(self, settings: Settings):
+                self.settings = settings
+
+            def quote(self, cart: Cart) -> Decimal:
+                price = cart.total()
+                if self.settings.flags.new_pricing:
+                    price *= Decimal("0.9")
+                return price + tax(self.settings.region, price)
+
+        # main.py: still exactly one Settings, made once and passed down
+        settings = Settings.from_env()
+        pricing = Pricing(settings)
+
+        # test_pricing.py: each test builds its own
+        pricing = Pricing(Settings(region="eu", flags=Flags(new_pricing=True)))
+      roles: { pricing: [1, 9], strategy: [2, 3], context: [12, 12], client: [11, 13], tests: [15, 16], create: [12, 12], pass: [13, 13], use: [5, 9], test: [16, 16] }
+    again:
+      file: main.py
+      source: |
+        # Per-tenant pricing: main builds a Pricing per tenant. Pricing itself does not change.
+        def pricing_for(tenant: str) -> Pricing:
+            return Pricing(tenants.settings(tenant))
+    cost:
+      before: { text: 4 lines · every hidden caller, value: 0.9 }
+      after: { text: 2 lines in main · 0 edits, value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: 'A module is already a singleton: Python runs its code once and caches it in `sys.modules`, so a module-level object needs no class tricks. The trouble is not making one; it is importing it from everywhere. Tests then reach for `monkeypatch` or `unittest.mock.patch` to swap it, which works but couples them to import paths.'
+      seenIn: '`logging.getLogger(name)` returns the same logger for the same name. The functions in `random` use one hidden module-level `Random` instance. Django''s `django.conf.settings`.'
+
+  typescript:
+    before:
+      file: config.ts · pricing.ts · pricing.test.ts
+      source: |
+        // config.ts: a module is evaluated once, so this object is a singleton
+        export const config = loadConfig(process.env);
+
+        // pricing.ts
+        import { config } from "./config";
+
+        export function quote(cart: Cart): Money {
+          let price = cart.total();
+          if (config.flags.newPricing) price = price.times(0.9);
+          return price.plus(tax(config.region, price));
+        }
+
+        // pricing.test.ts
+        test("new pricing gives 10% off", () => {
+          config.flags.newPricing = true; // every later test in this file sees this
+          expect(quote(cart)).toEqual(discounted(cart));
+        });
+      roles: { context: [1, 2], client: [5, 5], pricing: [7, 11], tests: [14, 17] }
+      change:
+        - { line: 2, replace: 'export const configs = new Map<string, Config>(); // one per tenant now' }
+        - { line: 5, replace: 'import { configs } from "./config";' }
+        - { after: 7, add: ['  const config = configs.get(cart.tenant)!;'] }
+        - { line: 15, replace: '  configs.get("acme")!.flags.newPricing = true; // still global, now per tenant' }
+    after:
+      file: pricing.ts · main.ts · pricing.test.ts
+      source: |
+        export class Pricing {
+          constructor(private readonly config: Config) {}
+
+          quote(cart: Cart): Money {
+            let price = cart.total();
+            if (this.config.flags.newPricing) price = price.times(0.9);
+            return price.plus(tax(this.config.region, price));
+          }
+        }
+
+        // main.ts: still exactly one Config, made once and passed down
+        const config = loadConfig(process.env);
+        const pricing = new Pricing(config);
+
+        // pricing.test.ts: each test builds its own
+        const pricing = new Pricing({ region: "eu", flags: { newPricing: true } });
+      roles: { pricing: [1, 9], strategy: [2, 2], context: [12, 12], client: [11, 13], tests: [15, 16], create: [12, 12], pass: [13, 13], use: [4, 8], test: [16, 16] }
+    again:
+      file: main.ts
+      source: |
+        // Per-tenant pricing: main builds a Pricing per tenant. Pricing itself does not change.
+        const pricingFor = (tenant: string) => new Pricing(tenants.config(tenant));
+    cost:
+      before: { text: 4 lines · every hidden caller, value: 0.9 }
+      after: { text: 1 line in main · 0 edits, value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: 'An ES module is evaluated once per module graph, so an exported `const` is a singleton. Two caveats: test runners such as Jest give each test file its own module registry, and two copies of a package in `node_modules` give you two "singletons". JavaScript is single-threaded, but async lazy init can still race: store the promise, not the result.'
+      seenIn: 'Prisma''s docs recommend one shared `PrismaClient`, kept on `globalThis` in development so hot reloading does not open new connection pools. Node''s `process` and `console` are global singletons.'
+
+  rust:
+    before:
+      file: config.rs · pricing.rs · tests
+      source: |
+        // config.rs
+        pub static CONFIG: LazyLock<RwLock<Config>> = LazyLock::new(|| RwLock::new(Config::from_env()));
+
+        // pricing.rs
+        pub fn quote(cart: &Cart) -> Money {
+            let cfg = CONFIG.read().unwrap();
+            let mut price = cart.total();
+            if cfg.flags.new_pricing {
+                price = price * 0.9;
+            }
+            price + tax(&cfg.region, price)
+        }
+
+        // tests
+        #[test]
+        fn new_pricing_gives_discount() {
+            CONFIG.write().unwrap().flags.new_pricing = true; // cargo test runs tests in parallel threads
+            assert_eq!(quote(&cart()), discounted(&cart()));
+        }
+      roles: { context: [1, 2], client: [6, 6], pricing: [5, 12], tests: [15, 19] }
+      change:
+        - { line: 2, replace: 'pub static CONFIGS: LazyLock<RwLock<HashMap<TenantId, Config>>> = LazyLock::new(Default::default);' }
+        - { line: 6, replace: '    let configs = CONFIGS.read().unwrap(); let cfg = &configs[&cart.tenant];' }
+        - { line: 17, replace: '    CONFIGS.write().unwrap().get_mut("acme").unwrap().flags.new_pricing = true; // still global' }
+    after:
+      file: pricing.rs · main.rs · tests
+      source: |
+        pub struct Pricing {
+            cfg: Arc<Config>,
+        }
+
+        impl Pricing {
+            pub fn new(cfg: Arc<Config>) -> Self { Pricing { cfg } }
+
+            pub fn quote(&self, cart: &Cart) -> Money {
+                let mut price = cart.total();
+                if self.cfg.flags.new_pricing {
+                    price = price * 0.9;
+                }
+                price + tax(&self.cfg.region, price)
+            }
+        }
+
+        // main.rs: still exactly one Config, made once and shared
+        let cfg = Arc::new(Config::from_env());
+        let pricing = Pricing::new(Arc::clone(&cfg));
+
+        // tests: each test builds its own
+        let pricing = Pricing::new(Arc::new(Config { region: "eu".into(), ..Config::test() }));
+      roles: { pricing: [1, 15], strategy: [6, 6], context: [18, 18], client: [17, 19], tests: [21, 22], create: [18, 18], pass: [19, 19], use: [8, 14], test: [22, 22] }
+    again:
+      file: main.rs
+      source: |
+        // Per-tenant pricing: main builds a Pricing per tenant. Pricing itself does not change.
+        let pricing_for = |tenant: &str| Pricing::new(tenants.config(tenant));
+    cost:
+      before: { text: 3 lines · every hidden caller, value: 0.85 }
+      after: { text: 1 line in main · 0 edits, value: 0.1 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Rust makes a global''s cost visible. A `static` must be thread-safe, lazy initialisation needs `OnceLock` (Rust 1.70) or `LazyLock` (1.80), and changing it needs a `Mutex` or `RwLock`. `static mut` needs `unsafe` on every access. Most code passes an `Arc<Config>` instead and keeps statics for true process-wide services.'
+      seenIn: '`std::io::stdout()` hands out access to one global, locked stdout. `tracing::subscriber::set_global_default` and `log::set_logger` can be called once per process. `OnceLock::get_or_init` for values that arrive at runtime.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: '`main` loads the config once. There is still exactly one instance in the process; that part of the singleton idea survives.'
+    nodes: [client, context]
+    edges: [client>context]
+    role: create
+  - text: It hands that instance to Pricing through the constructor. The dependency is now in Pricing's signature, where readers and tools can see it.
+    nodes: [context, strategy, pricing]
+    edges: [context>strategy, pricing>strategy]
+    role: pass
+  - text: Quote reads the flag and region from the config it was given. It never reaches for a global, so it can be given a different one.
+    nodes: [pricing]
+    edges: []
+    role: use
+  - text: A test builds its own config with the EU region and the new pricing flag, and its own Pricing. No other test can see or change it, so tests can run in any order, in parallel.
+    nodes: [tests, strategy]
+    edges: [tests>strategy]
+    role: test
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these is a good reason to have exactly one instance?
+    options:
+      - text: The pool of connections to the orders database. Opening a second pool would double the connections the database has to hold.
+        correct: true
+        why: Right. The resource is limited and shared by design. Create it once, at startup, and pass it to what needs it.
+      - text: The pricing config, so any function can read it without taking a parameter.
+        why: That is convenience, and it creates hidden dependencies. One config can still be passed in; being reachable from anywhere is the part that hurts.
+      - text: The shopping cart, because each request uses one.
+        why: One per request is not one per process. A global cart would be shared by every customer at once.
+  engineer:
+    question: Tests pass alone but fail together because they share a global Config. A teammate adds a reset() call in every teardown. What problem remains?
+    options:
+      - text: Tests that run in parallel still see each other's changes, so the suite has to run serially, and the dependency on Config is still invisible in the code under test.
+        correct: true
+        why: Right. Reset fixes ordering on one worker. It cannot separate two tests that use the one object at the same time.
+      - text: None. Resetting in teardown makes the tests independent.
+        why: Only when they never overlap. With parallel workers a reset can even wipe a setting another test is in the middle of using.
+      - text: The tests now fail when run alone.
+        why: Resetting to defaults after a test does not affect that test. Each one still passes alone.
+  deep:
+    question: In Go, two goroutines call Pool() during a cold start, and Pool() does `if pool == nil { pool = openPool() }`. What can happen?
+    options:
+      - text: Both see nil and each opens a pool. One is overwritten and leaks, and the unsynchronised read and write is a data race that `go test -race` reports.
+        correct: true
+        why: Right. Check-then-act on shared memory is not atomic. sync.Once or sync.OnceValue makes the second caller wait for the first and run the function exactly once.
+      - text: Nothing. The Go scheduler never runs two calls of the same package function at once.
+        why: Goroutines run in parallel on multiple threads, and any of them may be inside Pool() at the same time.
+      - text: The second goroutine panics with a nil pointer error.
+        why: No pointer is dereferenced before it is set. The failure is quieter, which is why it is dangerous.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Singleton
+      example: { go: "Config behind config.Get()", python: "config.settings (module-level)", typescript: "export const config", rust: "static CONFIG: LazyLock<…>" }
+      job: The one instance, and the global way to reach it.
+    - role: Once-guard
+      example: { go: "sync.Once / sync.OnceValue", python: "the import system", typescript: "module evaluation", rust: "OnceLock / LazyLock" }
+      job: Makes sure the instance is created once, even under concurrency.
+    - role: Composition root (the alternative)
+      example: main
+      job: Creates the one instance and passes it to whatever needs it.
+  useWhen:
+    - Something really must exist once per process, such as a connection pool, a metrics registry or the process's logger.
+    - Creating it twice would waste or exhaust a limited resource.
+    - Even then, prefer creating it in main and passing it in. Keep the global accessor for code you do not control.
+  avoidWhen:
+    - The only reason is to avoid passing a parameter.
+    - The object holds settings that tests, tenants or requests need to vary.
+    - Tests must run in parallel.
+  tradeoffs:
+    - Hidden dependencies. A function's signature no longer says what it uses.
+    - Tests share state. Order and parallelism start to matter, and resets only fix order.
+    - Hard to change later. Going from one to one-per-tenant edits every caller.
+    - Lazy initialisation must be thread-safe, or you get more than one.
+  lookalikes:
+    - name: Dependency injection
+      how: Keeps the one instance and drops the global access. It is the usual replacement for a singleton.
+    - name: Monostate
+      how: Many instances that share their state through static fields. The same coupling, harder to notice.
+    - name: Flyweight
+      how: Shares instances to save memory, one per distinct value. A singleton is one instance in total.
+    - name: Service locator
+      how: A global registry you ask for dependencies. It hides dependencies the same way a singleton does.
+---
+
+## [concept] Singleton
+
+**Make sure a class has one instance and give everyone a global way to reach it. Sometimes one instance is right; the global access is usually the part to drop.**
+
+Some things should exist once per process. That does not mean every function should be able to reach them without asking.
+
+<Depth level={2}>
+The pattern bundles two ideas. *One instance* is often reasonable: a connection pool, a metrics registry. *Global access* is where it hurts. Any code can read or change <Term id="global-state">global state</Term>, so functions get <Term id="hidden-dependency">hidden dependencies</Term> their signatures do not show, and tests start depending on each other. <Term id="dependency-injection">Dependency injection</Term> keeps the first idea and drops the second.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue presents Singleton as an improvement over global variables: the class controls its sole instance, keeps it out of the global namespace, and can later allow subclasses or more than one instance. Its examples are a print spooler and a file system. The book also describes a registry of singletons for choosing a subclass at runtime. Later practice turned more critical. In 2008 Miško Hevery argued on the Google Testing Blog that singletons let an API lie about its dependencies, and that is now the common view.
+</Depth>
+
+## [problem] One config, reachable from anywhere
+
+A pricing service reads its region and feature flags from a config that is loaded once and reached globally. Quote calls it directly, and so do billing, reports and a dozen other places.
+
+Read it once. Nothing in Quote's signature says it depends on configuration.
+
+<Depth level={2}>
+Look at the test. To try the new pricing, it changes the global, and it never changes it back. Every test that runs after it in the same process sees the new pricing flag. Each test passes alone, and the suite fails depending on order.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`go test` runs the tests in one package sequentially by default, but `t.Parallel()` and the shared global do not mix. The `-shuffle` flag makes order-dependent failures show up early.</Lang>
+<Lang only="python">pytest runs tests in one process, in file order, so the leak is deterministic until the order changes. With pytest-xdist, tests run in several processes, and the failures start to move around.</Lang>
+<Lang only="typescript">Jest and Vitest give each test file its own module registry, so the leak stays inside one file. Within that file, it follows the order of the tests.</Lang>
+<Lang only="rust">`cargo test` runs tests in parallel threads by default. The `RwLock` keeps the global memory-safe, but two tests can still see each other's settings. `--test-threads=1` hides the problem by giving up parallelism.</Lang>
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** pricing must use each tenant's own region and flags.
+
+One global config cannot be two configs at once. The global turns into a map keyed by tenant, and every caller has to pass a tenant ID it never needed before.
+
+<Depth level={2}>
+The hard part is finding the callers. They are not listed in any signature: you search for `config.Get()`, or the import, and hope nothing reaches it indirectly. The cost meter says "every hidden caller" because nobody can count them in advance.
+</Depth>
+
+<Depth level={3}>
+The tests stay coupled too. They now write into the global map under a tenant ID, which is the same shared state with a longer name.
+</Depth>
+
+## [morph] Keep one instance, pass it in
+
+Drag the slider. The global accessor disappears. `main` creates the one config and passes it to Pricing through the constructor.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+There is still exactly one config in production. What changed is who can reach it: only code that was handed it. The dependency shows up in `NewPricing(cfg)`, tests build their own, and a second config for a second tenant is just another constructor call. The place where `main` wires everything together is often called the composition root.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The `Pricing` struct holds a `*Config`. If the config can change at runtime, make the struct hold an interface or an `atomic.Pointer[Config]` so readers always see a whole config.</Lang>
+<Lang only="python">Nothing stops another module from still importing a global, so make the module that builds `Settings` the only one that calls `from_env()`. A linter rule against importing it elsewhere helps.</Lang>
+<Lang only="typescript">`private readonly config: Config` is a parameter property: it declares the field and assigns it in one line. Tests can pass a plain object literal, since types are structural.</Lang>
+<Lang only="rust">`Arc<Config>` lets many services share one immutable config cheaply. If it must change at runtime, `arc_swap` or an `RwLock<Arc<Config>>` swaps the whole value at once.</Lang>
+</Depth>
+
+## [walk] Follow the config from main to a quote
+
+One config, from startup to a price, and then a test. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`sync.Once` uses an atomic flag for the fast path and a mutex for the first call, so later calls cost one atomic load. With injection there is no such cost: the pointer is a struct field.</Lang>
+<Lang only="python">A module-level object is created when the module is first imported, under the import lock, and then cached in `sys.modules`. That is why it behaves as a singleton without any code to enforce it.</Lang>
+<Lang only="typescript">Node evaluates a module once and caches it by resolved path. The same package resolved to two different paths, for example two versions in `node_modules`, is two modules with two "singletons".</Lang>
+<Lang only="rust">`LazyLock` runs its closure on first access and blocks other threads until it finishes. Reading an `Arc<Config>` field afterwards is a plain pointer load.</Lang>
+</Depth>
+
+## [again] Per-tenant pricing, the second time
+
+The same request after the refactor. `main` builds one Pricing per tenant, from that tenant's config. Pricing, Quote and their tests do not change at all.
+
+<Depth level={2}>
+When one instance really is the right answer, keep it, and make it safely. A connection pool should be created once, with a once-guard: <Term id="once-initialisation">once-initialisation</Term> such as `sync.OnceValue`, a module import, or `OnceLock`. A plain "if nil, create" check is a <Term id="data-race">data race</Term> that can open several pools at a cold start.
+</Depth>
+
+<Depth level={3}>
+Global singletons still have honest uses: the process's logger and metrics registry, which libraries you do not control need to find, or `stdout`. Even then, prefer handing them to your own code explicitly and keeping the global only as the default.
+</Depth>
+
+## [play] Run the suite against one global config
+
+Six tests for the pricing service, each one green on its own. Run them together, in different orders and on more workers, and see what a shared global does to a test suite. Then make a connection pool, the one thing here that really should exist once.
+
+## [lens] How each language writes it
+
+Making one instance is easy everywhere, and in Python and TypeScript it happens by default. The languages differ in how much they make you pay for global access: Rust makes it explicit, the others make it free.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="singleton" />
+
+### One instance without a singleton
+
+Create the instance once in `main`, pass it to what needs it, and give tests their own. You keep everything the singleton promised, one pool and one config, and lose the hidden dependencies. Keep a true global only for code that cannot be handed anything, and create it with a once-guard.
