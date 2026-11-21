@@ -1,0 +1,519 @@
+---
+title: Scheduling basics
+track: operating-systems
+group: Scheduling
+order: 7
+summary: A scheduler picks which ready task runs next. Shortest-first wins turnaround, taking turns wins response time, and no policy wins both.
+intent: Choose a scheduling policy by the metric that matters, and recognise the convoy effect in your own queues.
+changeRequest: The monthly invoice export for each customer, about two minutes per job, now runs on the same job queue.
+languages: [go, python, typescript, rust]
+glossary: [turnaround-time, response-time, convoy-effect, shortest-job-first, stcf, round-robin, time-slice, context-switch]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [operating-systems/limited-direct-execution-and-context-switch]
+skills: [os, scheduling]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: scheduling-basics
+  scenarios:
+    - try: "Make a prediction, then run the Convoy set: a 100 ms export a moment before two 10 ms jobs."
+      notice: "FIFO averages 110 ms turnaround. SJF and STCF average 50 ms, and the export still finishes at 120 ms."
+    - try: "Switch to Late arrivals: the two short jobs arrive 10 ms after the export starts."
+      notice: "SJF cannot help, because the export is already running. STCF preempts it and gets back to 50 ms."
+    - try: "On Batch + interactive, set the slice to 1 ms and the switch cost to 1 ms."
+      notice: "Round robin answers every job within a few ms, but the red switch slivers make it the worst policy for turnaround, worse than FIFO."
+    - try: "Edit the run times until FIFO and SJF give the same schedule."
+      notice: "When the jobs already arrive shortest first, or are all the same length, the order rule makes no difference."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: api
+      kind: client
+      before: { x: 12, y: 30, w: 120, h: 50, title: API handlers, sub: enqueue jobs }
+      after:  { x: 12, y: 30, w: 120, h: 50, title: API handlers, sub: enqueue by lane }
+    - id: sched
+      kind: context
+      before: { x: 150, y: 14, w: 398, h: 246, title: Job queue, sub: "first in, first out" }
+      after:  { x: 176, y: 30, w: 150, h: 50, title: Worker loop, sub: pops the next job }
+    - id: rule
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 110, w: 100, h: 50, title: "" }
+      after:  { x: 360, y: 30, w: 188, h: 50, title: Pick rule, sub: short lane first }
+    - id: export
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 60, w: 358, h: 40, title: "invoice export · 2 min" }
+      after:  { x: 396, y: 196, w: 152, h: 50, title: Export chunk, sub: "~1 s, then re-queued" }
+    - id: short
+      kind: concrete
+      before: { x: 170, y: 112, w: 358, h: 40, title: "reset email waits" }
+      after:  { x: 12, y: 196, w: 150, h: 50, title: Short lane, sub: "resets, thumbnails" }
+    - id: long
+      kind: concrete
+      before: { x: 170, y: 164, w: 358, h: 40, title: "thumbnail waits" }
+      after:  { x: 204, y: 196, w: 150, h: 50, title: Long lane, sub: one chunk at a time }
+  edges:
+    - { from: api, to: sched, label: enqueue }
+    - { from: rule, to: sched, label: decides }
+    - { from: sched, to: short, label: first }
+    - { from: sched, to: long, label: then }
+    - { from: export, to: long, label: re-queued }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: worker.go
+      source: |
+        // worker.go: one worker drains the jobs queue in arrival order
+        func (w *Worker) Run(ctx context.Context) error {
+            for {
+                job, err := w.queue.Pop(ctx) // FIFO
+                if err != nil {
+                    return err
+                }
+                w.handle(ctx, job)
+            }
+        }
+
+        func (w *Worker) handle(ctx context.Context, job Job) {
+            switch job.Kind {
+            case "password_reset":
+                w.mail.SendReset(ctx, job.UserID) // ~50 ms
+            case "thumbnail":
+                w.media.Thumbnail(ctx, job.ImageID) // ~200 ms
+            }
+        }
+      roles: { sched: [2, 10], short: [14, 15], long: [16, 17], api: [4, 4] }
+      change:
+        - { after: 17, add: ['    case "invoice_export":', '        w.billing.ExportMonth(ctx, job.CustomerID) // ~2 min'] }
+    after:
+      file: worker.go
+      source: |
+        // worker.go: short jobs first; exports run in chunks and go to the back
+        func (w *Worker) Run(ctx context.Context) error {
+            for {
+                job, err := w.queue.PopFirst(ctx, "short", "long") // short lane first
+                if err != nil {
+                    return err
+                }
+                w.handle(ctx, job)
+            }
+        }
+
+        func (w *Worker) handle(ctx context.Context, job Job) {
+            switch job.Kind {
+            case "password_reset":
+                w.mail.SendReset(ctx, job.UserID)
+            case "thumbnail":
+                w.media.Thumbnail(ctx, job.ImageID)
+            case "invoice_export":
+                next, done := w.billing.ExportChunk(ctx, job.CustomerID, job.Cursor, 1000) // ~1 s
+                if !done {
+                    job.Cursor = next
+                    w.queue.Push(ctx, "long", job) // back of the line: a time slice
+                }
+            }
+        }
+      roles: { api: [4, 4], sched: [2, 10], rule: [4, 4], short: [14, 17], long: [18, 23], export: [19, 22], arrive: [4, 4], pick: [4, 4], run: [19, 19], slice: [20, 23], measure: [4, 4] }
+    again:
+      file: queue-wait.txt
+      source: |
+        // time from enqueue to start, on export night
+        // password_reset   p99 0.9 s   (was 118 s)
+        // invoice_export   total +3%   (one re-queue per 1,000 rows)
+    cost:
+      before: { text: "reset email waits up to 2 min", value: 0.9 }
+      after: { text: "waits ≤ one chunk, ~1 s", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'Your job queue is a scheduler, and FIFO is its default policy. Go''s own scheduler is closer to round robin: each P takes goroutines from a FIFO run queue and preempts one after 10 ms. It also has a `runnext` slot, so a goroutine woken by the running one jumps the queue, which favours short request-response hand-offs.'
+      seenIn: 'Priority lanes in job systems (separate queues per class, polled in order). `runtime/metrics` reports `/sched/latencies:seconds`, the time goroutines spent runnable before running: the response time of Go''s own scheduler.'
+
+  python:
+    before:
+      file: worker.py
+      source: |
+        # worker.py: one worker drains the jobs queue in arrival order
+        def run(queue: JobQueue) -> None:
+            while True:
+                job = queue.pop()  # FIFO, blocks when empty
+                handle(job)
+
+        def handle(job: Job) -> None:
+            match job.kind:
+                case "password_reset":
+                    mail.send_reset(job.user_id)  # ~50 ms
+                case "thumbnail":
+                    media.thumbnail(job.image_id)  # ~200 ms
+      roles: { sched: [2, 5], short: [9, 10], long: [11, 12], api: [4, 4] }
+      change:
+        - { after: 12, add: ['        case "invoice_export":', '            billing.export_month(job.customer_id)  # ~2 min'] }
+    after:
+      file: worker.py
+      source: |
+        # worker.py: short jobs first; exports run in chunks and go to the back
+        from dataclasses import replace
+
+        def run(queue: JobQueue) -> None:
+            while True:
+                job = queue.pop_first("short", "long")  # short lane first
+                handle(queue, job)
+
+        def handle(queue: JobQueue, job: Job) -> None:
+            match job.kind:
+                case "password_reset":
+                    mail.send_reset(job.user_id)
+                case "thumbnail":
+                    media.thumbnail(job.image_id)
+                case "invoice_export":
+                    cursor = billing.export_chunk(job.customer_id, job.cursor, rows=1000)  # ~1 s
+                    if cursor is not None:
+                        queue.push("long", replace(job, cursor=cursor))  # back of the line
+      roles: { api: [6, 6], sched: [4, 7], rule: [6, 6], short: [11, 14], long: [15, 18], export: [16, 18], arrive: [6, 6], pick: [6, 6], run: [16, 16], slice: [17, 18], measure: [6, 6] }
+    again:
+      file: queue-wait.txt
+      source: |
+        # time from enqueue to start, on export night
+        # password_reset   p99 0.9 s   (was 118 s)
+        # invoice_export   total +3%   (one re-queue per 1,000 rows)
+    cost:
+      before: { text: "reset email waits up to 2 min", value: 0.9 }
+      after: { text: "waits ≤ one chunk, ~1 s", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'asyncio''s own scheduler is FIFO without preemption: ready callbacks wait in one queue and each runs until it awaits. A callback that computes for 2 minutes is the export at the head of the convoy. Threads add the GIL''s round robin: a thread that wants the GIL asks for it after the 5 ms switch interval.'
+      seenIn: 'Celery and RQ route jobs to named queues so workers can poll the short ones first. `sys.setswitchinterval` sets the GIL slice. asyncio debug mode logs callbacks slower than `loop.slow_callback_duration`.'
+
+  typescript:
+    before:
+      file: worker.ts
+      source: |
+        // worker.ts: one worker drains the jobs queue in arrival order
+        export async function run(queue: JobQueue): Promise<never> {
+          for (;;) {
+            const job = await queue.pop(); // FIFO
+            await handle(job);
+          }
+        }
+
+        async function handle(job: Job): Promise<void> {
+          switch (job.kind) {
+            case "password_reset":
+              return mail.sendReset(job.userId); // ~50 ms
+            case "thumbnail":
+              return media.thumbnail(job.imageId); // ~200 ms
+          }
+        }
+      roles: { sched: [2, 7], short: [11, 12], long: [13, 14], api: [4, 4] }
+      change:
+        - { after: 14, add: ['    case "invoice_export":', '      return billing.exportMonth(job.customerId); // ~2 min'] }
+    after:
+      file: worker.ts
+      source: |
+        // worker.ts: short jobs first; exports run in chunks and go to the back
+        export async function run(queue: JobQueue): Promise<never> {
+          for (;;) {
+            const job = await queue.popFirst("short", "long"); // short lane first
+            await handle(queue, job);
+          }
+        }
+
+        async function handle(queue: JobQueue, job: Job): Promise<void> {
+          switch (job.kind) {
+            case "password_reset":
+              return mail.sendReset(job.userId);
+            case "thumbnail":
+              return media.thumbnail(job.imageId);
+            case "invoice_export": {
+              const next = await billing.exportChunk(job.customerId, job.cursor, 1000); // ~1 s
+              if (next !== null) await queue.push("long", { ...job, cursor: next }); // back of the line
+            }
+          }
+        }
+      roles: { api: [4, 4], sched: [2, 7], rule: [4, 4], short: [11, 14], long: [15, 18], export: [16, 17], arrive: [4, 4], pick: [4, 4], run: [16, 16], slice: [17, 17], measure: [4, 4] }
+    again:
+      file: queue-wait.txt
+      source: |
+        // time from enqueue to start, on export night
+        // password_reset   p99 0.9 s   (was 118 s)
+        // invoice_export   total +3%   (one re-queue per 1,000 rows)
+    cost:
+      before: { text: "reset email waits up to 2 min", value: 0.9 }
+      after: { text: "waits ≤ one chunk, ~1 s", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'Node''s event loop is FIFO without preemption, phase by phase. Microtasks (resolved promises, `process.nextTick`) are a priority lane: all of them run before the loop moves on, so a chain of microtasks can starve timers and I/O. That is the opposite failure of a convoy: the short lane never empties.'
+      seenIn: 'BullMQ job priorities and named queues. `setImmediate` yields to I/O between chunks of work, where `await Promise.resolve()` does not.'
+
+  rust:
+    before:
+      file: worker.rs
+      source: |
+        // worker.rs: one worker drains the jobs queue in arrival order
+        pub async fn run(queue: JobQueue) -> anyhow::Result<()> {
+            loop {
+                let job = queue.pop().await?; // FIFO
+                handle(&job).await?;
+            }
+        }
+
+        async fn handle(job: &Job) -> anyhow::Result<()> {
+            match job {
+                Job::PasswordReset { user_id } => mail::send_reset(*user_id).await, // ~50 ms
+                Job::Thumbnail { image_id } => media::thumbnail(*image_id).await,  // ~200 ms
+            }
+        }
+      roles: { sched: [2, 7], short: [11, 11], long: [12, 12], api: [4, 4] }
+      change:
+        - { after: 12, add: ['            Job::InvoiceExport { customer_id, .. } => billing::export_month(*customer_id).await, // ~2 min'] }
+    after:
+      file: worker.rs
+      source: |
+        // worker.rs: short jobs first; exports run in chunks and go to the back
+        pub async fn run(queue: JobQueue) -> anyhow::Result<()> {
+            loop {
+                let job = queue.pop_first(&[Lane::Short, Lane::Long]).await?; // short lane first
+                handle(&queue, job).await?;
+            }
+        }
+
+        async fn handle(queue: &JobQueue, job: Job) -> anyhow::Result<()> {
+            match job {
+                Job::PasswordReset { user_id } => mail::send_reset(user_id).await,
+                Job::Thumbnail { image_id } => media::thumbnail(image_id).await,
+                Job::InvoiceExport { customer_id, cursor } => {
+                    let next = billing::export_chunk(customer_id, cursor, 1000).await?; // ~1 s
+                    if let Some(cursor) = next {
+                        queue.push(Lane::Long, Job::InvoiceExport { customer_id, cursor }).await?; // back of the line
+                    }
+                    Ok(())
+                }
+            }
+        }
+      roles: { api: [4, 4], sched: [2, 7], rule: [4, 4], short: [11, 12], long: [13, 19], export: [14, 17], arrive: [4, 4], pick: [4, 4], run: [14, 14], slice: [15, 17], measure: [4, 4] }
+    again:
+      file: queue-wait.txt
+      source: |
+        // time from enqueue to start, on export night
+        // password_reset   p99 0.9 s   (was 118 s)
+        // invoice_export   total +3%   (one re-queue per 1,000 rows)
+    cost:
+      before: { text: "reset email waits up to 2 min", value: 0.9 }
+      after: { text: "waits ≤ one chunk, ~1 s", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'Tokio gives each worker a FIFO run queue plus a LIFO slot for the task woken most recently, much like Go''s `runnext`. It cannot preempt, so it gives each task a budget of operations; when the budget runs out, resources report "not ready" and the task yields at its next `.await`. A loop with no `.await` ignores the budget entirely.'
+      seenIn: '`tokio::task::yield_now`, `tokio::task::unconstrained` (opts out of the budget). Separate `mpsc` channels per lane, polled with a biased `tokio::select!`, give a short-lane-first worker.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The API handlers push a reset email to the short lane and an export to the long lane. Each lane keeps arrival order.
+    nodes: [api, sched, short]
+    edges: [api>sched, sched>short]
+    role: arrive
+  - text: The worker asks the pick rule for the next job. The short lane goes first, an approximation of shortest-job-first that needs only a job's kind, not its exact length.
+    nodes: [rule, sched, short]
+    edges: [rule>sched, sched>short]
+    role: pick
+  - text: With the short lane empty, the worker takes the export from the long lane and runs one chunk of 1,000 rows, about a second.
+    nodes: [sched, long, export]
+    edges: [sched>long]
+    role: run
+  - text: The chunk ends and the export goes to the back of the long lane. That is a time slice. Any reset email that arrived meanwhile runs before the next chunk.
+    nodes: [export, long]
+    edges: [export>long]
+    role: slice
+  - text: A reset email now waits at most one chunk, its response time. The export takes a little longer in total, its turnaround, because it shares the worker.
+    nodes: [short, long]
+    edges: [sched>short, sched>long]
+    role: measure
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A worker runs jobs in arrival order. Two 50 ms emails wait while a 2-minute export runs. What is this called?
+    options:
+      - text: The convoy effect. Short jobs queue behind a long one and wait for all of it.
+        correct: true
+        why: Right. FIFO is fair in arrival order and terrible for short jobs that arrive after a long one.
+      - text: Starvation. The emails will never run.
+        why: They will run, after the export. Starvation means a job may wait forever because others keep being chosen ahead of it.
+      - text: A deadlock between the emails and the export.
+        why: Nothing waits for anything held by another job. They simply queue.
+  engineer:
+    question: A worker switches from FIFO to round robin, 1 s per turn. Five 10 s exports and one 50 ms email arrive together, the email last. What changes?
+    options:
+      - text: The email starts within about 5 s instead of up to 50 s, and the exports' average turnaround gets worse because they now share the worker.
+        correct: true
+        why: Right. Round robin improves response time and makes turnaround worse for jobs of similar length. That is the trade.
+      - text: Everything finishes sooner, because round robin uses the worker better.
+        why: The worker does the same total work. Taking turns adds switches and spreads every export out.
+      - text: Nothing, because the total work is the same.
+        why: The total is the same, but the order changes who waits, and response time depends only on the order.
+  deep:
+    question: All jobs arrive at once and run without I/O. Why does shortest-job-first give the lowest average turnaround?
+    options:
+      - text: Swap any long job that runs just before a shorter one, and the short job finishes earlier by the long job's length while the long one finishes later by only the short one's length.
+        correct: true
+        why: Right. Every such swap lowers the total, so the order with no long-before-short pair, shortest first, is optimal.
+      - text: Because short jobs use the CPU more efficiently.
+        why: The CPU does the same work either way. Only the waiting changes with the order.
+      - text: Because SJF preempts long jobs.
+        why: SJF does not preempt. Its preemptive form is STCF, which is what you need when jobs arrive at different times.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Ready queue
+      example: the job queue, a run queue
+      job: Holds the tasks that could run now.
+    - role: Policy
+      example: FIFO, SJF, STCF, round robin
+      job: Picks which ready task runs next.
+    - role: Preemption rule
+      example: "on arrival (STCF), after a slice (RR), never (FIFO, SJF)"
+      job: Decides when the running task may be stopped for another.
+    - role: Metric
+      example: turnaround, response time
+      job: What the policy is judged by. Batch work cares about turnaround, interactive work about response.
+  useWhen:
+    - A queue or pool mixes slow and fast work, and the fast work has a latency target.
+    - Choosing a slice or chunk size for long jobs. Long enough to amortise the switch, short enough that waiting work is not delayed much.
+    - Reading a latency histogram with a long tail that matches the length of your slowest job.
+  avoidWhen:
+    - All jobs are about the same length. FIFO is then as good as any order and simplest to reason about.
+  tradeoffs:
+    - Shortest-first minimises average turnaround but needs run times, and long jobs can wait indefinitely if short ones keep coming.
+    - Round robin bounds the wait to first run but stretches every job; a short slice adds switch overhead.
+    - Preemption needs a way to stop work midway, such as chunks in a job queue or the timer in a kernel.
+  lookalikes:
+    - name: Priority queue
+      how: Picks by an assigned priority, not by length. SJF is a priority queue keyed by run time.
+    - name: Fair queuing
+      how: Shares capacity between flows or tenants by weight. Round robin is its equal-weight form.
+    - name: Load balancing
+      how: Decides which worker gets a job. Scheduling decides which job a worker runs next.
+---
+
+## [concept] Scheduling basics
+
+**A scheduler picks which ready task runs next. Running the shortest work first gives the best <Term id="turnaround-time">turnaround time</Term>; taking turns gives the best <Term id="response-time">response time</Term>. No policy wins both.**
+
+The kernel's CPU scheduler, a thread pool and your own job queue face the same choice with the same metrics.
+
+<Depth level={2}>
+Four classic policies. **FIFO** runs jobs in arrival order, each to completion. **<Term id="shortest-job-first">SJF</Term>** runs the shortest job first, to completion. **<Term id="stcf">STCF</Term>** is preemptive SJF: when a job arrives, whichever has the least time left runs. **<Term id="round-robin">Round robin</Term>** runs each ready job for one <Term id="time-slice">time slice</Term> and moves it to the back. Turnaround is finish time minus arrival; response is first run minus arrival.
+</Depth>
+
+<Depth level={3}>
+The textbook setup assumes jobs that only compute and whose run times are known. Both assumptions are false in practice. Jobs block on I/O, and an OS treats each CPU burst between I/O waits as a separate short job, so the CPU runs one job while another waits on disk. Run times are unknown, which is why real schedulers estimate them from past behaviour. That is the next lesson.
+</Depth>
+
+## [problem] One worker, one queue, arrival order
+
+A web app sends password reset emails and makes thumbnails through a background job queue. One worker per instance pops jobs in arrival order and runs each to completion.
+
+Every job takes well under a second. FIFO is simple, fair in the obvious sense, and nobody has complained.
+
+<Depth level={2}>
+The mental model: fair means first come, first served, and the queue is fast because every job is fast. The queue is a scheduler, though, and FIFO only works while the jobs are about the same length.
+</Depth>
+
+<Depth level={3}>
+FIFO is also non-preemptive. Once a job starts, nothing runs on that worker until it finishes, however long it takes and whatever arrives behind it.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the monthly invoice export for each customer, about two minutes per job, now runs on the same job queue.
+
+The marked lines add it. On the first of the month, users ask for password resets and the emails arrive minutes later, after the reset links have expired. The workers are busy, but nothing is broken and no job is slow on its own. It is the <Term id="convoy-effect">convoy effect</Term>: every short job behind an export waits for all of it.
+
+<Depth level={2}>
+The queue-wait histogram shows the shape: most jobs start at once, and a tail matches the export length almost exactly. Adding workers moves the tail but keeps it, because each worker can still pick up an export ahead of a burst of emails.
+</Depth>
+
+<Depth level={3}>
+The cost meter shows the worst wait of a reset email. Its own run time is 50 ms. Nearly all of its turnaround is spent behind the export.
+</Depth>
+
+## [morph] From one FIFO queue to lanes and slices
+
+Drag the slider. The single FIFO queue becomes a worker with a pick rule: a short lane served first, and a long lane whose jobs run one chunk at a time.
+
+The code adds the two lanes and splits the export into chunks that re-queue themselves.
+
+<Depth level={2}>
+Two ideas from the classic policies, adapted to a queue where exact run times are unknown. The short lane approximates SJF by job kind. Chunking the export makes it preemptible, so the worker can take a turn at the short lane between chunks, as round robin does.
+</Depth>
+
+<Depth level={3}>
+The chunk size is the time slice. Ten-row chunks would re-queue thousands of times, each with a round trip to the queue. Ten-minute chunks would bring the convoy back. About a second keeps the overhead to a few percent and the email wait to about a second.
+</Depth>
+
+## [walk] Follow one email past an export
+
+One reset email and one export through the lanes. Step through it with the numbered buttons.
+
+<Depth level={3}>
+The kernel faces the same problem with no lanes declared for it. Linux's fair scheduler gives each runnable thread a share of the CPU and tracks how much each has used against its share. A thread that mostly sleeps, waiting on I/O, has used little, so when it wakes it is usually picked soon. The kernel learns from behaviour what this worker had to be told.
+</Depth>
+
+## [again] Export night, the second time
+
+The same exports, the same emails. A reset email now waits at most one chunk, about a second, and the exports take a few percent longer in total for the extra trips through the queue.
+
+<Depth level={2}>
+Measure both metrics. Queue wait per job kind is the response time; enqueue to done for an export is its turnaround. A policy change that improves one usually costs the other, and you want to see both numbers move.
+</Depth>
+
+<Depth level={3}>
+Shortest-first has a failure of its own: if short jobs never stop arriving, the long lane never runs. A worker that polls the short lane first needs a guard, such as taking a long-lane job every N short ones or after a maximum wait.
+</Depth>
+
+## [play] Race four schedulers
+
+Set arrival and run times for a handful of jobs and see FIFO, SJF, STCF and round robin side by side on one time axis, with turnaround and response for each.
+
+Start with the Convoy set, then break round robin with a tiny slice and a costly switch.
+
+## [lens] How each runtime orders its own work
+
+Every runtime has a scheduler of its own between your code and the kernel. Go's is close to round robin with a 10 ms slice. asyncio's and Node's are FIFO without preemption. Tokio's is FIFO with a budget.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="scheduling-basics" />
+
+### The classic examples
+
+| Jobs (arrival, run) | FIFO | SJF | STCF | Round robin, 1 ms |
+|---|---|---|---|---|
+| A, B, C at 0, 10 ms each | turnaround 20 | 20 | 20 | turnaround 29, response 1 |
+| A 100 ms at 0, B and C 10 ms at 0 | 110 | 50 | 50 | 56.7 at a 10 ms slice |
+| A 100 ms at 0, B and C 10 ms at 10 | 103.3 | 103.3 | 50 | 50 at a 10 ms slice |
+
+Averages in milliseconds. The FIFO, SJF and STCF figures match the examples in OSTEP's scheduling chapter, and the playground reproduces every cell.

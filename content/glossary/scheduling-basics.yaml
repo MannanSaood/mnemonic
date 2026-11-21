@@ -1,0 +1,19 @@
+# Terms introduced by the scheduling basics lesson.
+- id: turnaround-time
+  term: Turnaround time
+  short: How long a job takes from arriving to finishing, waiting included. The metric batch work cares about.
+- id: response-time
+  term: Response time
+  short: How long a job waits from arriving until it first runs. The metric interactive work cares about.
+- id: convoy-effect
+  term: Convoy effect
+  short: Short jobs queued behind one long job, all waiting for it to finish. FIFO scheduling causes it.
+- id: shortest-job-first
+  term: Shortest job first (SJF)
+  short: Run the job with the shortest total run time next, to completion. Best average turnaround when all jobs arrive together, but it needs run times in advance.
+- id: stcf
+  term: Shortest time-to-completion first (STCF)
+  short: The preemptive form of SJF. When a job arrives, run whichever job has the least time left, preempting the current one if needed.
+- id: round-robin
+  term: Round robin
+  short: Run each ready job for one time slice, then move it to the back of the queue. Good response time, poor turnaround.
