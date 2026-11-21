@@ -1,0 +1,15 @@
+- id: liskov-substitution
+  term: Liskov substitution principle
+  short: Code written against a type must keep working, unchanged, when given any of its subtypes. A subtype has to keep the promises of the type it replaces.
+- id: behavioural-subtyping
+  term: Behavioural subtyping
+  short: Subtyping judged by behaviour, not only by method signatures. Barbara Liskov and Jeannette Wing defined it formally in 1994.
+- id: precondition
+  term: Precondition
+  short: What must be true before a method is called, such as "the key is at most 1024 bytes". A subtype may accept more, never less.
+- id: postcondition
+  term: Postcondition
+  short: What a method promises is true after it returns, such as "get(k) now returns the data". A subtype may promise more, never less.
+- id: history-constraint
+  term: History constraint
+  short: Liskov and Wing's rule that a subtype may not allow state changes its supertype rules out, such as making an immutable value changeable.

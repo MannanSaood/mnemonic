@@ -1,0 +1,587 @@
+---
+title: Liskov substitution
+track: design-patterns
+group: Principles
+order: 15
+summary: Any implementation of an interface must keep every promise the interface makes, so callers never need to know which one they were given.
+intent: Code that works with one implementation of an interface should work, unchanged, with every other implementation.
+changeRequest: Compliance moves closed years to cold storage, and the customer portal must still show those invoices with previews.
+languages: [go, python, typescript, rust]
+glossary: [liskov-substitution, behavioural-subtyping, precondition, postcondition, history-constraint, interface]
+
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, testing]
+depths: [overview, engineer, deep]
+
+playground:
+  model: liskov-substitution
+  scenarios:
+    - try: "Answer the prediction, then plug ArchiveStore in where S3 was."
+      notice: "It compiles, and three of four callers break. Only the monthly report, which never writes, gets a perfect substitute."
+    - try: "Plug in ReplicaStore and NfsStore, and open the Thumbnailer's trace for each."
+      notice: "The replica throws nothing at all; it quietly promises less after a write. The NFS share fails only on long keys, so short-key tests passed."
+    - try: "Try each fix for ArchiveStore and watch the four counters."
+      notice: "Type checks and a weaker contract hide the crash and leave the feature broken. Splitting the interface turns the failures into build errors."
+    - try: "Get every pair to work or be refused by the compiler, with no caller naming a backend."
+      notice: "Fix the replica and the NFS store inside themselves. Substitutability is the implementation's job, not the caller's."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 8, y: 30, w: 90, h: 48, title: portal, sub: shows invoices }
+      after:  { x: 8, y: 100, w: 90, h: 48, title: portal, sub: wires stores }
+    - id: context
+      kind: context
+      before: { x: 116, y: 14, w: 176, h: 140, title: Preview, sub: "Get, then Put the cache" }
+      after:  { x: 120, y: 100, w: 120, h: 52, title: Preview, sub: src · cache }
+    - id: reader
+      kind: strategy
+      appears: after
+      before: { x: 300, y: 20, w: 120, h: 50, title: "" }
+      after:  { x: 300, y: 20, w: 120, h: 50, title: BlobReader, sub: Get }
+    - id: store
+      kind: strategy
+      before: { x: 330, y: 40, w: 220, h: 56, title: BlobStore, sub: Get · Put · Delete }
+      after:  { x: 418, y: 104, w: 134, h: 50, title: BlobStore, sub: reader + Put }
+    - id: archive
+      kind: concrete
+      before: { x: 300, y: 196, w: 120, h: 48, title: ArchiveStore, sub: Put → read-only }
+      after:  { x: 300, y: 196, w: 120, h: 48, title: ArchiveStore, sub: Get only }
+    - id: s3
+      kind: concrete
+      before: { x: 440, y: 196, w: 112, h: 48, title: S3Store, sub: all three }
+      after:  { x: 440, y: 196, w: 112, h: 48, title: S3Store, sub: all three }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: context, to: reader, label: reads }
+    - { from: context, to: store, label: caches }
+    - { from: archive, to: reader, kind: implements }
+    - { from: s3, to: store, kind: implements }
+
+code:
+  go:
+    before:
+      file: blob.go · archive.go · preview.go
+      source: |
+        // blob.go
+        type BlobStore interface {
+            Get(ctx context.Context, key string) ([]byte, error)
+            Put(ctx context.Context, key string, data []byte) error
+            Delete(ctx context.Context, key string) error
+        }
+
+        // archive.go: closed years, moved to cold storage
+        type ArchiveStore struct{ vault *coldstore.Vault }
+
+        func (a ArchiveStore) Get(ctx context.Context, key string) ([]byte, error) {
+            return a.vault.Read(ctx, key)
+        }
+        func (a ArchiveStore) Put(context.Context, string, []byte) error { return ErrReadOnly }
+        func (a ArchiveStore) Delete(context.Context, string) error      { return ErrReadOnly }
+
+        // preview.go
+        func Preview(ctx context.Context, s BlobStore, key string) ([]byte, error) {
+            if p, err := s.Get(ctx, "previews/"+key); err == nil {
+                return p, nil
+            }
+            img, err := s.Get(ctx, key)
+            if err != nil {
+                return nil, err
+            }
+            p := resize(img, 320)
+            return p, s.Put(ctx, "previews/"+key, p)
+        }
+      roles: { store: [2, 6], archive: [8, 15], context: [17, 28] }
+      change:
+        - { after: 26, add: ['    if _, ok := s.(ArchiveStore); ok {', '        return p, nil // the archive cannot cache', '    }'] }
+        - { after: 28, add: ['// upload.go and retention.go need the same check'] }
+    after:
+      file: blob.go · archive.go · preview.go · main.go
+      source: |
+        // blob.go
+        type BlobReader interface {
+            Get(ctx context.Context, key string) ([]byte, error)
+        }
+
+        type BlobStore interface {
+            BlobReader
+            Put(ctx context.Context, key string, data []byte) error
+            Delete(ctx context.Context, key string) error
+        }
+
+        // archive.go: promises only what it can keep
+        type ArchiveStore struct{ vault *coldstore.Vault }
+
+        func (a ArchiveStore) Get(ctx context.Context, key string) ([]byte, error) {
+            return a.vault.Read(ctx, key)
+        }
+
+        // preview.go: reads from any reader, caches in a real store
+        func Preview(ctx context.Context, src BlobReader, cache BlobStore, key string) ([]byte, error) {
+            if p, err := cache.Get(ctx, "previews/"+key); err == nil {
+                return p, nil
+            }
+            img, err := src.Get(ctx, key)
+            if err != nil {
+                return nil, err
+            }
+            p := resize(img, 320)
+            return p, cache.Put(ctx, "previews/"+key, p)
+        }
+
+        // main.go
+        p, err := Preview(ctx, s3, s3, key)
+        // Preview(ctx, archive, archive, key) does not compile: ArchiveStore has no Put or Delete
+      roles: { reader: [2, 4], store: [6, 10], archive: [12, 17], context: [19, 30], client: [32, 34], wire: [33, 33], read: [24, 24], cache: [29, 29], refuse: [34, 34] }
+    again:
+      file: portal.go
+      source: |
+        // portal.go: closed years come from the archive; previews are cached in S3
+        p, err := Preview(ctx, archive, s3, key)
+        // Preview, upload.go and retention.go do not change.
+    cost:
+      before: { text: a type check in every caller that writes, value: 0.8 }
+      after: { text: 1 line of wiring · 0 callers edited, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Go builds big interfaces out of small ones by embedding, as `BlobStore` embeds `BlobReader`. A type assertion such as `s.(ArchiveStore)` in a caller is the usual sign that substitution failed.'
+      seenIn: '`io.Reader`, `io.Writer` and `io.ReadWriter` are composed the same way: `bytes.Reader` is a Reader and not a Writer. `net/http` checks for optional extras such as `http.Flusher` with a type assertion, and documents that callers must handle their absence.'
+
+  python:
+    before:
+      file: blob.py · archive.py · preview.py
+      source: |
+        # blob.py
+        class BlobStore(Protocol):
+            def get(self, key: str) -> bytes: ...
+            def put(self, key: str, data: bytes) -> None: ...
+            def delete(self, key: str) -> None: ...
+
+        # archive.py: closed years, moved to cold storage
+        class ArchiveStore:
+            def __init__(self, vault: Vault):
+                self.vault = vault
+
+            def get(self, key: str) -> bytes:
+                return self.vault.read(key)
+
+            def put(self, key: str, data: bytes) -> None:
+                raise ReadOnlyError(key)
+
+            def delete(self, key: str) -> None:
+                raise ReadOnlyError(key)
+
+        # preview.py
+        def preview(store: BlobStore, key: str) -> bytes:
+            try:
+                return store.get(f"previews/{key}")
+            except NotFound:
+                pass
+            p = resize(store.get(key), 320)
+            store.put(f"previews/{key}", p)
+            return p
+      roles: { store: [2, 5], archive: [7, 19], context: [21, 29] }
+      change:
+        - { after: 27, add: ['    if isinstance(store, ArchiveStore):', '        return p  # the archive cannot cache'] }
+        - { after: 29, add: ['# upload.py and retention.py need the same check'] }
+    after:
+      file: blob.py · archive.py · preview.py · main.py
+      source: |
+        # blob.py
+        class BlobReader(Protocol):
+            def get(self, key: str) -> bytes: ...
+
+        class BlobStore(BlobReader, Protocol):
+            def put(self, key: str, data: bytes) -> None: ...
+            def delete(self, key: str) -> None: ...
+
+        # archive.py: promises only what it can keep
+        class ArchiveStore:
+            def __init__(self, vault: Vault):
+                self.vault = vault
+
+            def get(self, key: str) -> bytes:
+                return self.vault.read(key)
+
+        # preview.py: reads from any reader, caches in a real store
+        def preview(src: BlobReader, cache: BlobStore, key: str) -> bytes:
+            try:
+                return cache.get(f"previews/{key}")
+            except NotFound:
+                pass
+            p = resize(src.get(key), 320)
+            cache.put(f"previews/{key}", p)
+            return p
+
+        # main.py
+        img = preview(s3, s3, key)
+        # preview(archive, archive, key) fails type checking: ArchiveStore has no put
+      roles: { reader: [2, 3], store: [5, 7], archive: [9, 15], context: [17, 25], client: [27, 29], wire: [28, 28], read: [23, 23], cache: [24, 24], refuse: [29, 29] }
+    again:
+      file: portal.py
+      source: |
+        # portal.py: closed years come from the archive; previews are cached in S3
+        img = preview(archive, s3, key)
+        # preview, upload.py and retention.py do not change.
+    cost:
+      before: { text: an isinstance check in every caller that writes, value: 0.8 }
+      after: { text: 1 line of wiring · 0 callers edited, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Duck typing makes substitution the default, so the promise matters even more: nothing stops a read-only object from reaching a writer until it runs. Protocols let mypy or pyright catch it before that.'
+      seenIn: '`collections.abc.Sequence` and `MutableSequence` split reading from writing: a `tuple` is a Sequence and not a MutableSequence. `typing.Mapping` versus `MutableMapping` does the same for dicts.'
+
+  typescript:
+    before:
+      file: blob.ts · archive.ts · preview.ts
+      source: |
+        // blob.ts
+        export interface BlobStore {
+          get(key: string): Promise<Uint8Array>;
+          put(key: string, data: Uint8Array): Promise<void>;
+          delete(key: string): Promise<void>;
+        }
+
+        // archive.ts: closed years, moved to cold storage
+        export class ArchiveStore implements BlobStore {
+          constructor(private readonly vault: Vault) {}
+          get(key: string) { return this.vault.read(key); }
+          async put(): Promise<void> { throw new ReadOnlyError(); }
+          async delete(): Promise<void> { throw new ReadOnlyError(); }
+        }
+
+        // preview.ts
+        export async function preview(store: BlobStore, key: string): Promise<Uint8Array> {
+          const cached = await store.get(`previews/${key}`).catch(() => null);
+          if (cached) return cached;
+          const p = resize(await store.get(key), 320);
+          await store.put(`previews/${key}`, p);
+          return p;
+        }
+      roles: { store: [2, 6], archive: [8, 14], context: [16, 23] }
+      change:
+        - { after: 20, add: ['  if (store instanceof ArchiveStore) return p; // the archive cannot cache'] }
+        - { after: 23, add: ['// upload.ts and retention.ts need the same check'] }
+    after:
+      file: blob.ts · archive.ts · preview.ts · main.ts
+      source: |
+        // blob.ts
+        export interface BlobReader {
+          get(key: string): Promise<Uint8Array>;
+        }
+
+        export interface BlobStore extends BlobReader {
+          put(key: string, data: Uint8Array): Promise<void>;
+          delete(key: string): Promise<void>;
+        }
+
+        // archive.ts: promises only what it can keep
+        export class ArchiveStore implements BlobReader {
+          constructor(private readonly vault: Vault) {}
+          get(key: string) { return this.vault.read(key); }
+        }
+
+        // preview.ts: reads from any reader, caches in a real store
+        export async function preview(src: BlobReader, cache: BlobStore, key: string): Promise<Uint8Array> {
+          const cached = await cache.get(`previews/${key}`).catch(() => null);
+          if (cached) return cached;
+          const p = resize(await src.get(key), 320);
+          await cache.put(`previews/${key}`, p);
+          return p;
+        }
+
+        // main.ts
+        const img = await preview(s3, s3, key);
+        // preview(archive, archive, key) is a type error: ArchiveStore has no put or delete
+      roles: { reader: [2, 4], store: [6, 9], archive: [11, 15], context: [17, 24], client: [26, 28], wire: [27, 27], read: [21, 21], cache: [22, 22], refuse: [28, 28] }
+    again:
+      file: portal.ts
+      source: |
+        // portal.ts: closed years come from the archive; previews are cached in S3
+        const img = await preview(archive, s3, key);
+        // preview, upload.ts and retention.ts do not change.
+    cost:
+      before: { text: an instanceof check in every caller that writes, value: 0.8 }
+      after: { text: 1 line of wiring · 0 callers edited, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The before code compiles even though `put()` takes no parameters: TypeScript lets a method with fewer parameters satisfy one with more. The checker compares shapes; what the method promises is up to you.'
+      seenIn: '`ReadonlyArray<T>` and `ReadonlyMap<K, V>` are the read-only halves of `Array` and `Map`. Node streams split `Readable` and `Writable`, with `Duplex` for both.'
+
+  rust:
+    before:
+      file: blob.rs · archive.rs · preview.rs
+      source: |
+        // blob.rs
+        pub trait BlobStore {
+            fn get(&self, key: &str) -> Result<Vec<u8>, StoreError>;
+            fn put(&self, key: &str, data: &[u8]) -> Result<(), StoreError>;
+            fn delete(&self, key: &str) -> Result<(), StoreError>;
+        }
+
+        // archive.rs: closed years, moved to cold storage
+        pub struct ArchiveStore { vault: Vault }
+
+        impl BlobStore for ArchiveStore {
+            fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> { self.vault.read(key) }
+            fn put(&self, _: &str, _: &[u8]) -> Result<(), StoreError> { Err(StoreError::ReadOnly) }
+            fn delete(&self, _: &str) -> Result<(), StoreError> { Err(StoreError::ReadOnly) }
+        }
+
+        // preview.rs
+        pub fn preview(store: &dyn BlobStore, key: &str) -> Result<Vec<u8>, StoreError> {
+            if let Ok(p) = store.get(&format!("previews/{key}")) {
+                return Ok(p);
+            }
+            let p = resize(&store.get(key)?, 320);
+            store.put(&format!("previews/{key}"), &p)?;
+            Ok(p)
+        }
+      roles: { store: [2, 6], archive: [8, 15], context: [17, 25] }
+      change:
+        - { after: 5, add: ['    fn is_read_only(&self) -> bool { false }'] }
+        - { after: 14, add: ['    fn is_read_only(&self) -> bool { true }'] }
+        - { after: 22, add: ['    if store.is_read_only() { return Ok(p); } // the archive cannot cache'] }
+    after:
+      file: blob.rs · archive.rs · preview.rs · main.rs
+      source: |
+        // blob.rs
+        pub trait BlobReader {
+            fn get(&self, key: &str) -> Result<Vec<u8>, StoreError>;
+        }
+
+        pub trait BlobStore: BlobReader {
+            fn put(&self, key: &str, data: &[u8]) -> Result<(), StoreError>;
+            fn delete(&self, key: &str) -> Result<(), StoreError>;
+        }
+
+        // archive.rs: promises only what it can keep
+        pub struct ArchiveStore { vault: Vault }
+
+        impl BlobReader for ArchiveStore {
+            fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> { self.vault.read(key) }
+        }
+
+        // preview.rs: reads from any reader, caches in a real store
+        pub fn preview(src: &dyn BlobReader, cache: &dyn BlobStore, key: &str) -> Result<Vec<u8>, StoreError> {
+            if let Ok(p) = cache.get(&format!("previews/{key}")) {
+                return Ok(p);
+            }
+            let p = resize(&src.get(key)?, 320);
+            cache.put(&format!("previews/{key}"), &p)?;
+            Ok(p)
+        }
+
+        // main.rs
+        let img = preview(&s3, &s3, key)?;
+        // preview(&archive, &archive, key) fails: the trait bound `ArchiveStore: BlobStore` is not satisfied
+      roles: { reader: [2, 4], store: [6, 9], archive: [11, 16], context: [18, 26], client: [28, 30], wire: [29, 29], read: [23, 23], cache: [24, 24], refuse: [30, 30] }
+    again:
+      file: portal.rs
+      source: |
+        // portal.rs: closed years come from the archive; previews are cached in S3
+        let img = preview(&archive, &s3, key)?;
+        // preview, upload.rs and retention.rs do not change.
+    cost:
+      before: { text: a new trait method · a check in every caller that writes, value: 0.85 }
+      after: { text: 1 line of wiring · 0 callers edited, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Rust has no subclassing, so substitution is about trait implementations. Supertraits (`BlobStore: BlobReader`) split capabilities, and a function asks for the smallest trait it needs. An `is_read_only()` method on the trait is the same type check in disguise.'
+      seenIn: '`std::io::Read` and `std::io::Write` are separate traits, so a read-only source is never passed where a sink is needed. Shared `&[T]` versus `&mut [T]` makes the same split for slices.'
+
+walk:
+  - text: The portal wires Preview with a source to read from and a cache to write to. Here both are the S3 store.
+    nodes: [client, context]
+    edges: [client>context]
+    role: wire
+  - text: Preview reads the original through BlobReader. Any reader works, the archive included, because reading is all it asks for.
+    nodes: [context, reader, archive]
+    edges: [context>reader, archive>reader]
+    role: read
+  - text: It writes the preview through BlobStore. Only types that can really store are allowed here.
+    nodes: [context, store, s3]
+    edges: [context>store, s3>store]
+    role: cache
+  - text: Passing the archive as the cache is refused when the code is built. The mistake that used to fail in production now fails in the editor.
+    nodes: [archive, store]
+    edges: []
+    role: refuse
+
+checks:
+  overview:
+    question: All three of these implement BlobStore. Which one breaks the Liskov substitution principle?
+    options:
+      - text: A read-only archive whose Put always returns a read-only error.
+        correct: true
+        why: Right. Callers were promised that Put stores the data. The archive compiles and then breaks every caller that writes.
+      - text: A store that compresses data on Put and decompresses it on Get.
+        why: Callers get back exactly what they stored. How the bytes sit on disk is invisible to them, so this keeps the contract.
+      - text: A store that is ten times faster than S3.
+        why: Doing what was promised, faster, keeps the contract. A subtype may promise more than its supertype.
+  engineer:
+    question: A new replica-backed store sometimes returns NotFound for about a second after a successful Put. It never throws anything new. Is it substitutable for S3Store?
+    options:
+      - text: No. Since December 2020 S3 promises strong read-after-write consistency, and callers such as the Thumbnailer rely on it. The replica weakens that postcondition.
+        correct: true
+        why: Right. Substitutability is about every promise callers rely on, including ones the types cannot express. Fix it in the store, for example by reading your own recent writes from the primary.
+      - text: Yes. It implements every method with the right signature and adds no new error types.
+        why: Signatures are only part of the contract. A weaker guarantee after a write breaks callers just as surely as an exception does, and more quietly.
+      - text: Yes, as long as callers add a short retry after every Put.
+        why: Then every caller is changed to suit one implementation, which is exactly the cost the principle exists to avoid.
+  deep:
+    question: An ImmutableConfig type promises its values never change after loading. A ReloadableConfig adds a reload() method and keeps every existing method's behaviour. Callers only call get(). Is ReloadableConfig a behavioural subtype?
+    options:
+      - text: No. Callers of ImmutableConfig may cache values forever. A subtype that allows changes the supertype rules out breaks Liskov and Wing's history constraint.
+        correct: true
+        why: Right. Each method looks fine on its own, but the history of the object can now include changes no ImmutableConfig ever has. This is the same reason a mutable point is not a subtype of an immutable one.
+      - text: Yes. Every existing method keeps its pre- and postconditions, and new methods are always allowed.
+        why: New methods are allowed only if they cannot produce states or changes the supertype forbids. reload() can.
+      - text: Yes, because callers never call reload() themselves.
+        why: Someone else can call it on the same object. A caller holding an ImmutableConfig sees values change that were promised never to change.
+
+reference:
+  roles:
+    - role: Contract
+      example: { go: "BlobStore (interface + doc)", python: "BlobStore (Protocol + docstring)", typescript: "BlobStore (interface + doc)", rust: "BlobStore (trait + doc)" }
+      job: The methods and the promises around them, including the ones the types cannot express.
+    - role: Substitute
+      example: S3Store, ArchiveStore
+      job: An implementation that keeps every promise of the contract it claims.
+    - role: Caller
+      example: Preview, Upload API, Retention job
+      job: Relies on the contract only, and never asks which implementation it holds.
+  useWhen:
+    - Several implementations sit behind one interface and callers must not care which one they get.
+    - A new implementation can only do part of what the interface promises. Split the interface instead of throwing.
+    - You write contract tests, a shared suite every implementation must pass.
+  avoidWhen:
+    - Treating it as a ban on all type checks. Optional capabilities, such as Go's http.Flusher, are a documented part of some contracts.
+    - Promising more in the interface than any implementation needs. Every promise is a burden on every future implementation.
+  tradeoffs:
+    - More, smaller interfaces to name and keep in step.
+    - Some promises (consistency, timing, ordering) cannot be written in types, only in docs and tests.
+    - A stricter contract excludes implementations that would be good enough for some callers.
+  lookalikes:
+    - name: Interface segregation
+      how: The usual fix for a failed substitution. Split the interface so each implementation claims only what it can keep.
+    - name: Design by contract
+      how: Bertrand Meyer's discipline of explicit pre- and postconditions. It gives LSP its rules for what a subtype may change.
+    - name: Adapter
+      how: Makes a type fit an interface it does not match. LSP asks whether, once it fits, it behaves.
+---
+
+## [concept] Liskov substitution
+
+**Every implementation of an interface must keep every promise the interface makes. Then callers never need to know which one they were given.**
+
+Barbara Liskov stated it in 1987: a type S is a subtype of T if programs written for T behave the same when given an S. The <Term id="liskov-substitution">Liskov substitution principle</Term> is that rule applied to everyday code. Matching method names and signatures is not enough. The behaviour callers rely on has to match too.
+
+<Depth level={2}>
+The promises are a method's <Term id="precondition">preconditions</Term> (what it accepts), its <Term id="postcondition">postconditions</Term> (what it guarantees afterwards) and the errors it may return. An implementation may accept more and promise more. It may not demand more, promise less or fail in new ways. When it does, callers start checking which implementation they hold, and every new one means editing them.
+</Depth>
+
+<Depth level={3}>
+Liskov gave the substitution property in her OOPSLA 1987 keynote, "Data Abstraction and Hierarchy". In 1994 she and Jeannette Wing defined <Term id="behavioural-subtyping">behavioural subtyping</Term> formally in "A Behavioral Notion of Subtyping": any property provable about objects of the supertype must hold for objects of the subtype. They added the <Term id="history-constraint">history constraint</Term>, so a subtype cannot allow state changes its supertype rules out. Robert C. Martin made it the L in SOLID, and in *Clean Architecture* he applies it beyond classes, to any set of implementations behind one interface, including services behind one REST API.
+</Depth>
+
+## [problem] An archive that cannot store
+
+Every store implements BlobStore, and every caller was written against S3. A new ArchiveStore holds closed years in cold storage. Writes there are switched off, so its Put and Delete return a read-only error.
+
+Read it once. It compiles. Nothing in the types says Put might refuse.
+
+<Depth level={2}>
+Preview reads an image, makes a smaller copy and caches it with Put. With S3 that always works. With the archive, the read succeeds and the cache write fails, so the preview fails too.
+</Depth>
+
+<Depth level={3}>
+The archive breaks the contract by adding a failure the callers were never told about. Returning an error value instead of throwing changes nothing: callers written against S3 treat any error from Put as a real failure.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** compliance moves closed years to cold storage, and the customer portal must still show those invoices with previews.
+
+The quick fix goes into Preview: if the store is the archive, skip the cache. The marked lines show it. The same check goes into every other caller that writes.
+
+<Depth level={2}>
+Each check names one implementation, so the callers now depend on the archive. The next read-only store, a legal-hold bucket say, needs the same edits in the same places. Martin's taxi example in *Clean Architecture* ends the same way: one dispatch service that broke the shared REST contract forced special-case code into the system that used them all.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The type assertion `s.(ArchiveStore)` compiles anywhere, so nothing reminds you to add it to the next caller. A wrapper around the archive would also slip past it.</Lang>
+<Lang only="python">`isinstance` checks the class, so a wrapper or a second read-only class slips past it.</Lang>
+<Lang only="typescript">`instanceof` checks the prototype chain at runtime. A plain object with the same shape, or an archive from another copy of the package, slips past it.</Lang>
+<Lang only="rust">There is no cheap runtime type check on a `&dyn BlobStore`, so the fix grows the trait instead. `is_read_only()` now sits on every store, and every new store must answer it.</Lang>
+</Depth>
+
+## [morph] Promise only what you can keep
+
+Drag the slider. BlobStore splits into a BlobReader that only reads and a BlobStore that adds writes. The archive implements only BlobReader. Preview asks for a reader for the source and a store for the cache.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The archive can do exactly what it did before. It now claims only what it can do, and a caller that needs writes cannot be given it. That turns a runtime failure into a build error, and it is the <Term id="interface">interface</Term> split that the next lesson names.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Embedding `BlobReader` in `BlobStore` means every BlobStore is automatically a BlobReader, so S3 can be passed as either.</Lang>
+<Lang only="python">`BlobStore(BlobReader, Protocol)` extends one protocol with another. A class with all three methods matches both without naming either.</Lang>
+<Lang only="typescript">`BlobStore extends BlobReader`, so an S3 store fits both by shape. ArchiveStore lacks `put`, and the checker refuses it where a BlobStore is needed.</Lang>
+<Lang only="rust">`trait BlobStore: BlobReader` makes BlobReader a supertrait. Every BlobStore must also implement BlobReader, and a `&dyn BlobStore` can call `get`.</Lang>
+</Depth>
+
+## [walk] Follow one preview
+
+One preview through the split design, and the one mistake it now refuses. Step through it with the numbered buttons.
+
+<Depth level={3}>
+Nothing extra happens at runtime. The calls go through the interface exactly as before. All of the new safety comes from the types: the check moved from production to the build.
+</Depth>
+
+## [again] Cold storage, the second time
+
+The portal passes the archive as the source and S3 as the cache. Preview does not change, and neither does any other caller. A caller that writes cannot be given the archive by mistake, because that no longer builds.
+
+<Depth level={2}>
+Not every promise fits in a type. Read-after-write consistency, key limits and timing live in documentation and tests. A shared contract test suite, run against every implementation, is how teams catch those breaks before callers do.
+</Depth>
+
+<Depth level={3}>
+Contract tests are Liskov's definition made executable: one suite written against the interface, run once per implementation. If the replica fails the "get after put" test, it is not a BlobStore yet, whatever the compiler says.
+</Depth>
+
+## [play] Plug every backend into every caller
+
+Four callers were written against S3. Three new backends implement the same interface and all of them compile. Plug each one in, read the traces, and find out what the compiler could not tell you.
+
+Then try the fixes, and look for the ones that do not spread knowledge of one backend into every caller.
+
+## [lens] How each language writes it
+
+The principle is the same everywhere. What the compiler can catch is not: Go and Rust refuse a missing method at build time, TypeScript checks shapes, and Python relies on a type checker you choose to run.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="liskov-substitution" />
+
+### The rules, in one place
+
+Liskov and Wing's rules for a behavioural subtype, in the words of this lesson: accept at least the inputs the interface accepts; guarantee at least what it guarantees; fail only in the ways it says it may fail; keep its invariants; and allow no state changes it rules out. Anything else a subtype adds is fine.
