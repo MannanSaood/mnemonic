@@ -3,6 +3,5 @@ node_modules/
 out/
 *.tsbuildinfo
 next-env.d.ts
-# Reference books and PDFs: local only, never committed or published
-reference/books/
-reference/**/*.pdf
+# Reference material (books, notes, private guides): local only, never committed or published
+reference/
