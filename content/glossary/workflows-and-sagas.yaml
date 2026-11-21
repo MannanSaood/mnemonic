@@ -1,0 +1,16 @@
+# Terms introduced by software-architecture/workflows-and-sagas
+- id: saga
+  term: Saga
+  short: A business transaction split into a sequence of local transactions, each in one service, where every step that succeeded has a compensating action that runs if a later step fails (Garcia-Molina and Salem, 1987).
+- id: compensating-transaction
+  term: Compensating transaction
+  short: A new action that semantically undoes an earlier step of a saga, such as a refund for a charge. It does not erase the step; others may already have seen it.
+- id: orchestration
+  term: Orchestration
+  short: A workflow style where one coordinator tells each service what to do next and tracks the workflow's state.
+- id: choreography
+  term: Choreography
+  short: A workflow style with no coordinator. Each service reacts to the events of others and publishes its own, so the flow lives in the subscriptions.
+- id: saga-log
+  term: Saga log
+  short: The durable record of which saga steps have started, completed and been compensated, so a coordinator that crashes can resume or undo the saga. Workflow engines keep it as the workflow history.

@@ -1,0 +1,585 @@
+---
+title: Orchestration, choreography and sagas
+track: software-architecture
+group: Distributed workflows
+order: 13
+summary: A workflow that spans services cannot roll back as one transaction. Run it as a saga, local steps each with a compensating action, coordinated by an orchestrator or by events.
+intent: When a step fails halfway through an order, every earlier step must be undone, and something durable must know which ones.
+changeRequest: Book a courier after the payment. If no courier serves the address, cancel the order and refund the customer.
+languages: [go, python, typescript, rust]
+glossary: [saga, compensating-transaction, orchestration, choreography, saga-log, idempotency-key, transactional-outbox, eventual-consistency]
+
+prerequisites: []
+skills: [architecture, distributed-systems]
+depths: [overview, engineer, deep]
+
+playground:
+  model: workflows-and-sagas
+  scenarios:
+    - try: "Answer the prediction, then press Next message until the saga ends. Shipping is set to fail."
+      notice: "The orchestrator refunds the card, releases the stock and rejects the order, newest step first. For several messages a pending order with a real charge was visible to everyone."
+    - try: "Click Payments to make the card fail instead, untick Compensating actions and run to the end."
+      notice: "The order is rejected, but Inventory still holds a unit for it. Nothing in any database says it should be released."
+    - try: "Make Shipping fail again, tick Orchestrator crashes and untick Durable saga log."
+      notice: "The restarted orchestrator has no record of order 1042. The card stays charged and the order stays pending. Tick the durable log and the same crash recovers."
+    - try: "Switch to Choreography, tick Inventory never subscribed to failure events, and fail Payments."
+      notice: "Fewer messages and no coordinator, but the release depends on Inventory listening for PaymentFailed. One missing subscription leaves stock held forever."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 52, title: Checkout API, sub: POST /orders }
+      after:  { x: 12, y: 30, w: 112, h: 52, title: Checkout API, sub: starts saga }
+    - id: context
+      kind: context
+      before: { x: 146, y: 14, w: 210, h: 150, title: PlaceOrder, sub: BEGIN · remote calls · COMMIT }
+      after:  { x: 146, y: 30, w: 180, h: 60, title: Order saga, sub: durable workflow }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 146, y: 196, w: 180, h: 56, title: "" }
+      after:  { x: 146, y: 160, w: 180, h: 60, title: Undo stack, sub: newest first }
+    - id: inventory
+      kind: concrete
+      before: { x: 380, y: 20, w: 168, h: 44, title: Inventory, sub: reserve }
+      after:  { x: 360, y: 20, w: 188, h: 44, title: Inventory, sub: reserve · release }
+    - id: payments
+      kind: concrete
+      before: { x: 380, y: 84, w: 168, h: 44, title: Payments, sub: charge }
+      after:  { x: 360, y: 88, w: 188, h: 44, title: Payments, sub: charge · refund }
+    - id: shipping
+      kind: concrete
+      appears: change
+      before: { x: 380, y: 170, w: 168, h: 44, title: Shipping, sub: new step }
+      after:  { x: 360, y: 156, w: 188, h: 44, title: Shipping, sub: book courier }
+  edges:
+    - { from: client, to: context, label: starts }
+    - { from: context, to: inventory }
+    - { from: context, to: payments }
+    - { from: context, to: shipping }
+    - { from: context, to: strategy, label: records undo }
+
+code:
+  go:
+    before:
+      file: checkout/place_order.go
+      source: |
+        // checkout/place_order.go: one local transaction around remote calls
+        func (s *Server) PlaceOrder(ctx context.Context, o Order) error {
+            tx, err := s.db.BeginTx(ctx, nil)
+            if err != nil {
+                return err
+            }
+            defer tx.Rollback() // if anything fails, nothing happened
+            if _, err := tx.ExecContext(ctx, insertOrder, o.ID, o.Cents, "confirmed"); err != nil {
+                return err
+            }
+            if err := s.inventory.Reserve(ctx, o.ID, o.Items); err != nil {
+                return err
+            }
+            if err := s.payments.Charge(ctx, o.ID, o.Cents); err != nil {
+                return err
+            }
+            return tx.Commit()
+        }
+      roles: { client: [2, 2], context: [1, 18], inventory: [11, 13], payments: [14, 16] }
+      change:
+        - { after: 16, add: ['    if err := s.shipping.BookCourier(ctx, o.ID, o.Address); err != nil {', '        return err // rolls back the order row; the card stays charged', '    }'] }
+    after:
+      file: checkout/workflow.go · payments/activities.go
+      source: |
+        // checkout/workflow.go: the saga as a durable Temporal workflow
+        func PlaceOrder(ctx workflow.Context, o Order) (err error) {
+            ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+                StartToCloseTimeout: 10 * time.Second,
+                RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 5},
+            })
+            var undo []func(workflow.Context) error
+            defer func() {
+                if err == nil {
+                    return
+                }
+                dctx, _ := workflow.NewDisconnectedContext(ctx)
+                for i := len(undo) - 1; i >= 0; i-- { // newest first
+                    _ = undo[i](dctx)
+                }
+            }()
+
+            if err = run(ctx, a.CreatePendingOrder, o); err != nil {
+                return err
+            }
+            undo = append(undo, func(c workflow.Context) error { return run(c, a.RejectOrder, o) })
+
+            if err = run(ctx, a.ReserveStock, o); err != nil {
+                return err
+            }
+            undo = append(undo, func(c workflow.Context) error { return run(c, a.ReleaseStock, o) })
+
+            if err = run(ctx, a.Charge, o); err != nil {
+                return err
+            }
+            undo = append(undo, func(c workflow.Context) error { return run(c, a.Refund, o) })
+
+            if err = run(ctx, a.BookCourier, o); err != nil {
+                return err
+            }
+            return run(ctx, a.ApproveAndConfirm, o)
+        }
+
+        // run executes one activity; Temporal records its result in the workflow history
+        func run(ctx workflow.Context, activity any, o Order) error {
+            return workflow.ExecuteActivity(ctx, activity, o).Get(ctx, nil)
+        }
+
+        // payments/activities.go: each step is a local transaction, idempotent by order id
+        func (a *Activities) Charge(ctx context.Context, o Order) error {
+            _, err := a.payments.Charge(ctx, ChargeReq{Order: o.ID, Cents: o.Cents, Key: "charge-" + o.ID})
+            return err
+        }
+      roles: { context: [1, 42], strategy: [7, 16], inventory: [23, 26], payments: [44, 48], shipping: [33, 35], start: [2, 6], step: [23, 26], charge: [28, 31], fail: [33, 35], compensate: [8, 16] }
+    again:
+      file: checkout/workflow_test.go
+      source: |
+        // checkout/workflow_test.go: fail the courier, expect the undo in reverse
+        func TestNoCourierRefundsAndReleases(t *testing.T) {
+            var suite testsuite.WorkflowTestSuite
+            env := suite.NewTestWorkflowEnvironment()
+            env.RegisterActivity(&Activities{})
+            mockForwardSteps(env) // CreatePendingOrder, ReserveStock and Charge succeed
+            env.OnActivity(a.BookCourier, mock.Anything, mock.Anything).Return(errors.New("no courier for this postcode"))
+            env.OnActivity(a.Refund, mock.Anything, mock.Anything).Return(nil).Once()
+            env.OnActivity(a.ReleaseStock, mock.Anything, mock.Anything).Return(nil).Once()
+            env.OnActivity(a.RejectOrder, mock.Anything, mock.Anything).Return(nil).Once()
+
+            env.ExecuteWorkflow(PlaceOrder, order1042)
+            require.Error(t, env.GetWorkflowError())
+            env.AssertExpectations(t)
+        }
+    cost:
+      before: { text: courier fails · card charged · stock held · no order row, value: 0.85 }
+      after: { text: 3 compensations · nothing left behind, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A Temporal workflow is a plain Go function that the engine replays from its history after a crash, so it must be deterministic: use `workflow.Now`, `workflow.Sleep` and `workflow.Go`, not `time.Now` or goroutines. Compensations run on a disconnected context so they still run when the workflow is cancelled. For choreography, Watermill gives Go publish and subscribe over Kafka, NATS or Postgres.'
+      seenIn: 'Temporal Go SDK: `workflow.ExecuteActivity`, `workflow.NewDisconnectedContext`, `testsuite.WorkflowTestSuite`. Watermill for event-driven choreography. A transactional outbox to publish an event in the same commit as the local step.'
+
+  python:
+    before:
+      file: checkout/place_order.py
+      source: |
+        # checkout/place_order.py: one local transaction around remote calls
+        def place_order(conn: Connection, o: Order) -> None:
+            with conn.transaction():  # if anything fails, nothing happened
+                conn.execute(INSERT_ORDER, (o.id, o.cents, "confirmed"))
+                inventory.reserve(o.id, o.items)
+                payments.charge(o.id, o.cents)
+      roles: { client: [2, 2], context: [1, 6], inventory: [5, 5], payments: [6, 6] }
+      change:
+        - { after: 6, add: ['        shipping.book_courier(o.id, o.address)  # raises: rolls back the row, not the charge'] }
+    after:
+      file: checkout/workflow.py · payments/activities.py
+      source: |
+        # checkout/workflow.py: the saga as a durable Temporal workflow
+        @workflow.defn
+        class PlaceOrder:
+            @workflow.run
+            async def run(self, o: Order) -> None:
+                undo: list[Callable[[], Awaitable[None]]] = []
+                try:
+                    await step(create_pending_order, o)
+                    undo.append(lambda: step(reject_order, o))
+                    await step(reserve_stock, o)
+                    undo.append(lambda: step(release_stock, o))
+                    await step(charge, o)
+                    undo.append(lambda: step(refund, o))
+                    await step(book_courier, o)
+                    await step(approve_and_confirm, o)
+                except ActivityError:
+                    for compensate in reversed(undo):  # newest first
+                        await compensate()
+                    raise
+
+        async def step(activity: Callable, o: Order) -> None:
+            await workflow.execute_activity(
+                activity, o,
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(maximum_attempts=5),
+            )
+
+        # payments/activities.py: each step is a local transaction, idempotent by order id
+        @activity.defn
+        async def charge(o: Order) -> None:
+            await payments.charge(order=o.id, cents=o.cents, idempotency_key=f"charge-{o.id}")
+      roles: { context: [1, 26], strategy: [6, 6], inventory: [10, 11], payments: [28, 31], shipping: [14, 14], start: [2, 5], step: [10, 11], charge: [12, 13], fail: [14, 14], compensate: [16, 19] }
+    again:
+      file: test_workflow.py
+      source: |
+        # test_workflow.py: fail the courier, expect the undo in reverse
+        async def test_no_courier_refunds_and_releases():
+            calls: list[str] = []
+            activities = fake_activities(calls, fail={"book_courier"})
+            async with await WorkflowEnvironment.start_time_skipping() as env:
+                async with Worker(env.client, task_queue="t", workflows=[PlaceOrder], activities=activities):
+                    with pytest.raises(WorkflowFailureError):
+                        await env.client.execute_workflow(PlaceOrder.run, order_1042, id="o-1042", task_queue="t")
+            assert calls[-3:] == ["refund", "release_stock", "reject_order"]
+    cost:
+      before: { text: courier fails · card charged · stock held · no order row, value: 0.85 }
+      after: { text: 3 compensations · nothing left behind, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The temporalio SDK runs workflow code in a sandbox that blocks non-deterministic calls, and replays it from history after a crash; activities are ordinary async functions. Celery can chain tasks, but nothing undoes a chain for you: a hand-rolled saga uses `link_error` callbacks and its own state table.'
+      seenIn: 'temporalio: `@workflow.defn`, `workflow.execute_activity`, `WorkflowEnvironment.start_time_skipping()`. Celery `chain` with `link_error` for compensation. Outbox tables written in the same transaction as the step.'
+
+  typescript:
+    before:
+      file: checkout/placeOrder.ts
+      source: |
+        // checkout/placeOrder.ts: one local transaction around remote calls
+        export async function placeOrder(db: Pool, o: Order): Promise<void> {
+          const client = await db.connect();
+          try {
+            await client.query("BEGIN"); // if anything fails, nothing happened
+            await client.query(INSERT_ORDER, [o.id, o.cents, "confirmed"]);
+            await inventory.reserve(o.id, o.items);
+            await payments.charge(o.id, o.cents);
+            await client.query("COMMIT");
+          } catch (err) {
+            await client.query("ROLLBACK");
+            throw err;
+          } finally {
+            client.release();
+          }
+        }
+      roles: { client: [2, 2], context: [1, 16], inventory: [7, 7], payments: [8, 8] }
+      change:
+        - { after: 8, add: ['    await shipping.bookCourier(o.id, o.address); // throws: rolls back the row, not the charge'] }
+    after:
+      file: checkout/workflow.ts · payments/activities.ts
+      source: |
+        // checkout/workflow.ts: the saga as a durable Temporal workflow
+        const a = proxyActivities<typeof activities>({
+          startToCloseTimeout: "10 seconds",
+          retry: { maximumAttempts: 5 },
+        });
+
+        export async function placeOrder(o: Order): Promise<void> {
+          const undo: Array<() => Promise<void>> = [];
+          try {
+            await a.createPendingOrder(o);
+            undo.push(() => a.rejectOrder(o));
+            await a.reserveStock(o);
+            undo.push(() => a.releaseStock(o));
+            await a.charge(o);
+            undo.push(() => a.refund(o));
+            await a.bookCourier(o);
+            await a.approveAndConfirm(o);
+          } catch (err) {
+            for (const compensate of undo.reverse()) await compensate(); // newest first
+            throw err;
+          }
+        }
+
+        // payments/activities.ts: each step is a local transaction, idempotent by order id
+        export async function charge(o: Order): Promise<void> {
+          await payments.charge({ order: o.id, cents: o.cents, idempotencyKey: `charge-${o.id}` });
+        }
+      roles: { context: [1, 22], strategy: [8, 8], inventory: [12, 13], payments: [24, 27], shipping: [16, 16], start: [7, 8], step: [12, 13], charge: [14, 15], fail: [16, 16], compensate: [18, 21] }
+    again:
+      file: workflow.test.ts
+      source: |
+        // workflow.test.ts: fail the courier, expect the undo in reverse
+        test("no courier refunds and releases", async () => {
+          const calls: string[] = [];
+          const env = await TestWorkflowEnvironment.createTimeSkipping();
+          const worker = await Worker.create({
+            connection: env.nativeConnection,
+            taskQueue: "t",
+            workflowsPath: require.resolve("./workflow"),
+            activities: fakeActivities(calls, { fail: ["bookCourier"] }),
+          });
+          await assert.rejects(worker.runUntil(
+            env.client.workflow.execute(placeOrder, { args: [order1042], workflowId: "o-1042", taskQueue: "t" })));
+          assert.deepEqual(calls.slice(-3), ["refund", "releaseStock", "rejectOrder"]);
+          await env.teardown();
+        });
+    cost:
+      before: { text: courier fails · card charged · stock held · no order row, value: 0.85 }
+      after: { text: 3 compensations · nothing left behind, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The Temporal TypeScript SDK bundles workflow code into an isolated, deterministic sandbox, so `Date.now()` and `Math.random()` are replaced and Node APIs are not available there; activities run in ordinary Node. AWS Step Functions expresses the same saga as a state machine with `Catch` transitions to compensation states.'
+      seenIn: '`proxyActivities` and `TestWorkflowEnvironment` in the Temporal TypeScript SDK. AWS Step Functions `Retry` and `Catch` fields. BullMQ flows, which run parent and child jobs but leave compensation to you.'
+
+  rust:
+    before:
+      file: checkout/place_order.rs
+      source: |
+        // checkout/place_order.rs: one local transaction around remote calls
+        pub async fn place_order(db: &PgPool, svc: &Services, o: &Order) -> anyhow::Result<()> {
+            let mut tx = db.begin().await?; // if anything fails, nothing happened
+            sqlx::query(INSERT_ORDER).bind(&o.id).bind(o.cents).bind("confirmed")
+                .execute(&mut *tx).await?;
+            svc.inventory.reserve(&o.id, &o.items).await?;
+            svc.payments.charge(&o.id, o.cents).await?;
+            tx.commit().await?;
+            Ok(())
+        }
+      roles: { client: [2, 2], context: [1, 10], inventory: [6, 6], payments: [7, 7] }
+      change:
+        - { after: 7, add: ['    svc.shipping.book_courier(&o.id, &o.address).await?; // Err drops tx: the row goes, the charge stays'] }
+    after:
+      file: checkout/saga.rs · payments/charge.rs
+      source: |
+        // checkout/saga.rs: an orchestrator that writes every step to a saga log
+        const STEPS: [Step; 4] = [Step::CreateOrder, Step::ReserveStock, Step::Charge, Step::BookCourier];
+
+        pub async fn place_order(db: &PgPool, svc: &Services, o: &Order) -> anyhow::Result<()> {
+            for (i, step) in STEPS.iter().enumerate() {
+                log(db, &o.id, i, Status::Started).await?; // durable before the call
+                match svc.run(*step, o).await {
+                    Ok(()) => log(db, &o.id, i, Status::Done).await?,
+                    Err(e) => {
+                        log(db, &o.id, i, Status::Failed).await?;
+                        compensate(db, svc, o, i).await?;
+                        return Err(e);
+                    }
+                }
+            }
+            svc.approve_and_confirm(o).await
+        }
+
+        /// Undo every step that completed, newest first. The recovery loop also calls
+        /// this for sagas whose log ends in Started or Failed after a crash.
+        pub async fn compensate(db: &PgPool, svc: &Services, o: &Order, failed: usize) -> anyhow::Result<()> {
+            for i in (0..failed).rev() {
+                svc.undo(STEPS[i], o).await?; // Refund, ReleaseStock, RejectOrder: each idempotent
+                log(db, &o.id, i, Status::Compensated).await?;
+            }
+            Ok(())
+        }
+
+        // payments/charge.rs: each step is a local transaction, idempotent by order id
+        pub async fn charge(&self, o: &Order) -> anyhow::Result<()> {
+            self.client.charge(&o.id, o.cents, &format!("charge-{}", o.id)).await
+        }
+      roles: { context: [1, 17], strategy: [19, 27], inventory: [5, 8], payments: [29, 32], shipping: [9, 13], start: [4, 4], step: [5, 8], charge: [29, 32], fail: [9, 13], compensate: [19, 27] }
+    again:
+      file: checkout/tests/saga.rs
+      source: |
+        // checkout/tests/saga.rs: fail the courier, expect the undo in reverse
+        #[sqlx::test]
+        async fn no_courier_refunds_and_releases(db: PgPool) {
+            let svc = FakeServices::failing(Step::BookCourier);
+            assert!(place_order(&db, &svc, &order_1042()).await.is_err());
+            assert_eq!(
+                svc.calls(),
+                ["create_order", "reserve_stock", "charge", "book_courier", "refund", "release_stock", "reject_order"]
+            );
+            assert_eq!(last_status(&db, "1042").await, Status::Compensated);
+        }
+    cost:
+      before: { text: courier fails · card charged · stock held · no order row, value: 0.85 }
+      after: { text: 3 compensations · nothing left behind, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Often hand-rolled
+      note: 'Temporal''s Rust SDK (`temporalio-sdk`) is in public preview, and Restate''s `restate-sdk` is still below 1.0, so many Rust services write the orchestrator themselves, as here: a saga log table, idempotent steps, and a recovery task that compensates sagas a crash left half done. The type system helps make the step list and its undo an exhaustive `match`.'
+      seenIn: '`temporalio-sdk` (public preview). `restate-sdk` durable handlers. `sqlx` for the saga log, and a `tokio::spawn`ed recovery loop that scans for unfinished sagas at startup.'
+
+walk:
+  - text: Checkout starts the saga for order 1042 and returns. From here the orchestrator owns the workflow, and every step it takes is recorded durably.
+    nodes: [client, context]
+    edges: [client>context]
+    role: start
+  - text: Each step is a local transaction in one service. As soon as Inventory confirms the reservation, the saga pushes its undo, ReleaseStock, onto the stack.
+    nodes: [context, inventory, strategy]
+    edges: [context>inventory, context>strategy]
+    role: step
+  - text: Payments charges the card with a key derived from the order id, so a retried step cannot charge twice. Refund goes on the stack.
+    nodes: [context, payments, strategy]
+    edges: [context>payments, context>strategy]
+    role: charge
+  - text: Booking the courier fails, no courier for this postcode. Three databases already changed and none of them can roll back the others.
+    nodes: [context, shipping]
+    edges: [context>shipping]
+    role: fail
+  - text: The saga pops the stack newest first. Refund, then release the stock, then reject the order. Each undo is itself idempotent and retried until it succeeds.
+    nodes: [context, strategy, payments, inventory]
+    edges: [context>strategy, context>payments, context>inventory]
+    role: compensate
+
+checks:
+  overview:
+    question: What does a saga use instead of one database transaction?
+    options:
+      - text: A sequence of local transactions, each with a compensating action that undoes it if a later step fails.
+        correct: true
+        why: Right. Each service commits its own step. Consistency comes from finishing every step, or undoing every one that finished.
+      - text: A two-phase commit across the services' databases.
+        why: That is a distributed transaction, the thing sagas avoid. It holds locks across services and blocks if the coordinator fails.
+      - text: Retrying each step until it succeeds, so no undo is ever needed.
+        why: Some failures are not transient. A declined card stays declined, and the steps before it must be undone.
+  engineer:
+    question: An order must reserve stock, charge the card and send a confirmation email. What order, and what compensates?
+    options:
+      - text: Reserve stock, then charge, then email last. Undo the charge with a refund and the reservation with a release; the email cannot be undone, so nothing may fail after it.
+        correct: true
+        why: Right. Put steps that cannot be compensated at the end, after the last step that can fail.
+      - text: Email first, so the customer hears quickly, then reserve and charge.
+        why: If the charge then fails, the customer has a confirmation for an order that does not exist, and an email cannot be unsent.
+      - text: Order does not matter, because every step has a compensation.
+        why: An email, a shipped parcel or a call to a partner's API often has none. Order is how you keep them out of the undo path.
+  deep:
+    question: Why must the orchestrator's record of finished steps be durable?
+    options:
+      - text: If it crashes mid-saga, it must know which steps took effect, or nothing will compensate them.
+        correct: true
+        why: Right. Without a log the restarted orchestrator has no record of the saga, and the charge and reservation are stranded. Workflow engines keep this log as the workflow history and replay it.
+      - text: So that other services can read the saga's state instead of their own databases.
+        why: Other services keep their own state. The log is for the coordinator's recovery.
+      - text: Mainly for auditing; the saga would still recover from memory.
+        why: Memory does not survive the crash. Auditing is a bonus; recovery is the reason.
+
+reference:
+  roles:
+    - role: Coordinator
+      example: the order saga, as a workflow or an orchestrator service
+      job: Runs the steps in order, records each one durably, and runs the compensations in reverse on failure. Absent in choreography.
+    - role: Participant
+      example: Inventory, Payments, Shipping
+      job: Runs one local transaction per step, and offers an idempotent compensating action for it.
+    - role: Saga log
+      example: the workflow history, or a saga_steps table
+      job: Survives crashes so the saga can be resumed or undone.
+    - role: Events and commands
+      example: ReserveStock, PaymentFailed
+      job: Carry the workflow between services. Published with an outbox so they are never lost after a commit.
+  useWhen:
+    - A business operation changes data owned by several services, and a distributed transaction is not available or not wanted.
+    - Steps can be undone semantically, by a refund, a release or a cancellation.
+    - Orchestration when the flow has many steps, branches or deadlines and someone must answer "where is order 1042?".
+    - Choreography when the flow is short, stable and each service only needs to react to one or two events.
+  avoidWhen:
+    - The data can live in one service and one database. One local transaction is simpler than any saga.
+    - Readers cannot tolerate seeing intermediate states and no countermeasure, such as a pending status, fits.
+  tradeoffs:
+    - No isolation. Other transactions see the order half done, and can act on it, until the saga finishes or compensates.
+    - Every step needs an idempotent compensation, written and tested by hand. Some actions have none.
+    - Orchestration couples the flow to one coordinator; choreography spreads it across subscriptions that nobody sees whole.
+    - Messages arrive at least once, so every step and compensation must deduplicate by key.
+  lookalikes:
+    - name: Two-phase commit
+      how: Atomic across participants, with locks held until the coordinator decides. Sagas give up atomicity and isolation to avoid the locks and the blocking.
+    - name: Transactional outbox
+      how: Makes one step's commit and its event atomic. A building block of a saga, not a saga.
+    - name: Workflow engine
+      how: Temporal, AWS Step Functions and similar run orchestrated sagas, keeping the log and the retries for you.
+---
+
+## [concept] Sagas
+
+**A workflow that changes several services cannot roll back as one transaction. A saga runs it as a sequence of local transactions, and for every step that succeeded it has a compensating action to run if a later step fails.**
+
+A <Term id="saga">saga</Term> trades atomicity for independence. Each service commits its own step. If step four fails, the saga runs the <Term id="compensating-transaction">compensations</Term> for steps three, two and one, newest first, and the system becomes consistent again, eventually.
+
+<Depth level={2}>
+Someone has to drive the steps. In <Term id="orchestration">orchestration</Term>, one coordinator tells each service what to do and keeps the state of the workflow. In <Term id="choreography">choreography</Term>, there is no coordinator: each service reacts to another's event and publishes its own. Orchestration makes the flow visible and the failure handling explicit, at the price of a central component. Choreography couples services less and scales well, at the price of a flow that exists only in who subscribes to what.
+</Depth>
+
+<Depth level={3}>
+Hector Garcia-Molina and Kenneth Salem introduced sagas at SIGMOD in 1987, for long-lived transactions inside one database: break the long transaction into short ones that other transactions may interleave with, and pair each with a compensation. Microservices adopted the idea because each service owns its own database, so a long transaction across them is not possible at all.
+</Depth>
+
+## [problem] A local transaction around remote calls
+
+PlaceOrder opens a database transaction, inserts the order, calls Inventory to reserve the items, calls Payments to charge the card, and commits. If anything returns an error, the deferred rollback runs. It reads as all-or-nothing, and in tests where nothing fails, it is.
+
+<Depth level={2}>
+The rollback only covers the order row in checkout's own database. The reservation lives in Inventory's database and the charge in Payments'. Neither is part of the transaction, whatever the indentation suggests.
+</Depth>
+
+<Depth level={3}>
+The remote calls also run while the local transaction holds its locks and its connection. A slow payment provider now holds a row lock in checkout's database for seconds.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** book a courier after the payment. If no courier serves the address, cancel the order and refund the customer.
+
+The courier call goes after the charge. The first time it fails, the rollback deletes the order row, and that is all it does. The card is charged, the stock is reserved, and there is no order to refund against. Support finds customers charged for orders the system has no record of.
+
+<Depth level={2}>
+The bug was there before the change: a declined card already left stock reserved for an order that was rolled back. The new step made it costlier and more frequent, because it fails after the money has moved.
+</Depth>
+
+<Depth level={3}>
+Retrying does not help. "No courier for this postcode" is a business failure, not a transient one; it will fail the same way every time. The only way forward is back, step by step.
+</Depth>
+
+## [morph] Every step brings its own undo
+
+Drag the slider. The order becomes a durable workflow. Each step runs as its own local transaction in its own service, and the moment a step succeeds, its compensation goes onto an undo stack. On failure, the stack runs newest first.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Two details make it safe. Each step and each compensation is idempotent, keyed by the order id, because a retry after a lost reply would otherwise charge or refund twice; the <Term id="idempotency-key">idempotency key</Term> from the distributed-systems track does that job here. And the workflow's progress is recorded in a <Term id="saga-log">saga log</Term>, so a crash in the middle resumes or compensates instead of forgetting.
+</Depth>
+
+<Depth level={3}>
+A step whose call timed out may or may not have taken effect. A careful saga compensates the failed step too when its outcome is unknown, which is safe only because refunding an order that was never charged is a no-op for an idempotent Payments service.
+</Depth>
+
+## [walk] Follow one failed order
+
+One order whose courier booking fails, from the start of the saga to the last compensation. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The deferred function sees the named result `err`, so it runs the stack only on failure. It uses a disconnected context, so compensations still run if the workflow itself was cancelled.</Lang>
+<Lang only="python">The `except ActivityError` block runs the stack and re-raises, so the workflow ends failed and its history shows both the failure and every compensation.</Lang>
+<Lang only="typescript">`undo.reverse()` walks the stack newest first. An activity failure reaches the workflow as an `ActivityFailure` and lands in the `catch`.</Lang>
+<Lang only="rust">The log is written before each call, so after a crash a saga whose last entry is Started is exactly one whose outcome is unknown, and the recovery loop knows where to begin compensating.</Lang>
+</Depth>
+
+## [again] The same request, the second time
+
+The courier fails, as it will for some postcodes. The saga refunds the card, releases the stock and rejects the order, and the customer gets a cancellation email instead of a charge for nothing. The test above fails the courier on purpose and asserts the three compensations, in reverse order.
+
+<Depth level={2}>
+Between the charge and the refund, the order was visible as pending with a real charge behind it. That is the price of a saga: no isolation. A report run at that moment would count it. Pending statuses, which other code treats as not yet real, are the usual countermeasure.
+</Depth>
+
+<Depth level={3}>
+The choreographed version of the same saga works without a coordinator. Payments listens for CourierUnavailable and refunds, Inventory listens for PaymentRefunded and releases, Orders listens for both and rejects. Each publishes through a <Term id="transactional-outbox">transactional outbox</Term> so an event is never lost after its commit. The flow is the same; it lives in four services' subscriptions instead of one function.
+</Depth>
+
+## [play] Break the order saga
+
+Click a service to make its step fail, pick orchestration or choreography, and step through the messages. Then break it: turn compensations off, crash the orchestrator without a durable log, or let Inventory miss the failure event, and see what is left behind. Each service's state shows what the rest of the company would see, one message at a time, until the system is <Term id="eventual-consistency">eventually consistent</Term> again.
+
+## [lens] How each language runs a saga
+
+Go, Python and TypeScript have mature workflow engines that keep the saga log and replay it after a crash. In Rust the engines are younger, and a hand-written orchestrator with a log table is still common.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="workflows-and-sagas" />
+
+### Choosing orchestration or choreography
+
+Count who must change when the workflow changes. Adding a fraud check between the reservation and the charge is one edit to an orchestrator, plus the new service. In choreography, Payments must now listen for FraudApproved instead of StockReserved, the fraud service must listen for StockReserved, and Inventory and Orders must learn FraudRejected so they can compensate. Short, stable flows suit choreography. Flows that grow steps, branches and deadlines, or that support staff must be able to inspect, suit an orchestrator.
