@@ -1,0 +1,7 @@
+# Terms introduced by the Decorator lesson.
+- id: middleware-onion
+  term: Middleware
+  short: A wrapper around an HTTP handler that has the handler's own shape. A stack of them forms layers that a request passes through inward and the response passes through outward.
+- id: short-circuit-response
+  term: Short-circuit
+  short: A wrapper answers the request itself (a 401, a 429, a cached response) and never calls the object inside it, so nothing further in runs.

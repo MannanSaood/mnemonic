@@ -1,0 +1,653 @@
+---
+title: Decorator
+track: design-patterns
+group: Structural
+order: 33
+summary: Wrap an object in another object with the same interface, which adds one behaviour and passes the call on.
+intent: Add responsibilities such as logging, auth or caching around an object without changing it, and choose which ones, in what order, when you wire it up.
+changeRequest: Security wants every endpoint rate limited per client IP, before the token check runs.
+languages: [go, python, typescript, rust]
+glossary: [interface, middleware-onion, short-circuit-response, open-closed, structural-typing, monomorphisation, dynamic-dispatch]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/composition-over-inheritance]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: decorator
+  scenarios:
+    - try: "Make a prediction, then send the traffic through the starting stack: Cache, then Auth, then Logging."
+      notice: "The request with no token gets Ana's orders from the cache, and only 2 of 9 requests reach the log. No wrapper has a bug. The order does."
+    - try: "Move Logging to the outside, one step at a time."
+      notice: "No response changes, but the log fills up with the 401s it never saw. A wrapper only sees what the wrappers outside it let through."
+    - try: "Move Cache inside Auth. Then add RateLimit and try it inside Auth and outside it."
+      notice: "Inside Auth, the scraper never gets a 429: Auth rejects it first, and every attempt costs a token check. Outside Auth, two attempts stop before the identity service."
+    - try: "Meet all four goals, then remove Auth for a moment."
+      notice: "Exactly one order of the four wrappers meets every goal. Without Auth, four of the six requests with no token get order data; only the two that RateLimit stopped do not."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: router, sub: "/orders, /search" }
+      after:  { x: 4, y: 160, w: 62, h: 48, title: router, sub: calls }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: handleOrders, sub: "auth, cache, logs inline" }
+      after:  { x: 444, y: 160, w: 112, h: 48, title: { go: handleOrders, python: handle_orders, typescript: handleOrders, rust: Orders }, sub: just orders }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 150, y: 14, w: 260, h: 50, title: "" }
+      after:  { x: 150, y: 14, w: 260, h: 50, title: { go: http.Handler, python: Handler, typescript: Handler, rust: Handler }, sub: { go: "ServeHTTP(w, r)", python: "request → response", typescript: "(req) => Promise<Response>", rust: "fn handle(&self, req)" } }
+    - id: logging
+      kind: concrete
+      before: { x: 188, y: 80, w: 222, h: 32, title: { go: log.Printf ×3, python: log.info ×3, typescript: logLine ×3, rust: log_line ×3 } }
+      after:  { x: 76, y: 160, w: 84, h: 48, title: Logging, sub: outermost }
+    - id: auth
+      kind: concrete
+      before: { x: 188, y: 120, w: 222, h: 32, title: { go: auth.Verify, python: auth.verify, typescript: auth.verify, rust: auth.verify } }
+      after:  { x: 280, y: 160, w: 70, h: 48, title: Auth, sub: "401?" }
+    - id: cache
+      kind: concrete
+      before: { x: 188, y: 160, w: 222, h: 32, title: cache get · set }
+      after:  { x: 362, y: 160, w: 70, h: 48, title: Cache, sub: hit? }
+    - id: ratelimit
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 214, w: 222, h: 32, title: { go: limiter.Allow, python: limiter.allow, typescript: limiter.allow, rust: limiter.allow } }
+      after:  { x: 172, y: 160, w: 96, h: 48, title: RateLimit, sub: "429?" }
+  edges:
+    - { from: client, to: logging, label: calls }
+    - { from: logging, to: auth }
+    - { from: auth, to: cache }
+    - { from: cache, to: context, label: wraps }
+    - { from: logging, to: strategy, kind: implements }
+    - { from: ratelimit, to: strategy, kind: implements }
+    - { from: auth, to: strategy, kind: implements }
+    - { from: cache, to: strategy, kind: implements, label: same interface }
+    - { from: context, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: orders.go · search.go
+      source: |
+        // orders.go
+        func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
+            start := time.Now()
+            user, err := s.auth.Verify(r.Header.Get("Authorization"))
+            if err != nil {
+                http.Error(w, "unauthorized", http.StatusUnauthorized)
+                log.Printf("%s %s 401 %v", r.Method, r.URL.Path, time.Since(start))
+                return
+            }
+            key := user.ID + r.URL.Path
+            if body, ok := s.cache.Get(key); ok {
+                w.Write(body)
+                log.Printf("%s %s 200 cached %v", r.Method, r.URL.Path, time.Since(start))
+                return
+            }
+            body := s.renderOrders(user, r)
+            s.cache.Set(key, body)
+            w.Write(body)
+            log.Printf("%s %s 200 %v", r.Method, r.URL.Path, time.Since(start))
+        }
+
+        // search.go: the same auth and logging, copied
+        func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+            start := time.Now()
+            user, err := s.auth.Verify(r.Header.Get("Authorization"))
+            if err != nil {
+                http.Error(w, "unauthorized", http.StatusUnauthorized)
+                log.Printf("%s %s 401 %v", r.Method, r.URL.Path, time.Since(start))
+                return
+            }
+            w.Write(s.runSearch(user, r))
+            log.Printf("%s %s 200 %v", r.Method, r.URL.Path, time.Since(start))
+        }
+      roles: { context: [2, 20], auth: [4, 9], cache: [10, 17], logging: [19, 19] }
+      change:
+        - { after: 3, add: ['    if !s.limiter.Allow(clientIP(r)) {', '        http.Error(w, "too many requests", http.StatusTooManyRequests)', '        log.Printf("%s %s 429 %v", r.Method, r.URL.Path, time.Since(start))', '        return', '    }'] }
+        - { after: 24, add: ['    if !s.limiter.Allow(clientIP(r)) {', '        http.Error(w, "too many requests", http.StatusTooManyRequests)', '        log.Printf("%s %s 429 %v", r.Method, r.URL.Path, time.Since(start))', '        return', '    }'] }
+    after:
+      file: middleware.go · main.go
+      source: |
+        type Middleware func(http.Handler) http.Handler
+
+        func Logging(next http.Handler) http.Handler {
+            return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                start := time.Now()
+                rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+                next.ServeHTTP(rec, r)
+                log.Printf("%s %s %d %v", r.Method, r.URL.Path, rec.status, time.Since(start))
+            })
+        }
+
+        func Auth(v Verifier) Middleware {
+            return func(next http.Handler) http.Handler {
+                return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                    user, err := v.Verify(r.Header.Get("Authorization"))
+                    if err != nil {
+                        http.Error(w, "unauthorized", http.StatusUnauthorized)
+                        return // next never runs
+                    }
+                    next.ServeHTTP(w, r.WithContext(withUser(r.Context(), user)))
+                })
+            }
+        }
+
+        // main.go: the outermost wrapper sees the request first.
+        // Cache is written like Auth and keys on the user that Auth stored.
+        orders := Logging(Auth(verifier)(Cache(store)(http.HandlerFunc(s.handleOrders))))
+        search := Logging(Auth(verifier)(http.HandlerFunc(s.handleSearch)))
+      roles: { strategy: [1, 1], logging: [3, 10], auth: [12, 23], client: [27, 28], cache: [27, 27], context: [27, 27], outer: [5, 7], reject: [15, 19], inner: [20, 20], out: [8, 8] }
+    again:
+      file: ratelimit.go
+      source: |
+        // ratelimit.go: a new wrapper; no handler changes
+        func RateLimit(l *Limiter) Middleware {
+            return func(next http.Handler) http.Handler {
+                return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                    if !l.Allow(clientIP(r)) {
+                        http.Error(w, "too many requests", http.StatusTooManyRequests)
+                        return
+                    }
+                    next.ServeHTTP(w, r)
+                })
+            }
+        }
+
+        // main.go: one more wrapper per route, outside Auth
+        orders := Logging(RateLimit(limiter)(Auth(verifier)(Cache(store)(http.HandlerFunc(s.handleOrders)))))
+    cost:
+      before: { text: 10 lines · every handler, value: 0.85 }
+      after: { text: 1 new wrapper · 0 handler edits, value: 0.18 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: '`func(http.Handler) http.Handler` is the standard shape of Go middleware. Each wrapper is a closure that returns a `http.HandlerFunc`, and the wrapped value is itself an `http.Handler`. To keep the order in one place, put the wrappers in a slice and apply it with a small `Chain` helper, or use a router that does it, such as chi''s `r.Use`.'
+      seenIn: '`http.TimeoutHandler`, `http.StripPrefix` and `http.MaxBytesHandler` all take a handler and return one. `bufio.NewReader` and `gzip.NewReader` wrap an `io.Reader` and are readers themselves.'
+
+  python:
+    before:
+      file: orders.py · search.py
+      source: |
+        # orders.py
+        def handle_orders(req: Request) -> Response:
+            start = time.monotonic()
+            user = auth.verify(req.headers.get("Authorization"))
+            if user is None:
+                log.info("%s %s 401 %.3fs", req.method, req.path, time.monotonic() - start)
+                return Response(401, "unauthorized")
+            key = (user.id, req.path)
+            if (body := cache.get(key)) is not None:
+                log.info("%s %s 200 cached %.3fs", req.method, req.path, time.monotonic() - start)
+                return Response(200, body)
+            body = render_orders(user, req)
+            cache.set(key, body)
+            log.info("%s %s 200 %.3fs", req.method, req.path, time.monotonic() - start)
+            return Response(200, body)
+
+        # search.py: the same auth and logging, copied
+        def handle_search(req: Request) -> Response:
+            start = time.monotonic()
+            user = auth.verify(req.headers.get("Authorization"))
+            if user is None:
+                log.info("%s %s 401 %.3fs", req.method, req.path, time.monotonic() - start)
+                return Response(401, "unauthorized")
+            resp = Response(200, run_search(user, req))
+            log.info("%s %s 200 %.3fs", req.method, req.path, time.monotonic() - start)
+            return resp
+      roles: { context: [2, 15], auth: [4, 7], cache: [8, 13], logging: [14, 14] }
+      change:
+        - { after: 3, add: ['    if not limiter.allow(req.client_ip):', '        log.info("%s %s 429 %.3fs", req.method, req.path, time.monotonic() - start)', '        return Response(429, "too many requests")'] }
+        - { after: 19, add: ['    if not limiter.allow(req.client_ip):', '        log.info("%s %s 429 %.3fs", req.method, req.path, time.monotonic() - start)', '        return Response(429, "too many requests")'] }
+    after:
+      file: middleware.py · main.py
+      source: |
+        from collections.abc import Callable
+
+        type Handler = Callable[[Request], Response]
+
+        def logging_mw(inner: Handler) -> Handler:
+            def handle(req: Request) -> Response:
+                start = time.monotonic()
+                resp = inner(req)
+                log.info("%s %s %d %.3fs", req.method, req.path, resp.status, time.monotonic() - start)
+                return resp
+            return handle
+
+        def auth_mw(verifier: Verifier) -> Callable[[Handler], Handler]:
+            def wrap(inner: Handler) -> Handler:
+                def handle(req: Request) -> Response:
+                    user = verifier.verify(req.headers.get("Authorization"))
+                    if user is None:
+                        return Response(401, "unauthorized")  # inner never runs
+                    return inner(req.with_user(user))
+                return handle
+            return wrap
+
+        # main.py: the outermost wrapper sees the request first.
+        # cache_mw is written like auth_mw and keys on the user that auth_mw attached.
+        orders = logging_mw(auth_mw(verifier)(cache_mw(store)(handle_orders)))
+        search = logging_mw(auth_mw(verifier)(handle_search))
+      roles: { strategy: [3, 3], logging: [5, 11], auth: [13, 21], client: [25, 26], cache: [25, 25], context: [25, 25], outer: [7, 8], reject: [16, 18], inner: [19, 19], out: [9, 10] }
+    again:
+      file: ratelimit.py
+      source: |
+        # ratelimit.py: a new wrapper; no handler changes
+        def rate_limit_mw(limiter: Limiter) -> Callable[[Handler], Handler]:
+            def wrap(inner: Handler) -> Handler:
+                def handle(req: Request) -> Response:
+                    if not limiter.allow(req.client_ip):
+                        return Response(429, "too many requests")
+                    return inner(req)
+                return handle
+            return wrap
+
+        # main.py: one more wrapper per route, outside auth
+        orders = logging_mw(rate_limit_mw(limiter)(auth_mw(verifier)(cache_mw(store)(handle_orders))))
+    cost:
+      before: { text: 6 lines · every handler, value: 0.75 }
+      after: { text: 1 new wrapper · 0 handler edits, value: 0.18 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Python''s `@decorator` syntax is related but not the same thing. `@cache` above a `def` wraps that one function once, when the module loads, and rebinds its name. The Decorator pattern wraps an object behind an interface, and the stack can be chosen at runtime, from config. Here the wrappers are plain functions applied at wiring time, so the order is visible in one line. You could still write `@logging_mw` on a handler; the order is then the order of the `@` lines, read from the bottom up.'
+      seenIn: 'WSGI middleware: any callable that takes a WSGI app and returns one, such as Werkzeug''s `ProxyFix(app.wsgi_app)`. `io.BufferedReader` wraps a raw binary stream and `gzip.GzipFile(fileobj=f)` wraps any file object; both are file objects themselves. `functools.lru_cache` is the function-decorator version of a cache wrapper.'
+
+  typescript:
+    before:
+      file: orders.ts · search.ts
+      source: |
+        // orders.ts
+        export async function handleOrders(req: Request): Promise<Response> {
+          const start = performance.now();
+          const user = await auth.verify(req.headers.get("authorization"));
+          if (!user) {
+            logLine(req, 401, start);
+            return new Response("unauthorized", { status: 401 });
+          }
+          const key = `${user.id}:${new URL(req.url).pathname}`;
+          const hit = cache.get(key);
+          if (hit !== undefined) {
+            logLine(req, 200, start, "cached");
+            return new Response(hit);
+          }
+          const body = await renderOrders(user, req);
+          cache.set(key, body);
+          logLine(req, 200, start);
+          return new Response(body);
+        }
+
+        // search.ts: the same auth and logging, copied
+        export async function handleSearch(req: Request): Promise<Response> {
+          const start = performance.now();
+          const user = await auth.verify(req.headers.get("authorization"));
+          if (!user) {
+            logLine(req, 401, start);
+            return new Response("unauthorized", { status: 401 });
+          }
+          const res = Response.json(await runSearch(user, req));
+          logLine(req, 200, start);
+          return res;
+        }
+      roles: { context: [2, 19], auth: [4, 8], cache: [9, 16], logging: [17, 17] }
+      change:
+        - { after: 3, add: ['  if (!limiter.allow(clientIp(req))) {', '    logLine(req, 429, start);', '    return new Response("too many requests", { status: 429 });', '  }'] }
+        - { after: 23, add: ['  if (!limiter.allow(clientIp(req))) {', '    logLine(req, 429, start);', '    return new Response("too many requests", { status: 429 });', '  }'] }
+    after:
+      file: middleware.ts · main.ts
+      source: |
+        type Handler = (req: Request) => Promise<Response>;
+        type Middleware = (next: Handler) => Handler;
+
+        const logging: Middleware = (next) => async (req) => {
+          const start = performance.now();
+          const res = await next(req);
+          console.log(req.method, new URL(req.url).pathname, res.status, performance.now() - start);
+          return res;
+        };
+
+        const auth = (verifier: Verifier): Middleware => (next) => async (req) => {
+          const user = await verifier.verify(req.headers.get("authorization"));
+          if (!user) return new Response("unauthorized", { status: 401 }); // next never runs
+          return next(withUser(req, user));
+        };
+
+        // main.ts: the outermost wrapper sees the request first.
+        // cache() is written like auth() and keys on the user that auth() attached.
+        const orders = logging(auth(verifier)(cache(store)(handleOrders)));
+        const search = logging(auth(verifier)(handleSearch));
+      roles: { strategy: [1, 2], logging: [4, 9], auth: [11, 15], client: [19, 20], cache: [19, 19], context: [19, 19], outer: [5, 6], reject: [12, 13], inner: [14, 14], out: [7, 8] }
+    again:
+      file: ratelimit.ts
+      source: |
+        // ratelimit.ts: a new wrapper; no handler changes
+        const rateLimit = (limiter: Limiter): Middleware => (next) => async (req) => {
+          if (!limiter.allow(clientIp(req))) return new Response("too many requests", { status: 429 });
+          return next(req);
+        };
+
+        // main.ts: one more wrapper per route, outside auth
+        const orders = logging(rateLimit(limiter)(auth(verifier)(cache(store)(handleOrders))));
+    cost:
+      before: { text: 8 lines · every handler, value: 0.8 }
+      after: { text: 1 new wrapper · 0 handler edits, value: 0.18 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A middleware is a function from handler to handler, and structural typing means any function of the right shape fits. Frameworks differ in the shape. Koa and Hono pass `(ctx, next)` and you `await next()` in the middle, which gives the same onion. TypeScript 5''s `@decorator` syntax for classes and methods is related but separate: it wraps a class member once, when the class is defined.'
+      seenIn: 'Redux middleware, written `store => next => action => …`, wraps `dispatch`. Koa''s onion, built by `koa-compose`. Hono''s `app.use(logger())`, which runs in registration order.'
+
+  rust:
+    before:
+      file: orders.rs · search.rs
+      source: |
+        // orders.rs
+        fn handle_orders(&self, req: &Request) -> Response {
+            let start = Instant::now();
+            let Some(user) = self.auth.verify(req.header("authorization")) else {
+                log_line(req, 401, start);
+                return Response::new(401, "unauthorized");
+            };
+            let key = (user.id, req.path().to_owned());
+            if let Some(body) = self.cache.get(&key) {
+                log_line(req, 200, start);
+                return Response::ok(body);
+            }
+            let body = self.render_orders(&user, req);
+            self.cache.insert(key, body.clone());
+            log_line(req, 200, start);
+            Response::ok(body)
+        }
+
+        // search.rs: the same auth and logging, copied
+        fn handle_search(&self, req: &Request) -> Response {
+            let start = Instant::now();
+            let Some(user) = self.auth.verify(req.header("authorization")) else {
+                log_line(req, 401, start);
+                return Response::new(401, "unauthorized");
+            };
+            let res = Response::ok(self.run_search(&user, req));
+            log_line(req, 200, start);
+            res
+        }
+      roles: { context: [2, 17], auth: [4, 7], cache: [8, 14], logging: [15, 15] }
+      change:
+        - { after: 3, add: ['    if !self.limiter.allow(req.client_ip()) {', '        log_line(req, 429, start);', '        return Response::new(429, "too many requests");', '    }'] }
+        - { after: 21, add: ['    if !self.limiter.allow(req.client_ip()) {', '        log_line(req, 429, start);', '        return Response::new(429, "too many requests");', '    }'] }
+    after:
+      file: middleware.rs · main.rs
+      source: |
+        trait Handler {
+            fn handle(&self, req: Request) -> Response;
+        }
+
+        struct Logging<H> { inner: H }
+
+        impl<H: Handler> Handler for Logging<H> {
+            fn handle(&self, req: Request) -> Response {
+                let start = Instant::now();
+                let what = format!("{} {}", req.method(), req.path());
+                let res = self.inner.handle(req);
+                log::info!("{what} {} {:?}", res.status(), start.elapsed());
+                res
+            }
+        }
+
+        struct Auth<H> { inner: H, verifier: Verifier }
+
+        impl<H: Handler> Handler for Auth<H> {
+            fn handle(&self, req: Request) -> Response {
+                let Some(user) = self.verifier.verify(req.header("authorization")) else {
+                    return Response::new(401, "unauthorized"); // inner never runs
+                };
+                self.inner.handle(req.with_user(user))
+            }
+        }
+
+        // main.rs: the type spells out the order, outermost first
+        let orders: Logging<Auth<Cache<Orders>>> =
+            Logging { inner: Auth { inner: Cache::new(Orders::new(db)), verifier } };
+      roles: { strategy: [1, 3], logging: [5, 15], auth: [17, 26], client: [29, 30], cache: [30, 30], context: [30, 30], outer: [9, 11], reject: [21, 23], inner: [24, 24], out: [12, 13] }
+    again:
+      file: rate_limit.rs
+      source: |
+        // rate_limit.rs: a new wrapper; no handler changes
+        struct RateLimit<H> { inner: H, limiter: Limiter }
+
+        impl<H: Handler> Handler for RateLimit<H> {
+            fn handle(&self, req: Request) -> Response {
+                if !self.limiter.allow(req.client_ip()) {
+                    return Response::new(429, "too many requests");
+                }
+                self.inner.handle(req)
+            }
+        }
+
+        // main.rs: the type becomes Logging<RateLimit<Auth<Cache<Orders>>>>
+    cost:
+      before: { text: 8 lines · every handler, value: 0.8 }
+      after: { text: 1 new wrapper · 0 handler edits, value: 0.18 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'In real services this is `tower`: a `Layer` takes an inner `Service` and returns a wrapping one, and `ServiceBuilder` stacks layers so that the layer added first sees the request first. The nested generic type gives static dispatch that the compiler can inline. The cost is that every stack is a different type; erase it with a boxed service such as `BoxCloneService` when routes need different stacks behind one type.'
+      seenIn: '`tower-http`''s `TraceLayer`, `TimeoutLayer` and `CompressionLayer`, used by axum and tonic. `std::io::BufReader<R: Read>` wraps any reader and is a `Read` itself.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The router calls the outermost wrapper, Logging. It looks like any other handler, so the router cannot tell it is a wrapper.
+    nodes: [client, logging]
+    edges: [client>logging]
+    role: client
+  - text: { go: 'Logging notes the time and calls `next.ServeHTTP`. It does nothing else on the way in.', python: 'Logging notes the time and calls `inner(req)`. It does nothing else on the way in.', typescript: 'Logging notes the time and awaits `next(req)`. It does nothing else on the way in.', rust: 'Logging notes the time and calls `self.inner.handle(req)`. It does nothing else on the way in.' }
+    nodes: [logging, auth]
+    edges: [logging>auth]
+    role: outer
+  - text: Auth checks the token. Without one it writes a 401 and returns. Nothing inside it runs, so a request it rejects never reaches Cache or the handler.
+    nodes: [auth]
+    edges: []
+    role: reject
+  - text: With a valid token, Auth attaches the user and calls the next wrapper. Cache keys on that user, which is why Cache must sit inside Auth.
+    nodes: [auth, cache, context]
+    edges: [auth>cache, cache>context]
+    role: inner
+  - text: The response unwinds outward through the same wrappers in reverse. Logging writes its line last, with the final status, whether it was a 200, a cached 200 or a 401.
+    nodes: [logging]
+    edges: []
+    role: out
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these situations calls for a Decorator?
+    options:
+      - text: Every storage client needs retries and metrics, and each deployment turns on a different mix of them.
+        correct: true
+        why: Right. Each extra is a wrapper with the storage client's own interface, so the mix and the order are chosen at wiring time, and the client itself never changes.
+      - text: A legacy payment SDK has a different method signature from the interface the rest of the code expects.
+        why: That is Adapter. It changes the interface. A decorator keeps the interface and adds behaviour.
+      - text: The service compresses with gzip, zstd or brotli, chosen from config, and uses exactly one of them.
+        why: That is Strategy. One algorithm is swapped in. Decorators are stacked, and several run on every call.
+  engineer:
+    question: Your cache middleware stores responses for GET /orders/{id}. Where should it go relative to Auth?
+    options:
+      - text: Inside Auth, keyed on the user Auth attached as well as the path.
+        correct: true
+        why: Right. Only requests with a valid token reach it, and two users never share an entry. Cache hits still save the database call.
+      - text: Outside Auth, so cache hits skip the token check and respond faster.
+        why: Then the cache answers before anyone knows who is asking. It can only key on the path, so it hands one customer's orders to anyone who asks for the same URL.
+      - text: It does not matter, as long as both wrappers are in the stack.
+        why: It matters. Each wrapper only sees the requests the wrappers outside it let through, and a cache hit stops everything inside it from running.
+  deep:
+    question: In Rust, the stack is the type `Logging<Auth<Cache<Orders>>>`. What does that buy and cost compared with `Box<dyn Handler>` at each layer?
+    options:
+      - text: Calls between layers are static and can be inlined, but each order is a different type, so routes with different stacks need boxing to share one type.
+        correct: true
+        why: Right. The compiler monomorphises the nested generics into one concrete type. tower uses this, and offers boxed services such as `BoxCloneService` to erase the type when you need to.
+      - text: Each layer allocates on the heap for every request.
+        why: No. The nested structs live inside each other in one value, built once at startup. Nothing is allocated per request by the nesting itself.
+      - text: The compiler can reorder the layers to run the cheapest check first.
+        why: No. The order is part of the program's meaning. The compiler never changes which wrapper sees the request first.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Component
+      example: { go: "http.Handler (interface)", python: "Handler (callable type)", typescript: "Handler (function type)", rust: "Handler (trait)" }
+      job: The interface that both the real object and every wrapper have.
+    - role: Concrete component
+      example: { go: handleOrders, python: handle_orders, typescript: handleOrders, rust: Orders }
+      job: The object that does the real work. It knows nothing about the wrappers.
+    - role: Decorator
+      example: "Logging, RateLimit, Auth, Cache"
+      job: Holds the next handler, adds one behaviour before or after calling it, and may answer early instead.
+    - role: Client
+      example: main, or the router setup
+      job: Builds the stack and decides the order.
+  useWhen:
+    - Several optional extras around the same interface, in combinations that differ by route, deployment or config.
+    - The extras are cross-cutting (logging, auth, retries, metrics, caching) and should not live inside business code.
+    - You cannot or should not change the wrapped object, for example a client from a library.
+  avoidWhen:
+    - There is only one extra and it always applies. Put it in the object.
+    - A wrapper needs to reach into the wrapped object's internals. That is a sign the behaviour belongs inside it, or that you want Strategy.
+    - The stack is so deep that a stack trace through it is hard to read and nobody can say the order from memory.
+  tradeoffs:
+    - The order is part of the behaviour, but nothing in the type system checks it. Write it in one place and test the important orderings.
+    - Many small wrappers. Debugging means stepping through every layer.
+    - A wrapper is not the wrapped object. Identity checks, type assertions and extra methods of the inner object do not get through.
+    - Each layer adds a call, and with interfaces or trait objects an indirect one. For HTTP this is noise next to the network.
+  lookalikes:
+    - name: Adapter
+      how: Changes the interface of an object. A decorator keeps the interface and adds behaviour.
+    - name: Proxy
+      how: Same shape, but a proxy controls access to one object (lazy loading, remote calls) and usually creates or owns it. Decorators are stacked freely by the client.
+    - name: Chain of Responsibility
+      how: Each handler decides whether to pass a request on, and usually exactly one handles it. With decorators, every layer normally runs and wraps the next. HTTP middleware sits between the two.
+    - name: Composite
+      how: Also recursive, but a composite holds many children and combines their results. A decorator holds exactly one.
+    - name: Strategy
+      how: Swaps the inside of an object. A decorator changes it from the outside, and several can stack.
+---
+
+## [concept] Decorator
+
+**Wrap an object in another object with the same <Term id="interface">interface</Term>. The wrapper adds one behaviour and passes the call on.**
+
+Because a wrapper looks exactly like the thing it wraps, you can wrap a wrapper. HTTP <Term id="middleware-onion">middleware</Term> is the everyday example: logging, auth, rate limiting and caching each wrap the handler, and you choose which ones, and in what order, when you wire the route.
+
+<Depth level={2}>
+Four roles. The **component** is the shared interface (`http.Handler`, a handler function type, a trait). The **concrete component** does the real work (`handleOrders`). Each **decorator** holds the next component, does its own job before or after calling it, and may answer early instead: a <Term id="short-circuit-response">short-circuit</Term> such as a 401. The **client** (`main`, the router setup) builds the stack. The design leans on composition over inheritance: a subclass per combination would need 64 classes for four extras, and fixes the order at compile time.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Decorator as an object structural pattern, also known as Wrapper. It names two benefits: more flexibility than static inheritance, since wrappers can be attached and removed at runtime, and simple classes instead of one class loaded with every optional feature. It also names two costs: a decorated object is not identical to the original, so identity checks fail, and a design built from many small look-alike objects can be hard to learn and debug. It notes that the same decorator can be applied twice, and contrasts Decorator with Strategy: a decorator changes the skin of an object, a strategy its guts.
+</Depth>
+
+## [problem] Handlers that do everything
+
+An API has an orders endpoint and a search endpoint. Each one checks the token, logs the request, and the orders one also caches. It works, and it is tested.
+
+Read it once. The token check and the log line are copied into both handlers, and each early return has to remember to log.
+
+<Depth level={2}>
+The order of the concerns is hidden in the control flow. Auth runs before the cache because the cache key needs the user, but nothing says so; it is just the order of the `if` statements. Every handler re-decides that order.
+</Depth>
+
+<Depth level={3}>
+The duplicated code also means duplicated bugs. When the log format changes, or a timing bug is found in the early returns, the fix goes into every handler, and the ones nobody remembers keep the bug.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** security wants every endpoint rate limited per client IP, before the token check runs.
+
+The marked lines must change, and they go into every handler. Each copy must sit in the right place: after the timer starts, so the 429 is logged, and before the token check, so floods never reach the identity service.
+
+<Depth level={2}>
+Two handlers today, more tomorrow. Miss one and it has no rate limit, and nothing fails: the requests still succeed. Put the check after the token check in one handler and that endpoint keeps calling the identity service for every flood request.
+</Depth>
+
+<Depth level={3}>
+Tests do not catch this well. Each handler's tests must now cover rate limiting too, and the ordering between the limiter and the token check is only visible in tests that count calls to the identity service.
+</Depth>
+
+## [morph] Turn each concern into a wrapper
+
+Drag the slider. The inline concerns leave the handler and become wrappers that all have the handler's shape, nested one inside the next.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The handler now does one thing. The order lives in one line of wiring per route, where a reviewer can read it from the outside in. Adding a concern means writing one wrapper and adding it to the wiring, without touching the handlers: the <Term id="open-closed">open/closed principle</Term>.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go middleware is a function `func(http.Handler) http.Handler`. Each wrapper returns an `http.HandlerFunc` closure that captures `next`. Logging wraps the `ResponseWriter` in a small recorder so it can read the status after `next` returns, a second, smaller decorator inside the first.</Lang>
+<Lang only="python">Each wrapper is a function that takes a handler and returns a new one, a closure over `inner`. This is the same mechanism the `@` syntax uses, but applied at wiring time, so the stack can differ by route or come from config.</Lang>
+<Lang only="typescript">A middleware is a function from `Handler` to `Handler`. TypeScript uses <Term id="structural-typing">structural typing</Term>, so any function with the right parameter and return types fits, with no interface to implement.</Lang>
+<Lang only="rust">Each wrapper is a generic struct `Logging<H>` with `impl<H: Handler> Handler for Logging<H>`. The stack's type spells out the order, and the compiler checks at every level that the inner value is a `Handler`.</Lang>
+</Depth>
+
+## [walk] Follow one request in and back out
+
+One request through the stack, in and back out. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Each layer is an `http.HandlerFunc` called through the `http.Handler` interface: an indirect call per layer, a few nanoseconds each. The request travels down the Go stack, and the response travels back up it as the calls return.</Lang>
+<Lang only="python">Each layer is a closure call: a frame per wrapper. Deep stacks show up in tracebacks as a column of `handle` frames, which is the debugging cost the catalogue warns about.</Lang>
+<Lang only="typescript">Each layer awaits the next, so a request through four wrappers creates a chain of promises that resolve from the inside out. Code after `await next(req)` runs on the way out.</Lang>
+<Lang only="rust">`Logging<Auth<Cache<Orders>>>` is one concrete type, built by <Term id="monomorphisation">monomorphisation</Term>, so the calls between layers are static and can be inlined. Storing layers as `Box<dyn Handler>` instead would make each call go through a vtable: <Term id="dynamic-dispatch">dynamic dispatch</Term>.</Lang>
+</Depth>
+
+## [again] Rate limiting, the second time
+
+The same request after the refactor. You write one new wrapper and add it to the wiring, outside Auth. No handler changes, and every route that uses the shared stack gets it.
+
+<Depth level={2}>
+Keep the stack in one place, such as a list of middleware applied by a helper or by the router, so adding a wrapper is one line and the order is reviewed once instead of per route.
+</Depth>
+
+<Depth level={3}>
+Test each wrapper alone with a fake inner handler: does RateLimit call it the first three times and not the fourth? Then add one test of the whole stack for the orderings that matter, such as "a request without a token never reaches the cache".
+</Depth>
+
+## [play] Reorder the stack, replay the traffic
+
+Four wrappers guard an orders API, in an order that looks reasonable. The same nine requests replay through the stack every time you change it: two from Ana, one with no token, five from a scraper, one from Ben.
+
+Change only the order, and meet all four goals.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. In Go and Rust it is the standard way to build HTTP services; in Python and TypeScript it competes with the `@` decorator syntax, which looks similar and is not quite the same thing.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="decorator" />
+
+### The order is the design
+
+A stack of decorators reads from the outside in, and the request travels the same way. Decide three things for each wrapper: what must already be known when it runs (Cache needs the user, so it sits inside Auth), which requests it must see (Logging must see rejections, so it sits outside them), and what it protects (RateLimit protects the identity service, so it sits outside Auth). Then write the order in one place and test it.
