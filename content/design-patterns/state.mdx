@@ -1,0 +1,707 @@
+---
+title: State
+track: design-patterns
+group: Behavioral
+order: 47
+summary: Give each state of an object its own object, and let the current one decide what every request does, including refusing it.
+intent: An object whose behaviour depends on its lifecycle should not answer every request by re-checking a pile of flags.
+changeRequest: The fraud team needs to hold risky orders for review before they ship.
+languages: [go, python, typescript, rust]
+glossary: [finite-state-machine, typestate, at-least-once-delivery, open-closed, dynamic-dispatch, itab]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/strategy]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: state
+  scenarios:
+    - try: Press Pay, Cancel, Ship.
+      notice: The flag order ships a parcel for an order it already refunded. The state order is in Cancelled, which has no Ship, so it refuses.
+    - try: Press Pay, Cancel, then Resend to replay the cancel webhook.
+      notice: The flag order refunds $160 on an $80 order. In the state order the retry reaches Cancelled and changes nothing.
+    - try: Press New order, then Cancel and Pay. Look at the flag grid.
+      notice: The flags land on a combination that looks legal, yet the shop kept the money for a cancelled order. Flags record where the order is, not how it got there.
+    - try: Run the stress test.
+      notice: About two in five flag orders end with wrong books or impossible flags. No state order does; the state design refuses the stray events instead.
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: callers, sub: webhooks · scanner }
+      after:  { x: 12, y: 30, w: 112, h: 48, title: callers, sub: webhooks · scanner }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: Order, sub: 4 flags · 4 guards }
+      after:  { x: 168, y: 30, w: 150, h: 56, title: Order, sub: { go: state OrderState, python: self.state, typescript: "state: OrderState", rust: "state: OrderState" } }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 30, w: 180, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 180, h: 56, title: OrderState, sub: { go: default reject, python: default reject, typescript: default reject, rust: enum + match } }
+    - id: pending
+      kind: concrete
+      before: { x: 188, y: 56, w: 222, h: 28, title: all flags false }
+      after:  { x: 12, y: 204, w: 82, h: 40, title: Pending }
+    - id: paid
+      kind: concrete
+      before: { x: 188, y: 90, w: 222, h: 28, title: paid bool }
+      after:  { x: 102, y: 204, w: 82, h: 40, title: Paid }
+    - id: shipped
+      kind: concrete
+      before: { x: 188, y: 124, w: 222, h: 28, title: shipped bool }
+      after:  { x: 192, y: 204, w: 82, h: 40, title: Shipped }
+    - id: delivered
+      kind: concrete
+      before: { x: 188, y: 158, w: 222, h: 28, title: delivered bool }
+      after:  { x: 282, y: 204, w: 82, h: 40, title: Delivered }
+    - id: cancelled
+      kind: concrete
+      before: { x: 188, y: 192, w: 222, h: 28, title: cancelled bool }
+      after:  { x: 372, y: 204, w: 82, h: 40, title: Cancelled }
+    - id: onhold
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 226, w: 222, h: 28, title: { go: onHold bool, python: on_hold bool, typescript: onHold bool, rust: on_hold bool } }
+      after:  { x: 462, y: 204, w: 82, h: 40, title: OnHold }
+  edges:
+    - { from: client, to: context, label: events }
+    - { from: context, to: strategy, label: delegates }
+    - { from: pending, to: strategy, kind: implements }
+    - { from: paid, to: strategy, kind: implements }
+    - { from: shipped, to: strategy, kind: implements, label: implements }
+    - { from: delivered, to: strategy, kind: implements }
+    - { from: cancelled, to: strategy, kind: implements }
+    - { from: onhold, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: order.go
+      source: |
+        // order.go
+        type Order struct {
+            paid, shipped, delivered, cancelled bool
+        }
+
+        func (o *Order) Pay() error {
+            if o.paid {
+                return ErrAlreadyPaid
+            }
+            o.paid = true
+            return charge(o)
+        }
+
+        func (o *Order) Ship() error {
+            if !o.paid {
+                return ErrNotPaid
+            }
+            o.shipped = true
+            return warehouse.Ship(o)
+        }
+
+        func (o *Order) Deliver() error {
+            if !o.shipped {
+                return ErrNotShipped
+            }
+            o.delivered = true
+            return nil
+        }
+
+        func (o *Order) Cancel() error {
+            if o.shipped {
+                return ErrAlreadyShipped
+            }
+            o.cancelled = true
+            if o.paid {
+                return refund(o)
+            }
+            return nil
+        }
+      roles: { context: [2, 39], pending: [2, 4], paid: [6, 12], shipped: [14, 20], delivered: [22, 28], cancelled: [30, 39] }
+      change:
+        - { line: 3, replace: '    paid, shipped, delivered, cancelled, onHold bool' }
+        - { after: 17, add: ['    if o.onHold {', '        return ErrOnHold', '    }'] }
+        - { after: 39, add: ['', 'func (o *Order) Hold() error {', '    if !o.paid || o.shipped || o.cancelled {', '        return ErrCannotHold', '    }', '    o.onHold = true', '    return nil', '}', '', 'func (o *Order) Release() error {', '    o.onHold = false', '    return nil', '}'] }
+    after:
+      file: order.go · states.go
+      source: |
+        type OrderState interface {
+            Pay(o *Order) error
+            Ship(o *Order) error
+            Deliver(o *Order) error
+            Cancel(o *Order) error
+        }
+
+        type Order struct{ state OrderState }
+
+        func NewOrder() *Order { return &Order{state: Pending{}} }
+
+        func (o *Order) Pay() error     { return o.state.Pay(o) }
+        func (o *Order) Ship() error    { return o.state.Ship(o) }
+        func (o *Order) Deliver() error { return o.state.Deliver(o) }
+        func (o *Order) Cancel() error  { return o.state.Cancel(o) }
+
+        // next moves to s only if the side effect succeeded.
+        func (o *Order) next(s OrderState, err error) error {
+            if err == nil {
+                o.state = s
+            }
+            return err
+        }
+
+        // reject is embedded in every state: an event is refused unless the state overrides it.
+        type reject struct{}
+
+        func (reject) Pay(*Order) error     { return ErrIllegal }
+        func (reject) Ship(*Order) error    { return ErrIllegal }
+        func (reject) Deliver(*Order) error { return ErrIllegal }
+        func (reject) Cancel(*Order) error  { return ErrIllegal }
+
+        type Pending struct{ reject }
+
+        func (Pending) Pay(o *Order) error    { return o.next(Paid{}, charge(o)) }
+        func (Pending) Cancel(o *Order) error { return o.next(Cancelled{}, nil) }
+
+        type Paid struct{ reject }
+
+        func (Paid) Ship(o *Order) error   { return o.next(Shipped{}, warehouse.Ship(o)) }
+        func (Paid) Cancel(o *Order) error { return o.next(Cancelled{}, refund(o)) }
+
+        type Shipped struct{ reject }
+
+        func (Shipped) Deliver(o *Order) error { return o.next(Delivered{}, nil) }
+
+        type Delivered struct{ reject }
+        type Cancelled struct{ reject }
+      roles: { strategy: [1, 6], context: [8, 23], client: [12, 15], pending: [33, 36], paid: [38, 41], shipped: [43, 45], delivered: [47, 47], cancelled: [48, 48], call: [15, 15], dispatch: [41, 41], swap: [18, 23], reject: [25, 31] }
+    again:
+      file: on_hold.go
+      source: |
+        // on_hold.go: one new state. OrderState and reject also gain Hold and Release.
+        func (Paid) Hold(o *Order) error { return o.next(OnHold{}, nil) }
+
+        type OnHold struct{ reject }
+
+        func (OnHold) Release(o *Order) error { return o.next(Paid{}, nil) }
+        func (OnHold) Cancel(o *Order) error  { return o.next(Cancelled{}, refund(o)) }
+
+        // OnHold has no Ship, so a held order cannot ship. Nobody had to remember that.
+    cost:
+      before: { text: 3 places · 16 → 32 combos, value: 0.85 }
+      after: { text: 1 new state · 1 new method, value: 0.25 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Embedding a `reject` struct gives every state the refusing methods for free; a state overrides only the events it accepts. For a small machine, a typed constant with one `switch` per method is the usual Go code. Go also has a lighter State: a state is a function that returns the next state function.'
+      seenIn: 'The lexer in `text/template/parse` is built on `type stateFn func(*lexer) stateFn`, each state a function returning the next. `net/http` reports each connection''s lifecycle as a `ConnState` (`StateNew`, `StateActive`, `StateIdle`, `StateClosed`) through `Server.ConnState`.'
+
+  python:
+    before:
+      file: order.py
+      source: |
+        # order.py
+        class Order:
+            def __init__(self) -> None:
+                self.paid = self.shipped = self.delivered = self.cancelled = False
+
+            def pay(self) -> None:
+                if self.paid:
+                    raise AlreadyPaid(self)
+                self.paid = True
+                charge(self)
+
+            def ship(self) -> None:
+                if not self.paid:
+                    raise NotPaid(self)
+                self.shipped = True
+                warehouse.ship(self)
+
+            def deliver(self) -> None:
+                if not self.shipped:
+                    raise NotShipped(self)
+                self.delivered = True
+
+            def cancel(self) -> None:
+                if self.shipped:
+                    raise AlreadyShipped(self)
+                self.cancelled = True
+                if self.paid:
+                    refund(self)
+      roles: { context: [2, 28], pending: [3, 4], paid: [6, 10], shipped: [12, 16], delivered: [18, 21], cancelled: [23, 28] }
+      change:
+        - { line: 4, replace: '        self.paid = self.shipped = self.delivered = self.cancelled = self.on_hold = False' }
+        - { after: 14, add: ['        if self.on_hold:', '            raise OnHoldError(self)'] }
+        - { after: 28, add: ['', '    def hold(self) -> None:', '        if not self.paid or self.shipped or self.cancelled:', '            raise CannotHold(self)', '        self.on_hold = True', '', '    def release(self) -> None:', '        self.on_hold = False'] }
+    after:
+      file: order.py
+      source: |
+        from __future__ import annotations
+        from typing import NoReturn
+
+        class OrderState:
+            """Every event is refused unless a state overrides it."""
+            def pay(self, order: Order) -> None: self._reject("pay")
+            def ship(self, order: Order) -> None: self._reject("ship")
+            def deliver(self, order: Order) -> None: self._reject("deliver")
+            def cancel(self, order: Order) -> None: self._reject("cancel")
+
+            def _reject(self, event: str) -> NoReturn:
+                raise IllegalTransition(f"{type(self).__name__} cannot {event}")
+
+        class Pending(OrderState):
+            def pay(self, order: Order) -> None:
+                charge(order)
+                order.state = Paid()
+
+            def cancel(self, order: Order) -> None:
+                order.state = Cancelled()
+
+        class Paid(OrderState):
+            def ship(self, order: Order) -> None:
+                warehouse.ship(order)
+                order.state = Shipped()
+
+            def cancel(self, order: Order) -> None:
+                refund(order)
+                order.state = Cancelled()
+
+        class Shipped(OrderState):
+            def deliver(self, order: Order) -> None:
+                order.state = Delivered()
+
+        class Delivered(OrderState): pass
+        class Cancelled(OrderState): pass
+
+        class Order:
+            def __init__(self) -> None:
+                self.state: OrderState = Pending()
+
+            def pay(self) -> None: self.state.pay(self)
+            def ship(self) -> None: self.state.ship(self)
+            def deliver(self) -> None: self.state.deliver(self)
+            def cancel(self) -> None: self.state.cancel(self)
+      roles: { strategy: [4, 12], pending: [14, 20], paid: [22, 29], shipped: [31, 33], delivered: [35, 35], cancelled: [36, 36], context: [38, 45], client: [42, 45], call: [45, 45], dispatch: [27, 28], swap: [29, 29], reject: [11, 12] }
+    again:
+      file: on_hold.py
+      source: |
+        # in class Paid, one new method:
+            def hold(self, order: Order) -> None:
+                order.state = OnHold()
+
+        # on_hold.py: a new state. OrderState gains hold and release that refuse by default.
+        class OnHold(OrderState):
+            def release(self, order: Order) -> None:
+                order.state = Paid()
+
+            def cancel(self, order: Order) -> None:
+                refund(order)
+                order.state = Cancelled()
+        # OnHold has no ship(), so a held order cannot ship.
+    cost:
+      before: { text: 3 places · 16 → 32 combos, value: 0.85 }
+      after: { text: 1 new class · 1 new method, value: 0.25 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'The base class with refusing defaults plays the role of the interface. For a machine whose states carry no behaviour of their own, an `Enum` of states and a dict of allowed `(state, event)` pairs is shorter, and the `transitions` library builds that table for you.'
+      seenIn: '`http.client.HTTPConnection` tracks whether a request is idle, started or sent, and raises `CannotSendRequest` or `ResponseNotReady` when you call a method in the wrong state. `asyncio.Future` refuses `set_result` once it is done or cancelled.'
+
+  typescript:
+    before:
+      file: order.ts
+      source: |
+        // order.ts
+        class Order {
+          private paid = false;
+          private shipped = false;
+          private delivered = false;
+          private cancelled = false;
+
+          async pay(): Promise<void> {
+            if (this.paid) throw new AlreadyPaid(this);
+            this.paid = true;
+            await charge(this);
+          }
+
+          async ship(): Promise<void> {
+            if (!this.paid) throw new NotPaid(this);
+            this.shipped = true;
+            await warehouse.ship(this);
+          }
+
+          async deliver(): Promise<void> {
+            if (!this.shipped) throw new NotShipped(this);
+            this.delivered = true;
+          }
+
+          async cancel(): Promise<void> {
+            if (this.shipped) throw new AlreadyShipped(this);
+            this.cancelled = true;
+            if (this.paid) await refund(this);
+          }
+        }
+      roles: { context: [2, 30], pending: [3, 6], paid: [8, 12], shipped: [14, 18], delivered: [20, 23], cancelled: [25, 29] }
+      change:
+        - { after: 6, add: ['  private onHold = false;'] }
+        - { after: 15, add: ['    if (this.onHold) throw new OrderOnHold(this);'] }
+        - { after: 29, add: ['', '  hold(): void {', '    if (!this.paid || this.shipped || this.cancelled) throw new CannotHold(this);', '    this.onHold = true;', '  }', '', '  release(): void {', '    this.onHold = false;', '  }'] }
+    after:
+      file: order.ts
+      source: |
+        abstract class OrderState {
+          // Every event is refused unless a state overrides it.
+          async pay(_o: Order): Promise<void> { this.reject("pay"); }
+          async ship(_o: Order): Promise<void> { this.reject("ship"); }
+          async deliver(_o: Order): Promise<void> { this.reject("deliver"); }
+          async cancel(_o: Order): Promise<void> { this.reject("cancel"); }
+          protected reject(event: string): never {
+            throw new IllegalTransition(`${this.constructor.name} cannot ${event}`);
+          }
+        }
+
+        class Pending extends OrderState {
+          async pay(o: Order) { await charge(o); o.state = new Paid(); }
+          async cancel(o: Order) { o.state = new Cancelled(); }
+        }
+
+        class Paid extends OrderState {
+          async ship(o: Order) { await warehouse.ship(o); o.state = new Shipped(); }
+          async cancel(o: Order) { await refund(o); o.state = new Cancelled(); }
+        }
+
+        class Shipped extends OrderState {
+          async deliver(o: Order) { o.state = new Delivered(); }
+        }
+
+        class Delivered extends OrderState {}
+        class Cancelled extends OrderState {}
+
+        class Order {
+          state: OrderState = new Pending();
+
+          pay() { return this.state.pay(this); }
+          ship() { return this.state.ship(this); }
+          deliver() { return this.state.deliver(this); }
+          cancel() { return this.state.cancel(this); }
+        }
+      roles: { strategy: [1, 10], pending: [12, 15], paid: [17, 20], shipped: [22, 24], delivered: [26, 26], cancelled: [27, 27], context: [29, 36], client: [32, 35], call: [35, 35], dispatch: [19, 19], swap: [19, 19], reject: [7, 9] }
+    again:
+      file: on-hold.ts
+      source: |
+        // in class Paid, one new method (OrderState gains refusing hold and release):
+          async hold(o: Order) { o.state = new OnHold(); }
+
+        // on-hold.ts: a new state. It has no ship(), so a held order cannot ship.
+        class OnHold extends OrderState {
+          async release(o: Order) { o.state = new Paid(); }
+          async cancel(o: Order) { await refund(o); o.state = new Cancelled(); }
+        }
+    cost:
+      before: { text: 3 places · 16 → 32 combos, value: 0.85 }
+      after: { text: 1 new class · 1 new method, value: 0.25 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Classes work, but the lighter TypeScript habit is a discriminated union, `type Order = { status: "pending" } | { status: "paid"; chargeId: string } | …`, with a transition function that `switch`es on `status`. Each state then carries only the data it can have. XState adds a visual statechart on top.'
+      seenIn: '`WebSocket.readyState` (`CONNECTING`, `OPEN`, `CLOSING`, `CLOSED`): `send()` throws `InvalidStateError` while connecting. A `Promise` settles once and ignores later resolve calls. XState machines.'
+
+  rust:
+    before:
+      file: order.rs
+      source: |
+        // order.rs
+        pub struct Order {
+            paid: bool,
+            shipped: bool,
+            delivered: bool,
+            cancelled: bool,
+        }
+
+        impl Order {
+            pub fn pay(&mut self) -> Result<(), OrderError> {
+                if self.paid {
+                    return Err(OrderError::AlreadyPaid);
+                }
+                self.paid = true;
+                charge(self)
+            }
+
+            pub fn ship(&mut self) -> Result<(), OrderError> {
+                if !self.paid {
+                    return Err(OrderError::NotPaid);
+                }
+                self.shipped = true;
+                warehouse::ship(self)
+            }
+
+            pub fn deliver(&mut self) -> Result<(), OrderError> {
+                if !self.shipped {
+                    return Err(OrderError::NotShipped);
+                }
+                self.delivered = true;
+                Ok(())
+            }
+
+            pub fn cancel(&mut self) -> Result<(), OrderError> {
+                if self.shipped {
+                    return Err(OrderError::AlreadyShipped);
+                }
+                self.cancelled = true;
+                if self.paid { refund(self) } else { Ok(()) }
+            }
+        }
+      roles: { context: [2, 41], pending: [2, 7], paid: [10, 16], shipped: [18, 24], delivered: [26, 32], cancelled: [34, 40] }
+      change:
+        - { after: 6, add: ['    on_hold: bool,'] }
+        - { after: 21, add: ['        if self.on_hold {', '            return Err(OrderError::OnHold);', '        }'] }
+        - { after: 40, add: ['', '    pub fn hold(&mut self) -> Result<(), OrderError> {', '        if !self.paid || self.shipped || self.cancelled {', '            return Err(OrderError::CannotHold);', '        }', '        self.on_hold = true;', '        Ok(())', '    }', '', '    pub fn release(&mut self) {', '        self.on_hold = false;', '    }'] }
+    after:
+      file: order.rs
+      source: |
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum OrderState { Pending, Paid, Shipped, Delivered, Cancelled }
+
+        #[derive(Clone, Copy, Debug)]
+        pub enum Event { Pay, Ship, Deliver, Cancel }
+
+        pub struct Order { state: OrderState }
+
+        impl Order {
+            pub fn handle(&mut self, event: Event) -> Result<(), OrderError> {
+                use Event::*;
+                use OrderState::*;
+                let next = match (self.state, event) {
+                    (Pending, Pay) => { charge(self)?; Paid }
+                    (Pending, Cancel) => Cancelled,
+                    (Paid, Ship) => { warehouse::ship(self)?; Shipped }
+                    (Paid, Cancel) => { refund(self)?; Cancelled }
+                    (Shipped, Deliver) => Delivered,
+                    (state, event) => return Err(OrderError::Illegal { state, event }),
+                };
+                self.state = next;
+                Ok(())
+            }
+        }
+      roles: { strategy: [1, 5], context: [7, 24], client: [10, 10], pending: [14, 15], paid: [16, 17], shipped: [18, 18], delivered: [2, 2], cancelled: [2, 2], call: [10, 13], dispatch: [17, 17], swap: [21, 21], reject: [19, 19] }
+    again:
+      file: order.rs
+      source: |
+        // OrderState gains OnHold; Event gains Hold and Release. Three new arms in handle:
+                    (Paid, Hold) => OnHold,
+                    (OnHold, Release) => Paid,
+                    (OnHold, Cancel) => { refund(self)?; Cancelled }
+                    // (OnHold, Ship) falls through to the last arm and is refused.
+    cost:
+      before: { text: 3 places · 16 → 32 combos, value: 0.85 }
+      after: { text: 1 variant · 3 new arms, value: 0.22 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'In Rust the usual State is an `enum` plus one `match` on `(state, event)`; the match must cover every pair, so refusing is one explicit catch-all arm. The trait-object version (`Box<dyn State>`) is the shape from the catalogue. With typestate, `Order<Paid>` has a `ship` method and `Order<Pending>` does not, so an illegal call does not compile.'
+      seenIn: 'The Rust Book''s blog-post example builds the same workflow twice: with `Box<dyn State>`, then with types per state. Embedded HAL crates give GPIO pins types like `Pin<Input>` and `Pin<Output>`, so writing to an input pin does not compile.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'Support cancels a paid order. The handler calls `order.Cancel()`. Order holds no flags; it forwards the call to its current state.', python: 'Support cancels a paid order. The handler calls `order.cancel()`. Order holds no flags; it forwards the call to its current state.', typescript: 'Support cancels a paid order. The handler calls `order.cancel()`. Order holds no flags; it forwards the call to its current state.', rust: 'Support cancels a paid order. The handler calls `order.handle(Cancel)`, and the match looks at the pair `(Paid, Cancel)`.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: call
+  - text: { go: 'The current state is `Paid`, so `Paid.Cancel` runs. It is the only code that knows what cancelling a paid order means: refund, then Cancelled.', python: 'The current state is `Paid`, so `Paid.cancel` runs. It is the only code that knows what cancelling a paid order means: refund, then Cancelled.', typescript: 'The current state is `Paid`, so `Paid.cancel` runs. It is the only code that knows what cancelling a paid order means: refund, then Cancelled.', rust: 'The `(Paid, Cancel)` arm runs. It is the only code that knows what cancelling a paid order means: refund, then Cancelled.' }
+    nodes: [context, strategy, paid]
+    edges: [context>strategy, paid>strategy]
+    role: dispatch
+  - text: { go: '`next` swaps the state only if the refund succeeded. The order changes state in one assignment, never through a half-set group of flags.', python: 'If `refund` raises, the assignment never runs and the order stays Paid. The order changes state in one assignment, never through a half-set group of flags.', typescript: 'If `refund` rejects, the assignment never runs and the order stays Paid. The order changes state in one assignment, never through a half-set group of flags.', rust: 'The `?` returns early if the refund fails, so `self.state = next` runs only on success. The order changes state in one assignment.' }
+    nodes: [paid, cancelled]
+    edges: []
+    role: swap
+  - text: { go: 'A minute later the warehouse scanner sends Ship. `Cancelled` never defined Ship, so the embedded `reject` answers. Nobody wrote a check for this case.', python: 'A minute later the warehouse scanner sends ship. `Cancelled` never defined `ship`, so the base class refuses. Nobody wrote a check for this case.', typescript: 'A minute later the warehouse scanner sends ship. `Cancelled` never defined `ship`, so the base class refuses. Nobody wrote a check for this case.', rust: 'A minute later the warehouse scanner sends Ship. No arm matches `(Cancelled, Ship)`, so the catch-all refuses. Nobody wrote a check for this case.' }
+    nodes: [cancelled, strategy]
+    edges: [cancelled>strategy]
+    role: reject
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these calls for the State pattern?
+    options:
+      - text: A deploy moves from queued to rolling out to healthy or rolled back, and Promote means something different, or is refused, at each stage.
+        correct: true
+        why: Right. The same request does different things depending on where the deploy is in its lifecycle, and the deploy moves itself from stage to stage.
+      - text: A billing service applies one tax rule per country, chosen from config when the request starts.
+        why: That is Strategy. The caller picks the rule and the rule never changes itself. In State, the object moves between states on its own as events arrive.
+      - text: An editor keeps snapshots of a document so the user can roll back to any of them.
+        why: That is Memento. It saves and restores state; it does not change how requests behave.
+  engineer:
+    question: The order service runs on three instances. A Cancel and a Ship for the same paid order arrive at the same moment on two different instances. What stops both from succeeding?
+    options:
+      - text: Nothing in the pattern. Store the state in the database and make each transition a conditional update, such as UPDATE ... WHERE status = 'paid', so only one commits.
+        correct: true
+        why: Right. Each instance loads its own copy of the order and both see Paid. State organises the rules for one copy; across processes you need the database, a lock or a single owner per order to make the transition atomic.
+      - text: The default reject. The second event reaches Cancelled and is refused.
+        why: Only on the instance that already moved to Cancelled. The other instance still holds its own Paid copy, so both events pass.
+      - text: State objects carry no fields, so they are safe to share between instances.
+        why: Sharing state objects saves allocations. The order's current state is still a separate copy per instance, and that copy is what races.
+  deep:
+    question: The state types here have no fields. What does that let you do?
+    options:
+      - text: Create one instance of each state and share it among every order, so a transition allocates nothing.
+        correct: true
+        why: Right. The catalogue notes that a state with no fields is a flyweight. In Go `Paid{}` is a zero-size value, and in Rust each state is just an enum tag. In Python and TypeScript you can keep module-level singletons instead of calling `Paid()` each time.
+      - text: Let the compiler reject illegal transitions.
+        why: No. Fieldless states are still checked at runtime. Compile-time checks need the state in the type of the order itself, which is typestate.
+      - text: Make each order safe to use from several threads at once.
+        why: No. The order's state field is still mutable and shared. Fieldless state objects do not add any synchronisation.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Context
+      example: Order
+      job: Holds the current state and forwards every request to it. Keeps no flags of its own.
+    - role: State
+      example: { go: "OrderState (interface) + reject", python: "OrderState (base class)", typescript: "OrderState (abstract class)", rust: "OrderState (enum)" }
+      job: Names every request the context accepts, and refuses each one by default.
+    - role: Concrete state
+      example: Pending, Paid, Shipped, Delivered, Cancelled
+      job: Handles the requests that are legal in that state, and picks the next state.
+    - role: Client
+      example: Payment webhook, warehouse scanner, support tool
+      job: Sends requests to the context. Never sees the state objects.
+  useWhen:
+    - An object has a lifecycle, and the same request means different things, or is illegal, depending on where it is.
+    - Several methods each branch on the same set of flags or status values.
+    - Events come from systems that do not coordinate, so they can arrive late, twice or out of order.
+  avoidWhen:
+    - There are two or three states and the rules fit in one readable switch. An enum and a switch are clearer.
+    - The states differ only in data, not behaviour. A status field and a transition table say it with less code.
+  tradeoffs:
+    - One type per state, so a small machine gets spread across many small classes.
+    - States that pick their successor know about each other, which couples them.
+    - The pattern guards one in-memory object. Concurrent processes still need a database constraint or a lock.
+    - The rules for one event are spread across the states. To see the whole machine at once, draw it or keep a table next to the code.
+  lookalikes:
+    - name: Strategy
+      how: Same shape, a context delegating to an object behind an interface. In Strategy the caller picks the object and it stays put; in State the object replaces itself as events arrive.
+    - name: Transition table
+      how: A map from (state, event) to the next state. Best when states differ in where they go but not in what they do. The catalogue describes it as the alternative to State.
+    - name: Typestate
+      how: Moves the state into the type, so illegal calls do not compile. Works when the state is known at compile time, not when it is loaded from a database.
+---
+
+## [concept] State
+
+**Give each state of an object its own object, and let the current one decide what every request does, including refusing it.**
+
+From the outside, the object seems to change its class as it moves through its lifecycle. Inside, it swaps one field.
+
+<Depth level={2}>
+The lifecycle is a <Term id="finite-state-machine">finite-state machine</Term>: a fixed set of states and the events each one accepts. The **context** (`Order`) holds the current state and forwards every request to it. The **state** interface lists every request and refuses each one by default. Each **concrete state** overrides only the requests that are legal for it, does the work, and names the next state. Anything a state did not list is refused without anyone writing that check.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files State under object behavioural patterns, with a TCP connection as its example, and gives it the alias Objects for States. It names three consequences. State-specific behaviour is collected in one place per state. Transitions become explicit, a single assignment instead of several variables changing one by one. And states with no fields can be shared between contexts. It also leaves open who picks the next state: the context or the states themselves.
+</Depth>
+
+## [problem] An order made of flags
+
+An online shop tracks each order with four booleans: paid, shipped, delivered and cancelled. Each method checks the flags it needs and sets one more. It works, and the tests for the normal path pass.
+
+Read the four guards. Each one asks about one or two flags. None asks about all four.
+
+<Depth level={2}>
+Events reach the order from different systems. The payment provider sends a webhook when a charge succeeds, the warehouse scanner calls Ship, support cancels. Webhooks use <Term id="at-least-once-delivery">at-least-once delivery</Term>, so the same event can arrive twice. Nothing stops Ship arriving after Cancel.
+</Depth>
+
+<Depth level={3}>
+Four booleans make 16 combinations, and only six of them are real orders. The other ten are states the business never defined, and the code reaches some of them. Cancel a paid order, then Ship: Ship checks only `paid`, which is still true, so a refunded order leaves the warehouse.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the fraud team needs to hold risky orders for review before they ship.
+
+One new flag means a new guard in Ship, two new methods, and a question for every other method: what should it do when the order is on hold? Five flags make 32 combinations.
+
+<Depth level={2}>
+The marked lines are the ones we remembered. Should Deliver check the hold? Can a held order be cancelled, and is it refunded then? Each answer is another guard, and a guard nobody wrote is a bug nobody sees until the event arrives in the wrong order.
+</Depth>
+
+<Depth level={3}>
+The existing bugs stay too. Ship still never checks `cancelled`, and Cancel still refunds twice if the webhook is retried. Each new flag multiplies the cases every guard must think about.
+</Depth>
+
+## [morph] Turn each lifecycle state into an object
+
+Drag the slider. The four flags become five state types behind one interface, and Order keeps a single field: the current state.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Now each state lists what it accepts. Pending accepts Pay and Cancel, Paid accepts Ship and Cancel, Shipped accepts Deliver. Everything else falls through to the default and is refused. The impossible combinations are gone, because a single field can hold only one state.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go has no inheritance, so the refusing defaults come from embedding. `Pending` embeds `reject`, which promotes all four methods; `Pending` then defines its own `Pay` and `Cancel`, which take precedence over the promoted ones.</Lang>
+<Lang only="python">The base class supplies the refusing methods, and each subclass overrides only what it accepts. Method lookup follows the class's MRO, so an override always wins over the default.</Lang>
+<Lang only="typescript">The abstract base class supplies the refusing methods. Its parameters are prefixed with `_` because the defaults ignore them. Subclasses override only the events they accept.</Lang>
+<Lang only="rust">An enum and one `match` replace the state classes. The compiler checks that the match covers every `(state, event)` pair, so refusing is a deliberate catch-all arm, not a forgotten case.</Lang>
+</Depth>
+
+## [walk] Follow one cancellation
+
+A paid order is cancelled, and then a late Ship arrives. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Each call through `o.state` is an interface call through the <Term id="itab">itab</Term>. The state values are zero-size structs, so `o.state = Paid{}` allocates nothing.</Lang>
+<Lang only="python">Each call is an attribute lookup on the current state object, then a call. `Paid()` allocates a small object each time; module-level instances would avoid that, since the states hold no data.</Lang>
+<Lang only="typescript">Between `await refund(o)` and the assignment, the event loop can run another event for the same order, and it still sees Paid. If events for one order can overlap, queue them per order so they run one at a time.</Lang>
+<Lang only="rust">The match compiles to a jump on two small integers, the enum tags. No allocation and no <Term id="dynamic-dispatch">dynamic dispatch</Term>, and `OrderState` is `Copy`, so reading it out of `self` borrows nothing.</Lang>
+</Depth>
+
+## [again] The fraud hold, the second time
+
+The same request, after the refactor. You add one state, OnHold, and Paid gains one method that moves into it. OnHold lists Release and Cancel. It does not list Ship, so a held order cannot ship, and nobody had to remember that.
+
+<Depth level={2}>
+The interface does grow: Hold and Release are new events, so the state interface and its refusing defaults gain two methods. Every existing state inherits the refusal and none of them changes. This follows the <Term id="open-closed">open/closed principle</Term>.
+</Depth>
+
+<Depth level={3}>
+Tests follow the machine. For each state, test the events it accepts and one it refuses. The number of tests grows with states times events, not with the 2 to the n flag combinations.
+</Depth>
+
+## [play] Try to break the order
+
+One order, built both ways, receives every event you send. Send them in the wrong order, replay a webhook, then run the stress test. Watch which design lets an impossible order through.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. Some languages make it lighter, and Rust can move the check into the compiler.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="state" />
+
+### Persisting the state
+
+A real order lives in a database, so the state object is rebuilt from a status column on every request. Keep the column a single enum, never several booleans, and make each transition a conditional write such as `UPDATE orders SET status = 'cancelled' WHERE id = $1 AND status = 'paid'`. If no row changed, another event got there first, and the request is refused just as the state object would refuse it.
