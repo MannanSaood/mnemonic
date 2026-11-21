@@ -1,0 +1,573 @@
+---
+title: Isolation levels and anomalies
+track: databases
+group: Transactions
+order: 21
+summary: An isolation level decides which interleavings of concurrent transactions you can observe. Read committed lets lost updates and write skew commit silently; repeatable read and serializable turn them into an error you must retry.
+intent: Recognise read skew, lost update and write skew in your own transactions, pick the level or lock that stops each one, and retry on serialization failure.
+changeRequest: Run a flash sale on one product, with hundreds of checkouts per second competing for the same stock row.
+languages: [go, python, typescript, rust]
+glossary: [isolation-level, read-skew, lost-update, write-skew, snapshot-isolation, serialization-failure, ssi]
+
+prerequisites: [databases/transactions-and-acid]
+skills: [transactions]
+depths: [overview, engineer, deep]
+
+playground:
+  model: isolation-levels-and-anomalies
+  scenarios:
+    - try: "Two checkouts, read committed: press Overlap them, then run the rest."
+      notice: "Both read 10. T2 waits for T1's lock, then writes 8 over T1's 7. Both commit, and one sale is gone."
+    - try: "Same race at repeatable read."
+      notice: "T2's UPDATE fails with 40001: the row changed after its snapshot. Press Retry T2 and it reads 7 and writes 5."
+    - try: "On-call rota at repeatable read, then at serializable."
+      notice: "At repeatable read both engineers go off call. At serializable the second commit fails, and on retry Bob sees he is the last one and stays."
+    - try: "Two checkouts at read committed with SELECT ... FOR UPDATE, then look at the table of every interleaving."
+      notice: "Every order is correct at read committed, because the second reader waits for the lock and then sees the new stock."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 104, h: 48, title: checkout ×2, sub: same sku }
+      after:  { x: 12, y: 111, w: 104, h: 48, title: checkout ×2, sub: retry on 40001 }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 260, h: 236, title: transaction, sub: "pictured as: runs alone" }
+      after:  { x: 140, y: 20, w: 124, h: 48, title: PostgreSQL, sub: SERIALIZABLE }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 140, y: 111, w: 124, h: 48, title: "" }
+      after:  { x: 140, y: 111, w: 124, h: 48, title: conflict check, sub: loser gets 40001 }
+    - id: t1
+      kind: concrete
+      before: { x: 160, y: 72, w: 220, h: 32, title: T1 · read 10 · write 7 }
+      after:  { x: 290, y: 20, w: 124, h: 44, title: T1 · sells 3, sub: commits 7 }
+    - id: t2
+      kind: concrete
+      before: { x: 160, y: 120, w: 220, h: 32, title: T2 · read 10 · write 8 }
+      after:  { x: 290, y: 111, w: 124, h: 44, title: T2 · sells 2, sub: 40001 · retry }
+    - id: row
+      kind: concrete
+      before: { x: 160, y: 168, w: 220, h: 32, title: stock 8 · a sale lost }
+      after:  { x: 440, y: 66, w: 108, h: 48, title: items row, sub: 10 → 7 → 5 }
+    - id: rota
+      kind: concrete
+      appears: change
+      before: { x: 424, y: 202, w: 124, h: 44, title: on-call rota }
+      after:  { x: 290, y: 202, w: 124, h: 44, title: on-call rota, sub: same helper }
+  edges:
+    - { from: client, to: context, label: BEGIN }
+    - { from: context, to: strategy, label: commits }
+    - { from: strategy, to: t1, label: first wins }
+    - { from: strategy, to: t2, label: "40001" }
+    - { from: t1, to: row, label: write }
+    - { from: t2, to: row, label: retry }
+    - { from: rota, to: strategy }
+
+code:
+  go:
+    before:
+      file: checkout.go
+      source: |
+        // checkout.go
+        func (s *Store) Reserve(ctx context.Context, sku string, qty int) error {
+            tx, err := s.pool.Begin(ctx) // READ COMMITTED, the default
+            if err != nil {
+                return err
+            }
+            defer tx.Rollback(ctx)
+
+            var stock int
+            if err := tx.QueryRow(ctx, `SELECT stock FROM items WHERE sku = $1`, sku).Scan(&stock); err != nil {
+                return err
+            }
+            if stock < qty {
+                return ErrSoldOut
+            }
+            if _, err := tx.Exec(ctx, `UPDATE items SET stock = $1 WHERE sku = $2`, stock-qty, sku); err != nil {
+                return err
+            }
+            return tx.Commit(ctx)
+        }
+      roles: { client: [2, 20], context: [3, 3], t1: [10, 10], t2: [16, 16], row: [16, 16] }
+      change:
+        - { line: 3, replace: '    tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})' }
+    after:
+      file: checkout.go
+      source: |
+        // checkout.go: run the whole transaction at SERIALIZABLE, and retry it when PostgreSQL says 40001
+        func (s *Store) Reserve(ctx context.Context, sku string, qty int) error {
+            return s.serializable(ctx, func(tx pgx.Tx) error {
+                var stock int
+                if err := tx.QueryRow(ctx, `SELECT stock FROM items WHERE sku = $1`, sku).Scan(&stock); err != nil {
+                    return err
+                }
+                if stock < qty {
+                    return ErrSoldOut
+                }
+                _, err := tx.Exec(ctx, `UPDATE items SET stock = $1 WHERE sku = $2`, stock-qty, sku)
+                return err
+            })
+        }
+
+        func (s *Store) serializable(ctx context.Context, fn func(pgx.Tx) error) error {
+            for attempt := 0; ; attempt++ {
+                err := pgx.BeginTxFunc(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.Serializable}, fn)
+                var pgErr *pgconn.PgError
+                if !errors.As(err, &pgErr) || pgErr.Code != "40001" || attempt == 4 {
+                    return err
+                }
+                time.Sleep(time.Duration(10<<attempt) * time.Millisecond) // back off, then run fn again from the top
+            }
+        }
+      roles: { client: [2, 14], context: [18, 18], strategy: [20, 20], t1: [5, 5], t2: [11, 11], row: [11, 11], read: [5, 5], write: [11, 11], conflict: [19, 21], retry: [23, 23] }
+    again:
+      file: rota.go
+      source: |
+        // rota.go: the same helper keeps one engineer on call. Snapshot isolation alone would let both leave.
+        return s.serializable(ctx, func(tx pgx.Tx) error {
+            var onCall int
+            if err := tx.QueryRow(ctx, `SELECT count(*) FROM rota WHERE on_call`).Scan(&onCall); err != nil {
+                return err
+            }
+            if onCall < 2 {
+                return ErrLastOnCall
+            }
+            _, err := tx.Exec(ctx, `UPDATE rota SET on_call = false WHERE name = $1`, name)
+            return err
+        })
+    cost:
+      before: { text: sales lost under load · stock drifts above the truth, value: 0.85 }
+      after: { text: 0 sales lost · a few checkouts retried once, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: A retry helper
+      note: '`database/sql` takes the level in `db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})`; pgx takes `pgx.TxOptions{IsoLevel: pgx.Serializable}`. `pgx.BeginTxFunc` commits when the function returns nil and rolls back otherwise, which is the shape a retry needs. The SQLSTATE is in `*pgconn.PgError`.Code: retry on 40001, and on 40P01 (deadlock) too.'
+      seenIn: '`pgx.BeginTxFunc`, `pgx.TxOptions`, `sql.TxOptions`, `pgconn.PgError`, the `pgerrcode` package for named codes.'
+
+  python:
+    before:
+      file: checkout.py
+      source: |
+        # checkout.py
+        import psycopg
+
+
+        def reserve(conn: psycopg.Connection, sku: str, qty: int) -> None:
+            with conn.transaction():  # READ COMMITTED, the default
+                (stock,) = conn.execute("SELECT stock FROM items WHERE sku = %s", (sku,)).fetchone()
+                if stock < qty:
+                    raise SoldOut(sku)
+                conn.execute("UPDATE items SET stock = %s WHERE sku = %s", (stock - qty, sku))
+      roles: { client: [5, 10], context: [6, 6], t1: [7, 7], t2: [10, 10], row: [10, 10] }
+      change:
+        - { after: 5, add: ['    conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE'] }
+    after:
+      file: checkout.py
+      source: |
+        # checkout.py: run the whole transaction at SERIALIZABLE, and retry it when PostgreSQL says 40001
+        import time
+        import psycopg
+        from psycopg import errors
+
+
+        def reserve(conn: psycopg.Connection, sku: str, qty: int) -> None:
+            def attempt() -> None:
+                (stock,) = conn.execute("SELECT stock FROM items WHERE sku = %s", (sku,)).fetchone()
+                if stock < qty:
+                    raise SoldOut(sku)
+                conn.execute("UPDATE items SET stock = %s WHERE sku = %s", (stock - qty, sku))
+
+            serializable(conn, attempt)
+
+
+        def serializable(conn: psycopg.Connection, fn, tries: int = 5) -> None:
+            conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE
+            for n in range(tries):
+                try:
+                    with conn.transaction():
+                        return fn()
+                except errors.SerializationFailure:
+                    if n == tries - 1:
+                        raise
+                    time.sleep(0.01 * 2**n)  # back off, then run fn again from the top
+      roles: { client: [7, 14], context: [18, 18], strategy: [23, 23], t1: [9, 9], t2: [12, 12], row: [12, 12], read: [9, 9], write: [12, 12], conflict: [23, 25], retry: [26, 26] }
+    again:
+      file: rota.py
+      source: |
+        # rota.py: the same helper keeps one engineer on call. Snapshot isolation alone would let both leave.
+        def go_off_call() -> None:
+            (on_call,) = conn.execute("SELECT count(*) FROM rota WHERE on_call").fetchone()
+            if on_call < 2:
+                raise LastOnCall(name)
+            conn.execute("UPDATE rota SET on_call = false WHERE name = %s", (name,))
+
+        serializable(conn, go_off_call)
+    cost:
+      before: { text: sales lost under load · stock drifts above the truth, value: 0.85 }
+      after: { text: 0 sales lost · a few checkouts retried once, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: A retry helper
+      note: 'psycopg 3 sets the level on the connection with `conn.isolation_level`, which applies from the next transaction. `with conn.transaction():` commits on a clean exit and rolls back on an exception. A failed transaction raises `psycopg.errors.SerializationFailure` (40001) or `DeadlockDetected` (40P01). Without autocommit, psycopg also opens a transaction on the first `execute`, so keep the whole unit inside one block.'
+      seenIn: '`psycopg.IsolationLevel`, `conn.transaction()`, `psycopg.errors.SerializationFailure`.'
+
+  typescript:
+    before:
+      file: checkout.ts
+      source: |
+        // checkout.ts
+        import type { Pool } from "pg";
+
+        export async function reserve(pool: Pool, sku: string, qty: number): Promise<void> {
+          const client = await pool.connect();
+          try {
+            await client.query("BEGIN"); // READ COMMITTED, the default
+            const { rows } = await client.query("SELECT stock FROM items WHERE sku = $1", [sku]);
+            if (rows[0].stock < qty) throw new SoldOut(sku);
+            await client.query("UPDATE items SET stock = $1 WHERE sku = $2", [rows[0].stock - qty, sku]);
+            await client.query("COMMIT");
+          } catch (err) {
+            await client.query("ROLLBACK");
+            throw err;
+          } finally {
+            client.release();
+          }
+        }
+      roles: { client: [4, 18], context: [7, 7], t1: [8, 8], t2: [10, 10], row: [10, 10] }
+      change:
+        - { line: 7, replace: '    await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");' }
+    after:
+      file: checkout.ts
+      source: |
+        // checkout.ts: run the whole transaction at SERIALIZABLE, and retry it when PostgreSQL says 40001
+        import type { Pool, PoolClient } from "pg";
+
+        export function reserve(pool: Pool, sku: string, qty: number): Promise<void> {
+          return serializable(pool, async (client) => {
+            const { rows } = await client.query("SELECT stock FROM items WHERE sku = $1", [sku]);
+            if (rows[0].stock < qty) throw new SoldOut(sku);
+            await client.query("UPDATE items SET stock = $1 WHERE sku = $2", [rows[0].stock - qty, sku]);
+          });
+        }
+
+        async function serializable<T>(pool: Pool, fn: (c: PoolClient) => Promise<T>, tries = 5): Promise<T> {
+          for (let n = 0; ; n++) {
+            const client = await pool.connect();
+            try {
+              await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+              const out = await fn(client);
+              await client.query("COMMIT");
+              return out;
+            } catch (err) {
+              await client.query("ROLLBACK");
+              if ((err as { code?: string }).code !== "40001" || n === tries - 1) throw err;
+              await new Promise((r) => setTimeout(r, 10 * 2 ** n)); // back off, then run fn again from the top
+            } finally {
+              client.release();
+            }
+          }
+        }
+      roles: { client: [4, 10], context: [16, 16], strategy: [22, 22], t1: [6, 6], t2: [8, 8], row: [8, 8], read: [6, 6], write: [8, 8], conflict: [20, 22], retry: [23, 23] }
+    again:
+      file: rota.ts
+      source: |
+        // rota.ts: the same helper keeps one engineer on call. Snapshot isolation alone would let both leave.
+        await serializable(pool, async (client) => {
+          const { rows } = await client.query("SELECT count(*)::int AS n FROM rota WHERE on_call");
+          if (rows[0].n < 2) throw new LastOnCall(name);
+          await client.query("UPDATE rota SET on_call = false WHERE name = $1", [name]);
+        });
+    cost:
+      before: { text: sales lost under load · stock drifts above the truth, value: 0.85 }
+      after: { text: 0 sales lost · a few checkouts retried once, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: A retry helper
+      note: 'node-postgres has no transaction object. You send `BEGIN`, `COMMIT` and `ROLLBACK` yourself, with the level in the BEGIN text, and all of them must go through one client from `pool.connect()`: `pool.query` may pick a different connection for each call. The SQLSTATE arrives as the string `err.code`.'
+      seenIn: '`pool.connect()`, `client.query("BEGIN ISOLATION LEVEL SERIALIZABLE")`, `client.release()`, `err.code === "40001"`.'
+
+  rust:
+    before:
+      file: checkout.rs
+      source: |
+        // checkout.rs
+        use sqlx::PgPool;
+
+        pub async fn reserve(pool: &PgPool, sku: &str, qty: i32) -> anyhow::Result<()> {
+            let mut tx = pool.begin().await?; // READ COMMITTED, the default
+            let stock: i32 = sqlx::query_scalar("SELECT stock FROM items WHERE sku = $1")
+                .bind(sku)
+                .fetch_one(&mut *tx)
+                .await?;
+            if stock < qty {
+                anyhow::bail!(SoldOut);
+            }
+            sqlx::query("UPDATE items SET stock = $1 WHERE sku = $2")
+                .bind(stock - qty)
+                .bind(sku)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        }
+      roles: { client: [4, 20], context: [5, 5], t1: [6, 9], t2: [13, 17], row: [13, 13] }
+      change:
+        - { after: 5, add: ['    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").execute(&mut *tx).await?;'] }
+    after:
+      file: checkout.rs
+      source: |
+        // checkout.rs: run the whole transaction at SERIALIZABLE, and retry it when PostgreSQL says 40001
+        use sqlx::PgPool;
+
+        pub async fn reserve(pool: &PgPool, sku: &str, qty: i32) -> anyhow::Result<()> {
+            for n in 0..5u32 {
+                match try_reserve(pool, sku, qty).await {
+                    Err(e) if is_serialization_failure(&e) && n < 4 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10 << n)).await; // then run again from the top
+                    }
+                    other => return other,
+                }
+            }
+            unreachable!()
+        }
+
+        async fn try_reserve(pool: &PgPool, sku: &str, qty: i32) -> anyhow::Result<()> {
+            let mut tx = pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").execute(&mut *tx).await?;
+            let stock: i32 = sqlx::query_scalar("SELECT stock FROM items WHERE sku = $1").bind(sku).fetch_one(&mut *tx).await?;
+            if stock < qty {
+                anyhow::bail!(SoldOut);
+            }
+            sqlx::query("UPDATE items SET stock = $1 WHERE sku = $2").bind(stock - qty).bind(sku).execute(&mut *tx).await?;
+            tx.commit().await?;
+            Ok(())
+        }
+
+        fn is_serialization_failure(e: &anyhow::Error) -> bool {
+            e.downcast_ref::<sqlx::Error>()
+                .and_then(|e| e.as_database_error())
+                .and_then(|d| d.code())
+                .is_some_and(|c| c == "40001")
+        }
+      roles: { client: [4, 14], context: [18, 18], strategy: [28, 33], t1: [19, 19], t2: [23, 23], row: [23, 23], read: [19, 19], write: [23, 23], conflict: [7, 7], retry: [8, 8] }
+    again:
+      file: rota.rs
+      source: |
+        // rota.rs: the same retry loop keeps one engineer on call. Snapshot isolation alone would let both leave.
+        let on_call: i64 = sqlx::query_scalar("SELECT count(*) FROM rota WHERE on_call").fetch_one(&mut *tx).await?;
+        if on_call < 2 {
+            anyhow::bail!(LastOnCall);
+        }
+        sqlx::query("UPDATE rota SET on_call = false WHERE name = $1").bind(name).execute(&mut *tx).await?;
+    cost:
+      before: { text: sales lost under load · stock drifts above the truth, value: 0.85 }
+      after: { text: 0 sales lost · a few checkouts retried once, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: A retry helper
+      note: '`pool.begin()` returns a `Transaction` that rolls back when it is dropped without `commit()`, so an early `?` is safe. sqlx has no isolation option on `begin`; send `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` as the first statement. `as_database_error().code()` gives the SQLSTATE. Because the closure would borrow the transaction across awaits, a retry loop around a plain async function is the simplest shape.'
+      seenIn: '`PgPool::begin`, `Transaction::commit`, `DatabaseError::code`, `SET TRANSACTION ISOLATION LEVEL`.'
+
+walk:
+  - text: Two checkouts for the same item start at SERIALIZABLE. Each takes a snapshot at its first statement and reads stock = 10.
+    nodes: [client, context, t1, t2]
+    edges: [client>context]
+    role: read
+  - text: T1 writes 7 and commits first. T2's UPDATE was waiting on T1's row lock.
+    nodes: [strategy, t1, row]
+    edges: [strategy>t1, t1>row]
+    role: write
+  - text: The row T2 wants to update was changed by a transaction that committed after T2's snapshot. PostgreSQL rolls T2 back with SQLSTATE 40001, could not serialize access due to concurrent update.
+    nodes: [strategy, t2]
+    edges: [strategy>t2]
+    role: conflict
+  - text: The helper waits a few milliseconds and runs T2's function again from the top. The new snapshot reads 7, and T2 writes 5. Both sales are counted.
+    nodes: [t2, row]
+    edges: [t2>row]
+    role: retry
+
+checks:
+  overview:
+    question: Two transactions each read stock = 10, then write back 10 minus their own quantity. At read committed both commit. What happened?
+    options:
+      - text: A lost update. The second write was computed from a stale read and overwrote the first
+        correct: true
+        why: Right. Each statement saw committed data, so nothing was dirty. The bug is the read-modify-write across two statements, which read committed does not protect.
+      - text: A dirty read, because one transaction saw uncommitted data
+        why: Read committed never shows uncommitted data, and PostgreSQL never does at any level. Both read the committed value 10.
+      - text: Nothing, read committed makes the two transactions run one after the other
+        why: Read committed only fixes what each statement sees. Two transactions can still interleave between statements.
+  engineer:
+    question: At repeatable read, two engineers on call each run "count who is on call; if 2 or more, take myself off". Both commit. Who is on call now, and what would have stopped it?
+    options:
+      - text: Nobody. Serializable, or SELECT ... FOR UPDATE on the rows counted, would have stopped it
+        correct: true
+        why: Right. That is write skew. Each read a snapshot with two people on call and updated a different row, so no write conflicted. Serializable detects the read/write cycle; FOR UPDATE makes the second transaction wait and see the change.
+      - text: One engineer, because repeatable read prevents lost updates
+        why: Repeatable read stops two writes to the same row. Here each transaction wrote its own row.
+      - text: Both engineers, because the second transaction gets an error
+        why: At repeatable read nothing conflicts. Only serializable raises an error for this pattern.
+  deep:
+    question: Why does snapshot isolation stop a lost update but allow write skew?
+    options:
+      - text: It only checks write-write conflicts on the same row. Write skew writes different rows based on reads of the other's row
+        correct: true
+        why: Right. The first-updater-wins rule catches two writes to one row. Write skew is a read/write dependency in each direction, which PostgreSQL's Serializable Snapshot Isolation tracks with predicate (SIRead) locks.
+      - text: Its snapshot is taken at BEGIN rather than at the first statement
+        why: In PostgreSQL the snapshot is taken at the first statement, and the timing is not the cause either way. Both transactions read before either committed.
+      - text: It does not lock rows on UPDATE
+        why: UPDATE takes a row lock at every level. The lock does not help because the two transactions update different rows.
+
+reference:
+  roles:
+    - role: Isolation level
+      example: SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+      job: Decides which concurrent changes a transaction can see, and which interleavings make it fail.
+    - role: Snapshot
+      example: taken at the first statement in repeatable read
+      job: The committed state a transaction reads from, however long it runs.
+    - role: Row lock
+      example: taken by UPDATE and SELECT ... FOR UPDATE
+      job: Makes a second writer of the same row wait until the first commits or rolls back.
+    - role: Retry loop
+      example: the serializable helper
+      job: Reruns the whole transaction, reads included, after a 40001 or 40P01.
+  useWhen:
+    - Read committed with atomic statements (UPDATE ... SET stock = stock - $1) or SELECT ... FOR UPDATE, when every invariant lives in one row you can lock.
+    - Repeatable read for reports and exports that must see one consistent state.
+    - Serializable plus a retry loop when invariants span several rows or tables and you do not want to reason about every interleaving.
+  avoidWhen:
+    - Serializable without a retry loop. Every conflict becomes a user-facing error.
+    - Long transactions at repeatable read or serializable. The longer they run, the more conflicts and retries.
+    - Holding a transaction open across a network call or user input.
+  tradeoffs:
+    - Stronger levels add aborts, not blocking. Under contention on one hot row, retries can pile up; there, an atomic UPDATE is cheaper.
+    - FOR UPDATE serialises writers on the locked rows. Correct and simple, but every checkout for the item waits in line.
+    - Serializable tracks reads in memory and can report false positives, so some retries are not strictly needed.
+  lookalikes:
+    - name: Optimistic concurrency with a version column
+      how: UPDATE ... WHERE id = $1 AND version = $2 and check the row count. The same first-writer-wins idea, done by the application.
+    - name: Constraints
+      how: A CHECK (stock >= 0) or a unique index turns some anomalies into errors at any isolation level.
+    - name: Consistency models in distributed systems
+      how: Linearizability and serializability answer different questions. Jepsen's map of consistency models places both.
+---
+
+## [concept] Isolation levels and anomalies
+
+**An <Term id="isolation-level">isolation level</Term> decides which interleavings of concurrent transactions your code can observe. The weaker ones let some interleavings commit with wrong results. The stronger ones turn those interleavings into an error that you retry.**
+
+Concurrent transactions run statement by statement, interleaved. If every transaction ran alone, one after another, the database would always be right. The isolation level says how far from that ideal the database may go. Each gap has a name: <Term id="read-skew">read skew</Term>, <Term id="lost-update">lost update</Term>, <Term id="write-skew">write skew</Term>.
+
+<Depth level={2}>
+PostgreSQL defaults to read committed: every statement sees what was committed when the statement started. Repeatable read gives the whole transaction one snapshot, which is <Term id="snapshot-isolation">snapshot isolation</Term>. Serializable promises the result of some serial order. MySQL's InnoDB defaults to repeatable read, and its repeatable read is not PostgreSQL's: plain SELECTs read a snapshot, but UPDATE and DELETE work on the newest committed rows.
+</Depth>
+
+<Depth level={3}>
+The SQL standard defines the levels by three phenomena: dirty read, nonrepeatable read and phantom. PostgreSQL's table adds a fourth column, serialization anomaly, and notes that it never allows dirty reads at any level and never allows phantoms at repeatable read. Its read uncommitted behaves like read committed. The standard's definitions miss lost update and write skew, which is why the names vary between databases.
+</Depth>
+
+## [problem] A checkout that reads, then writes
+
+A checkout reserves stock inside a transaction: read the stock, check there is enough, write back the stock minus the quantity, commit. It runs at the default level. In tests, with one checkout at a time, it is always right.
+
+Read the code once. Every line does what it says. The transaction even makes the read and the write commit together.
+
+<Depth level={2}>
+The value written is computed in the application, from a read made one statement earlier. Between that read and the write, another checkout can commit. At read committed, the UPDATE then lands on the new row with a number computed from the old one.
+</Depth>
+
+<Depth level={3}>
+When the second UPDATE finds the row locked by the first, read committed waits. When the first commits, PostgreSQL re-checks the UPDATE's WHERE clause on the new version of the row and applies the UPDATE to it. That is exactly right for `SET stock = stock - 2` and exactly wrong for `SET stock = 8`.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** run a flash sale on one product, with hundreds of checkouts per second competing for the same stock row.
+
+The stock count stops matching the orders. The warehouse ships more items than it had. The marked line is the first fix: run the transaction at SERIALIZABLE.
+
+<Depth level={2}>
+The lost updates stop, and errors start. Every checkout that loses a race now fails with SQLSTATE 40001, "could not serialize access", and the handler turns it into a 500. During the sale, that is most checkouts. The level was right; the code was not ready for it.
+</Depth>
+
+<Depth level={3}>
+A <Term id="serialization-failure">serialization failure</Term> means: this transaction, as it ran, cannot be placed in any serial order with the others. The documentation says to abort and retry the whole transaction from the beginning, reads included, because results read before the error may be wrong.
+</Depth>
+
+## [morph] Let the database choose a loser, and retry it
+
+Drag the slider. The lone transaction box turns into two transactions, a conflict check, and a retry.
+
+The fix is a small helper that runs a function inside a serializable transaction and reruns it on 40001. The checkout code moves into that function unchanged. When two checkouts race, PostgreSQL lets the first to commit win and fails the other; the helper runs the loser again, and the second attempt sees the new stock.
+
+<Depth level={2}>
+Back off between attempts, cap the number of attempts, and keep the function free of side effects outside the database, since it may run more than once. Repeatable read with the same helper would also fix this checkout. Serializable is needed for the next case, where the two transactions write different rows.
+</Depth>
+
+<Depth level={3}>
+PostgreSQL implements serializable as <Term id="ssi">Serializable Snapshot Isolation</Term>. It runs snapshot isolation and also records what each transaction read, as SIRead predicate locks. Those locks never block. When two concurrent transactions each read something the other wrote, they form a cycle no serial order can produce, and one of them is rolled back.
+</Depth>
+
+## [walk] Follow two checkouts through the race
+
+Two transactions, one row, one conflict. Use the numbered buttons.
+
+<Depth level={2}>
+For a single row there are cheaper fixes at read committed. `UPDATE items SET stock = stock - $1 WHERE sku = $2 AND stock >= $1` does the check and the write in one statement, and the row count says whether it worked. `SELECT ... FOR UPDATE` locks the row on the read, so the second checkout waits and then reads the new stock.
+</Depth>
+
+<Depth level={3}>
+At repeatable read the conflict is detected on the write: updating or locking a row that another transaction changed and committed after your snapshot fails at once. At serializable the same rule applies, and the read/write check runs as transactions read, write and commit.
+</Depth>
+
+## [again] The same request, for an on-call rota
+
+The team adds a rule: at least one engineer must stay on call. Two engineers each run the same transaction: count who is on call, and if there are two or more, take themselves off. Each updates only their own row. At repeatable read, both see two people on call in their snapshots, both update, both commit, and nobody is on call. The same serializable helper fixes it with no new code.
+
+<Depth level={2}>
+This is write skew: two transactions read an overlapping set of rows and write disjoint ones, based on what they read. Snapshot isolation only checks conflicting writes, so it cannot see it. Without serializable, the fix is to lock the rows you read, with `SELECT ... FOR UPDATE`, or to turn the rule into a single row both transactions must update.
+</Depth>
+
+<Depth level={3}>
+Phantoms make write skew harder to lock away. If the check is "no other booking overlaps this time slot", there may be no row yet to lock. Serializable's predicate locks cover the range that was read, rows that do not exist included; a plain FOR UPDATE does not.
+</Depth>
+
+## [play] Interleave two transactions yourself
+
+Pick a workload and an isolation level, then run one statement at a time from either transaction. The timeline shows what each statement saw, who waited for a lock, and which transaction PostgreSQL rolled back. Below it, a table runs every possible interleaving at each level.
+
+Produce each anomaly, then watch the stronger level stop it.
+
+## [lens] How each driver exposes transactions and isolation
+
+Every driver can run a transaction at any level. They differ in where the level goes (an option, a property, or SQL text), whether a transaction is an object that cleans up after itself, and how the SQLSTATE reaches your code. Those three decide how a retry helper looks.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Retry the whole function, never a single statement. A statement retried inside a failed transaction gets "current transaction is aborted"; and a retry that reuses values read before the error repeats the bug. Also retry when COMMIT itself fails: under serializable, the conflict can be detected at commit time.
+</Depth>
+
+<Depth level={3}>
+Connection poolers in transaction mode, such as PgBouncer, hand a connection to one transaction at a time. Session settings like `SET default_transaction_isolation` do not survive between transactions there, so set the level per transaction, in BEGIN or SET TRANSACTION.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="isolation-levels-and-anomalies" />
+
+### Which anomaly each PostgreSQL level allows
+
+Read committed allows nonrepeatable reads, read skew, lost updates and write skew; each statement sees fresh committed data. Repeatable read allows write skew only; lost updates and changed rows raise 40001. Serializable allows none of them and raises 40001 instead. No PostgreSQL level shows uncommitted data. In MySQL's InnoDB, repeatable read lets a read-modify-write lose an update without an error, because UPDATE works on the newest rows rather than the snapshot.

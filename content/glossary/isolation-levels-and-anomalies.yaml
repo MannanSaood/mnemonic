@@ -1,0 +1,22 @@
+# Terms introduced by databases/isolation-levels-and-anomalies.
+- id: isolation-level
+  term: Isolation level
+  short: The setting that decides which effects of concurrent transactions a transaction can see. PostgreSQL offers read committed (default), repeatable read and serializable.
+- id: read-skew
+  term: Read skew
+  short: A transaction reads two related values at different moments and sees one before and one after another transaction's change, so they do not add up.
+- id: lost-update
+  term: Lost update
+  short: Two transactions read the same value, each writes back a result computed from it, and the second write silently replaces the first.
+- id: write-skew
+  term: Write skew
+  short: Two transactions read an overlapping set of rows, then each updates a different row based on what it read, breaking a rule that spans both rows.
+- id: snapshot-isolation
+  term: Snapshot isolation
+  short: Each transaction reads from one consistent snapshot of committed data, and two transactions may not both change the same row. PostgreSQL's repeatable read.
+- id: serialization-failure
+  term: Serialization failure
+  short: The error (SQLSTATE 40001) a database raises when a transaction cannot be placed in a serial order with the others. The application must retry the whole transaction.
+- id: ssi
+  term: Serializable Snapshot Isolation (SSI)
+  short: Snapshot isolation plus tracking of what each transaction read, so that read/write cycles between concurrent transactions are detected and one is rolled back. PostgreSQL's serializable.
