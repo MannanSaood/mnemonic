@@ -1,0 +1,19 @@
+# Terms introduced by typescript/types-as-sets.
+- id: union-type
+  term: Union type
+  short: A | B, the set of every value that is in A or in B. You may only use what both sides have until you narrow it.
+- id: intersection-type
+  term: Intersection type
+  short: A & B, the set of values that are in both A and B. For object types it has the properties of both, and so holds fewer values.
+- id: literal-type
+  term: Literal type
+  short: A type with exactly one value, such as "POST" or 503. Unions of literals name small, fixed sets.
+- id: top-type
+  term: Top type
+  short: The type that contains every value. In TypeScript it is unknown; any value is assignable to it, and you must narrow it before use.
+- id: bottom-type
+  term: Bottom type
+  short: The type with no values, never in TypeScript. It is assignable to every type, and it is what a fully narrowed union leaves behind.
+- id: assignability
+  term: Assignability
+  short: Whether a value of one type may be used where another is expected. Read it as a subset test - every value of the first is also in the second.

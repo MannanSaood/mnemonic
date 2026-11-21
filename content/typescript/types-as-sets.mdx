@@ -1,0 +1,612 @@
+---
+title: Types are sets of values
+track: typescript
+group: Types
+order: 2
+summary: Read every type as the set of values it allows. A union is a bigger set, an intersection a smaller one, and "assignable to" means "is a subset of".
+intent: A parameter typed string accepts every string ever written, so the checker cannot tell your four valid methods from a typo or a dangerous one.
+changeRequest: Add PATCH for partial invoice updates. PATCH is not idempotent, so it must never go through the retry helper.
+languages: [go, python, typescript, rust]
+glossary: [union-type, intersection-type, literal-type, top-type, bottom-type, assignability, structural-typing]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [types]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: types-as-sets
+  scenarios:
+    - try: Leave A as { method Method } and B as { url string }. Switch the operator from A | B to A & B.
+      notice: "The intersection promises two properties instead of one, and the shaded region shrinks from 6 values to 3. Every requirement you add is one more test a value must pass."
+    - try: Set A to Idempotent and B to Method. Look at the A-only region and the assignability panel.
+      notice: The A-only region is empty, so every Idempotent value is a Method. That empty region is exactly what assignable means. Swap them and "POST" appears as the counterexample.
+    - try: Set A to { method Idempotent }, B to { method "POST" }, and pick A & B.
+      notice: No value is in both, so the intersection is never. TypeScript 3.9 and later reduce such an object intersection to never itself.
+    - try: Click "PATCH" and "get" in the value list with A = Method.
+      notice: '"PATCH" is in Method, "get" is not. string would accept both, which is why a string parameter cannot catch the lowercase typo.'
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 132, h: 48, title: callers, sub: billing · sync · jobs }
+      after:  { x: 12, y: 30, w: 132, h: 48, title: callers, sub: sendWithRetry(req) }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 380, h: 240, title: "method: string", sub: every string fits }
+      after:  { x: 388, y: 30, w: 160, h: 56, title: Method, sub: Idempotent | POST }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 190, y: 30, w: 170, h: 56, title: "" }
+      after:  { x: 186, y: 30, w: 160, h: 56, title: Idempotent, sub: retry-safe subset }
+    - id: get
+      kind: concrete
+      before: { x: 190, y: 90, w: 100, h: 30, title: '"GET"' }
+      after:  { x: 168, y: 204, w: 64, h: 40, title: '"GET"' }
+    - id: put
+      kind: concrete
+      before: { x: 300, y: 90, w: 100, h: 30, title: '"PUT"' }
+      after:  { x: 240, y: 204, w: 64, h: 40, title: '"PUT"' }
+    - id: delete
+      kind: concrete
+      before: { x: 410, y: 90, w: 110, h: 30, title: '"DELETE"' }
+      after:  { x: 312, y: 204, w: 82, h: 40, title: '"DELETE"' }
+    - id: post
+      kind: concrete
+      before: { x: 190, y: 140, w: 100, h: 30, title: '"POST"' }
+      after:  { x: 404, y: 204, w: 68, h: 40, title: '"POST"' }
+    - id: patch
+      kind: concrete
+      appears: change
+      before: { x: 300, y: 140, w: 110, h: 30, title: '"PATCH"' }
+      after:  { x: 480, y: 204, w: 72, h: 40, title: '"PATCH"' }
+  edges:
+    - { from: client, to: strategy, label: accepts }
+    - { from: strategy, to: context, label: subset of }
+    - { from: get, to: strategy, kind: implements }
+    - { from: put, to: strategy, kind: implements, label: member }
+    - { from: delete, to: strategy, kind: implements }
+    - { from: post, to: context, kind: implements }
+    - { from: patch, to: context, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  typescript:
+    before:
+      file: http.ts · billing.ts
+      source: |
+        // http.ts
+        const RETRYABLE = ["GET", "HEAD", "PUT", "DELETE"];
+
+        export function send(method: string, url: string, body?: string) {
+          return fetch(url, { method, body });
+        }
+
+        export async function sendWithRetry(method: string, url: string, body?: string) {
+          if (!RETRYABLE.includes(method)) throw new Error(`not retryable: ${method}`);
+          for (let attempt = 1; ; attempt++) {
+            const res = await send(method, url, body);
+            if (res.status < 500 || attempt === 3) return res;
+            await sleep(100 * 2 ** attempt);
+          }
+        }
+
+        // billing.ts: both calls compile
+        await sendWithRetry("PUT", `/v1/invoices/${id}`, invoice);
+        await sendWithRetry("POST", "/v1/charges", charge);
+      roles: { context: [4, 15], strategy: [2, 2], client: [17, 19], post: [19, 19] }
+      change:
+        - { after: 2, add: ['const METHODS = [...RETRYABLE, "POST", "PATCH"];'] }
+        - { after: 4, add: ['  if (!METHODS.includes(method)) throw new Error(`unknown method: ${method}`);'] }
+        - { after: 19, add: ['// PATCH must never be retried: grep every caller of sendWithRetry by hand.'] }
+    after:
+      file: http.ts · billing.ts
+      source: |
+        type Idempotent = "GET" | "HEAD" | "PUT" | "DELETE";
+        type Method = Idempotent | "POST";
+
+        type Req = { method: Method; url: string; body?: string };
+        type RetryableReq = Req & { method: Idempotent };
+
+        export function send(req: Req) {
+          return fetch(req.url, { method: req.method, body: req.body });
+        }
+
+        export async function sendWithRetry(req: RetryableReq) {
+          for (let attempt = 1; ; attempt++) {
+            const res = await send(req); // a RetryableReq is also a Req
+            if (res.status < 500 || attempt === 3) return res;
+            await sleep(100 * 2 ** attempt);
+          }
+        }
+
+        // billing.ts
+        await sendWithRetry({ method: "PUT", url: `/v1/invoices/${id}`, body: invoice });
+        await sendWithRetry({ method: "POST", url: "/v1/charges", body: charge });
+        //                    ~~~~~~ error: '"POST"' is not assignable to 'Idempotent'
+      roles: { strategy: [1, 1], context: [2, 5], client: [19, 22], post: [2, 2], call: [21, 22], check: [5, 5], subset: [11, 13], union: [2, 2] }
+    again:
+      file: http.ts · invoices.ts
+      source: |
+        // http.ts: one edit. PATCH joins Method, not Idempotent.
+        type Method = Idempotent | "POST" | "PATCH";
+
+        // invoices.ts
+        await send({ method: "PATCH", url: `/v1/invoices/${id}`, body: patch });          // ok
+        await sendWithRetry({ method: "PATCH", url: `/v1/invoices/${id}`, body: patch }); // error
+        // Every caller that tries to retry a PATCH is a compile error. Nobody greps.
+    cost:
+      before: { text: 2 runtime checks · 23 callers audited by hand, value: 0.85 }
+      after: { text: 1 line · the compiler lists every bad call, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Unions of literal types are everyday TypeScript, and the checker really does reason about them as sets: `"GET" & string` is `"GET"`, `Idempotent | Method` is `Method`, and `"GET" & "POST"` is `never`. `unknown` is the set of every value and `never` the empty set. `{}` is not the empty object; it is every value except `null` and `undefined`.'
+      seenIn: 'lib.dom.d.ts types `RequestInit.credentials` as `RequestCredentials`, the union `"include" | "omit" | "same-origin"`, while `RequestInit.method` is plain `string`, the wide set this lesson started from. Node''s `BufferEncoding` is a union of literal encoding names.'
+
+  go:
+    before:
+      file: httpx.go · billing.go
+      source: |
+        // httpx.go
+        var retryable = map[string]bool{"GET": true, "HEAD": true, "PUT": true, "DELETE": true}
+
+        func Send(ctx context.Context, method, url string, body []byte) (*http.Response, error) {
+        	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
+        	if err != nil {
+        		return nil, err
+        	}
+        	return http.DefaultClient.Do(req)
+        }
+
+        func SendWithRetry(ctx context.Context, method, url string, body []byte) (*http.Response, error) {
+        	if !retryable[method] {
+        		return nil, fmt.Errorf("not retryable: %s", method)
+        	}
+        	for attempt := 1; ; attempt++ {
+        		res, err := Send(ctx, method, url, body)
+        		if err != nil || res.StatusCode < 500 || attempt == 3 {
+        			return res, err
+        		}
+        		res.Body.Close()
+        		time.Sleep(time.Duration(100<<attempt) * time.Millisecond)
+        	}
+        }
+
+        // billing.go: both calls compile
+        httpx.SendWithRetry(ctx, "PUT", "/v1/invoices/"+id, invoice)
+        httpx.SendWithRetry(ctx, "POST", "/v1/charges", charge)
+      roles: { context: [4, 24], strategy: [2, 2], client: [26, 28], post: [28, 28] }
+      change:
+        - { after: 2, add: ['var methods = map[string]bool{"GET": true, "HEAD": true, "PUT": true, "DELETE": true, "POST": true, "PATCH": true}'] }
+        - { after: 4, add: ['	if !methods[method] {', '		return nil, fmt.Errorf("unknown method: %s", method)', '	}'] }
+        - { after: 28, add: ['// PATCH must never be retried: grep every caller of SendWithRetry by hand.'] }
+    after:
+      file: httpx.go · billing.go
+      source: |
+        type Method string
+
+        // Idempotent is a closed set: its field is unexported, so only httpx can fill one in.
+        type Idempotent struct{ m Method }
+
+        var (
+        	Get    = Idempotent{"GET"}
+        	Head   = Idempotent{"HEAD"}
+        	Put    = Idempotent{"PUT"}
+        	Delete = Idempotent{"DELETE"}
+        )
+
+        const Post Method = "POST"
+
+        // Method widens an Idempotent into the bigger set.
+        func (i Idempotent) Method() Method { return i.m }
+
+        func Send(ctx context.Context, m Method, url string, body []byte) (*http.Response, error) {
+        	req, err := http.NewRequestWithContext(ctx, string(m), url, bytes.NewReader(body))
+        	if err != nil {
+        		return nil, err
+        	}
+        	return http.DefaultClient.Do(req)
+        }
+
+        func SendWithRetry(ctx context.Context, m Idempotent, url string, body []byte) (*http.Response, error) {
+        	for attempt := 1; ; attempt++ {
+        		res, err := Send(ctx, m.Method(), url, body)
+        		if err != nil || res.StatusCode < 500 || attempt == 3 {
+        			return res, err
+        		}
+        		res.Body.Close()
+        		time.Sleep(time.Duration(100<<attempt) * time.Millisecond)
+        	}
+        }
+
+        // billing.go
+        httpx.SendWithRetry(ctx, httpx.Put, "/v1/invoices/"+id, invoice)
+        httpx.SendWithRetry(ctx, httpx.Post, "/v1/charges", charge) // does not compile: Post is a Method, not an Idempotent
+      roles: { strategy: [3, 11], context: [1, 1], client: [37, 39], post: [13, 13], call: [39, 39], check: [26, 26], subset: [15, 16], union: [1, 13] }
+    again:
+      file: httpx.go · invoices.go
+      source: |
+        // httpx.go: one new constant. Patch is a Method; nobody can make it an Idempotent.
+        const Patch Method = "PATCH"
+
+        // invoices.go
+        httpx.Send(ctx, httpx.Patch, "/v1/invoices/"+id, patch)             // ok
+        httpx.SendWithRetry(ctx, httpx.Patch, "/v1/invoices/"+id, patch)    // does not compile
+    cost:
+      before: { text: 2 runtime checks · 23 callers audited by hand, value: 0.85 }
+      after: { text: 1 constant · the compiler lists every bad call, value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Go has no union or literal types for ordinary values. A named type such as `Method` still accepts any untyped string constant, so `Send(ctx, "PTACH", …)` compiles; a struct with an unexported field is the usual way to close the set. Outside the package, `httpx.Idempotent{}` still makes the zero value, so check for it. Go does think in sets for generics: since Go 1.18 the spec defines every interface by its type set, and a constraint may be a union such as `~int | ~string`.'
+      seenIn: '`net/http` declares `MethodGet`, `MethodPost` and friends as untyped string constants, so any string still fits. `cmp.Ordered` (Go 1.21) is a constraint whose type set is a union of the ordered basic types.'
+
+  python:
+    before:
+      file: http_client.py · billing.py
+      source: |
+        # http_client.py
+        RETRYABLE = {"GET", "HEAD", "PUT", "DELETE"}
+
+        def send(method: str, url: str, body: bytes | None = None) -> httpx.Response:
+            return client.request(method, url, content=body)
+
+        def send_with_retry(method: str, url: str, body: bytes | None = None) -> httpx.Response:
+            if method not in RETRYABLE:
+                raise ValueError(f"not retryable: {method}")
+            for attempt in range(1, 4):
+                res = send(method, url, body)
+                if res.status_code < 500 or attempt == 3:
+                    return res
+                time.sleep(0.1 * 2 ** attempt)
+            raise AssertionError("unreachable")
+
+        # billing.py: both calls pass the type checker
+        send_with_retry("PUT", f"/v1/invoices/{invoice_id}", invoice)
+        send_with_retry("POST", "/v1/charges", charge)
+      roles: { context: [4, 15], strategy: [2, 2], client: [17, 19], post: [19, 19] }
+      change:
+        - { after: 2, add: ['METHODS = RETRYABLE | {"POST", "PATCH"}'] }
+        - { after: 4, add: ['    if method not in METHODS:', '        raise ValueError(f"unknown method: {method}")'] }
+        - { after: 19, add: ['# PATCH must never be retried: grep every caller of send_with_retry by hand.'] }
+    after:
+      file: http_client.py · billing.py
+      source: |
+        from typing import Literal
+
+        type Idempotent = Literal["GET", "HEAD", "PUT", "DELETE"]
+        type Method = Idempotent | Literal["POST"]
+
+        def send(method: Method, url: str, body: bytes | None = None) -> httpx.Response:
+            return client.request(method, url, content=body)
+
+        def send_with_retry(method: Idempotent, url: str, body: bytes | None = None) -> httpx.Response:
+            for attempt in range(1, 4):
+                res = send(method, url, body)  # every Idempotent is a Method
+                if res.status_code < 500 or attempt == 3:
+                    return res
+                time.sleep(0.1 * 2 ** attempt)
+            raise AssertionError("unreachable")
+
+        # billing.py
+        send_with_retry("PUT", f"/v1/invoices/{invoice_id}", invoice)
+        send_with_retry("POST", "/v1/charges", charge)  # mypy and pyright reject "POST" here
+      roles: { strategy: [3, 3], context: [4, 4], client: [17, 19], post: [4, 4], call: [19, 19], check: [9, 9], subset: [9, 11], union: [4, 4] }
+    again:
+      file: http_client.py · invoices.py
+      source: |
+        # http_client.py: one edit. PATCH joins Method, not Idempotent.
+        type Method = Idempotent | Literal["POST", "PATCH"]
+
+        # invoices.py
+        send("PATCH", f"/v1/invoices/{invoice_id}", patch)             # ok
+        send_with_retry("PATCH", f"/v1/invoices/{invoice_id}", patch)  # rejected by the checker
+    cost:
+      before: { text: 2 runtime checks · 23 callers audited by hand, value: 0.85 }
+      after: { text: 1 line · the checker lists every bad call, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`Literal` (Python 3.8) and `X | Y` unions (3.10) give Python the same sets, and the `type` statement (3.12) names them. Only a checker such as mypy or pyright enforces them; at runtime the annotation does nothing, so keep a runtime check where untrusted input enters. `object` is the set of everything and `Never` (3.11) the empty set. Python typing has no intersection type.'
+      seenIn: 'typeshed types the `mode` argument of `open()` with `Literal` unions, which is how checkers know `open(p, "rb")` returns a binary file. `http.HTTPMethod` (3.11) is an enum of the standard methods.'
+
+  rust:
+    before:
+      file: http.rs · billing.rs
+      source: |
+        // http.rs
+        const RETRYABLE: [&str; 4] = ["GET", "HEAD", "PUT", "DELETE"];
+
+        pub async fn send(method: &str, url: &str, body: Vec<u8>) -> anyhow::Result<Response> {
+            let method = reqwest::Method::from_bytes(method.as_bytes())?;
+            Ok(client().request(method, url).body(body).send().await?)
+        }
+
+        pub async fn send_with_retry(method: &str, url: &str, body: Vec<u8>) -> anyhow::Result<Response> {
+            anyhow::ensure!(RETRYABLE.contains(&method), "not retryable: {method}");
+            let mut attempt = 1;
+            loop {
+                let res = send(method, url, body.clone()).await?;
+                if res.status().as_u16() < 500 || attempt == 3 {
+                    return Ok(res);
+                }
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+            }
+        }
+
+        // billing.rs: both calls compile
+        send_with_retry("PUT", &invoice_url, invoice).await?;
+        send_with_retry("POST", "/v1/charges", charge).await?;
+      roles: { context: [4, 20], strategy: [2, 2], client: [22, 24], post: [24, 24] }
+      change:
+        - { after: 2, add: ['const METHODS: [&str; 6] = ["GET", "HEAD", "PUT", "DELETE", "POST", "PATCH"];'] }
+        - { after: 4, add: ['    anyhow::ensure!(METHODS.contains(&method), "unknown method: {method}");'] }
+        - { after: 24, add: ['// PATCH must never be retried: grep every caller of send_with_retry by hand.'] }
+    after:
+      file: http.rs · billing.rs
+      source: |
+        #[derive(Clone, Copy, Debug)]
+        pub enum Idempotent { Get, Head, Put, Delete }
+
+        #[derive(Clone, Copy, Debug)]
+        pub enum Method { Idempotent(Idempotent), Post }
+
+        // Every Idempotent is a Method; the conversion is spelled out once.
+        impl From<Idempotent> for Method {
+            fn from(m: Idempotent) -> Self { Method::Idempotent(m) }
+        }
+
+        pub async fn send(method: impl Into<Method>, url: &str, body: Vec<u8>) -> reqwest::Result<Response> {
+            let m: reqwest::Method = method.into().into(); // From<Method> for reqwest::Method, one match
+            client().request(m, url).body(body).send().await
+        }
+
+        pub async fn send_with_retry(method: Idempotent, url: &str, body: Vec<u8>) -> reqwest::Result<Response> {
+            let mut attempt = 1;
+            loop {
+                let res = send(method, url, body.clone()).await?;
+                if res.status().as_u16() < 500 || attempt == 3 {
+                    return Ok(res);
+                }
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+            }
+        }
+
+        // billing.rs
+        send_with_retry(Idempotent::Put, &invoice_url, invoice).await?;
+        send_with_retry(Method::Post, "/v1/charges", charge).await?; // error[E0308]: mismatched types
+      roles: { strategy: [1, 2], context: [4, 5], client: [29, 31], post: [5, 5], call: [31, 31], check: [17, 17], subset: [7, 10], union: [4, 5] }
+    again:
+      file: http.rs · invoices.rs
+      source: |
+        // http.rs: one new variant (and one new arm in the reqwest conversion).
+        pub enum Method { Idempotent(Idempotent), Post, Patch }
+
+        // invoices.rs
+        send(Method::Patch, &invoice_url, patch).await?;            // ok
+        send_with_retry(Method::Patch, &invoice_url, patch).await?; // error[E0308]: mismatched types
+    cost:
+      before: { text: 2 runtime checks · 23 callers audited by hand, value: 0.85 }
+      after: { text: 1 variant · the compiler lists every bad call, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Rust types are nominal and never overlap, so there is no `A | B` to write. A subset becomes its own enum, and widening it is an explicit `From`. The empty set exists: `std::convert::Infallible` is an enum with no variants, and the never type `!` is the return type of functions that never return.'
+      seenIn: 'The `http` crate''s `Method` is a struct with associated constants such as `Method::GET`, so extension methods still fit. `impl FromStr for String` uses `type Err = Infallible`: parsing a string into a String cannot fail, and the type says so.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { typescript: 'Billing calls `sendWithRetry` with an object literal. The literal `"POST"` has its own type: the set with one member, `"POST"`.', go: 'Billing passes `httpx.Post`, a constant of type `Method`, where an `Idempotent` is expected.', python: 'Billing passes the literal `"POST"`. To the checker its type is `Literal["POST"]`, the set with one member.', rust: 'Billing passes `Method::Post` where an `Idempotent` is expected.' }
+    nodes: [client, strategy]
+    edges: [client>strategy]
+    role: call
+  - text: { typescript: 'The parameter type is `Req & { method: Idempotent }`. The checker asks one question: is every value of the argument also a value of the parameter? `"POST"` is not in `Idempotent`, so no.', go: 'Go asks whether `Method` and `Idempotent` are the same type. They are different named types, so the call does not compile. Nothing outside the package can turn `"POST"` into an `Idempotent`.', python: 'The checker asks whether `Literal["POST"]` is a subset of `Idempotent`. It is not, so mypy and pyright report the call.', rust: 'The types differ, so rustc reports a mismatch. `Idempotent` has no `Post` variant to choose.' }
+    nodes: [strategy, post]
+    edges: []
+    role: check
+  - text: { typescript: 'Inside the helper, `send(req)` passes a `RetryableReq` where a `Req` is expected. That compiles: the smaller set fits inside the bigger one.', go: '`m.Method()` widens the value into the bigger set. Every `Idempotent` has a `Method`, so the call to `Send` is fine.', python: 'Inside the helper, `send(method, …)` passes an `Idempotent` where a `Method` is expected. Subset into superset: fine.', rust: '`send` takes `impl Into<Method>`, and `From<Idempotent>` supplies the conversion from the subset to the bigger set.' }
+    nodes: [strategy, context]
+    edges: [strategy>context]
+    role: subset
+  - text: { typescript: '`Method` is the union `Idempotent | "POST"`: every value of either side. `"POST"` lives in `Method` only, so `send` accepts it and `sendWithRetry` does not.', go: '`Method` is the bigger set. `Post` is a `Method`, so `Send` accepts it and `SendWithRetry` does not.', python: '`Method` is the union of `Idempotent` and `Literal["POST"]`. `"POST"` is in it, so `send` accepts it and `send_with_retry` does not.', rust: '`Method` holds every `Idempotent` plus `Post`. `send` accepts `Post`; `send_with_retry` cannot.' }
+    nodes: [context, post]
+    edges: [post>context]
+    role: union
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which type accepts the value "PATCH"?
+    options:
+      - text: '"GET" | "PATCH"'
+        correct: true
+        why: Right. A union holds every value of either side, and "PATCH" is one of them.
+      - text: '"GET" & "PATCH"'
+        why: An intersection holds only values in both sets. No string is both "GET" and "PATCH", so this type is never.
+      - text: '"GET" | "HEAD" | "PUT" | "DELETE"'
+        why: That is the Idempotent set from the lesson. "PATCH" is not one of its four members.
+  engineer:
+    question: "type Account = { id: string } and type Customer = { id: string; email: string }. Which is true?"
+    options:
+      - text: Customer is assignable to Account. Every value with an id and an email also has an id, so Customer is the smaller set.
+        correct: true
+        why: Right. More required properties means fewer values. An object literal with extra properties can still trip the separate excess property check, but a Customer variable passes as an Account.
+      - text: Account is assignable to Customer, because it has fewer requirements.
+        why: Fewer requirements means a bigger set. An Account may have no email, so it cannot stand in where a Customer is needed.
+      - text: Neither, because they are declared separately and TypeScript compares names.
+        why: TypeScript compares shapes, not names. That is structural typing.
+  deep:
+    question: "With A = { id: string; email: string } and B = { id: string; phone: string }, what is keyof (A | B)?"
+    options:
+      - text: '"id"'
+        correct: true
+        why: Right. A value of A | B may be either one, so only keys both members have are safe to read. Bigger set, fewer guaranteed keys.
+      - text: '"id" | "email" | "phone"'
+        why: That is keyof (A & B). An intersection guarantees every key of both sides, which is why it holds fewer values.
+      - text: never
+        why: The members share id, so the result is not empty. keyof would be never only if no key were common.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Universe
+      example: unknown
+      job: The set of every value. Every type is assignable to it, and you must narrow it before you use it.
+    - role: Empty set
+      example: never
+      job: The set with no values. Assignable to every type; nothing but never is assignable to it.
+    - role: Literal type
+      example: '"POST", 503'
+      job: A set with exactly one member.
+    - role: Union
+      example: Idempotent | "POST"
+      job: Every value in either set. Bigger set, fewer properties you can rely on.
+    - role: Intersection
+      example: Req & { method Idempotent }
+      job: Only values in both sets. Smaller set, more properties you can rely on.
+  useWhen:
+    - A parameter accepts a handful of known values. Name the set as a union of literals instead of string or number.
+    - Some operations are only safe for part of a set. Give that part its own name, as Idempotent is to Method.
+    - You need to reason about assignability. Ask whether every value of one type is in the other.
+  avoidWhen:
+    - The values are open-ended, such as user names or URLs. A union of literals cannot list them.
+    - The set comes from runtime data, such as feature flags in a database. The checker only knows what is written in the source.
+  tradeoffs:
+    - Precise sets catch more mistakes at compile time, but every new member is a source change and a deploy.
+    - A union reads naturally but tells you less about each value, so you must narrow before you use member-specific properties.
+    - The types vanish at runtime. Values arriving over the network still need checking at the boundary.
+  lookalikes:
+    - name: Enum
+      how: TypeScript enums are a runtime object plus a type. A union of string literals is only a type, so it adds no code and works with plain strings from JSON.
+    - name: Subclass
+      how: In nominal languages, a subtype is declared with extends. In TypeScript any value with the right shape is in the set, declared or not.
+    - name: Go type sets
+      how: Go defines interfaces by their type sets, but unions are allowed only in generic constraints, not as ordinary parameter types.
+---
+
+## [concept] Types are sets of values
+
+**Read every type as the set of values it allows. A union is a bigger set, an intersection a smaller one, and "assignable to" means "is a subset of".**
+
+`string` is the set of every string. The <Term id="literal-type">literal type</Term> `"POST"` is a set with one member. When the checker asks whether one type is assignable to another, it asks whether every value of the first is also in the second.
+
+<Depth level={2}>
+Two operators build new sets. A <Term id="union-type">union</Term> `A | B` holds every value of either side, so it is at least as big as each. An <Term id="intersection-type">intersection</Term> `A & B` holds only values in both, so it is at most as big as the smaller side. For object types this feels backwards at first: `A & B` has more properties than A, because a value must pass both tests, and passing more tests leaves fewer values. Two types close the picture. `unknown` is the <Term id="top-type">top type</Term>, the set of everything. `never` is the <Term id="bottom-type">bottom type</Term>, the empty set.
+</Depth>
+
+<Depth level={3}>
+The checker does not list values. It decides <Term id="assignability">assignability</Term> by comparing structure: literal to its base type, each union member against the target, and each property of an object type against the target's properties. The set reading is the model that structural comparison approximates. Because TypeScript uses <Term id="structural-typing">structural typing</Term>, an object type is the set of every value with at least those properties, declared anywhere or not at all. The checker also simplifies as a set would: `"GET" | string` reduces to `string`, `"GET" & string` to `"GET"`, and since TypeScript 3.9 an intersection of object types whose literal properties conflict reduces to `never` itself.
+</Depth>
+
+## [problem] A retry helper that takes any string
+
+An HTTP client wraps `fetch` with a retry helper. Retrying is only safe for idempotent methods, where sending the request twice has the same effect as sending it once. So the helper checks the method against a list of four and throws for anything else.
+
+It works. The tests send GET and PUT, and both retry on a 503.
+
+<Depth level={2}>
+Look at the parameter type. `method: string` is the set of every string: `"GET"`, `"get"`, `"PTACH"`, `"POST"`. The function handles four of them correctly and rejects the rest at runtime. The checker cannot help, because every one of those strings is a legal `string`. The call in billing that retries a POST compiles, and it only fails when that code path runs.
+</Depth>
+
+<Depth level={3}>
+The list on line 2 is the real type, written as data. The rule "only these four" exists, but in a form the compiler cannot read.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** add PATCH for partial invoice updates. PATCH is not idempotent, so it must never go through the retry helper.
+
+With `string` parameters there is nowhere to write that rule in the types. The team adds a second runtime list and a check in `send`, and then someone has to read all 23 callers of the retry helper to make sure none of them will ever pass PATCH.
+
+<Depth level={2}>
+Nothing marks the risky calls. A caller that builds the method from a variable, such as `sendWithRetry(op.method, …)`, passes review because the reviewer cannot see the value. The mistake shows up as a duplicated charge or a duplicated invoice line, long after the deploy.
+</Depth>
+
+<Depth level={3}>
+Retrying a non-idempotent request is a classic way to double-charge. Many payment APIs add an idempotency key header for exactly this reason. The type system can enforce the simpler half of the rule: which methods may be retried at all.
+</Depth>
+
+## [morph] Give the sets names
+
+Drag the slider. The one big box, `string`, becomes two named sets: `Idempotent` with four members, inside `Method`, which adds POST. The helper accepts only the inner set.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+`RetryableReq` is `Req & { method: Idempotent }`. The intersection adds a requirement, so it holds fewer requests: only the ones whose method is retry-safe. Because it is a subset of `Req`, the helper can still pass it to `send` without a cast.
+</Depth>
+
+<Depth level={3}>
+<Lang only="typescript">The `method` property of the intersection has the type `Method & Idempotent`, which the checker reduces to `Idempotent`, because `Idempotent` already sits inside `Method`.</Lang>
+<Lang only="go">Go cannot write `Method | "POST"`, so the subset gets its own struct type. The unexported field means other packages cannot construct one with a value, only use the four variables `httpx` exports.</Lang>
+<Lang only="python">`Literal["GET", "HEAD", "PUT", "DELETE"]` is a set of four strings to the checker. At runtime `send_with_retry("POST", …)` still runs; only mypy or pyright will stop it.</Lang>
+<Lang only="rust">Rust has no unions of types, so `Method` wraps `Idempotent` as one of its variants. The `From` impl is the subset relation, written by hand once.</Lang>
+</Depth>
+
+## [walk] Follow one bad call
+
+Billing tries to retry a POST. Step through what the checker does with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="typescript">The checker compares the object literal property by property. `url` is a `string`, fine; `method` is `"POST"`, and `"POST"` is not assignable to `Idempotent`. The error points at the property, not the whole call.</Lang>
+<Lang only="go">The check is nominal: different named types are different, even with the same underlying type. That is stricter than a set check, and it is what makes the closed struct work.</Lang>
+<Lang only="python">Checkers treat `Literal` unions as finite sets and check membership exactly. A plain `str` variable, even one holding "GET", is not accepted, because `str` is the bigger set.</Lang>
+<Lang only="rust">The error is E0308, mismatched types. There is no implicit widening in Rust; `impl Into<Method>` on `send` is what lets an `Idempotent` in.</Lang>
+</Depth>
+
+## [again] PATCH, the second time
+
+The same request, after the refactor. PATCH joins `Method` and nothing else. `send` accepts it. Every call that tries to retry it is a compile error, listed by the compiler with file and line. Nobody reads 23 call sites.
+
+<Depth level={2}>
+The rule lives in one place: which set a method belongs to. Had PATCH been added to `Idempotent` by mistake, the review would show exactly that one-line decision.
+</Depth>
+
+<Depth level={3}>
+The types prove nothing about values that arrive at runtime. A method read from a job queue is a `string` until a check moves it into `Method`. That check is narrowing, the next lesson.
+</Depth>
+
+## [play] Drop values into two types
+
+Pick two types. Sixteen real values move into the regions they belong to, and the shaded area is the union or the intersection. Click a value to see why it lands where it does. Watch the A-only region: when it is empty, A is assignable to B.
+
+## [lens] How each language writes it
+
+TypeScript reasons about types as sets more directly than most languages. Python's checkers come close, Go thinks in sets only for generics, and Rust keeps every type disjoint and makes you convert explicitly.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="types-as-sets" />
+
+### The set laws you will use
+
+| Expression | Same set as | Why |
+|---|---|---|
+| `T \| never` | `T` | Adding the empty set adds nothing |
+| `T & unknown` | `T` | Everything is in unknown, so the test always passes |
+| `T \| unknown` | `unknown` | Nothing is outside unknown |
+| `T & never` | `never` | No value is in the empty set |
+| `"GET" \| string` | `string` | The literal is already a string |
+| `"GET" & "POST"` | `never` | No value is both |
+| `keyof (A \| B)` | `keyof A & keyof B` | Only shared keys are safe on a value that may be either |
