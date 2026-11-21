@@ -1,0 +1,502 @@
+---
+title: Why concurrency is hard
+track: concurrency
+group: Foundations
+order: 1
+summary: "calls++ is three steps: read, add, write. When two threads run it at once, most orders of those steps lose an update, and tests almost never pick one of them."
+intent: Look at any line that touches shared state and say whether two threads running it at once can lose or corrupt data, and what makes it one indivisible step.
+changeRequest: The API moved to a 16-core host, and the busiest customers' invoices came out about 0.3% below the access logs.
+languages: [go, python, typescript, rust]
+glossary: [race-condition, data-race, interleaving, read-modify-write, lost-update, atomic-operation, concurrency-vs-parallelism]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [concurrency]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: why-concurrency-is-hard
+  scenarios:
+    - try: "Step A once, then B once, then let each finish."
+      notice: "Both threads read 41, both compute 42, and the second write lands on top of the first. Two requests, one count."
+    - try: "Press Show all 20, then run 1,000 schedules with time slices."
+      notice: "18 of the 20 orders lose a count, yet the time-slice scheduler loses only about 2% of runs. A rare switch inside a three-step window is why tests pass."
+    - try: "Run 1,000 schedules with a coin flip per step."
+      notice: "Now about three runs in four lose a count. Two cores running at once behave much more like this than like time slices."
+    - try: "Switch to the lock, then click a red order such as ABABAB."
+      notice: "It cannot happen any more: B waits at mu.lock() until A has written and unlocked. Only the two serial orders are left, and both are right."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: a
+      kind: client
+      before: { x: 12, y: 108, w: 112, h: 52, title: request A, sub: "calls++" }
+      after:  { x: 12, y: 16, w: 112, h: 52, title: request A, sub: "read · add · write" }
+    - id: b
+      kind: client
+      before: { x: 436, y: 108, w: 112, h: 52, title: request B, sub: "calls++" }
+      after:  { x: 436, y: 16, w: 112, h: 52, title: request B, sub: "read · add · write" }
+    - id: meter
+      kind: context
+      before: { x: 150, y: 20, w: 260, h: 230, title: meter, sub: "you think: calls++ is one step" }
+      after:  { x: 200, y: 204, w: 160, h: 50, title: calls, sub: shared memory }
+    - id: rega
+      kind: concrete
+      appears: after
+      before: { x: 12, y: 120, w: 130, h: 50, title: "" }
+      after:  { x: 12, y: 120, w: 130, h: 50, title: "A's register", sub: "41 → 42" }
+    - id: regb
+      kind: concrete
+      appears: after
+      before: { x: 418, y: 120, w: 130, h: 50, title: "" }
+      after:  { x: 418, y: 120, w: 130, h: 50, title: "B's register", sub: "41 → 42" }
+    - id: guard
+      kind: strategy
+      appears: after
+      before: { x: 190, y: 100, w: 180, h: 52, title: "" }
+      after:  { x: 190, y: 100, w: 180, h: 52, title: { go: atomic.Int64, python: threading.Lock, typescript: Atomics.add, rust: AtomicU64 }, sub: one indivisible step }
+  edges:
+    - { from: a, to: rega, label: read }
+    - { from: rega, to: meter, label: write }
+    - { from: b, to: regb, label: read }
+    - { from: regb, to: meter, label: write }
+    - { from: a, to: guard }
+    - { from: b, to: guard }
+    - { from: guard, to: meter, label: one step }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: meter.go
+      source: |
+        // meter.go
+        type Meter struct {
+            calls int64 // billable API calls since the last flush
+        }
+
+        func (m *Meter) Record() {
+            m.calls++
+        }
+
+        // Flush runs once a minute and sends the count to billing.
+        func (m *Meter) Flush() int64 {
+            n := m.calls
+            m.calls = 0
+            return n
+        }
+      roles: { meter: [2, 4], a: [6, 8], b: [6, 8] }
+      change:
+        - { line: 7, replace: "    m.calls++ // read, add, write: two requests can read the same value" }
+        - { line: 13, replace: "    m.calls = 0 // a Record between line 12 and here is wiped out" }
+    after:
+      file: meter.go
+      source: |
+        // meter.go
+        type Meter struct {
+            calls atomic.Int64 // billable API calls since the last flush
+        }
+
+        func (m *Meter) Record() {
+            m.calls.Add(1) // read, add and write as one step
+        }
+
+        // Flush runs once a minute and sends the count to billing.
+        func (m *Meter) Flush() int64 {
+            return m.calls.Swap(0) // take the count and reset it in one step
+        }
+      roles: { meter: [2, 4], guard: [3, 3], a: [6, 8], b: [6, 8], rega: [7, 7], regb: [7, 7], record: [6, 8], add: [7, 7], flush: [11, 13] }
+    again:
+      file: the same busy hour
+      source: |
+        // 16 cores, 8,000 requests a second, one hour
+        // requests in the access log:  28,800,000
+        // calls billed:                28,800,000
+        // go test -race ./...:         ok, no races reported
+    cost:
+      before: { text: "about 1 call in 300 never billed · worse with more cores", value: 0.65 }
+      after: { text: "0 calls lost · one atomic add per request", value: 0.06 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Goroutines run in parallel on GOMAXPROCS threads, so `m.calls++` on shared memory is a data race: the Go memory model says programs that modify data read by other goroutines must serialise access. `go test -race` reports a race when a test makes both accesses happen. `sync/atomic` types such as `atomic.Int64` make the read, add and write one step.'
+      seenIn: '`expvar.Int.Add` is an atomic add. `sync.Mutex` for anything bigger than one word. Prometheus client counters use atomics.'
+
+  python:
+    before:
+      file: meter.py
+      source: |
+        # meter.py
+        class Meter:
+            def __init__(self) -> None:
+                self.calls = 0  # billable API calls since the last flush
+
+            def record(self) -> None:
+                self.calls += 1
+
+            # flush runs once a minute and sends the count to billing.
+            def flush(self) -> int:
+                n = self.calls
+                self.calls = 0
+                return n
+      roles: { meter: [2, 4], a: [6, 7], b: [6, 7] }
+      change:
+        - { line: 7, replace: "        self.calls += 1  # load, add, store: a thread switch can land in between" }
+        - { line: 12, replace: "        self.calls = 0  # a record() between these two lines is lost" }
+    after:
+      file: meter.py
+      source: |
+        # meter.py
+        import threading
+
+        class Meter:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self.calls = 0  # guarded by _lock
+
+            def record(self) -> None:
+                with self._lock:
+                    self.calls += 1
+
+            # flush runs once a minute and sends the count to billing.
+            def flush(self) -> int:
+                with self._lock:
+                    n, self.calls = self.calls, 0
+                return n
+      roles: { meter: [4, 7], guard: [6, 6], a: [9, 11], b: [9, 11], rega: [11, 11], regb: [11, 11], record: [9, 11], add: [10, 11], flush: [14, 17] }
+    again:
+      file: the same busy hour
+      source: |
+        # 16 worker threads, 8,000 requests a second, one hour
+        # requests in the access log:  28,800,000
+        # calls billed:                28,800,000
+        # the same on the free-threaded build
+    cost:
+      before: { text: "calls lost under load · how many depends on the build", value: 0.6 }
+      after: { text: "0 calls lost · one lock per request", value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The GIL lets one thread run Python bytecode at a time, but `self.calls += 1` is several bytecodes (load, add, store), and a switch between them loses an update. How often that happens depends on the CPython version. The free-threaded build, optional since 3.13, runs threads truly in parallel. Either way, guard shared state with a `threading.Lock`.'
+      seenIn: '`queue.Queue` guards its deque with a lock. `prometheus_client` counters take a lock to increment. `concurrent.futures` executors keep their shared state behind locks.'
+
+  typescript:
+    before:
+      file: meter.ts
+      source: |
+        // meter.ts: the main thread creates it and passes the buffer to each worker in workerData
+        export class Meter {
+          readonly cell: Int32Array;
+          constructor(buf = new SharedArrayBuffer(4)) {
+            this.cell = new Int32Array(buf); // billable API calls since the last flush
+          }
+
+          record(): void { // in a worker, once per request
+            this.cell[0]++;
+          }
+
+          flush(): number { // on the main thread, once a minute
+            const n = this.cell[0];
+            this.cell[0] = 0;
+            return n;
+          }
+        }
+      roles: { meter: [2, 6], a: [8, 10], b: [8, 10] }
+      change:
+        - { line: 9, replace: "    this.cell[0]++; // a plain load and store: two workers can read the same value" }
+        - { line: 14, replace: "    this.cell[0] = 0; // a worker's ++ between these two lines is lost" }
+    after:
+      file: meter.ts
+      source: |
+        // meter.ts: the main thread creates it and passes the buffer to each worker in workerData
+        export class Meter {
+          readonly cell: Int32Array;
+          constructor(buf = new SharedArrayBuffer(4)) {
+            this.cell = new Int32Array(buf); // billable API calls since the last flush
+          }
+
+          record(): void { // in a worker, once per request
+            Atomics.add(this.cell, 0, 1); // read, add and write as one step
+          }
+
+          flush(): number { // on the main thread, once a minute
+            return Atomics.exchange(this.cell, 0, 0); // take the count and reset it in one step
+          }
+        }
+      roles: { meter: [2, 6], guard: [9, 9], a: [8, 10], b: [8, 10], rega: [9, 9], regb: [9, 9], record: [8, 10], add: [9, 9], flush: [12, 14] }
+    again:
+      file: the same busy hour
+      source: |
+        // 16 worker threads, 8,000 requests a second, one hour
+        // requests in the access log:  28,800,000
+        // calls billed:                28,800,000
+    cost:
+      before: { text: "about 1 call in 300 never billed · worse with more workers", value: 0.65 }
+      after: { text: "0 calls lost · one Atomics.add per request", value: 0.06 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: 'One thread runs your JavaScript, and nothing can interrupt `calls++` on the main thread, so a meter that lives there is safe. Races come back in two places. A read and a write split by an `await` let other code run in between. And worker_threads that share a `SharedArrayBuffer` run in parallel, where `cell[0]++` is a plain load and store; `Atomics.add` and `Atomics.exchange` are indivisible.'
+      seenIn: '`Atomics.add`, `Atomics.compareExchange`, `Atomics.wait` and `Atomics.notify` on a SharedArrayBuffer. Any `const x = await get(); await set(x + 1)` against a shared store.'
+
+  rust:
+    before:
+      file: meter.rs
+      source: |
+        // meter.rs
+        pub struct Meter {
+            calls: AtomicU64, // billable API calls since the last flush
+        }
+
+        impl Meter {
+            pub fn record(&self) {
+                let n = self.calls.load(Ordering::Relaxed);
+                self.calls.store(n + 1, Ordering::Relaxed);
+            }
+
+            // flush runs once a minute and sends the count to billing.
+            pub fn flush(&self) -> u64 {
+                let n = self.calls.load(Ordering::Relaxed);
+                self.calls.store(0, Ordering::Relaxed);
+                n
+            }
+        }
+      roles: { meter: [2, 4], a: [7, 10], b: [7, 10] }
+      change:
+        - { line: 9, replace: "        self.calls.store(n + 1, Ordering::Relaxed); // another thread may have stored since the load" }
+        - { line: 15, replace: "        self.calls.store(0, Ordering::Relaxed); // drops any record() since line 14" }
+    after:
+      file: meter.rs
+      source: |
+        // meter.rs
+        pub struct Meter {
+            calls: AtomicU64, // billable API calls since the last flush
+        }
+
+        impl Meter {
+            pub fn record(&self) {
+                self.calls.fetch_add(1, Ordering::Relaxed); // read, add and write as one step
+            }
+
+            // flush runs once a minute and sends the count to billing.
+            pub fn flush(&self) -> u64 {
+                self.calls.swap(0, Ordering::Relaxed) // take the count and reset it in one step
+            }
+        }
+      roles: { meter: [2, 4], guard: [8, 8], a: [7, 9], b: [7, 9], rega: [8, 8], regb: [8, 8], record: [7, 9], add: [8, 8], flush: [12, 14] }
+    again:
+      file: the same busy hour
+      source: |
+        // 16 threads, 8,000 requests a second, one hour
+        // requests in the access log:  28,800,000
+        // calls billed:                28,800,000
+    cost:
+      before: { text: "about 1 call in 300 never billed · no data race, still a race", value: 0.65 }
+      after: { text: "0 calls lost · one fetch_add per request", value: 0.06 }
+    lens:
+      need: 2
+      needLabel: The compiler helps
+      note: 'Safe Rust has no data races. A plain `u64` shared between threads cannot be changed without a `Mutex` or an atomic, so `calls += 1` on shared state does not compile. The compiler cannot stop a race condition: a separate load and store on an atomic, as in the code before, still lose updates. Deadlocks are also allowed in safe Rust.'
+      seenIn: '`AtomicU64::fetch_add` and `swap`. `Arc<Mutex<T>>` for state bigger than one word. Counters in the metrics crates use atomic adds.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Request A reaches the increment on one core while request B reaches it on another. Neither knows about the other.
+    nodes: [a, b, guard]
+    edges: [a>guard, b>guard]
+    role: record
+  - text: { go: 'A runs `Add(1)`. On x86 this is one `LOCK XADD` instruction: the core holds the cache line for the whole read, add and write, so nothing can write calls in between.', python: 'A takes the lock, then loads, adds and stores. Every other thread that wants calls waits at `with self._lock`, so the three bytecodes behave as one step.', typescript: 'A runs `Atomics.add`. The engine uses the CPU''s atomic add instruction, so the read, add and write of the shared cell happen as one step.', rust: 'A runs `fetch_add`. On x86 this is one `LOCK XADD` instruction: the core holds the cache line for the whole read, add and write.' }
+    nodes: [a, guard, meter]
+    edges: [a>guard, guard>meter]
+    role: add
+  - text: B's add, issued at the same moment, cannot start until A's has finished. It reads 42 and writes 43. The order between A and B is still unknown, but both orders are right.
+    nodes: [b, guard, meter]
+    edges: [b>guard, guard>meter]
+    role: add
+  - text: { go: 'Once a minute Flush takes the count and puts 0 in its place with one `Swap`. A Record cannot land between the read and the reset, because there is no between.', python: 'Once a minute `flush` takes the lock, reads the count and resets it. A `record` that arrives meanwhile waits and counts toward the next minute.', typescript: 'Once a minute `flush` takes the count and resets it with one `Atomics.exchange`. A worker''s add cannot land between the read and the reset.', rust: 'Once a minute `flush` takes the count and resets it with one `swap`. A `record` cannot land between the read and the reset.' }
+    nodes: [guard, meter]
+    edges: [guard>meter]
+    role: flush
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Two threads each run count++ once, starting from count = 5, with no lock. What can count end up as?
+    options:
+      - text: 6 or 7.
+        correct: true
+        why: Right. If one thread writes before the other reads, you get 7. If both read 5 before either writes, both write 6 and one increment is lost.
+      - text: Always 7, because each ++ is a single statement.
+        why: One statement is still three machine steps, read, add and write. Another thread can run between them.
+      - text: 5, 6 or 7.
+        why: Each thread writes a value one higher than something it read, and both read at least 5. The count cannot stay at 5.
+  engineer:
+    question: A concurrent test of the meter ran 1,000 times on a laptop and never lost a count. What does that tell you?
+    options:
+      - text: Only that the bad interleavings were rare under that test's timing. Run the race detector, or reason about the shared access, instead.
+        correct: true
+        why: Right. Most interleavings of the three steps are wrong, but a scheduler that seldom switches inside the window seldom picks them. More cores, more load or a different runtime pick them far more often.
+      - text: The race window is too small to matter in production.
+        why: Production has more cores and far more requests. A window hit once in a million runs is hit many times a day at 8,000 requests a second.
+      - text: The language must make ++ atomic on this platform.
+        why: None of Go, Python, JavaScript on shared memory or Rust makes a plain increment of shared memory atomic. The test was lucky, not right.
+  deep:
+    question: The Rust meter before the fix loads the AtomicU64, adds 1 and stores it. Is that a data race?
+    options:
+      - text: No. Every access is atomic, so there is no data race, but it is still a race condition that loses updates.
+        correct: true
+        why: Right. A data race is unsynchronised access to the same memory. A race condition is a timing-dependent bug. Two atomic steps used as a pair can still interleave, so both threads can load 41 and store 42.
+      - text: Yes. Relaxed ordering allows a data race.
+        why: Relaxed atomics give no ordering with other memory, but each load and store is still atomic. The bug is the gap between two atomic operations, which no ordering would close.
+      - text: No, and it cannot lose updates, because AtomicU64 is atomic.
+        why: Each call is atomic on its own. The pair is not. fetch_add does the whole read-modify-write as one step.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Shared variable
+      example: { go: "calls int64", python: "self.calls", typescript: "Int32Array on a SharedArrayBuffer", rust: "calls: AtomicU64" }
+      job: State more than one thread can read and write.
+    - role: Read-modify-write
+      example: calls++
+      job: Three steps that look like one. The source of most lost updates.
+    - role: Guard
+      example: { go: "atomic.Int64 or sync.Mutex", python: "threading.Lock", typescript: "Atomics.add", rust: "fetch_add or Mutex" }
+      job: Makes the steps one indivisible step that other threads see either before or after, never in the middle.
+    - role: Scheduler
+      example: OS, Go runtime, CPU cores
+      job: Decides the interleaving. You do not control it, so code must be right for every order.
+  useWhen:
+    - An atomic counter, for one number that many threads update, such as a metric or a sequence number.
+    - A lock, when an update touches more than one value or must keep an invariant between them.
+    - Confinement, when only one thread or task ever touches the state and others send it messages.
+  avoidWhen:
+    - Do not rely on a test passing as proof. A race shows up under timing your test does not produce.
+    - Do not split an atomic operation into a load and a store. Use fetch-and-add, swap or compare-and-swap.
+  tradeoffs:
+    - An atomic add costs more than a plain one, because the core must own the cache line. Under heavy contention many cores fight over one line.
+    - A lock makes any block indivisible, but threads queue behind it, and two locks can deadlock.
+    - Not sharing at all is the cheapest fix when the design allows it.
+  lookalikes:
+    - name: Data race
+      how: Unsynchronised access to the same memory with at least one write. Undefined or corrupt results in Go, C, C++ and Rust's unsafe code.
+    - name: Race condition
+      how: Any bug that depends on timing. Atomics remove data races but not race conditions between two atomic steps.
+    - name: Check-then-act
+      how: The same bug with an if, such as if stock > 0 then stock--. Two threads both see 1 and both sell it.
+---
+
+## [concept] Two threads, one counter
+
+**`calls++` is three steps: read the value, add one, write it back.** When two threads run it at the same time, another thread can run between those steps, and one of the two updates disappears.
+
+Every concurrency bug in this track grows from that fact. A line of code is not one step, and the scheduler, not you, decides how the steps of different threads are merged.
+
+<Depth level={2}>
+The bug is a <Term id="race-condition">race condition</Term>: the result depends on the order in which threads happen to run. Each possible merged order is an <Term id="interleaving">interleaving</Term>. `calls++` is a <Term id="read-modify-write">read-modify-write</Term>, and when two of them interleave, the second write lands on a value computed from a stale read. That is a <Term id="lost-update">lost update</Term>.
+
+<Term id="concurrency-vs-parallelism">Concurrency and parallelism</Term> are different things. Concurrency means the tasks may overlap. Parallelism means they actually run at the same instant on different cores. A race needs only concurrency: one core switching threads at the wrong moment is enough. Parallelism makes the wrong moment far more common.
+</Depth>
+
+<Depth level={3}>
+At the machine level, `calls++` on a field compiles to a load into a register, an add on the register, and a store. Each thread has its own registers, so two threads can each hold 41, each make it 42, and each store 42. Compilers and CPUs may also reorder and cache plain memory accesses, so without synchronisation one thread may see another's writes late or out of order. A <Term id="data-race">data race</Term> is the formal name for unsynchronised access to the same memory with at least one write. In Go and C it makes the program's behaviour undefined, and a race on a multi-word value such as a Go slice or interface can tear it into a value nobody wrote.
+</Depth>
+
+## [problem] A meter that counts every call
+
+An API bills customers per call. Each request handler records one call on an in-memory meter, and once a minute a flusher sends the count to billing and resets it to zero.
+
+It is the simplest code imaginable, and it works. On a developer laptop, and in a load test, the meter matches the access log exactly.
+
+<Depth level={2}>
+The mental model behind the code is that a line runs all at once. `calls++` looks like one action, and in a single-threaded program it is. The meter was written as if requests took turns.
+</Depth>
+
+<Depth level={3}>
+The load test passed because the window is tiny. The three instructions take a few nanoseconds, and on a lightly loaded machine a thread is rarely interrupted or overlapped in exactly that window. The test was correct only for the interleavings it happened to produce.
+</Depth>
+
+## [pain] The invoices come out short
+
+**What happened:** the API moved to a 16-core host, and finance found that the busiest customers' invoices were about 0.3% below the access logs. Roughly one call in 300 was never billed.
+
+The marked lines are both read-modify-writes. In `Record`, two requests on two cores read the same count and both write count + 1. In `Flush`, a request that records between the read and the reset is wiped out with the reset.
+
+<Depth level={2}>
+The loss grows with load and with cores, which is why it appeared after the move. More requests in flight means more pairs of threads inside the window at once. Nothing crashes and nothing is logged. The only symptom is a number that is slightly too low, found weeks later by someone reconciling two systems.
+</Depth>
+
+<Depth level={3}>
+In Go the before code is a data race, and `go test -race` reports it the first time a test runs two `Record` calls concurrently. In Python the outcome depends on where the interpreter switches threads, which differs between versions, so the bug can come and go with an upgrade. In Rust the compiler refused a plain `u64`, so the code uses an atomic, but splits the update into a load and a store, which brings the lost update straight back.
+</Depth>
+
+## [morph] From one step to three
+
+Drag the slider. The single step you imagined splits into what each core does: read calls into its own register, add one there, write it back. Between those steps the other request can do the same.
+
+The code changes the update into one <Term id="atomic-operation">atomic operation</Term>. An atomic add, or a lock around the three steps, means other threads see the increment either not started or finished, never in the middle. Flush becomes one swap, which reads the count and resets it in the same step.
+
+<Depth level={2}>
+Pick the smallest guard that covers the whole update. One number updated on its own: an atomic add or swap. Several values that must change together, such as a count and a total: a lock around all of them. Do not mix the two on the same data. A plain read next to atomic writes is still a race.
+</Depth>
+
+<Depth level={3}>
+On x86, `atomic.Int64.Add`, `fetch_add` and `Atomics.add` compile to one `LOCK XADD` instruction. The core takes the cache line in exclusive state and keeps it for the whole read-modify-write, so no other core can write it in between. On ARMv8.1 and later it is a single `LDADD`; older ARM cores use a load-exclusive and store-exclusive loop that retries if another core touched the line.
+</Depth>
+
+## [walk] Follow two requests
+
+Two requests record a call at the same moment, and then the flusher runs. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`atomic.Int64` also guarantees that the value is 8-byte aligned, which plain `int64` fields on 32-bit platforms do not, and the old `atomic.AddInt64` function needs. The race detector understands `sync/atomic`, so it stays quiet about the fixed meter.</Lang>
+<Lang only="python">Python has no public atomic integer. A `threading.Lock` costs well under a microsecond to take when nobody else holds it, which is small next to handling a request.</Lang>
+<Lang only="typescript">`Atomics` works only on integer typed arrays that view a `SharedArrayBuffer`. A plain object or a normal `ArrayBuffer` cannot be shared between workers at all; it is copied or transferred by `postMessage`.</Lang>
+<Lang only="rust">`Ordering::Relaxed` is enough for a counter: a read-modify-write always acts on the latest value of that one variable. Stronger orderings matter when the counter is used to publish other data, which a later lesson covers.</Lang>
+</Depth>
+
+## [again] The same busy hour, again
+
+The same 16 cores and the same 8,000 requests a second. Every increment is now one indivisible step, so every pair of concurrent requests ends with both counted. The meter matches the access log to the call.
+
+<Depth level={2}>
+Keep the race detector in CI for Go and run it on tests that actually exercise concurrency. It only sees races that a test executes, but when it sees one it is never a false alarm.
+</Depth>
+
+<Depth level={3}>
+Under very heavy load, one atomic counter that every core updates becomes a hot cache line that moves between cores on every add. The fix then is a counter per core or per shard, summed at flush time. That is a later lesson; correctness comes first.
+</Depth>
+
+## [play] Be the scheduler
+
+You decide which thread runs next. Step the two requests by hand, or click any of the 20 possible orders to replay it, then let a scheduler run 1,000 schedules.
+
+Predict first. Then find the lost update, count how many orders lose one, and see why the time-slice scheduler almost never finds them. Finish by switching to a lock or an atomic add.
+
+## [lens] How each language meets it
+
+Go and Rust run threads in parallel on every core. Python runs one thread at a time on the standard build, and in parallel on the optional free-threaded build. Node runs your code on one thread unless you start workers.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+The question in each language is the same: can two threads reach this line at the same time, and is the line one step? Go: yes and no, use `sync/atomic` or a mutex, and run `-race`. Python: yes and no, use a lock. Node: only across `await` or between workers. Rust: the compiler forces a lock or an atomic, but you can still split the update.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="why-concurrency-is-hard" />
+
+### Race condition or data race
+
+A data race is about memory: two unsynchronised accesses to the same location, at least one a write. A race condition is about logic: a result that depends on timing. Each can happen without the other. Two atomic operations used as a pair, such as checking a stock level and then decrementing it, have no data race but are still a race condition. Removing data races, with a race detector or with Rust's type system, is necessary but not enough.

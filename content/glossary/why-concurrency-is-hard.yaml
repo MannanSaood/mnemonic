@@ -1,0 +1,19 @@
+# Terms introduced by the why-concurrency-is-hard lesson.
+- id: race-condition
+  term: Race condition
+  short: A bug where the result depends on the order in which threads happen to run. It can exist even when every single memory access is synchronised.
+- id: interleaving
+  term: Interleaving
+  short: One possible order in which the steps of several threads run, merged into a single sequence. Two threads of three steps each have 20 interleavings.
+- id: read-modify-write
+  term: Read-modify-write
+  short: An update that reads a value, computes a new one from it and writes it back, such as count++. Unless it runs as one atomic step, another thread can write in between.
+- id: lost-update
+  term: Lost update
+  short: Two threads read the same value, each computes a new one, and the second write overwrites the first, so one change disappears.
+- id: atomic-operation
+  term: Atomic operation
+  short: An operation that other threads see as a single step, either not started or finished, never half-done. A CPU instruction such as fetch-and-add, or code run under a lock.
+- id: concurrency-vs-parallelism
+  term: Concurrency and parallelism
+  short: Concurrency is a program structured as tasks that may overlap in time. Parallelism is tasks actually running at the same instant on different cores. One core gives concurrency without parallelism.
