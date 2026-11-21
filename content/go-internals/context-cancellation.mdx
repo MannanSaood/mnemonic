@@ -1,0 +1,536 @@
+---
+title: Context and cancellation
+track: go-internals
+group: Channels and goroutines
+order: 10
+summary: A context carries a cancel signal, a deadline and request values down a tree of calls. Cancelling closes a channel; only the code that checks it stops.
+intent: Know which work stops when a request is cancelled, and make sure the rest stops too.
+changeRequest: During a pricing outage, checkout errors took 250 ms instead of 60, and CPU on the checkout pods went to scoring carts nobody would buy.
+languages: [go, python, typescript, rust]
+glossary: [context-tree, done-channel, cooperative-cancellation, goroutine-leak]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [go-internals/channels-hchan]
+skills: [concurrency, go-language]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: context-cancellation
+  scenarios:
+    - try: "Predict, then run the request where pricing fails at 60 ms."
+      notice: "gctx closes at 60 ms and inventory stops at once, but fraud.Score keeps burning until 250 ms, and the error waits for it. recs runs on to 500 ms in a tree of its own."
+    - try: "Drag time to 100 ms and read the Done column."
+      notice: "The group's context is closed, but the handler's and the request's are still open. Cancel flows down, never up."
+    - try: "Fix fraud, then recs, and run again."
+      notice: "The error goes out at 65 ms and nothing but the audit write runs after it. The audit write runs on purpose, under WithoutCancel."
+    - try: "Pick 'client hangs up' and a 150 ms deadline, with and without the fixes."
+      notice: "Every cause closes the same channels. Whether work stops still depends only on whether it looks."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 240
+  nodes:
+    - id: req
+      kind: client
+      before: { x: 12, y: 96, w: 104, h: 48, title: request, sub: "r" }
+      after:  { x: 12, y: 96, w: 104, h: 48, title: { go: r.Context(), python: the request, typescript: req.signal, rust: the request }, sub: client connection }
+    - id: handler
+      kind: context
+      before: { x: 136, y: 14, w: 280, h: 214, title: handler, sub: "go ×3, then wait for all" }
+      after:  { x: 136, y: 96, w: 120, h: 48, title: { go: ctx, python: timeout, typescript: signal, rust: token }, sub: 300 ms deadline }
+    - id: group
+      kind: strategy
+      appears: after
+      before: { x: 276, y: 60, w: 120, h: 48, title: "" }
+      after:  { x: 276, y: 60, w: 120, h: 48, title: { go: gctx, python: TaskGroup, typescript: Promise.all, rust: try_join! }, sub: first error cancels }
+    - id: inventory
+      kind: concrete
+      before: { x: 156, y: 70, w: 150, h: 30, title: inventory }
+      after:  { x: 420, y: 18, w: 128, h: 34, title: inventory }
+    - id: pricing
+      kind: concrete
+      before: { x: 156, y: 108, w: 150, h: 30, title: pricing }
+      after:  { x: 420, y: 62, w: 128, h: 34, title: pricing }
+    - id: fraud
+      kind: concrete
+      before: { x: 156, y: 146, w: 150, h: 30, title: fraud }
+      after:  { x: 420, y: 106, w: 128, h: 34, title: fraud }
+    - id: recs
+      kind: concrete
+      before: { x: 156, y: 184, w: 150, h: 30, title: recs }
+      after:  { x: 420, y: 150, w: 128, h: 34, title: recs }
+    - id: audit
+      kind: concrete
+      before: { x: 320, y: 70, w: 80, h: 30, title: audit }
+      after:  { x: 420, y: 194, w: 128, h: 34, title: audit }
+  edges:
+    - { from: req, to: handler }
+    - { from: handler, to: group }
+    - { from: group, to: inventory }
+    - { from: group, to: pricing }
+    - { from: group, to: fraud }
+    - { from: handler, to: recs }
+    - { from: handler, to: audit, label: WithoutCancel }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: checkout.go
+      source: |
+        // checkout.go
+        func (h *Handler) Quote(w http.ResponseWriter, r *http.Request) {
+            cart := parseCart(r)
+            var q Quote
+            var wg sync.WaitGroup
+            var errs [3]error
+            wg.Add(3)
+            go func() { defer wg.Done(); q.Inv, errs[0] = h.inventory.Reserve(cart) }()
+            go func() { defer wg.Done(); q.Price, errs[1] = h.pricing.Quote(cart) }()
+            go func() { defer wg.Done(); q.Risk, errs[2] = h.fraud.Score(cart) }()
+            go h.recs.Warm(context.Background(), cart.UserID) // optional, never waited for
+            wg.Wait()
+            if err := errors.Join(errs[:]...); err != nil {
+                http.Error(w, err.Error(), http.StatusBadGateway)
+                return
+            }
+            go h.audit.Write(cart)
+            writeJSON(w, q)
+        }
+      roles: { handler: [2, 19], inventory: [8, 8], pricing: [9, 9], fraud: [10, 10], recs: [11, 11], audit: [17, 17] }
+      change:
+        - { line: 9, replace: '    go func() { defer wg.Done(); q.Price, errs[1] = h.pricing.Quote(cart) }() // fails at 60 ms' }
+        - { line: 10, replace: '    go func() { defer wg.Done(); q.Risk, errs[2] = h.fraud.Score(cart) }() // 250 ms of CPU, thrown away' }
+        - { line: 11, replace: '    go h.recs.Warm(context.Background(), cart.UserID) // runs on after the response' }
+        - { line: 12, replace: '    wg.Wait() // waits for all three, even after the failure' }
+    after:
+      file: checkout.go · fraud.go
+      source: |
+        // checkout.go
+        func (h *Handler) Quote(w http.ResponseWriter, r *http.Request) {
+            ctx, cancel := context.WithTimeout(r.Context(), 300*time.Millisecond)
+            defer cancel() // on every path: releases the timer and stops the children
+            cart := parseCart(r)
+            var q Quote
+            g, gctx := errgroup.WithContext(ctx) // the first error cancels gctx
+            g.Go(func() (err error) { q.Inv, err = h.inventory.Reserve(gctx, cart); return })
+            g.Go(func() (err error) { q.Price, err = h.pricing.Quote(gctx, cart); return })
+            g.Go(func() (err error) { q.Risk, err = h.fraud.Score(gctx, cart); return })
+            go h.recs.Warm(ctx, cart.UserID) // stops when the handler returns
+            if err := g.Wait(); err != nil {
+                http.Error(w, err.Error(), statusFor(err)) // 504 for DeadlineExceeded
+                return
+            }
+            go h.audit.Write(context.WithoutCancel(ctx), cart) // keeps values, outlives us
+            writeJSON(w, q)
+        }
+
+        // fraud.go: a CPU loop has to look for itself
+        func (f *Fraud) Score(ctx context.Context, c Cart) (Score, error) {
+            var s Score
+            for i, row := range f.rows(c) {
+                if i%1000 == 0 && ctx.Err() != nil {
+                    return Score{}, ctx.Err()
+                }
+                s.Add(row)
+            }
+            return s, nil
+        }
+      roles: { handler: [2, 18], req: [3, 3], root: [3, 4], cancel: [4, 4], group: [7, 7], inventory: [8, 8], pricing: [9, 9], fraud: [10, 10], recs: [11, 11], wait: [12, 15], audit: [16, 16], check: [24, 26] }
+    again:
+      file: pricing fails at 60 ms, again
+      source: |
+        // before: 502 sent at 250 ms; fraud burned 190 ms; recs ran to 500 ms
+        // after:  error sent at 65 ms; fraud stopped at its next check
+        //         recs stopped on return; the audit write still finished
+    cost:
+      before: { text: "error after 250 ms · 440 ms of work for nobody", value: 0.85 }
+      after: { text: "error after 65 ms · 5 ms of work for nobody", value: 0.1 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Pass `ctx` as the first parameter of anything that does I/O or long work, derive children with `WithCancel`, `WithTimeout` or `errgroup.WithContext`, and `defer cancel()` straight away. Cancelling closes a channel; nothing is killed. Code that never checks `ctx.Done()` or `ctx.Err()` keeps running.'
+      seenIn: '`http.Request.Context()`, `http.NewRequestWithContext`, `sql.DB.QueryContext`, `errgroup.WithContext`, `signal.NotifyContext`. `context.WithCancelCause` arrived in Go 1.20; `context.WithoutCancel` and `context.AfterFunc` in Go 1.21.'
+
+  python:
+    before:
+      file: checkout.py
+      source: |
+        # checkout.py
+        async def quote(request: Request) -> Response:
+            cart = parse_cart(request)
+            asyncio.create_task(recs.warm(cart.user_id))  # optional, never awaited
+            try:
+                inv, price, risk = await asyncio.gather(
+                    inventory.reserve(cart),
+                    pricing.quote(cart),
+                    asyncio.to_thread(fraud.score, cart),
+                )
+            except BackendError as e:
+                return JSONResponse({"error": str(e)}, status_code=502)
+            asyncio.create_task(audit.write(cart))
+            return JSONResponse(make_quote(inv, price, risk))
+      roles: { handler: [2, 14], recs: [4, 4], inventory: [7, 7], pricing: [8, 8], fraud: [9, 9], audit: [13, 13] }
+      change:
+        - { line: 4, replace: '    asyncio.create_task(recs.warm(cart.user_id))  # runs on after the response' }
+        - { line: 6, replace: '        inv, price, risk = await asyncio.gather(  # on error, the others keep running' }
+        - { line: 8, replace: '            pricing.quote(cart),  # fails at 60 ms' }
+        - { line: 9, replace: '            asyncio.to_thread(fraud.score, cart),  # a thread: cannot be cancelled' }
+    after:
+      file: checkout.py
+      source: |
+        # checkout.py
+        async def quote(request: Request) -> Response:
+            cart = parse_cart(request)
+            warm = asyncio.create_task(recs.warm(cart.user_id))
+            try:
+                async with asyncio.timeout(0.3):
+                    async with asyncio.TaskGroup() as tg:  # the first error cancels the rest
+                        inv = tg.create_task(inventory.reserve(cart))
+                        price = tg.create_task(pricing.quote(cart))
+                        risk = tg.create_task(fraud.score(cart))  # async now: awaits between chunks
+            except ExceptionGroup as eg:
+                return JSONResponse({"error": str(eg.exceptions[0])}, status_code=502)
+            except TimeoutError:
+                return JSONResponse({"error": "timeout"}, status_code=504)
+            finally:
+                warm.cancel()  # optional work stops when we return
+            asyncio.create_task(audit.write(cart))
+            return JSONResponse(make_quote(inv.result(), price.result(), risk.result()))
+      roles: { handler: [2, 18], req: [2, 2], root: [6, 6], cancel: [15, 16], group: [7, 7], inventory: [8, 8], pricing: [9, 9], fraud: [10, 10], recs: [4, 4], wait: [11, 14], audit: [17, 17], check: [10, 10] }
+    again:
+      file: pricing fails at 60 ms, again
+      source: |
+        # before: 502 at 60 ms, but inventory, the fraud thread and recs ran on
+        # after:  TaskGroup cancels inventory and fraud at their next await;
+        #         recs is cancelled on return; the audit task still runs
+    cost:
+      before: { text: "error at 60 ms · 3 pieces of work run on", value: 0.7 }
+      after: { text: "error at ~65 ms · the rest cancelled", value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'asyncio cancels a task by throwing `CancelledError` into it at its next `await`. `TaskGroup` cancels the rest when one task fails; `gather` does not. A thread from `to_thread` cannot be cancelled at all, so CPU work has to check a flag itself or run as a coroutine that yields.'
+      seenIn: '`asyncio.TaskGroup`, `asyncio.timeout()`, `task.cancel()`, and `asyncio.shield()`, the nearest thing to `WithoutCancel`.'
+
+  typescript:
+    before:
+      file: checkout.ts
+      source: |
+        // checkout.ts
+        export async function quote(req: Request): Promise<Response> {
+          const cart = await parseCart(req);
+          void recs.warm(cart.userId); // optional, never awaited
+          try {
+            const [inv, price, risk] = await Promise.all([
+              inventory.reserve(cart),
+              pricing.quote(cart),
+              fraud.score(cart),
+            ]);
+            void audit.write(cart);
+            return Response.json(makeQuote(inv, price, risk));
+          } catch (e) {
+            return Response.json({ error: String(e) }, { status: 502 });
+          }
+        }
+      roles: { handler: [2, 16], recs: [4, 4], inventory: [7, 7], pricing: [8, 8], fraud: [9, 9], audit: [11, 11] }
+      change:
+        - { line: 4, replace: '  void recs.warm(cart.userId); // runs on after the response' }
+        - { line: 8, replace: '      pricing.quote(cart), // rejects at 60 ms' }
+        - { line: 9, replace: '      fraud.score(cart), // keeps scoring after the rejection' }
+    after:
+      file: checkout.ts
+      source: |
+        // checkout.ts
+        export async function quote(req: Request): Promise<Response> {
+          const ac = new AbortController();
+          const signal = AbortSignal.any([req.signal, ac.signal, AbortSignal.timeout(300)]);
+          const cart = await parseCart(req);
+          void recs.warm(cart.userId, { signal }).catch(() => {});
+          try {
+            const [inv, price, risk] = await Promise.all([
+              inventory.reserve(cart, { signal }),
+              pricing.quote(cart, { signal }),
+              fraud.score(cart, { signal }), // checks signal.aborted between chunks
+            ]);
+            void audit.write(cart); // no signal: it must finish
+            return Response.json(makeQuote(inv, price, risk));
+          } catch (e) {
+            return Response.json({ error: String(e) }, { status: 502 });
+          } finally {
+            ac.abort(); // first failure or return: stop whatever is still running
+          }
+        }
+      roles: { handler: [2, 20], req: [4, 4], root: [3, 4], cancel: [17, 19], group: [8, 12], inventory: [9, 9], pricing: [10, 10], fraud: [11, 11], recs: [6, 6], wait: [8, 12], audit: [13, 13], check: [11, 11] }
+    again:
+      file: pricing fails at 60 ms, again
+      source: |
+        // before: 502 at 60 ms, but inventory, fraud and recs kept going
+        // after:  finally { ac.abort() } at 60 ms; every call that took the signal stops
+        //         the audit write has no signal and finishes
+    cost:
+      before: { text: "error at 60 ms · 3 calls run on", value: 0.7 }
+      after: { text: "error at 60 ms · the rest aborted", value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'An `AbortSignal` is a context without values: pass it down, and every API that accepts one stops when it fires. `Promise.all` rejects on the first failure but stops nothing. CPU work in a worker has to check `signal.aborted` itself.'
+      seenIn: '`fetch(url, { signal })`, `AbortSignal.timeout()`, `AbortSignal.any()`, `Request.signal`, Node''s `stream.pipeline(..., { signal })`.'
+
+  rust:
+    before:
+      file: checkout.rs
+      source: |
+        // checkout.rs
+        async fn quote(State(app): State<App>, Json(cart): Json<Cart>) -> Result<Json<Quote>, AppError> {
+            tokio::spawn(app.recs.clone().warm(cart.user_id)); // optional, detached
+            let fraud = tokio::task::spawn_blocking({
+                let (f, c) = (app.fraud.clone(), cart.clone());
+                move || f.score(&c)
+            });
+            let (inv, price) = tokio::try_join!(app.inventory.reserve(&cart), app.pricing.quote(&cart))?;
+            let risk = fraud.await??;
+            tokio::spawn(app.audit.clone().write(cart));
+            Ok(Json(Quote::new(inv, price, risk)))
+        }
+      roles: { handler: [2, 12], recs: [3, 3], fraud: [4, 7], inventory: [8, 8], pricing: [8, 8], audit: [10, 10] }
+      change:
+        - { line: 3, replace: '    tokio::spawn(app.recs.clone().warm(cart.user_id)); // runs on after we return' }
+        - { line: 4, replace: '    let fraud = tokio::task::spawn_blocking({ // a thread: dropping the handle does not stop it' }
+    after:
+      file: checkout.rs
+      source: |
+        // checkout.rs
+        async fn quote(State(app): State<App>, Json(cart): Json<Cart>) -> Result<Json<Quote>, AppError> {
+            let token = CancellationToken::new();
+            let _stop = token.clone().drop_guard(); // cancels on every return path
+            tokio::spawn(app.recs.clone().warm(cart.user_id, token.child_token()));
+            let work = async {
+                tokio::try_join!(
+                    app.inventory.reserve(&cart),
+                    app.pricing.quote(&cart),
+                    app.fraud.score(&cart, token.child_token()), // checks is_cancelled() between chunks
+                )
+            };
+            let (inv, price, risk) = timeout(Duration::from_millis(300), work).await??;
+            tokio::spawn(app.audit.clone().write(cart)); // no token: it must finish
+            Ok(Json(Quote::new(inv, price, risk)))
+        }
+      roles: { handler: [2, 16], req: [2, 2], root: [3, 4], cancel: [4, 4], group: [6, 12], inventory: [8, 8], pricing: [9, 9], fraud: [10, 10], recs: [5, 5], wait: [13, 13], audit: [14, 14], check: [10, 10] }
+    again:
+      file: pricing fails at 60 ms, again
+      source: |
+        // before: error at 60 ms; inventory dropped, but the fraud thread and recs ran on
+        // after:  try_join! drops inventory and fraud; the guard cancels recs on return
+        //         the audit task has no token and finishes
+    cost:
+      before: { text: "error at 60 ms · fraud thread and recs run on", value: 0.6 }
+      after: { text: "error at ~65 ms · the rest cancelled", value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Dropping a future cancels it at its last `.await`, so `try_join!` and `select!` stop the losers for free. Spawned tasks and `spawn_blocking` threads are not cancelled by a drop; pass a `CancellationToken` and check it.'
+      seenIn: '`tokio::time::timeout`, `tokio::select!`, `tokio_util::sync::CancellationToken` with `child_token()` and `drop_guard()`, `tokio::task::JoinSet`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'The handler derives `ctx` from the request with a 300 ms deadline and defers `cancel()` on the next line.', python: '`asyncio.timeout(0.3)` puts a deadline on everything inside the block.', typescript: 'One signal fires on whichever comes first: the client going away, the 300 ms timeout, or the handler''s own `ac.abort()`.', rust: 'A `CancellationToken` and a drop guard: whatever path the function leaves by, the token is cancelled.' }
+    nodes: [req, handler]
+    edges: [req>handler]
+    role: root
+  - text: { go: '`errgroup.WithContext` makes `gctx`, a child of `ctx`. Each backend call gets `gctx`: the HTTP clients watch it, and the fraud loop checks it every 1,000 rows.', python: '`TaskGroup` starts the three calls as tasks it owns. Each awaits network I/O or yields between chunks, so each has places where it can be cancelled.', typescript: 'Each call gets the same signal. `fetch` listens for it; the fraud worker checks `signal.aborted` between chunks.', rust: '`try_join!` polls the three futures together. The fraud scorer gets a child token and checks it between chunks.' }
+    nodes: [group, inventory, pricing, fraud]
+    edges: [handler>group, group>inventory, group>pricing, group>fraud]
+    role: group
+  - text: { go: 'pricing fails at 60 ms. errgroup cancels `gctx`, closing its Done channel. The inventory request is aborted at once; fraud sees it at its next check, 5 ms later. `ctx` above it is still open.', python: 'pricing raises at 60 ms. The TaskGroup cancels the other two tasks; each gets `CancelledError` at its next await.', typescript: '`pricing.quote` rejects at 60 ms, so `Promise.all` rejects and the `finally` block aborts the signal. The other calls reject with `AbortError`.', rust: 'pricing returns an error at 60 ms. `try_join!` returns it and drops the other two futures, which cancels them.' }
+    nodes: [pricing, group, inventory, fraud]
+    edges: [group>pricing, group>inventory, group>fraud]
+    role: pricing
+  - text: { go: '`g.Wait()` returns once all three have returned, at 65 ms, with pricing''s error. The handler answers, and `defer cancel()` closes `ctx`, which stops recs.', python: 'The `except` answers with a 502 at about 65 ms, and `finally` cancels the recs task.', typescript: 'The `catch` answers with a 502. `ac.abort()` in `finally` also stops recs, which shares the signal.', rust: 'The `?` returns the error at about 65 ms. The drop guard cancels the token, and the recs task sees it.' }
+    nodes: [handler, recs]
+    edges: [handler>recs]
+    role: wait
+  - text: { go: 'The audit write runs under `context.WithoutCancel(ctx)`. It keeps the request''s values, such as the trace ID, but not its cancellation, so it finishes after the handler has returned.', python: 'The audit task is not in the TaskGroup and is never cancelled, so it finishes after the response.', typescript: 'The audit write gets no signal, so the abort never reaches it.', rust: 'The audit task gets no token, so it finishes after the response.' }
+    nodes: [audit]
+    edges: [handler>audit]
+    role: audit
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A handler cancels its context while a goroutine it started is in a CPU loop that never looks at ctx. What happens to that goroutine?
+    options:
+      - text: It keeps running until its loop ends. Cancelling only closes the context's Done channel.
+        correct: true
+        why: Right. Cancellation is cooperative. Nothing in Go can stop a goroutine from outside; it stops when its own code checks ctx and returns.
+      - text: The runtime stops it at the next function call.
+        why: The runtime never stops goroutines on a context's behalf. A context is an ordinary value with a channel inside.
+      - text: It panics with context.Canceled.
+        why: context.Canceled is an error value that ctx.Err() returns. Nothing panics, and nothing happens to code that never asks.
+  engineer:
+    question: In an errgroup, pricing fails at 60 ms, but the error response goes out at 250 ms. Why?
+    options:
+      - text: g.Wait() waits for every goroutine in the group to return, and fraud.Score ignores gctx.
+        correct: true
+        why: Right. errgroup cancels gctx at the first error, but Wait still waits for every function passed to Go. One goroutine that ignores ctx holds up the response.
+      - text: errgroup only cancels the context after Wait returns.
+        why: It cancels the derived context the first time a function returns a non-nil error, and again when Wait returns. The cancel happened at 60 ms.
+      - text: The 300 ms deadline has to pass before an error can be returned.
+        why: The deadline is an upper bound. Any earlier cancel closes the same Done channel.
+  deep:
+    question: What does a cancelCtx do if cancel runs before anyone has called Done?
+    options:
+      - text: It stores a shared channel that is already closed, because Done creates its channel lazily and nobody has asked for one yet.
+        correct: true
+        why: Right. Many contexts are never waited on, so context.go only makes the channel on the first Done call. If cancel comes first, later Done calls get the shared closed channel.
+      - text: It creates a new channel and closes it at once.
+        why: That would allocate a channel per cancelled context. The package keeps one closed channel and reuses it.
+      - text: Nothing; Done will block forever because its channel was never created.
+        why: That would break every late caller of Done. The cancel records the shared closed channel so they return at once.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Root context
+      example: { go: "r.Context()", python: "the request task", typescript: "req.signal", rust: "the request future" }
+      job: Cancelled when the client goes away or the handler returns.
+    - role: Derived context
+      example: { go: "WithTimeout, errgroup.WithContext", python: "asyncio.timeout, TaskGroup", typescript: "AbortSignal.any", rust: "child_token()" }
+      job: Adds a deadline or a cancel cause. Cancelled with its parent, never the reverse.
+    - role: Worker
+      example: inventory, pricing, fraud
+      job: Checks Done (or passes ctx to calls that do) and returns when it closes.
+    - role: Detached work
+      example: { go: "context.WithoutCancel(ctx)", python: "asyncio.shield or a separate task", typescript: "no signal", rust: "no token" }
+      job: Keeps the request's values but must finish even if the request is cancelled.
+  useWhen:
+    - Any request-scoped work that does I/O or runs longer than a few milliseconds.
+    - Fan-out where one failure makes the other results useless.
+    - Deadlines that must hold across several calls and services.
+  avoidWhen:
+    - Storing a context in a struct field. Pass it as the first argument of each call.
+    - Passing optional parameters through WithValue. Use it only for request-scoped data such as trace IDs.
+    - Using context.Background() inside a request to stop work being cut short. Use WithoutCancel, so it is visible.
+  tradeoffs:
+    - Every function on the path must take ctx and honour it, or the chain breaks at that function.
+    - CPU loops must check ctx.Err() themselves, which costs a little per check.
+    - Cancellation stops work; it does not undo it. A reservation made before the cancel still needs releasing.
+  lookalikes:
+    - name: Killing a thread
+      how: Stops code from outside, at any point. Go has no such thing; a context only asks.
+    - name: Timeout on one call
+      how: Limits one operation. A context deadline limits a whole tree of calls with one clock.
+    - name: Done channel by hand
+      how: The pre-context way, a channel you close to signal stop. A context adds deadlines, values and the tree.
+---
+
+## [concept] Context and cancellation
+
+**A context carries a cancel signal, a deadline and request values down a tree of calls.** Cancelling one closes a channel. Only the code that checks that channel stops.
+
+Every context you derive is a child of the one you derived it from. That makes a <Term id="context-tree">context tree</Term>, and cancelling any node cancels everything below it.
+
+<Depth level={2}>
+The signal is the <Term id="done-channel">Done channel</Term>. `ctx.Done()` returns it, and it is closed when the context is cancelled, its deadline passes, or its parent is cancelled. `ctx.Err()` then says why: `context.Canceled` or `context.DeadlineExceeded`. This is <Term id="cooperative-cancellation">cooperative cancellation</Term>: nothing stops a goroutine from outside. Work stops because its own code looks at `ctx` and returns.
+</Depth>
+
+<Depth level={3}>
+In `context/context.go`, a `cancelCtx` holds a mutex, a lazily created `done` channel, a set of children, and the error. `cancel` stores the error, closes `done` (or, if nobody ever asked for it, stores one shared closed channel), then calls `cancel` on each child and removes itself from its parent. A `timerCtx` adds a deadline and uses `time.AfterFunc` to call the same `cancel` when it passes.
+</Depth>
+
+## [problem] Three checks, one quote
+
+A checkout quote needs three answers: inventory reserves the items, pricing quotes the total, and a fraud model scores the cart. They are independent, so the handler runs them at the same time and waits for all three. It also warms the recommendations cache, and writes an audit record at the end.
+
+When every backend answers, it is fast: about 250 ms, set by the fraud model.
+
+<Depth level={2}>
+The mental model is that a request ends when the handler returns, and everything it started ends with it. In Go that is never true. A goroutine ends when its own function returns, and nothing here ever tells the others to stop.
+</Depth>
+
+<Depth level={3}>
+`context.Background()` in the recs call is a deliberate choice: someone did not want a slow client to cut cache warming short. It works, but it also takes recs out of the request's tree, so nothing can ever stop it.
+</Depth>
+
+## [pain] Pricing goes down
+
+**What happened:** during a pricing outage, checkout errors took 250 ms instead of 60, and CPU on the checkout pods went to scoring carts nobody would buy.
+
+Pricing fails at 60 ms. Nothing stops the other two: `wg.Wait()` waits for inventory and for the full 250 ms of fraud scoring, then returns the error. The recs goroutine runs on for its full 500 ms after the response has gone.
+
+<Depth level={2}>
+Under load it gets worse. Every failed request still pays for a full fraud score, so during the outage the pods spend most of their CPU on answers that will be thrown away, and healthy requests queue behind them. Retries from clients double it.
+</Depth>
+
+<Depth level={3}>
+None of this shows up as an error. The goroutines all finish, so there is no leak, and the CPU profile shows `fraud.Score` as the hottest function, as it always is. You only see it by comparing when the error happened with when it was sent.
+</Depth>
+
+## [morph] Put the request in a tree
+
+Drag the slider. The flat group of goroutines becomes a tree: the request's context at the root, the handler's deadline below it, the errgroup's context below that, and each call hanging off the context it should stop with.
+
+The code changes in four places. `ctx` gets a deadline and a `defer cancel()`. The three calls move into an errgroup and take `gctx`. The fraud loop checks `ctx.Err()`. And recs takes `ctx`, while the audit write takes `context.WithoutCancel(ctx)` on purpose.
+
+<Depth level={2}>
+`defer cancel()` matters even when nothing goes wrong. Until a derived context is cancelled, its parent keeps a reference to it, and a `WithTimeout` keeps its timer. `go vet` warns when a cancel function is not called on every path.
+</Depth>
+
+<Depth level={3}>
+When the parent is a context from this package, `propagateCancel` simply adds the child to the parent's children set. For a parent of some other type, it registers through the parent's `AfterFunc` if it has one, and otherwise starts a goroutine that waits on the parent's Done channel. That fallback is one reason to avoid custom Context implementations.
+</Depth>
+
+## [walk] Follow the failure
+
+The pricing failure, traced through the fixed handler, from the root context to the audit write. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Closing a channel wakes every goroutine parked on it at once, so cancelling a context with a thousand waiting goroutines costs one close, not a thousand sends. `http.Client` watches the request's context and closes the connection when Done closes; `database/sql` asks the driver to cancel the query.</Lang>
+<Lang only="python">`task.cancel()` only requests cancellation. The `CancelledError` is thrown at the task's next `await`, and a task can catch it and refuse. `TaskGroup` re-raises the original error as part of an `ExceptionGroup` once all its tasks have finished.</Lang>
+<Lang only="typescript">`AbortSignal.any` returns a signal that fires when any of its inputs fires. Listeners run synchronously in `abort()`, so `fetch` closes its connection before `abort()` returns.</Lang>
+<Lang only="rust">Dropping a future runs the destructors of everything it owns, which closes connections and releases locks at once. That only reaches futures. A thread from `spawn_blocking` keeps running until its closure returns.</Lang>
+</Depth>
+
+## [again] Pricing goes down again
+
+The same outage. The error goes out at 65 ms: the failure at 60 ms, plus up to one fraud-loop check. Inventory's request is aborted, fraud stops at its next check, recs stops when the handler returns, and only the audit write runs on, as it should.
+
+<Depth level={2}>
+Check it in tests. Give a fake backend a context-aware method that blocks until `ctx.Done()`, cancel the context, and assert the handler returns within a few milliseconds. A goroutine that ignores ctx fails the test by timing out.
+</Depth>
+
+<Depth level={3}>
+`context.WithCancelCause` (Go 1.20) records why a context was cancelled, and `context.Cause(ctx)` returns it, so logs can say "pricing failed" instead of "context canceled". `context.AfterFunc` (Go 1.21) runs a function when a context is done, without a goroutine waiting on it.
+</Depth>
+
+## [play] Cancel a request tree
+
+The handler from this lesson, as one tree you can break and repair. Each row is a context or a goroutine, drawn over time.
+
+Pick what goes wrong, run the request and drag time back and forth. Then fix the two goroutines that do not listen.
+
+## [lens] How each language meets it
+
+Every language here cancels cooperatively. They differ in what carries the signal and in which work cannot hear it.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Go passes `ctx` by hand and cancels nothing automatically. Python throws `CancelledError` into a task at its next `await`. TypeScript passes an `AbortSignal` to the APIs that accept one. Rust cancels a future by dropping it. In all four, threads and CPU loops only stop if they check.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="context-cancellation" />
+
+### Values and causes
+
+`context.WithValue` carries request-scoped data, such as a trace ID or the authenticated user, through APIs that do not know about it. Use a private key type so packages cannot collide, and never use it for optional parameters. `WithoutCancel` keeps these values while dropping cancellation, which is why the audit write uses it rather than `context.Background()`: the audit record still gets the trace ID.

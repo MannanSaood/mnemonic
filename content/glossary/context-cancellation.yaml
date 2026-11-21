@@ -1,0 +1,10 @@
+# Terms introduced by the context-cancellation lesson.
+- id: context-tree
+  term: Context tree
+  short: Every derived context (WithCancel, WithTimeout, errgroup.WithContext) is a child of the one it came from. Cancelling a node cancels everything below it and nothing above it.
+- id: done-channel
+  term: Done channel
+  short: The channel a Go context closes when it is cancelled or its deadline passes. Code that wants to stop on cancel waits on it or checks ctx.Err().
+- id: cooperative-cancellation
+  term: Cooperative cancellation
+  short: Cancelling only asks work to stop. The work has to check for the request and return; nothing is killed from outside.
