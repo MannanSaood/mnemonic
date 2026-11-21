@@ -1,0 +1,16 @@
+# Terms introduced by design-patterns/composition-over-inheritance
+- id: inheritance
+  term: Inheritance
+  short: Defining a class as an extension of another, so it gets the parent's fields and methods and can override some of them.
+- id: composition
+  term: Composition
+  short: Building an object out of other objects it holds and calls through their interfaces, instead of extending a class.
+- id: fragile-base-class
+  term: Fragile base class
+  short: A change inside a parent class breaks subclasses that relied on how it worked, though its public methods did not change.
+- id: delegation
+  term: Delegation
+  short: Handing a call on to another object you hold, often after doing some work of your own.
+- id: struct-embedding
+  term: Struct embedding
+  short: In Go, putting one type inside a struct without a field name, so its methods are promoted. It is composition, not inheritance.

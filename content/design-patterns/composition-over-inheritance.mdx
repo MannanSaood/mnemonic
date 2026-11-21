@@ -1,0 +1,661 @@
+---
+title: Composition over inheritance
+track: design-patterns
+group: Principles
+order: 12
+summary: Build behaviour by wrapping objects that share an interface, instead of writing a subclass for every combination of features.
+intent: Adding a feature should add one piece, not one class per existing combination.
+changeRequest: Security wants every outgoing HTTP request logged with its latency.
+languages: [go, python, typescript, rust]
+glossary: [inheritance, composition, delegation, fragile-base-class, struct-embedding, middleware-onion, interface, monomorphisation]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: composition-over-inheritance
+  scenarios:
+    - try: "Predict, then ship Security's request: logging for every team."
+      notice: "The class tree grows from 3 to 7 classes, and the logging code is written four times. The wrapper side gains one Logging wrapper."
+    - try: "Toggle more features in the team grid."
+      notice: "Every new mix is another subclass. Wrappers stay at one per feature, however the teams mix them."
+    - try: "Send a Payments request, then move Logging below Retry and send again."
+      notice: "Outside Retry, Logging writes one line with the total time. Inside, it logs the failed attempt too. Order is a decision, and only wrappers let you make it per team."
+    - try: "Move Auth above Retry and send."
+      notice: "One token fetch instead of one per attempt. Same pieces, different behaviour."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: teams, sub: pick a class }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: main, sub: stacks layers }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 380, h: 246, title: class tree, sub: one class per mix }
+      after:  { x: 150, y: 30, w: 140, h: 56, title: payments, sub: "Auth(Retry(Http))" }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 340, y: 30, w: 200, h: 56, title: "" }
+      after:  { x: 340, y: 30, w: 200, h: 56, title: { go: RoundTripper, python: Transport, typescript: Transport, rust: Transport }, sub: { go: RoundTrip(req), python: send(req), typescript: send(req), rust: send(req) } }
+    - id: base
+      kind: concrete
+      before: { x: 188, y: 70, w: 150, h: 32, title: { go: Client, python: HttpClient, typescript: HttpClient, rust: Client } }
+      after:  { x: 300, y: 200, w: 56, h: 40, title: Http }
+    - id: retry
+      kind: concrete
+      before: { x: 208, y: 112, w: 180, h: 32, title: RetryingClient }
+      after:  { x: 362, y: 200, w: 60, h: 40, title: Retry }
+    - id: auth
+      kind: concrete
+      before: { x: 228, y: 154, w: 300, h: 32, title: "AuthRetrying · AuthClient" }
+      after:  { x: 428, y: 200, w: 56, h: 40, title: Auth }
+    - id: logging
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 206, w: 340, h: 32, title: "Logging…Client ×4" }
+      after:  { x: 490, y: 200, w: 66, h: 40, title: Logging }
+  edges:
+    - { from: client, to: context, label: stacks }
+    - { from: context, to: strategy, label: calls }
+    - { from: base, to: strategy, kind: implements }
+    - { from: retry, to: strategy, kind: implements, label: implements }
+    - { from: auth, to: strategy, kind: implements }
+    - { from: logging, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: client.go
+      source: |
+        type Client struct{ http *http.Client }
+
+        func (c *Client) Do(req *http.Request) (*http.Response, error) { return c.http.Do(req) }
+
+        type RetryingClient struct{ Client }
+
+        func (c *RetryingClient) Do(req *http.Request) (*http.Response, error) {
+            resp, err := c.Client.Do(req)
+            for i := 1; i < 3 && (err != nil || resp.StatusCode >= 500); i++ {
+                if err == nil {
+                    resp.Body.Close()
+                }
+                time.Sleep(200 * time.Millisecond << i)
+                resp, err = c.Client.Do(req)
+            }
+            return resp, err
+        }
+
+        type AuthRetryingClient struct {
+            RetryingClient
+            tokens TokenSource
+        }
+
+        func (c *AuthRetryingClient) Do(req *http.Request) (*http.Response, error) {
+            req.Header.Set("Authorization", "Bearer "+c.tokens.Token())
+            return c.RetryingClient.Do(req)
+        }
+
+        type AuthClient struct { // auth without retry: the header code is copied
+            Client
+            tokens TokenSource
+        }
+
+        func (c *AuthClient) Do(req *http.Request) (*http.Response, error) {
+            req.Header.Set("Authorization", "Bearer "+c.tokens.Token())
+            return c.Client.Do(req)
+        }
+      roles: { context: [1, 37], base: [1, 3], retry: [5, 17], auth: [19, 37] }
+      change:
+        - { after: 37, add: ['', 'type LoggingClient struct{ Client }                         // + Do with the logging lines', 'type LoggingRetryingClient struct{ RetryingClient }         // + Do, the same lines again', 'type LoggingAuthRetryingClient struct{ AuthRetryingClient } // + Do, again', 'type LoggingAuthClient struct{ AuthClient }                 // + Do, and again'] }
+    after:
+      file: transport.go · main.go
+      source: |
+        // http.RoundTripper: RoundTrip(*http.Request) (*http.Response, error)
+
+        type Retry struct { // for idempotent requests
+            Next     http.RoundTripper
+            Attempts int
+        }
+
+        func (r Retry) RoundTrip(req *http.Request) (*http.Response, error) {
+            resp, err := r.Next.RoundTrip(req)
+            for i := 1; i < r.Attempts && (err != nil || resp.StatusCode >= 500); i++ {
+                if err == nil {
+                    resp.Body.Close()
+                }
+                time.Sleep(200 * time.Millisecond << i)
+                resp, err = r.Next.RoundTrip(req)
+            }
+            return resp, err
+        }
+
+        type Auth struct {
+            Next   http.RoundTripper
+            Tokens TokenSource
+        }
+
+        func (a Auth) RoundTrip(req *http.Request) (*http.Response, error) {
+            req = req.Clone(req.Context()) // a RoundTripper must not modify the caller's request
+            req.Header.Set("Authorization", "Bearer "+a.Tokens.Token())
+            return a.Next.RoundTrip(req)
+        }
+
+        // main.go: each team stacks what it needs
+        payments := &http.Client{Transport: Auth{Next: Retry{Next: http.DefaultTransport, Attempts: 3}, Tokens: tokens}}
+        search := &http.Client{Transport: Retry{Next: http.DefaultTransport, Attempts: 3}}
+      roles: { strategy: [1, 1], retry: [3, 18], auth: [20, 29], client: [31, 33], context: [32, 32], stack: [31, 33], authsend: [25, 29], retrysend: [8, 18], swap: [33, 33] }
+    again:
+      file: logging.go
+      source: |
+        // logging.go: one new wrapper; nothing above changes
+        type Logging struct {
+            Next http.RoundTripper
+            Log  *slog.Logger
+        }
+
+        func (l Logging) RoundTrip(req *http.Request) (*http.Response, error) {
+            start := time.Now()
+            resp, err := l.Next.RoundTrip(req)
+            l.Log.Info("http", "method", req.Method, "url", req.URL.String(), "took", time.Since(start), "err", err)
+            return resp, err
+        }
+
+        // main.go: wrap each team's stack once more, e.g. Logging{Next: Auth{…}, Log: log}
+    cost:
+      before: { text: 4 new types · 4 copies of logging, value: 0.85 }
+      after: { text: 1 new wrapper, value: 0.12 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Go has no inheritance. Embedding promotes the inner type''s methods, but the inner type never calls the outer one''s methods, so it cannot be used to override behaviour. Wrapping an interface value (`http.RoundTripper`, `http.Handler`, `io.Reader`) is how Go adds behaviour.'
+      seenIn: '`http.Client{Transport: …}` with wrapping RoundTrippers, as in this lesson. `http.TimeoutHandler(h, d, msg)` wraps any handler. `bufio.NewReader` over a `gzip.Reader` over a file is a stack of `io.Reader`s.'
+
+  python:
+    before:
+      file: client.py
+      source: |
+        class HttpClient:
+            def send(self, req: Request) -> Response:
+                return self.session.send(req)
+
+        class RetryingClient(HttpClient):
+            def send(self, req: Request) -> Response:
+                for attempt in range(3):
+                    resp = super().send(req)
+                    if resp.status_code < 500:
+                        return resp
+                    time.sleep(0.2 * 2 ** attempt)
+                return resp
+
+        class AuthRetryingClient(RetryingClient):
+            def send(self, req: Request) -> Response:
+                req.headers["Authorization"] = f"Bearer {self.tokens.get()}"
+                return super().send(req)
+
+        class AuthClient(HttpClient):  # auth without retry: the header code is copied
+            def send(self, req: Request) -> Response:
+                req.headers["Authorization"] = f"Bearer {self.tokens.get()}"
+                return super().send(req)
+      roles: { context: [1, 22], base: [1, 3], retry: [5, 12], auth: [14, 22] }
+      change:
+        - { after: 22, add: ['', 'class LoggingClient(HttpClient): ...                        # send() with the logging lines', 'class LoggingRetryingClient(RetryingClient): ...            # the same lines again', 'class LoggingAuthRetryingClient(AuthRetryingClient): ...    # again', 'class LoggingAuthClient(AuthClient): ...                    # and again'] }
+    after:
+      file: transport.py · main.py
+      source: |
+        class Transport(Protocol):
+            def send(self, req: Request) -> Response: ...
+
+        class Retry:
+            def __init__(self, inner: Transport, attempts: int = 3):
+                self.inner, self.attempts = inner, attempts
+
+            def send(self, req: Request) -> Response:
+                for attempt in range(self.attempts):
+                    resp = self.inner.send(req)
+                    if resp.status_code < 500:
+                        return resp
+                    time.sleep(0.2 * 2 ** attempt)
+                return resp
+
+        class Auth:
+            def __init__(self, inner: Transport, tokens: TokenSource):
+                self.inner, self.tokens = inner, tokens
+
+            def send(self, req: Request) -> Response:
+                req.headers["Authorization"] = f"Bearer {self.tokens.get()}"
+                return self.inner.send(req)
+
+        # main.py: each team stacks what it needs
+        payments = Auth(Retry(HttpTransport()), tokens)
+        search = Retry(HttpTransport())
+      roles: { strategy: [1, 2], retry: [4, 14], auth: [16, 22], client: [24, 26], context: [25, 25], stack: [24, 26], authsend: [20, 22], retrysend: [8, 14], swap: [26, 26] }
+    again:
+      file: logging_transport.py
+      source: |
+        # logging_transport.py: one new wrapper; nothing above changes
+        class Logging:
+            def __init__(self, inner: Transport, log: logging.Logger):
+                self.inner, self.log = inner, log
+
+            def send(self, req: Request) -> Response:
+                start = time.monotonic()
+                resp = self.inner.send(req)
+                ms = (time.monotonic() - start) * 1000
+                self.log.info("%s %s -> %d in %.0f ms", req.method, req.url, resp.status_code, ms)
+                return resp
+
+        # main.py: payments = Logging(Auth(Retry(HttpTransport()), tokens), log)
+    cost:
+      before: { text: 4 new classes · 4 copies of logging, value: 0.85 }
+      after: { text: 1 new wrapper, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Python has multiple inheritance, so mixins (`class LoggingAuthClient(LoggingMixin, AuthMixin, HttpClient)`) avoid copying the code. You still write a class per mix, and the order of the layers is the method resolution order, which is easy to misread. Wrapping keeps the order visible on one line.'
+      seenIn: '`requests` mounts `HTTPAdapter(max_retries=Retry(...))` on a `Session` instead of subclassing it. `io.TextIOWrapper` over an `io.BufferedReader` over a raw file. Handlers and filters attached to a `logging.Logger`.'
+
+  typescript:
+    before:
+      file: client.ts
+      source: |
+        class HttpClient {
+          send(req: Request): Promise<Response> { return fetch(req); }
+        }
+
+        class RetryingClient extends HttpClient {
+          async send(req: Request): Promise<Response> {
+            let res = await super.send(req.clone());
+            for (let i = 1; i < 3 && res.status >= 500; i++) {
+              await sleep(200 * 2 ** i);
+              res = await super.send(req.clone());
+            }
+            return res;
+          }
+        }
+
+        class AuthRetryingClient extends RetryingClient {
+          constructor(private readonly tokens: TokenSource) { super(); }
+          send(req: Request): Promise<Response> {
+            req.headers.set("Authorization", `Bearer ${this.tokens.get()}`);
+            return super.send(req);
+          }
+        }
+
+        class AuthClient extends HttpClient { // auth without retry: the header code is copied
+          constructor(private readonly tokens: TokenSource) { super(); }
+          send(req: Request): Promise<Response> {
+            req.headers.set("Authorization", `Bearer ${this.tokens.get()}`);
+            return super.send(req);
+          }
+        }
+      roles: { context: [1, 30], base: [1, 3], retry: [5, 14], auth: [16, 30] }
+      change:
+        - { after: 30, add: ['', 'class LoggingClient extends HttpClient { /* send() with the logging lines */ }', 'class LoggingRetryingClient extends RetryingClient { /* the same lines again */ }', 'class LoggingAuthRetryingClient extends AuthRetryingClient { /* again */ }', 'class LoggingAuthClient extends AuthClient { /* and again */ }'] }
+    after:
+      file: transport.ts · main.ts
+      source: |
+        interface Transport {
+          send(req: Request): Promise<Response>;
+        }
+
+        class Retry implements Transport {
+          constructor(private readonly inner: Transport, private readonly attempts = 3) {}
+
+          async send(req: Request): Promise<Response> {
+            let res = await this.inner.send(req.clone());
+            for (let i = 1; i < this.attempts && res.status >= 500; i++) {
+              await sleep(200 * 2 ** i);
+              res = await this.inner.send(req.clone());
+            }
+            return res;
+          }
+        }
+
+        class Auth implements Transport {
+          constructor(private readonly inner: Transport, private readonly tokens: TokenSource) {}
+
+          send(req: Request): Promise<Response> {
+            req.headers.set("Authorization", `Bearer ${this.tokens.get()}`);
+            return this.inner.send(req);
+          }
+        }
+
+        // main.ts: each team stacks what it needs
+        const payments = new Auth(new Retry(new FetchTransport()), tokens);
+        const search = new Retry(new FetchTransport());
+      roles: { strategy: [1, 3], retry: [5, 16], auth: [18, 25], client: [27, 29], context: [28, 28], stack: [27, 29], authsend: [21, 24], retrysend: [8, 15], swap: [29, 29] }
+    again:
+      file: logging.ts
+      source: |
+        // logging.ts: one new wrapper; nothing above changes
+        class Logging implements Transport {
+          constructor(private readonly inner: Transport, private readonly log: Logger) {}
+
+          async send(req: Request): Promise<Response> {
+            const start = performance.now();
+            const res = await this.inner.send(req);
+            this.log.info(`${req.method} ${req.url} -> ${res.status} in ${Math.round(performance.now() - start)} ms`);
+            return res;
+          }
+        }
+
+        // main.ts: const payments = new Logging(new Auth(…), log);
+    cost:
+      before: { text: 4 new classes · 4 copies of logging, value: 0.85 }
+      after: { text: 1 new wrapper, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Classes have single inheritance, so feature mixes become chains of subclasses. Wrappers fit naturally because types are structural: anything with `send(req)` is a `Transport`. A plain function such as `(next) => (req) => …` works as well as a class.'
+      seenIn: 'Express and Koa middleware stacks. Axios interceptors. The `beforeRequest` and `afterResponse` hooks in `ky`.'
+
+  rust:
+    before:
+      file: client.rs
+      source: |
+        struct Client { http: reqwest::blocking::Client }
+
+        struct RetryingClient { http: reqwest::blocking::Client }
+
+        impl RetryingClient {
+            fn send(&self, req: Request) -> Result<Response, Error> {
+                let mut res = self.http.execute(req.try_clone().expect("replayable body"));
+                for i in 1..3 {
+                    if matches!(&res, Ok(r) if !r.status().is_server_error()) { break; }
+                    thread::sleep(Duration::from_millis(200 << i));
+                    res = self.http.execute(req.try_clone().expect("replayable body"));
+                }
+                res
+            }
+        }
+
+        struct AuthRetryingClient { inner: RetryingClient, tokens: TokenSource }
+
+        impl AuthRetryingClient {
+            fn send(&self, mut req: Request) -> Result<Response, Error> {
+                req.headers_mut().insert(AUTHORIZATION, self.tokens.bearer());
+                self.inner.send(req)
+            }
+        }
+
+        struct AuthClient { http: reqwest::blocking::Client, tokens: TokenSource } // header code copied
+
+        impl AuthClient {
+            fn send(&self, mut req: Request) -> Result<Response, Error> {
+                req.headers_mut().insert(AUTHORIZATION, self.tokens.bearer());
+                self.http.execute(req)
+            }
+        }
+      roles: { context: [1, 33], base: [1, 1], retry: [3, 15], auth: [17, 33] }
+      change:
+        - { after: 33, add: ['', 'struct LoggingClient { /* … */ }               // + send() with the logging lines', 'struct LoggingRetryingClient { /* … */ }       // the same lines again', 'struct LoggingAuthRetryingClient { /* … */ }   // again', 'struct LoggingAuthClient { /* … */ }           // and again'] }
+    after:
+      file: transport.rs · main.rs
+      source: |
+        trait Transport {
+            fn send(&self, req: Request) -> Result<Response, Error>;
+        }
+
+        struct Retry<T> { inner: T, attempts: u32 }
+
+        impl<T: Transport> Transport for Retry<T> {
+            fn send(&self, req: Request) -> Result<Response, Error> {
+                let mut res = self.inner.send(req.try_clone().expect("replayable body"));
+                for i in 1..self.attempts {
+                    if matches!(&res, Ok(r) if !r.status().is_server_error()) { break; }
+                    thread::sleep(Duration::from_millis(200 << i));
+                    res = self.inner.send(req.try_clone().expect("replayable body"));
+                }
+                res
+            }
+        }
+
+        struct Auth<T> { inner: T, tokens: TokenSource }
+
+        impl<T: Transport> Transport for Auth<T> {
+            fn send(&self, mut req: Request) -> Result<Response, Error> {
+                req.headers_mut().insert(AUTHORIZATION, self.tokens.bearer());
+                self.inner.send(req)
+            }
+        }
+
+        // main.rs: each team stacks what it needs
+        let payments = Auth { inner: Retry { inner: Http::new(), attempts: 3 }, tokens };
+        let search = Retry { inner: Http::new(), attempts: 3 };
+      roles: { strategy: [1, 3], retry: [5, 17], auth: [19, 26], client: [28, 30], context: [29, 29], stack: [28, 30], authsend: [21, 26], retrysend: [7, 17], swap: [30, 30] }
+    again:
+      file: logging.rs
+      source: |
+        // logging.rs: one new wrapper; nothing above changes
+        struct Logging<T> { inner: T }
+
+        impl<T: Transport> Transport for Logging<T> {
+            fn send(&self, req: Request) -> Result<Response, Error> {
+                let (method, url, start) = (req.method().clone(), req.url().clone(), Instant::now());
+                let res = self.inner.send(req);
+                tracing::info!(%method, %url, took = ?start.elapsed(), ok = res.is_ok());
+                res
+            }
+        }
+
+        // main.rs: let payments = Logging { inner: Auth { … } };
+    cost:
+      before: { text: 4 new structs · 4 copies of logging, value: 0.85 }
+      after: { text: 1 new wrapper, value: 0.12 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Rust has no inheritance at all; the trap here is a concrete struct per mix. Generic wrappers such as `Retry<T: Transport>` are compiled once per stack, so the layers usually inline into straight-line code. `Box<dyn Transport>` trades that for choosing the stack at runtime.'
+      seenIn: '`tower::ServiceBuilder::new().layer(…)` with `Timeout` and `Retry` middleware, used under `hyper` and `axum`. `BufReader::new(File::open(path)?)`. Iterator adapters: `iter.map(f).filter(g)` is a stack of wrappers.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: '`main` builds the Payments client as Auth around Retry around the real transport. The stack is one expression you can read.'
+    nodes: [client, context]
+    edges: [client>context]
+    role: stack
+  - text: A call reaches Auth first. Auth sets the header and hands the request to whatever it wraps. It does not know that is Retry.
+    nodes: [context, strategy, auth]
+    edges: [context>strategy, auth>strategy]
+    role: authsend
+  - text: Retry calls its inner transport, gets a 503, waits, and tries again. Retry does not know about tokens, and Http does not know about retries.
+    nodes: [retry, base, strategy]
+    edges: [retry>strategy, base>strategy]
+    role: retrysend
+  - text: Search needs retries without auth. It is the same Retry wrapped around Http. No new class, no copied code.
+    nodes: [client, retry, base]
+    edges: [client>context, retry>strategy]
+    role: swap
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Teams need retry, auth and logging in different mixes. How many types does each design need for all seven possible mixes?
+    options:
+      - text: Subclassing needs up to seven classes, one per mix. Wrapping needs three wrappers, stacked per team.
+        correct: true
+        why: Right. A class per combination grows with the product of the features; wrappers grow with their sum.
+      - text: Both need three, one per feature.
+        why: A subclass can inherit only one parent's features, so each mix needs its own class, and the features it cannot inherit get copied in.
+      - text: Subclassing needs three; wrapping needs seven, one per stack.
+        why: The stacks are expressions in `main`, not types. Each wrapper is written once and reused in every stack.
+  engineer:
+    question: Payments wraps Logging around Retry. Search wraps Retry around Logging. A request fails once with 503, then succeeds. What differs?
+    options:
+      - text: Payments logs one line with the total time. Search logs two lines, one per attempt, including the 503.
+        correct: true
+        why: Right. Each wrapper sees only the calls that pass through it. Outside Retry, Logging sees one call; inside, it sees every attempt. Choose per team which one you want.
+      - text: Nothing. The same wrappers produce the same behaviour in any order.
+        why: Order is behaviour. The same goes for Auth and Retry (one token or one per attempt) and for caching and auth (whose responses are shared).
+      - text: Search does not retry, because Logging swallows the 503.
+        why: Logging passes the response on unchanged. Retry, outside it, still sees the 503 and tries again.
+  deep:
+    question: A base client's `get(url)` builds a request and calls `do(req)`. A subclass, or in Go an embedding struct, overrides `do` to retry. You call `get` on it. Does the request retry?
+    options:
+      - text: In Python and TypeScript, yes, because the base's call to `do` is dispatched on the real object. In Go, no; the promoted `Get` runs on the embedded Client, which calls its own `Do`.
+        correct: true
+        why: Right. Python and TypeScript let a base class's internal calls land in subclass code, so those calls become part of the subclass contract (the fragile base class). Go embedding is composition with promoted methods, and has no overriding.
+      - text: Yes in all three, because all three let a type override a method.
+        why: Go has no overriding. Defining `Do` on the outer struct only shadows the promoted method when called on the outer struct; the embedded value never sees it.
+      - text: No in all three, because a base class always calls its own methods.
+        why: In Python and TypeScript, `self.do` and `this.do` are looked up on the actual object at call time, so the subclass's version runs.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Interface
+      example: { go: "http.RoundTripper", python: "Transport (Protocol)", typescript: "Transport (interface)", rust: "Transport (trait)" }
+      job: The one shape every layer has and every layer accepts.
+    - role: Wrapper
+      example: "Retry, Auth, Logging"
+      job: Holds an inner layer, adds one feature, delegates the rest.
+    - role: Core
+      example: "Http"
+      job: Does the real work at the bottom of the stack.
+    - role: Assembly
+      example: main
+      job: Stacks the layers per use, in the order that use needs.
+  useWhen:
+    - Features are optional and combine freely, like retry, auth, caching, logging or metrics.
+    - Different callers need different mixes, or the same features in a different order.
+    - You want to reuse behaviour from a type you do not own, which you cannot or should not subclass.
+  avoidWhen:
+    - There is a real is-a relationship with a stable base, such as a framework's base handler class designed for overriding.
+    - There is one variant and no second one coming. A wrapper stack of one is just indirection.
+  tradeoffs:
+    - Behaviour is spread over several small objects; reading one request means following the stack.
+    - Wrappers can only use the interface, so a feature that needs a layer's internals does not fit.
+    - Order is now a decision someone has to get right, per stack.
+    - More objects at runtime, and in some languages more indirect calls.
+  lookalikes:
+    - name: Decorator
+      how: The pattern this lesson uses. A wrapper with the same interface as what it wraps, adding behaviour around the call.
+    - name: Strategy
+      how: Also composition, but it swaps one step for another. Wrappers add steps around a call and keep it.
+    - name: Bridge
+      how: Splits two independent dimensions (such as transport and auth scheme) into two hierarchies joined by composition, to avoid the same product of subclasses.
+---
+
+## [concept] Composition over inheritance
+
+**Build behaviour by wrapping objects that share an interface, instead of writing a subclass for every combination of features.**
+
+With <Term id="inheritance">inheritance</Term>, a class gets its behaviour from one parent. With <Term id="composition">composition</Term>, an object holds other objects and calls them. When features combine freely, the first needs a class per combination and the second needs one piece per feature.
+
+<Depth level={2}>
+Each wrapper adds one feature and passes the call on to the object it holds (<Term id="delegation">delegation</Term>). Because every layer has the same <Term id="interface">interface</Term>, any layer can wrap any other, and the caller cannot tell a bare client from a stack of five. You choose the mix and the order where the object is built, per use.
+</Depth>
+
+<Depth level={3}>
+*Design Patterns* (1994) names this its second principle: favour object composition over class inheritance. Its reasons: inheritance is fixed at compile time, and a subclass sees its parent's internals, so a change inside the parent can break the subclass (often called the <Term id="fragile-base-class">fragile base class</Term> problem). Composition reaches objects only through their interfaces and can be rearranged at runtime. The book adds the cost: more, smaller objects, and behaviour that lives in how they are connected.
+</Depth>
+
+## [problem] An HTTP client with a subclass per mix
+
+Several teams call the same internal APIs. Payments needs retries and an auth token. Search needs only retries. Admin needs only the token. Each mix became a client class.
+
+Read it once. There are four classes for three mixes plus the base, and the auth code is written twice: the class that has retries and the class that does not cannot share it.
+
+<Depth level={2}>
+Each subclass calls up to its parent for the part it inherits. That fixes the order of the layers in the class tree: auth always sets the header before retries run, for every team that uses that class.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go has no inheritance; this is the closest imitation, with <Term id="struct-embedding">struct embedding</Term>. Each struct embeds the one below and calls it by name, which is already composition, but over concrete types, so each mix is still its own type.</Lang>
+<Lang only="python">`super().send(req)` follows the class hierarchy, so the order of the layers is decided by the inheritance chain, not at the place the client is built.</Lang>
+<Lang only="typescript">Single inheritance forces a chain. `AuthClient` cannot extend both `HttpClient` and something shared with `AuthRetryingClient`, so the header code is copied.</Lang>
+<Lang only="rust">Rust has no inheritance; the equivalent trap is a concrete struct per mix. `AuthRetryingClient` holds a `RetryingClient` by its concrete type, so it cannot be reused with anything else.</Lang>
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** Security wants every outgoing HTTP request logged with its latency.
+
+Every mix needs a logging version. That is four new classes, each with the same logging lines, and every team changes which class it constructs. Add a fifth feature later and the count doubles again.
+
+<Depth level={2}>
+Bugs multiply the same way. A mistake in the logging code is now in four places, and a fix that misses one leaves one team logging wrong. Nothing links the copies.
+</Depth>
+
+<Depth level={3}>
+The number of possible mixes of *n* optional features is 2<sup>n</sup>. Teams rarely use all of them, but every one they do use needs a class, plus the parents those classes inherit from.
+</Depth>
+
+## [morph] One wrapper per feature
+
+Drag the slider. The class tree flattens into small wrappers that each implement the same interface, and each team's client becomes a stack of them.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Each wrapper holds the next layer as the interface type, not as a concrete class. That is the step that makes them stack in any order. The same Retry serves Payments and Search.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go's standard library is built for this: `http.Client` takes any `http.RoundTripper` as its `Transport`, and the RoundTripper contract says not to modify the request, which is why Auth clones it.</Lang>
+<Lang only="python">Wrappers are plain classes with a `send` method. The `Transport` Protocol lets a type checker confirm each layer fits; nothing is inherited.</Lang>
+<Lang only="typescript">`implements Transport` is optional with structural types, but it puts the error on the wrapper if a method is missing.</Lang>
+<Lang only="rust">`Retry<T>` and `Auth<T>` are generic over the inner layer, so `Auth<Retry<Http>>` is a concrete type the compiler can optimise as one.</Lang>
+</Depth>
+
+## [walk] Follow one request
+
+One Payments request, with a 503 on the first attempt. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Each layer is called through the `http.RoundTripper` interface, so each hop is an indirect call. Next to a network round trip, three indirect calls cost nothing you can measure.</Lang>
+<Lang only="python">Each hop is a method lookup and a call, a fraction of a microsecond. The stack depth shows up in tracebacks, which list every layer the request passed through.</Lang>
+<Lang only="typescript">With `async` wrappers, each layer adds a promise and a microtask hop. That is microseconds next to a network call.</Lang>
+<Lang only="rust">With generics, `Auth<Retry<Http>>` is one type known at compile time; the calls between layers are direct and usually inlined (<Term id="monomorphisation">monomorphisation</Term>). Use `Box<dyn Transport>` only where the stack is chosen at runtime.</Lang>
+</Depth>
+
+## [again] Logging, the second time
+
+The same request, after the refactor. You write one Logging wrapper and add it to each team's stack in `main`. No existing class changes, and each team decides whether Logging goes outside Retry (one line per call) or inside it (one line per attempt).
+
+<Depth level={2}>
+Each wrapper is tested alone with a fake inner transport: does Retry retry on 503 and stop on 200, does Auth set the header. The stacks need only a small test each, to check the order.
+</Depth>
+
+<Depth level={3}>
+The order of the layers is now explicit and per use. In the class tree it was implicit, decided once by which class extended which.
+</Depth>
+
+## [play] Feature mixes: subclasses vs wrappers
+
+Four teams, three features. Tick the features each team needs and watch both designs count what they cost. Then ship Security's logging request.
+
+Below, send one request through a team's stack. Reorder the layers and send again: same pieces, different behaviour.
+
+## [lens] How each language writes it
+
+Two of these languages have no inheritance at all, and their standard libraries show the wrapping style throughout.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="composition-over-inheritance" />
+
+### When inheritance is still right
+
+Inheritance works when the parent was designed to be extended: a framework's base class with documented hooks, or a small closed hierarchy you own. It goes wrong when it is used to mix features, or to reuse code from a class that was never meant to be a parent. Ask whether the new type is a kind of the old one that every caller can use the same way, or just wants some of its code.
