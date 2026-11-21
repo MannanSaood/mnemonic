@@ -1,0 +1,19 @@
+# Terms introduced by the G, M and P lesson.
+- id: goroutine
+  term: Goroutine
+  short: A function running concurrently under the Go runtime, with its own small stack that grows as needed. The runtime, not the kernel, decides when it runs and on which thread.
+- id: os-thread
+  term: OS thread
+  short: A thread the kernel schedules onto CPU cores. In Go's runtime it is called an M (machine). Each costs kernel memory and a larger stack than a goroutine.
+- id: go-p
+  term: P (processor)
+  short: In the Go runtime, the permission to run Go code, plus a local run queue and caches. An OS thread must hold a P to run goroutines. There are GOMAXPROCS of them.
+- id: gomaxprocs
+  term: GOMAXPROCS
+  short: The number of Ps, and so the most goroutines that can run Go code at the same instant. Threads blocked in system calls do not count against it.
+- id: run-queue
+  term: Run queue
+  short: A list of goroutines that are ready to run and waiting for a P. Each P has a local one (256 slots), and there is one global queue shared by all Ps.
+- id: preemption
+  term: Preemption
+  short: The scheduler stopping a running goroutine so another can have the CPU. Go preempts a goroutine that has run for about 10 ms.

@@ -1,0 +1,501 @@
+---
+title: G, M and P
+track: go-internals
+group: Scheduler
+order: 3
+summary: Go runs many goroutines on a few OS threads, and a thread may run Go code only while it holds one of GOMAXPROCS processors.
+intent: Know how many goroutines really run at once, where the rest wait, and what GOMAXPROCS controls.
+changeRequest: The nightly thumbnail export must cover whole tenants, 50,000 images per run instead of 500.
+languages: [go, python, typescript, rust]
+glossary: [goroutine, os-thread, go-p, gomaxprocs, run-queue, preemption]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [concurrency, go-runtime]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: gmp-scheduler
+  scenarios:
+    - try: "Make a prediction, then run the batch with 64 goroutines, one per image, at GOMAXPROCS 4."
+      notice: "Never more than 4 goroutines run at once. P0's queue overflows into the global queue, idle Ps pull work from it, and /healthz waits about 100 ms behind the queue."
+    - try: "Switch to 4 workers and run the same batch."
+      notice: "The batch takes exactly as long, 325 ms. The queues stay empty, so /healthz waits one time slice."
+    - try: "Try GOMAXPROCS 1, 2 and 8 with 64 goroutines."
+      notice: "1 and 2 Ps are slower. 8 Ps on 4 cores is no faster than 4: the extra threads share the same cores."
+    - try: "Start a run with 16 workers, then drop GOMAXPROCS to 2 half-way."
+      notice: "The removed Ps hand their goroutines to the global queue, and the remaining two Ps finish the work."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: code
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: exporter, sub: { go: "go resize(img)", python: "Thread(target=…)", typescript: "new Worker(…)", rust: "tokio::spawn(…)" } }
+      after:  { x: 12, y: 30, w: 112, h: 48, title: exporter, sub: { go: "4 workers", python: "4 processes", typescript: "pool of 4", rust: "rayon pool" } }
+    - id: sched
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: kernel, sub: "runs them all at once?" }
+      after:  { x: 150, y: 30, w: 150, h: 48, title: Go runtime, sub: "schedule()" }
+    - id: p
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 110, w: 110, h: 50, title: "" }
+      after:  { x: 330, y: 24, w: 220, h: 60, title: "P × GOMAXPROCS", sub: "local run queue" }
+    - id: g
+      kind: concrete
+      before: { x: 170, y: 60, w: 230, h: 32, title: "1 goroutine = 1 thread" }
+      after:  { x: 12, y: 190, w: 112, h: 48, title: G, sub: goroutine }
+    - id: m
+      kind: concrete
+      before: { x: 170, y: 102, w: 230, h: 32, title: "500 threads" }
+      after:  { x: 160, y: 190, w: 112, h: 48, title: M, sub: OS thread }
+    - id: cpu
+      kind: concrete
+      before: { x: 170, y: 144, w: 230, h: 32, title: "all run at once" }
+      after:  { x: 300, y: 190, w: 112, h: 48, title: CPU core, sub: "4 of them" }
+    - id: probe
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 208, w: 230, h: 32, title: "50,000 at once" }
+      after:  { x: 438, y: 190, w: 112, h: 48, title: /healthz, sub: waits in queue }
+  edges:
+    - { from: code, to: g, label: creates }
+    - { from: g, to: p, label: queued on }
+    - { from: m, to: p, label: holds }
+    - { from: m, to: cpu, label: runs on }
+    - { from: sched, to: p, label: picks next }
+    - { from: probe, to: p }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: export.go · jobs.go
+      source: |
+        // export.go
+        func ExportThumbnails(imgs []Image) []Thumb {
+            out := make([]Thumb, len(imgs))
+            var wg sync.WaitGroup
+            for i, img := range imgs {
+                wg.Add(1)
+                go func() {
+                    defer wg.Done()
+                    out[i] = resize(img, 256) // about 20 ms of CPU
+                }()
+            }
+            wg.Wait()
+            return out
+        }
+
+        // jobs.go: runs nightly, in the same process as /healthz
+        imgs := store.ListImages(ctx, tenantID, 500)
+        thumbs := ExportThumbnails(imgs)
+      roles: { sched: [2, 14], g: [5, 11], code: [16, 18] }
+      change:
+        - { line: 17, replace: "imgs := store.ListAllImages(ctx, tenantID) // 50,000" }
+    after:
+      file: export.go
+      source: |
+        func ExportThumbnails(imgs []Image) []Thumb {
+            out := make([]Thumb, len(imgs))
+            next := make(chan int)
+            var wg sync.WaitGroup
+            for range runtime.GOMAXPROCS(0) { // one worker per P
+                wg.Add(1)
+                go func() {
+                    defer wg.Done()
+                    for i := range next {
+                        out[i] = resize(imgs[i], 256)
+                    }
+                }()
+            }
+            for i := range imgs {
+                next <- i
+            }
+            close(next)
+            wg.Wait()
+            return out
+        }
+      roles: { p: [5, 5], g: [7, 12], code: [14, 16], m: [9, 11], cpu: [10, 10], spawn: [7, 7], run: [9, 10], slice: [9, 11], probe: [5, 5] }
+    again:
+      file: jobs.go
+      source: |
+        // jobs.go: the same call, now with 50,000 images
+        imgs := store.ListAllImages(ctx, tenantID)
+        thumbs := ExportThumbnails(imgs) // 4 workers on 4 Ps
+        // run queues stay short; /healthz waits about one 10 ms slice
+    cost:
+      before: { text: "/healthz waits seconds", value: 0.9 }
+      after: { text: "/healthz waits ~10 ms", value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Built in
+      note: 'The runtime multiplexes goroutines onto Ms through GOMAXPROCS Ps for you. Goroutines are cheap, so starting one per item is fine for I/O. For CPU work, more goroutines than Ps only lengthen the run queues; bound them with a worker pool or `errgroup.Group.SetLimit`.'
+      seenIn: '`runtime.GOMAXPROCS(0)` reads the current value. `GODEBUG=schedtrace=1000` prints the run queue lengths every second. `runtime/metrics` exposes `/sched/latencies:seconds`, the time goroutines spent runnable before they ran.'
+
+  python:
+    before:
+      file: export.py · jobs.py
+      source: |
+        # export.py
+        def export_thumbnails(imgs: list[Image]) -> list[Thumb]:
+            out: list[Thumb | None] = [None] * len(imgs)
+
+            def work(i: int) -> None:
+                out[i] = resize(imgs[i], 256)  # about 20 ms of CPU
+
+            threads = [threading.Thread(target=work, args=(i,)) for i in range(len(imgs))]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            return out
+
+        # jobs.py: runs nightly, in the same process as /healthz
+        imgs = store.list_images(tenant_id, limit=500)
+        thumbs = export_thumbnails(imgs)
+      roles: { sched: [2, 13], g: [8, 10], code: [15, 17] }
+      change:
+        - { line: 16, replace: "imgs = store.list_all_images(tenant_id)  # 50,000" }
+    after:
+      file: export.py
+      source: |
+        import os
+        from concurrent.futures import ProcessPoolExecutor
+
+        def resize_256(img: Image) -> Thumb:
+            return resize(img, 256)
+
+        def export_thumbnails(imgs: list[Image]) -> list[Thumb]:
+            # one process per CPU, each with its own GIL
+            with ProcessPoolExecutor(max_workers=os.cpu_count()) as pool:
+                return list(pool.map(resize_256, imgs, chunksize=64))
+      roles: { p: [9, 9], g: [4, 5], code: [7, 7], m: [9, 9], cpu: [8, 9], spawn: [9, 9], run: [10, 10], slice: [10, 10], probe: [8, 9] }
+    again:
+      file: jobs.py
+      source: |
+        # jobs.py: the same call, now with 50,000 images
+        imgs = store.list_all_images(tenant_id)
+        thumbs = export_thumbnails(imgs)  # 4 processes, chunks of 64
+        # the web process keeps its GIL for /healthz
+    cost:
+      before: { text: "50,000 threads · one GIL", value: 0.95 }
+      after: { text: "4 processes", value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Manual
+      note: 'Python threads are OS threads, and the GIL lets only one of them run Python code at a time, handing it over every 5 ms by default (`sys.getswitchinterval()`). Threads help with I/O, not CPU. For CPU work use processes, one per core. asyncio is one thread: a CPU-bound coroutine blocks the whole loop.'
+      seenIn: '`ProcessPoolExecutor`, `asyncio.to_thread` and `loop.run_in_executor`. The free-threaded build of CPython 3.13+ removes the GIL as an option.'
+
+  typescript:
+    before:
+      file: export.ts · jobs.ts
+      source: |
+        // export.ts
+        import { Worker } from "node:worker_threads";
+
+        function resizeInWorker(img: Image): Promise<Thumb> {
+          return new Promise((resolve, reject) => {
+            const w = new Worker(new URL("./resize-worker.js", import.meta.url), { workerData: img });
+            w.once("message", resolve);
+            w.once("error", reject);
+          });
+        }
+
+        export function exportThumbnails(imgs: Image[]): Promise<Thumb[]> {
+          return Promise.all(imgs.map(resizeInWorker)); // one thread per image
+        }
+
+        // jobs.ts: runs nightly, in the same process as /healthz
+        const imgs = await store.listImages(tenantId, { limit: 500 });
+        const thumbs = await exportThumbnails(imgs);
+      roles: { sched: [12, 14], g: [4, 10], code: [16, 18] }
+      change:
+        - { line: 17, replace: "const imgs = await store.listAllImages(tenantId); // 50,000" }
+    after:
+      file: export.ts
+      source: |
+        import Piscina from "piscina";
+        import { availableParallelism } from "node:os";
+
+        // one worker thread per core, reused for every image
+        const pool = new Piscina({
+          filename: new URL("./resize-worker.js", import.meta.url).href,
+          maxThreads: availableParallelism(),
+        });
+
+        export function exportThumbnails(imgs: Image[]): Promise<Thumb[]> {
+          return Promise.all(imgs.map((img) => pool.run(img))); // queued in the pool
+        }
+      roles: { p: [5, 8], g: [4, 8], code: [10, 10], m: [7, 7], cpu: [7, 7], spawn: [11, 11], run: [11, 11], slice: [11, 11], probe: [7, 7] }
+    again:
+      file: jobs.ts
+      source: |
+        // jobs.ts: the same call, now with 50,000 images
+        const imgs = await store.listAllImages(tenantId);
+        const thumbs = await exportThumbnails(imgs); // 4 threads, 50,000 queued tasks
+        // the event loop stays free for /healthz
+    cost:
+      before: { text: "50,000 worker threads", value: 0.95 }
+      after: { text: "4 threads", value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Manual
+      note: 'Node runs your JavaScript on one event loop thread. CPU work on it blocks every request, so it goes to `worker_threads`. A worker is a whole thread with its own V8 isolate, far heavier than a goroutine, so you reuse a fixed pool of them.'
+      seenIn: '`worker_threads` and pools built on it such as Piscina. libuv runs file system, DNS and some crypto work on its own pool, 4 threads by default (`UV_THREADPOOL_SIZE`).'
+
+  rust:
+    before:
+      file: export.rs · jobs.rs
+      source: |
+        // export.rs
+        async fn export_thumbnails(imgs: Vec<Image>) -> Vec<Thumb> {
+            let mut handles = Vec::with_capacity(imgs.len());
+            for img in imgs {
+                // about 20 ms of CPU inside an async task
+                handles.push(tokio::spawn(async move { resize(&img, 256) }));
+            }
+            let mut out = Vec::with_capacity(handles.len());
+            for h in handles {
+                out.push(h.await.expect("resize panicked"));
+            }
+            out
+        }
+
+        // jobs.rs: runs nightly, on the same runtime as /healthz
+        let imgs = store.list_images(tenant_id, 500).await?;
+        let thumbs = export_thumbnails(imgs).await;
+      roles: { sched: [2, 13], g: [4, 7], code: [15, 17] }
+      change:
+        - { line: 16, replace: "let imgs = store.list_all_images(tenant_id).await?; // 50,000" }
+    after:
+      file: export.rs
+      source: |
+        use rayon::prelude::*;
+
+        async fn export_thumbnails(imgs: Vec<Image>) -> Vec<Thumb> {
+            // CPU work leaves the async workers; rayon keeps one thread per core
+            tokio::task::spawn_blocking(move || {
+                imgs.par_iter().map(|img| resize(img, 256)).collect()
+            })
+            .await
+            .expect("resize panicked")
+        }
+      roles: { p: [5, 5], g: [6, 6], code: [3, 3], m: [5, 7], cpu: [6, 6], spawn: [5, 5], run: [6, 6], slice: [6, 6], probe: [4, 5] }
+    again:
+      file: jobs.rs
+      source: |
+        // jobs.rs: the same call, now with 50,000 images
+        let imgs = store.list_all_images(tenant_id).await?;
+        let thumbs = export_thumbnails(imgs).await; // rayon, one thread per core
+        // tokio's workers stay free for /healthz
+    cost:
+      before: { text: "/healthz waits for the batch", value: 0.9 }
+      after: { text: "/healthz ~ms", value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Pick a runtime
+      note: 'Tokio''s multi-threaded runtime is the closest cousin of Go''s: one worker thread per core, a local queue per worker and a shared one. It cannot preempt a task, though. A task runs until it reaches an `.await` that is not ready, so 20 ms of CPU in a task holds a worker for 20 ms. CPU work goes to `spawn_blocking` or rayon.'
+      seenIn: '`tokio::runtime::Builder::worker_threads`, `tokio::task::spawn_blocking`, `rayon::ThreadPool`. std threads are plain OS threads with no scheduler on top.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: '`go func()` creates a G, a goroutine with a small stack, and puts it on the run queue of the P that the creating goroutine is running on.', python: 'In Go, `go func()` creates a G and puts it on the run queue of the current P. Python has no such layer: each `Thread` is an OS thread, which is why the fix uses a fixed pool of processes.', typescript: 'In Go, `go func()` creates a G and puts it on the run queue of the current P. Node has no such layer: each `Worker` is an OS thread, which is why the fix reuses a fixed pool.', rust: 'In Go, `go func()` creates a G and puts it on the run queue of the current P. In tokio, `tokio::spawn` does the same with a task and the current worker''s queue.' }
+    nodes: [code, g, p]
+    edges: [code>g, g>p]
+    role: spawn
+  - text: An M, an OS thread, holds the P. It takes the next G from the P's queue and runs it on a CPU core. With GOMAXPROCS 4 there are 4 Ps, so at most 4 goroutines run Go code at the same instant.
+    nodes: [m, p, cpu]
+    edges: [m>p, m>cpu]
+    role: run
+  - text: When the G blocks, finishes, or has run for about 10 ms, the scheduler stops it and picks the next G from the queue. Every other runnable G waits its turn.
+    nodes: [sched, p, g]
+    edges: [sched>p, g>p]
+    role: slice
+  - text: The /healthz goroutine joins a queue like any other. With 4 workers the queues are nearly empty and it runs within one time slice. With 50,000 goroutines it waits behind hundreds of them.
+    nodes: [probe, p]
+    edges: [probe>p]
+    role: probe
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: GOMAXPROCS is 8 and 10,000 goroutines are ready to run CPU-bound code. How many of them execute Go code at this instant?
+    options:
+      - text: At most 8. The rest wait in run queues.
+        correct: true
+        why: Right. Each of the 8 Ps runs one goroutine at a time on the thread that holds it. The others are runnable but queued.
+      - text: All 10,000, each on its own OS thread.
+        why: No. Goroutines are not threads. The runtime keeps only a few threads running Go code, one per P.
+      - text: One, because Go runs goroutines on a single thread unless you ask for more.
+        why: That was true before Go 1.5. Since then GOMAXPROCS defaults to the number of CPUs the process may use.
+  engineer:
+    question: A Go 1.24 service runs in a container limited to 2 CPUs on a 32-core host. Latency is spiky and the container is CPU-throttled. What is the likely cause?
+    options:
+      - text: GOMAXPROCS defaulted to 32, so up to 32 threads run Go code and burn the 2-CPU quota in bursts.
+        correct: true
+        why: Right. Before Go 1.25 the default ignored the cgroup CPU limit. Set GOMAXPROCS to the limit, or move to Go 1.25+, where the default follows the cgroup CPU bandwidth limit.
+      - text: The service has too many goroutines, and each one needs its own thread.
+        why: Goroutines do not need their own threads. The number of threads running Go code follows GOMAXPROCS, not the goroutine count.
+      - text: The garbage collector is limited to one CPU inside containers.
+        why: No such limit exists. GC work is spread over the Ps like other work.
+  deep:
+    question: Why does every P have its own local run queue instead of all Ms sharing one queue?
+    options:
+      - text: So that putting and taking goroutines usually touches only the P's own queue, without a lock shared by every thread.
+        correct: true
+        why: Right. The local queue is a fixed ring of 256 slots that the owner uses without a lock. The global queue, behind a lock, is only for overflow and fairness, checked once every 61 schedules.
+      - text: So that each goroutine always runs on the same core for its whole life.
+        why: No. Goroutines move between Ps when idle Ps steal work or when they come back from the global queue.
+      - text: Because the kernel requires one queue per thread.
+        why: The kernel knows nothing about goroutines or Ps. The run queues are the Go runtime's own data structures.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: G
+      example: a goroutine running resize
+      job: The work. A function, its stack and its state (runnable, running, waiting, in a syscall).
+    - role: M
+      example: an OS thread
+      job: Executes code. Runs Go code only while it holds a P.
+    - role: P
+      example: one of GOMAXPROCS
+      job: The right to run Go code, plus a local run queue of up to 256 runnable Gs.
+    - role: Scheduler
+      example: "runtime.schedule()"
+      job: Picks the next G for a P. Local queue first, the global queue now and then, then other Ps.
+  useWhen:
+    - Choosing how many goroutines to start for CPU-bound work. About GOMAXPROCS of them is enough.
+    - Reading a GODEBUG=schedtrace line or a CPU profile with long run queues.
+    - Sizing a Go service's CPU limit in a container, and checking which GOMAXPROCS it got.
+  avoidWhen:
+    - The work is I/O-bound. Goroutines that wait on the network cost no thread and little memory, so one per request is the normal Go style.
+  tradeoffs:
+    - More Ps than cores add threads that compete for the same cores.
+    - Fewer Ps than cores leave cores idle for CPU-bound work.
+    - Many runnable goroutines raise scheduling latency for all of them, including the ones that answer health checks.
+  lookalikes:
+    - name: OS thread scheduler
+      how: Schedules threads onto cores, preemptively, in the kernel. Go's scheduler sits above it and schedules goroutines onto a few threads.
+    - name: tokio multi-threaded runtime
+      how: Same shape (worker per core, local queues, a shared queue), but tasks are never preempted; they yield only at .await.
+    - name: Python asyncio
+      how: One event loop on one thread. Coroutines take turns at await points; there is no parallelism for CPU work.
+---
+
+## [concept] G, M and P
+
+**Go runs many <Term id="goroutine">goroutines</Term> on a few <Term id="os-thread">OS threads</Term>. A thread may run Go code only while it holds a <Term id="go-p">P</Term>, and there are <Term id="gomaxprocs">GOMAXPROCS</Term> of them.**
+
+So at any instant, at most GOMAXPROCS goroutines are running. Every other goroutine that is ready waits in a <Term id="run-queue">run queue</Term>.
+
+<Depth level={2}>
+Three roles. A **G** is a goroutine: a function and its stack. An **M** (machine) is an OS thread that the kernel schedules onto a core. A **P** (processor) is the permission to run Go code, plus a local queue of runnable Gs. An M with a P runs Gs from that P's queue. GOMAXPROCS sets the number of Ps. It defaults to the number of CPUs the process may use, and since Go 1.25 on Linux it also respects a lower cgroup CPU limit.
+</Depth>
+
+<Depth level={3}>
+The runtime source (`runtime/proc.go`) describes P as "a resource that is required to execute Go code". Each P owns a run queue of 256 slots, used without a lock by its owner, and a `runnext` slot for a goroutine that should run next. A global run queue, protected by a lock, takes overflow and is checked once every 61 schedules so nothing there starves. Threads blocked in system calls do not hold a P, so the number of Ms can be larger than GOMAXPROCS; the package docs say there is no limit on those threads (the runtime stops at 10,000 by default).
+</Depth>
+
+## [problem] An exporter that starts a goroutine per image
+
+A media service renders thumbnails every night. The exporter starts one goroutine per image and waits for all of them. The same process serves the API and `/healthz`. It works, and it is tested with a few hundred images.
+
+Read it with the mental model most people start with: each goroutine is a small thread, they all run at once, so more goroutines mean more done in parallel.
+
+<Depth level={2}>
+For I/O this style is fine: goroutines that wait on the network cost a few kilobytes each and no thread. Resizing is CPU work. Twenty milliseconds of it per image keeps a core busy, whoever runs it.
+</Depth>
+
+<Depth level={3}>
+Each goroutine also holds its decoded image for as long as it lives. With one goroutine per image, a preempted goroutine keeps its half-done image in memory while it waits, so peak memory follows the number of started goroutines, not the number of cores.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the nightly export must cover whole tenants, 50,000 images per run instead of 500.
+
+The marked line is the only change. That night the load balancer marks the pod unhealthy: `/healthz` takes seconds to answer, while the export itself is no faster than before per image. The naive model cannot explain it. If every goroutine runs at once, why does a tiny handler wait?
+
+<Depth level={2}>
+On a 4-core node with GOMAXPROCS 4, four goroutines run at a time. The other 49,996 are runnable and wait in the run queues. A goroutine runs for up to about 10 ms before it is <Term id="preemption">preempted</Term>, so a handler goroutine that joins the back of a queue of 256 waits roughly 256 × 10 ms, about 2.5 s, before its first instruction. That estimate is ours, from the queue size and the time slice; measure your own with `runtime/metrics`.
+</Depth>
+
+<Depth level={3}>
+The cost meter shows the health check's wait. The export's total time is set by the CPU work, 50,000 × 20 ms spread over 4 cores, whatever the number of goroutines.
+</Depth>
+
+## [morph] From threads at once to G, M and P
+
+Drag the slider. The kernel running every goroutine at once becomes what the runtime actually does: goroutines queue on Ps, an M holds each P, and each M runs on a core.
+
+The code morphs from one goroutine per image to one worker per P, fed through a channel.
+
+<Depth level={2}>
+The batch takes the same time either way, because the cores are the limit. What changes is the length of the run queues: with GOMAXPROCS workers they stay nearly empty, so any other goroutine, such as the health check, gets a P within about one time slice.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`runtime.GOMAXPROCS(0)` reads the setting without changing it. `for range n` over an integer needs Go 1.22. For mixed work, size the pool by the CPU part, or split CPU and I/O into separate stages with their own limits.</Lang>
+<Lang only="python">`ProcessPoolExecutor` runs each task in a separate process with its own interpreter and its own GIL. `chunksize=64` sends images in batches, so 50,000 tasks do not mean 50,000 round trips between processes.</Lang>
+<Lang only="typescript">Piscina keeps a fixed set of `worker_threads` and queues tasks in the main thread. `os.availableParallelism()` is the Node API meant for sizing such pools.</Lang>
+<Lang only="rust">`spawn_blocking` moves the batch off tokio's async workers onto its blocking pool, and rayon splits the iterator over its own pool of one thread per core.</Lang>
+</Depth>
+
+## [walk] Follow one goroutine
+
+One goroutine from `go` to a CPU core, and the health check behind it. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`newproc` puts the new G in the creating P's `runnext` slot, and the G that was there moves to the back of the local queue. When the local queue is full, `runqputslow` moves half of it to the global queue. `findRunnable` looks at the local queue, then the global queue, then the network poller, then tries to steal from other Ps. Preemption after 10 ms has been asynchronous, signal-based, since Go 1.14, so even a tight loop without function calls can be stopped.</Lang>
+<Lang only="python">CPython threads are real OS threads scheduled by the kernel. The GIL decides which one may run bytecode: a thread that wants it asks, and the holder drops it at the next switch interval. There is no run queue in Python itself.</Lang>
+<Lang only="typescript">Node's event loop runs callbacks one at a time. A worker thread has its own event loop and V8 heap; messages between threads are copied with the structured clone algorithm unless you transfer or share buffers.</Lang>
+<Lang only="rust">Tokio's scheduler gives each worker a local queue and a LIFO slot for the most recently woken task, much like Go's `runnext`. Because tasks are not preempted, tokio also gives each task a budget of operations, after which its resources report "not ready" so the task yields at its next `.await`.</Lang>
+</Depth>
+
+## [again] 50,000 images, the second time
+
+The same request with workers sized to GOMAXPROCS. The batch takes as long as the CPU work needs. The run queues stay short, so `/healthz` waits about one time slice instead of seconds, and memory holds four decoded images instead of thousands.
+
+<Depth level={2}>
+In containers, check what GOMAXPROCS the process got. Go 1.25+ follows the cgroup CPU bandwidth limit and updates it if the limit changes. On older versions, set the `GOMAXPROCS` environment variable to the CPU limit.
+</Depth>
+
+<Depth level={3}>
+Setting `GOMAXPROCS` yourself, with the environment variable or `runtime.GOMAXPROCS`, turns off the automatic container-aware default and its updates.
+</Depth>
+
+## [play] Run the batch on a scheduler board
+
+A machine with 4 cores resizes 64 images while a health check arrives. You choose how many goroutines main starts and how many Ps there are, then watch where every goroutine waits.
+
+Compare one goroutine per image with a few workers, at the same GOMAXPROCS.
+
+## [lens] How each language runs the same batch
+
+Go puts a scheduler between your goroutines and the kernel. Python, Node and Rust give you OS threads directly, plus a runtime of your choice on top.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="gmp-scheduler" />
+
+### Seeing the scheduler in a real program
+
+Run with `GODEBUG=schedtrace=1000` and the runtime prints one line per second with GOMAXPROCS, idle Ps, thread counts, the global queue length and each P's local queue length. Long local queues under CPU load mean more runnable goroutines than Ps. `go tool trace` shows the same thing per P on a timeline.
