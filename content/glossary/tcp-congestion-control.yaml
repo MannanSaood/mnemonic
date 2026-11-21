@@ -1,0 +1,25 @@
+# Terms introduced by the congestion control lesson.
+- id: cwnd
+  term: Congestion window (cwnd)
+  short: The sender's own limit on unacknowledged data in flight, kept per connection and adjusted from ACKs and losses. The sender uses the smaller of cwnd and the receiver's window.
+- id: ssthresh
+  term: Slow start threshold (ssthresh)
+  short: The window size at which TCP stops doubling and starts growing by one segment per round trip. Set to half the flight on each loss.
+- id: slow-start
+  term: Slow start
+  short: TCP's opening phase. The window grows by one segment per ACK, so it doubles every round trip, until it reaches ssthresh or a loss happens.
+- id: aimd
+  term: AIMD
+  short: Additive increase, multiplicative decrease. Grow the window by a fixed amount per round trip, cut it by a fraction on loss. It is what makes competing flows converge to fair shares.
+- id: bdp
+  term: Bandwidth-delay product (BDP)
+  short: Link rate times round-trip time. The amount of data that must be in flight to keep a path busy; 12 Mbit/s at 40 ms is 60 KB, about 40 full-size packets.
+- id: fast-retransmit
+  term: Fast retransmit
+  short: Resending a segment as soon as three duplicate ACKs say it is missing, without waiting for the retransmission timer.
+- id: rto
+  term: Retransmission timeout (RTO)
+  short: How long TCP waits for an ACK before resending. On Linux it never drops below 200 ms; when it fires, the congestion window falls to one segment.
+- id: ack-clock
+  term: ACK clock
+  short: In steady state each returning ACK releases one new segment, so a TCP sender sends at the rate the bottleneck delivers.

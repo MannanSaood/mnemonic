@@ -1,0 +1,514 @@
+---
+title: "Congestion control: slow start and AIMD"
+track: networking
+group: Congestion
+order: 19
+summary: A TCP sender is never told the path's capacity. It finds it by growing its window until something drops, then backing off.
+intent: Know why a fresh connection is slow for its first few round trips, and why loss makes TCP halve its rate instead of stopping.
+changeRequest: Move the pricing service from us-east to eu-west. Checkout in us-east must still get its price book in under 150 ms.
+languages: [go, python, typescript, rust]
+glossary: [cwnd, ssthresh, slow-start, aimd, bdp, fast-retransmit, rto, ack-clock]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [networking/tcp-retransmission, networking/tcp-flow-control]
+skills: [networking]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: tcp-congestion-control
+  scenarios:
+    - try: "Press Play and watch flow A from its first round trip."
+      notice: "The window doubles every round trip until the queue overflows, halves, then climbs one packet per round trip. That sawtooth is TCP measuring a link it was never told about."
+    - try: "Add flow B while A is filling the link, and keep playing for 80 round trips."
+      notice: "B starts small and still ends near half. In the A-against-B plot every loss pulls the dot toward the diagonal."
+    - try: "Set the buffer to ¼ BDP, then to 2 BDP, and compare Link busy and Worst queue delay."
+      notice: "A small buffer leaves the link idle after each halving. A big one keeps it full but adds up to two round trips of queueing delay. One BDP is the point where Reno keeps the link full."
+    - try: "Lose A's whole window, then turn on the UDP sender."
+      notice: "A lost window costs a 200 ms silence and a restart from one packet. The UDP sender never backs off, so TCP gives way to it at every loss."
+
+# ---------------------------------------------------------------- diagram
+# Data flows left to right: the pricing server is the sender, checkout the receiver.
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: server
+      kind: client
+      before: { x: 12, y: 100, w: 112, h: 56, title: pricing, sub: eu-west }
+      after:  { x: 12, y: 40, w: 112, h: 56, title: pricing, sub: sends 200 KB }
+    - id: conn
+      kind: context
+      before: { x: 146, y: 28, w: 262, h: 214, title: the network, sub: "what you assumed: a 1 Gbps pipe" }
+      after:  { x: 150, y: 40, w: 124, h: 56, title: TCP sender, sub: server kernel }
+    - id: cwnd
+      kind: strategy
+      appears: after
+      before: { x: 150, y: 176, w: 124, h: 56, title: "" }
+      after:  { x: 150, y: 176, w: 124, h: 56, title: cwnd, sub: "10, 20, 40, 80" }
+    - id: queue
+      kind: concrete
+      before: { x: 166, y: 118, w: 222, h: 48, title: "200 KB ÷ 1 Gbps", sub: "1.6 ms, then done" }
+      after:  { x: 300, y: 40, w: 116, h: 56, title: bottleneck, sub: link + queue }
+    - id: app
+      kind: concrete
+      before: { x: 436, y: 100, w: 112, h: 56, title: checkout, sub: us-east }
+      after:  { x: 440, y: 40, w: 108, h: 56, title: checkout, sub: ACKs back }
+  edges:
+    - { from: server, to: conn, label: write }
+    - { from: conn, to: queue, label: ≤ cwnd }
+    - { from: queue, to: app }
+    - { from: cwnd, to: conn, kind: implements, label: limits }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: pricing.go
+      source: |
+        // pricing.go
+        const pricingURL = "http://pricing.us-east.internal/v1/book"
+
+        // Called for every checkout page. Returns a 200 KB JSON price book.
+        func fetchPriceBook(ctx context.Context, sku string) ([]byte, error) {
+            client := &http.Client{
+                Timeout:   2 * time.Second,
+                Transport: &http.Transport{DisableKeepAlives: true},
+            }
+            req, err := http.NewRequestWithContext(ctx, "GET", pricingURL+"?sku="+sku, nil)
+            if err != nil {
+                return nil, err
+            }
+            resp, err := client.Do(req)
+            if err != nil {
+                return nil, err
+            }
+            defer resp.Body.Close()
+            return io.ReadAll(resp.Body)
+        }
+      roles: { app: [5, 5], conn: [6, 9], queue: [14, 14], server: [2, 2] }
+      change:
+        - { line: 2, replace: 'const pricingURL = "http://pricing.eu-west.internal/v1/book" // 80 ms RTT' }
+        - { after: 13, add: ['    // new connection every call: 1 RTT handshake, then cwnd starts at 10 segments'] }
+    after:
+      file: pricing.go
+      source: |
+        // pricing.go
+        const pricingURL = "http://pricing.eu-west.internal/v1/book"
+
+        // One client for the process. Its pool keeps connections open, and an
+        // open connection keeps the congestion window it has already grown.
+        var pricingClient = &http.Client{
+            Timeout: 2 * time.Second,
+            Transport: &http.Transport{
+                MaxIdleConnsPerHost: 32, // the default is 2
+                IdleConnTimeout:     90 * time.Second,
+            },
+        }
+
+        func fetchPriceBook(ctx context.Context, sku string) ([]byte, error) {
+            req, err := http.NewRequestWithContext(ctx, "GET", pricingURL+"?sku="+sku, nil)
+            if err != nil {
+                return nil, err
+            }
+            resp, err := pricingClient.Do(req) // a warm connection from the pool
+            if err != nil {
+                return nil, err
+            }
+            defer resp.Body.Close()
+            return io.ReadAll(resp.Body)
+        }
+      roles: { app: [14, 14], conn: [6, 12], cwnd: [4, 5], queue: [19, 19], server: [2, 2], handshake: [8, 11], slowstart: [19, 19], loss: [7, 7], reuse: [9, 10] }
+    again:
+      file: main.go
+      source: |
+        // main.go: warm one connection before the pod takes traffic
+        if _, err := fetchPriceBook(ctx, "warmup"); err != nil {
+            log.Printf("pricing warmup: %v", err)
+        }
+    cost:
+      before: { text: 5 RTTs · about 400 ms, value: 0.85 }
+      after: { text: 1 RTT · about 82 ms, value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'You rarely touch the algorithm. You do control reuse: one `http.Client` per process, and a higher `MaxIdleConnsPerHost` (default 2) for a busy upstream. On Linux a `net.Dialer` `Control` func can set `TCP_CONGESTION` per socket with `unix.SetsockoptString`.'
+      seenIn: '`net/http.Transport` keeps the idle pool. `golang.org/x/sys/unix` has `TCP_CONGESTION` and `GetsockoptTCPInfo`, which reads the kernel''s cwnd. gRPC multiplexes calls over long-lived HTTP/2 connections.'
+
+  python:
+    before:
+      file: pricing.py
+      source: |
+        # pricing.py
+        import requests
+
+        PRICING_URL = "http://pricing.us-east.internal/v1/book"
+
+        # Called for every checkout page. Returns a 200 KB JSON price book.
+        def fetch_price_book(sku: str) -> bytes:
+            resp = requests.get(PRICING_URL, params={"sku": sku}, timeout=2)
+            resp.raise_for_status()
+            return resp.content
+      roles: { app: [7, 7], conn: [8, 8], queue: [8, 8], server: [4, 4] }
+      change:
+        - { line: 4, replace: 'PRICING_URL = "http://pricing.eu-west.internal/v1/book"  # 80 ms RTT' }
+        - { after: 7, add: ['    # requests.get makes a new Session: new connection, cwnd back to 10'] }
+    after:
+      file: pricing.py
+      source: |
+        # pricing.py
+        import requests
+        from requests.adapters import HTTPAdapter
+
+        PRICING_URL = "http://pricing.eu-west.internal/v1/book"
+
+        # One session for the process. Its pool keeps connections open, and an
+        # open connection keeps the congestion window it has already grown.
+        session = requests.Session()
+        session.mount("http://", HTTPAdapter(pool_maxsize=32))
+
+        def fetch_price_book(sku: str) -> bytes:
+            resp = session.get(PRICING_URL, params={"sku": sku}, timeout=2)  # warm connection
+            resp.raise_for_status()
+            return resp.content
+      roles: { app: [12, 12], conn: [9, 10], cwnd: [7, 8], queue: [13, 13], server: [5, 5], handshake: [10, 10], slowstart: [13, 13], loss: [13, 13], reuse: [9, 10] }
+    again:
+      file: app.py
+      source: |
+        # app.py: warm one connection before the worker takes traffic
+        fetch_price_book("warmup")
+    cost:
+      before: { text: 5 RTTs · about 400 ms, value: 0.85 }
+      after: { text: 1 RTT · about 82 ms, value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`requests.get` opens and closes a connection on every call. A `Session` (or an `httpx.Client`) pools them. On Linux, `sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION, b"bbr")` picks the algorithm for one socket (Python 3.6+), if the kernel allows it.'
+      seenIn: '`requests.Session` with `HTTPAdapter` (pool of 10 by default). `urllib3.PoolManager`. `socket.TCP_INFO` with `getsockopt` exposes the kernel''s window, as raw bytes you unpack.'
+
+  typescript:
+    before:
+      file: pricing.ts
+      source: |
+        // pricing.ts
+        import { Agent, request } from "undici";
+
+        const PRICING_URL = "http://pricing.us-east.internal/v1/book";
+
+        // Called for every checkout page. Returns a 200 KB JSON price book.
+        export async function fetchPriceBook(sku: string): Promise<Buffer> {
+          const dispatcher = new Agent({ headersTimeout: 2_000, bodyTimeout: 2_000 });
+          try {
+            const res = await request(`${PRICING_URL}?sku=${sku}`, { dispatcher });
+            if (res.statusCode !== 200) throw new Error(`pricing: ${res.statusCode}`);
+            return Buffer.from(await res.body.arrayBuffer());
+          } finally {
+            await dispatcher.close();
+          }
+        }
+      roles: { app: [7, 7], conn: [8, 8], queue: [10, 10], server: [4, 4] }
+      change:
+        - { line: 4, replace: 'const PRICING_URL = "http://pricing.eu-west.internal/v1/book"; // 80 ms RTT' }
+        - { after: 7, add: ['  // a new Agent per call: new connection, cwnd back to 10 segments'] }
+    after:
+      file: pricing.ts
+      source: |
+        // pricing.ts
+        import { Agent, request } from "undici";
+
+        const PRICING_URL = "http://pricing.eu-west.internal/v1/book";
+
+        // One agent for the process. Its pool keeps connections open, and an
+        // open connection keeps the congestion window it has already grown.
+        const pricingAgent = new Agent({
+          connections: 32,
+          keepAliveTimeout: 30_000,
+          headersTimeout: 2_000,
+          bodyTimeout: 2_000,
+        });
+
+        export async function fetchPriceBook(sku: string): Promise<Buffer> {
+          const res = await request(`${PRICING_URL}?sku=${sku}`, { dispatcher: pricingAgent });
+          if (res.statusCode !== 200) throw new Error(`pricing: ${res.statusCode}`);
+          return Buffer.from(await res.body.arrayBuffer());
+        }
+      roles: { app: [15, 15], conn: [8, 13], cwnd: [6, 7], queue: [16, 16], server: [4, 4], handshake: [9, 10], slowstart: [16, 16], loss: [11, 12], reuse: [10, 10] }
+    again:
+      file: server.ts
+      source: |
+        // server.ts: warm one connection before the server takes traffic
+        await fetchPriceBook("warmup").catch((err) => console.warn("pricing warmup", err));
+    cost:
+      before: { text: 5 RTTs · about 400 ms, value: 0.85 }
+      after: { text: 1 RTT · about 82 ms, value: 0.2 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: 'Node has no `setsockopt`, so the algorithm is whatever the host''s `net.ipv4.tcp_congestion_control` says. What you control is reuse: share one undici `Agent` (global `fetch` already shares one), or use an `http.Agent` with `keepAlive`, which `http.globalAgent` has by default since Node 19.'
+      seenIn: '`fetch` and undici''s global dispatcher. `http.globalAgent`. `socket.setNoDelay()` is one of the few TCP knobs `net` gives you.'
+
+  rust:
+    before:
+      file: pricing.rs
+      source: |
+        // pricing.rs
+        const PRICING_URL: &str = "http://pricing.us-east.internal/v1/book";
+
+        // Called for every checkout page. Returns a 200 KB JSON price book.
+        pub async fn fetch_price_book(sku: &str) -> reqwest::Result<Bytes> {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()?;
+            client
+                .get(format!("{PRICING_URL}?sku={sku}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await
+        }
+      roles: { app: [5, 5], conn: [6, 8], queue: [11, 12], server: [2, 2] }
+      change:
+        - { line: 2, replace: 'const PRICING_URL: &str = "http://pricing.eu-west.internal/v1/book"; // 80 ms RTT' }
+        - { after: 5, add: ['    // a new Client per call: new pool, new connection, cwnd back to 10'] }
+    after:
+      file: pricing.rs
+      source: |
+        // pricing.rs
+        use std::sync::LazyLock;
+
+        const PRICING_URL: &str = "http://pricing.eu-west.internal/v1/book";
+
+        // One client for the process. Its pool keeps connections open, and an
+        // open connection keeps the congestion window it has already grown.
+        static PRICING: LazyLock<reqwest::Client> = LazyLock::new(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .pool_max_idle_per_host(32)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .build()
+                .expect("pricing client")
+        });
+
+        pub async fn fetch_price_book(sku: &str) -> reqwest::Result<Bytes> {
+            PRICING
+                .get(format!("{PRICING_URL}?sku={sku}"))
+                .send()
+                .await? // a warm connection from the pool
+                .error_for_status()?
+                .bytes()
+                .await
+        }
+      roles: { app: [17, 17], conn: [8, 15], cwnd: [6, 7], queue: [20, 21], server: [4, 4], handshake: [11, 12], slowstart: [20, 21], loss: [10, 10], reuse: [11, 12] }
+    again:
+      file: main.rs
+      source: |
+        // main.rs: warm one connection before the service takes traffic
+        if let Err(e) = fetch_price_book("warmup").await {
+            tracing::warn!("pricing warmup: {e}");
+        }
+    cost:
+      before: { text: 5 RTTs · about 400 ms, value: 0.85 }
+      after: { text: 1 RTT · about 82 ms, value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Build one `reqwest::Client` and clone it where needed; every `Client::new()` brings its own empty pool. `socket2::Socket::set_tcp_congestion(b"bbr")` sets the algorithm per socket on Linux and FreeBSD.'
+      seenIn: '`reqwest::Client` (an `Arc` inside, cheap to clone). The pooled client in `hyper-util`. `socket2` for the socket options `std::net` does not expose.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The first checkout after a deploy finds no idle connection in the pool. The client opens one, and a round trip for SYN and SYN-ACK passes before the GET can leave.
+    nodes: [app, server]
+    edges: []
+    role: handshake
+  - text: The pricing server's kernel gives the new connection a congestion window of 10 segments, about 14.6 KB. Each ACK adds one segment, so the window doubles every round trip, 10, 20, 40, 80. The 200 KB needs four flights.
+    nodes: [server, conn, cwnd]
+    edges: [server>conn, cwnd>conn]
+    role: slowstart
+  - text: On a busy, long-lived connection the window keeps growing until the bottleneck queue overflows. Three duplicate ACKs report the hole, cwnd is halved, and growth goes back to one segment per round trip. A whole lost window means a timeout and a restart from one segment. The client's 2 s timeout bounds the worst case.
+    nodes: [conn, cwnd, queue]
+    edges: [conn>queue, cwnd>conn]
+    role: loss
+  - text: The next checkout borrows the warm connection from the pool. Its window is already wide open, so the whole 200 KB leaves in one flight and arrives one round trip after the request.
+    nodes: [conn, queue, app]
+    edges: [conn>queue, queue>app]
+    role: reuse
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: What does slow start do with the congestion window?
+    options:
+      - text: Doubles it every round trip, until it reaches ssthresh or a packet is lost.
+        correct: true
+        why: Right. Each ACK adds one segment, and a whole window of ACKs comes back each round trip. The growth is exponential; the name only means it does not send everything at once.
+      - text: Adds one segment every round trip from the very first packet.
+        why: That is congestion avoidance, the phase after slow start. Starting that way, a fresh connection would need hundreds of round trips to fill a fast link.
+      - text: Keeps it fixed until the receiver says how much the path can carry.
+        why: The receiver's window says how much the receiver can buffer. Nobody tells the sender what the path can carry; it has to find out by probing.
+  engineer:
+    question: A Reno sender has 40 segments in flight when three duplicate ACKs arrive. What happens to its window?
+    options:
+      - text: ssthresh becomes 20, the window settles at about 20 after the retransmit, and it grows by one segment per round trip from there.
+        correct: true
+        why: Right. Duplicate ACKs prove later segments are still getting through, so the path is congested, not dead. Halving is enough (RFC 5681 fast retransmit and fast recovery).
+      - text: The window drops to one segment and slow start begins again.
+        why: That is the response to a retransmission timeout, when no ACKs come back at all. Three duplicate ACKs avoid it.
+      - text: The window stays at 40; TCP only resends the missing segment.
+        why: Then loss would never slow anyone down, and a congested queue would stay congested. Every loss cuts the window.
+  deep:
+    question: Two Reno flows share a bottleneck, start at different windows, and lose packets at the same moments. Why do their shares converge?
+    options:
+      - text: Halving cuts the larger window by more, and additive increase grows both by the same amount, so the gap between them halves at every loss.
+        correct: true
+        why: Right. This is the Chiu and Jain argument for AIMD. In the A-against-B plot each loss moves the point toward the origin along a line through it, which brings it closer to the diagonal.
+      - text: The router's queue gives each flow an equal number of slots.
+        why: A plain tail-drop queue knows nothing about flows; it drops whatever arrives when it is full. Fairness comes from the senders.
+      - text: The flow with the shorter round trip deliberately slows down to let the other catch up.
+        why: The opposite happens. Reno grows by one segment per round trip, so a flow with a shorter RTT grows faster and gets more than its share. Equal shares need equal RTTs.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Congestion window (cwnd)
+      example: 10 segments on a new Linux connection
+      job: The sender's own limit on data in flight. Grows on ACKs, shrinks on loss.
+    - role: Receiver window (rwnd)
+      example: advertised in every ACK
+      job: The receiver's limit. The sender uses the smaller of cwnd and rwnd.
+    - role: ssthresh
+      example: half the flight at the last loss
+      job: Where slow start hands over to congestion avoidance.
+    - role: Bottleneck queue
+      example: a router or switch buffer
+      job: Absorbs bursts above the link rate. When it overflows, the drop is the signal.
+    - role: ACK clock
+      example: one ACK releases one segment
+      job: Paces the sender at the rate the bottleneck delivers.
+  useWhen:
+    - A service makes short requests to a far-away dependency on new connections. Each one pays the handshake and slow start.
+    - Throughput on a long, fast path stays far below the link rate. Check retransmits and cwnd with `ss -ti`.
+    - Latency rises under load with no packet loss. A deep queue is absorbing the sawtooth.
+  avoidWhen:
+    - Do not set `DisableKeepAlives` or build a client per request to work around a flaky upstream. Fix idle timeouts instead.
+    - Do not reach for a bigger initial window or a different algorithm before you reuse connections. Reuse removes the problem.
+  tradeoffs:
+    - Loss-based control fills the bottleneck queue before it backs off, so it adds queueing delay.
+    - A small router buffer keeps delay low but leaves the link idle after each halving.
+    - Reno shares fairly only between flows with similar round-trip times.
+    - Linux resets the window after a connection sits idle longer than one RTO (`tcp_slow_start_after_idle`), so even pooled connections can start cold.
+  lookalikes:
+    - name: Flow control
+      how: The receiver's window protects the receiver's buffer. Congestion control protects the network between them.
+    - name: CUBIC and BBR
+      how: Newer algorithms. CUBIC (the Linux default) grows along a cubic curve and cuts by 30% instead of 50%. BBR models bandwidth and RTT instead of waiting for loss.
+    - name: Retransmission
+      how: Retransmission repairs the lost data. Congestion control decides how fast to send after the loss.
+---
+
+## [concept] Congestion control: slow start and AIMD
+
+**A TCP sender is never told how much the path can carry. It finds out by sending more each round trip until something drops, then cutting back and probing again.**
+
+The limit it probes with is the <Term id="cwnd">congestion window</Term>: how much unacknowledged data it allows itself in flight. A new connection starts small, grows fast, then grows gently, and halves when it sees loss.
+
+<Depth level={2}>
+Two windows apply at once. The receiver advertises how much it can buffer; the sender keeps its own congestion window; the sender uses the smaller. The window starts at 10 segments on Linux (RFC 6928). In <Term id="slow-start">slow start</Term> every ACK adds a segment, so the window doubles each round trip. At <Term id="ssthresh">ssthresh</Term>, or at the first loss, it switches to congestion avoidance: one segment per round trip. A loss reported by three duplicate ACKs halves the window. A <Term id="rto">retransmission timeout</Term> drops it to one segment.
+</Depth>
+
+<Depth level={3}>
+The rules come from Van Jacobson's 1988 fix for the congestion collapses of 1986, and are written down in RFC 5681. Growing by one and halving is <Term id="aimd">AIMD</Term>, and Chiu and Jain showed in 1989 that, of the simple linear rules, it is the one that drives competing flows toward full use and equal shares. Once the window is open, each returning ACK lets one new segment out, so the <Term id="ack-clock">ACK clock</Term> paces the sender at the bottleneck's rate. Linux's default is CUBIC (RFC 9438), which keeps slow start but replaces the linear growth with a cubic curve and cuts by 30% instead of half.
+</Depth>
+
+## [problem] A price book fetched on a fresh connection
+
+Checkout calls the pricing service on every page and gets back a 200 KB price book. Both run in us-east, a millisecond apart. The code works, the tests pass, and p50 is 4 ms.
+
+Read the client. Every call builds a new connection, sends one request and closes it. With a round trip of 1 ms, nobody can see the cost.
+
+<Depth level={2}>
+The mental model behind the code: transfer time is size divided by bandwidth. On a 1 Gbps network, 200 KB is 1.6 ms of wire time, plus one round trip for the answer. Keep-alive was turned off months ago to stop errors from connections the load balancer closed while idle.
+</Depth>
+
+<Depth level={3}>
+At 1 ms RTT, slow start is invisible: four extra round trips cost 4 ms. TCP's costs are counted in round trips, so they stay hidden until the round trip grows.
+</Depth>
+
+## [pain] Then pricing moves to another region
+
+**Change request:** move the pricing service from us-east to eu-west. Checkout in us-east must still get its price book in under 150 ms.
+
+The round trip is now 80 ms, and the price book takes about 400 ms. The link still has gigabits to spare. The marked lines are why: every call starts a new connection, and every new connection starts with a 10-segment window.
+
+<Depth level={2}>
+Count round trips. One for the handshake. Then the server may send 10 segments (14.6 KB) and must wait for ACKs. The window doubles to 20, 40, 80: 150 segments after four flights, enough for 200 KB. Five round trips at 80 ms is 400 ms, against the 82 ms the bandwidth model predicts. Bigger machines and faster links change nothing here.
+</Depth>
+
+<Depth level={3}>
+The window that matters belongs to the sender of the 200 KB: the pricing server's kernel. The client controls it only through the connection: a new connection gets a new window. Linux starts at 10 segments for every connection, even to a host it just talked to, unless the route has an `initcwnd` set.
+</Depth>
+
+## [morph] From a pipe to a window that has to grow
+
+Drag the slider. The fat pipe turns into what actually limits the transfer: a sender whose window starts small, a bottleneck it cannot see, and ACKs that let the window grow.
+
+The code moves from one client per call to one pooled client for the whole process. A reused connection keeps the window it already grew.
+
+<Depth level={2}>
+Reuse fixes the cold start; it does not change congestion control. A warm connection still halves on loss and still shares the bottleneck with everyone else. What changes is that the four round trips of slow start are paid once per connection instead of once per request.
+</Depth>
+
+<Depth level={3}>
+Linux keeps a warm window only while the connection is busy. With `net.ipv4.tcp_slow_start_after_idle = 1`, the default, a connection idle for longer than one RTO has its window cut back to the initial window (RFC 2861 behaviour). For bursty traffic, set it to 0 on the sending side or keep connections busy. Senders can also pace: Linux's `fq` qdisc spreads a window over the round trip instead of sending it in one burst.
+</Depth>
+
+## [walk] Follow one price book
+
+One request on a cold connection, then the loss that eventually comes, then the next request on the warm connection.
+
+<Depth level={3}>
+After a loss Linux does not wait for a full recovery to halve; with SACK it repairs several holes in one recovery, and RACK-TLP (RFC 8985) detects losses by time instead of only by counting duplicate ACKs. The shape stays the same: a cut on loss, then growth.
+</Depth>
+
+## [again] The same request, warm
+
+The same 200 KB from eu-west on a pooled connection. The window is already large, so the request goes out and the whole response comes back in one round trip: about 82 ms instead of 400.
+
+<Depth level={2}>
+The first request on each new pool connection still pays slow start. A warm-up call at startup moves that cost out of a customer's request. Check the pool's idle timeout against the server's keep-alive timeout, so the client never reuses a connection the server has already closed. Those are the errors that got keep-alive disabled in the first place.
+</Depth>
+
+<Depth level={3}>
+For responses that must be fast on cold connections, the knobs are on the server: a larger initial window per route (`ip route change ... initcwnd 20`), or HTTP/2 and HTTP/3, which put all requests to a host on one connection so it stays warm.
+</Depth>
+
+## [play] Watch a sender find the link
+
+A bottleneck link, a router queue, and a TCP Reno sender that knows neither. Play it, watch the window, then add a second flow and break things.
+
+Each step of the chart is one round trip. The solid line is what the link carries; the dashed line is where the queue overflows.
+
+## [lens] How each language meets it
+
+Application code almost never sees the congestion window. It decides how many connections exist and how long they live, and that decides how often slow start runs.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+On Linux the algorithm can be chosen per socket with `TCP_CONGESTION`. An unprivileged process may only pick from `net.ipv4.tcp_allowed_congestion_control`.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="tcp-congestion-control" />
+
+### Read the window on a live connection
+
+`ss -ti dst <host>` prints each connection's `cwnd`, `ssthresh`, `rtt` and retransmit counts. Run it on the sending side while a transfer runs. A `cwnd` stuck at 10 on every connection means you are paying slow start on each request; a high `retrans` with a small `cwnd` means real loss on the path.
