@@ -1,0 +1,464 @@
+---
+title: References and the borrow checker
+track: rust
+group: Ownership
+order: 2
+summary: A reference lets code use a value without owning it. At any moment a value has either any number of shared references or exactly one mutable one, and a borrow lasts until its last use.
+intent: Before you change a collection, know who else still holds a reference into it, and whether that reference is used again later.
+changeRequest: After a database failover, half the stale connections survived the pool's eviction sweep, and the next requests failed with connection reset.
+languages: [go, python, typescript, rust]
+glossary: [borrow, shared-reference, mutable-reference, aliasing, non-lexical-lifetimes, iterator-invalidation, data-race]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [rust/ownership]
+skills: [rust, memory]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: borrowing
+  scenarios:
+    - try: "In Grow the pool, read the two errors, then remove oldest's use on line 7."
+      notice: "oldest's borrow now ends on line 3, before the push. Both errors disappear, because a borrow lasts until its last use, not until the end of the block."
+    - try: "Put the use on line 7 back and run it without the borrow checker."
+      notice: "The push reallocates the Vec, and line 7 reads oldest from freed memory. The capacity was full, so this is not a rare case."
+    - try: "Switch to Evict while iterating and run it without the checker."
+      notice: "Removing inside the loop shifts the next connection into the slot already visited. A stale connection survives, which is what Python, Go's index loop and forEach all do."
+    - try: "Switch to Evict with retain."
+      notice: "One mutable borrow for the whole sweep and no other borrow alive. It compiles, and every stale connection is removed."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: evict
+      kind: client
+      before: { x: 12, y: 100, w: 100, h: 52, title: sweeper, sub: every 30 s }
+      after:  { x: 12, y: 100, w: 100, h: 52, title: sweeper, sub: every 30 s }
+    - id: idle
+      kind: context
+      before: { x: 140, y: 24, w: 250, h: 222, title: idle conns, sub: "you think: edit it while you walk it" }
+      after:  { x: 140, y: 24, w: 250, h: 52, title: { go: "p.idle []*Conn", python: "self.idle list", typescript: "this.idle Conn[]", rust: "idle: Vec<Conn>" }, sub: owner }
+    - id: shared
+      kind: concrete
+      appears: after
+      before: { x: 140, y: 100, w: 120, h: 56, title: "" }
+      after:  { x: 140, y: 100, w: 120, h: 56, title: { go: read p.idle, python: read the list, typescript: read the array, rust: "&Conn" }, sub: many readers }
+    - id: excl
+      kind: concrete
+      appears: after
+      before: { x: 270, y: 100, w: 120, h: 56, title: "" }
+      after:  { x: 270, y: 100, w: 120, h: 56, title: { go: one write, python: assign once, typescript: assign once, rust: "&mut idle" }, sub: one writer }
+    - id: rule
+      kind: strategy
+      appears: after
+      before: { x: 140, y: 184, w: 250, h: 56, title: "" }
+      after:  { x: 140, y: 184, w: 250, h: 56, title: aliasing xor mutability, sub: { go: "kept by hand", python: "kept by hand", typescript: "kept by hand", rust: "checked at compile time" } }
+    - id: drop
+      kind: concrete
+      before: { x: 420, y: 100, w: 128, h: 52, title: sockets, sub: to postgres }
+      after:  { x: 420, y: 100, w: 128, h: 52, title: closed conns, sub: { go: closed in the callback, python: closed in the loop, typescript: closed in the loop, rust: dropped in retain } }
+  edges:
+    - { from: evict, to: idle, label: calls }
+    - { from: idle, to: shared, label: lends }
+    - { from: idle, to: excl, label: lends }
+    - { from: shared, to: rule }
+    - { from: excl, to: rule }
+    - { from: excl, to: drop, label: removes }
+
+# ---------------------------------------------------------------- code
+code:
+  rust:
+    before:
+      file: pool.rs
+      source: |
+        // pool.rs
+        impl Pool {
+            fn evict_stale(&mut self, now: Instant) {
+                for (i, conn) in self.idle.iter().enumerate() {
+                    if conn.idle_since + self.max_idle < now {
+                        self.idle.remove(i);
+                    }
+                }
+            }
+        }
+      roles: { evict: [3, 9], idle: [4, 4], drop: [6, 6] }
+      change:
+        - { line: 6, replace: "                self.idle.remove(i); // error[E0502]: cannot borrow `self.idle` as mutable because it is also borrowed as immutable" }
+    after:
+      file: pool.rs
+      source: |
+        // pool.rs
+        impl Pool {
+            fn evict_stale(&mut self, now: Instant) {
+                // retain borrows self.idle mutably, for the length of this one call
+                self.idle.retain(|conn| conn.idle_since + self.max_idle >= now);
+                // each Conn it removes is dropped inside retain, which closes the socket
+                self.metrics.idle.set(self.idle.len() as i64); // the &mut has ended: reading is fine
+            }
+        }
+      roles: { evict: [3, 8], idle: [5, 5], excl: [4, 5], shared: [5, 5], rule: [4, 5], drop: [6, 6], read: [7, 7] }
+    again:
+      file: the same failover
+      source: |
+        // failover at 03:12: all 32 idle connections are stale
+        // sweep at 03:12:30   removed 32, kept 0
+        // next 32 checkouts   open fresh connections
+        // requests failed     0
+    cost:
+      before: { text: "1 compile error · 0 dead conns shipped", value: 0.25 }
+      after: { text: "0 dead conns handed out", value: 0.06 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: "At any point a value has either any number of `&` references or exactly one `&mut`, never both. A borrow lasts until its last use, so most conflicts are about order. Iterating holds a shared borrow of the whole collection, so changing the collection inside the loop is rejected before it can run."
+      seenIn: "`Vec::retain`, `Vec::drain` and `HashMap::entry` do the edit in one exclusive borrow. `slice::split_at_mut` hands out two `&mut` to parts that cannot overlap. `RefCell` checks the same rule at runtime and panics instead."
+
+  go:
+    before:
+      file: pool.go
+      source: |
+        // pool.go
+        func (p *Pool) evictStale(now time.Time) {
+            for i := 0; i < len(p.idle); i++ {
+                if now.Sub(p.idle[i].idleSince) > p.maxIdle {
+                    p.idle[i].Close()
+                    p.idle = append(p.idle[:i], p.idle[i+1:]...)
+                }
+            }
+        }
+      roles: { evict: [2, 9], idle: [3, 3], drop: [5, 6] }
+      change:
+        - { line: 3, replace: "    for i := 0; i < len(p.idle); i++ { // i++ runs after every removal" }
+        - { line: 6, replace: "            p.idle = append(p.idle[:i], p.idle[i+1:]...) // shifts the next conn into slot i" }
+    after:
+      file: pool.go
+      source: |
+        // pool.go
+        func (p *Pool) evictStale(now time.Time) {
+            p.idle = slices.DeleteFunc(p.idle, func(c *Conn) bool {
+                if now.Sub(c.idleSince) > p.maxIdle {
+                    c.Close()
+                    return true
+                }
+                return false
+            })
+            p.metrics.Idle.Set(float64(len(p.idle)))
+        }
+      roles: { evict: [2, 11], idle: [3, 3], excl: [3, 3], shared: [4, 4], rule: [3, 9], drop: [5, 6], read: [10, 10] }
+    again:
+      file: the same failover
+      source: |
+        // failover at 03:12: all 32 idle connections are stale
+        // sweep at 03:12:30   removed 32, kept 0
+        // next 32 checkouts   open fresh connections
+        // requests failed     0
+    cost:
+      before: { text: "16 of 32 dead conns kept · 16 failed requests", value: 0.8 }
+      after: { text: "0 dead conns handed out", value: 0.06 }
+    lens:
+      need: 2
+      needLabel: By convention
+      note: "Go lets any number of pointers and slices alias the same array, and any of them may write. The race detector (`go test -race`) catches unsynchronised access from two goroutines at runtime, but nothing catches changing a slice while one loop walks it. Build a new slice, or use `slices.DeleteFunc`."
+      seenIn: "`slices.DeleteFunc` (Go 1.21) compacts in one pass and, since Go 1.22, zeroes the leftover tail. The spec allows deleting map entries during `range`; an entry removed before it is reached is not produced."
+
+  python:
+    before:
+      file: pool.py
+      source: |
+        # pool.py
+        def evict_stale(self, now: float) -> None:
+            for conn in self.idle:
+                if now - conn.idle_since > self.max_idle:
+                    conn.close()
+                    self.idle.remove(conn)
+      roles: { evict: [2, 6], idle: [3, 3], drop: [5, 6] }
+      change:
+        - { line: 6, replace: "            self.idle.remove(conn)  # the loop's index now skips the next conn" }
+    after:
+      file: pool.py
+      source: |
+        # pool.py
+        def evict_stale(self, now: float) -> None:
+            keep: list[Conn] = []
+            for conn in self.idle:  # only read the list while walking it
+                if now - conn.idle_since > self.max_idle:
+                    conn.close()
+                else:
+                    keep.append(conn)
+            self.idle = keep  # one write, after the walk is done
+            metrics.idle.set(len(self.idle))
+      roles: { evict: [2, 10], idle: [9, 9], excl: [9, 9], shared: [4, 4], rule: [4, 9], drop: [5, 6], read: [10, 10] }
+    again:
+      file: the same failover
+      source: |
+        # failover at 03:12: all 32 idle connections are stale
+        # sweep at 03:12:30   closed 32, kept 0
+        # next 32 checkouts   open fresh connections
+        # requests failed     0
+    cost:
+      before: { text: "16 of 32 dead conns kept · 16 failed requests", value: 0.8 }
+      after: { text: "0 dead conns handed out", value: 0.06 }
+    lens:
+      need: 2
+      needLabel: By convention
+      note: "A list lets you change it while a `for` loop walks it, and the loop silently skips elements. Dicts and sets do check: changing their size during iteration raises `RuntimeError`. Python has no shared versus mutable reference; every name can mutate what it points at."
+      seenIn: "List comprehensions and `filter` build a new list. `for k in list(d):` iterates a snapshot when the loop deletes from the dict."
+
+  typescript:
+    before:
+      file: pool.ts
+      source: |
+        // pool.ts
+        evictStale(now: number): void {
+          this.idle.forEach((conn, i) => {
+            if (now - conn.idleSince > this.maxIdle) {
+              conn.close();
+              this.idle.splice(i, 1);
+            }
+          });
+        }
+      roles: { evict: [2, 9], idle: [3, 3], drop: [5, 6] }
+      change:
+        - { line: 6, replace: "      this.idle.splice(i, 1); // shifts the next conn into index i, already visited" }
+    after:
+      file: pool.ts
+      source: |
+        // pool.ts
+        evictStale(now: number): void {
+          const keep: Conn[] = [];
+          for (const conn of this.idle) { // only read the array while walking it
+            if (now - conn.idleSince > this.maxIdle) conn.close();
+            else keep.push(conn);
+          }
+          this.idle = keep; // one write, after the walk is done
+          metrics.idle.set(this.idle.length);
+        }
+      roles: { evict: [2, 10], idle: [8, 8], excl: [8, 8], shared: [4, 4], rule: [4, 8], drop: [5, 5], read: [9, 9] }
+    again:
+      file: the same failover
+      source: |
+        // failover at 03:12: all 32 idle connections are stale
+        // sweep at 03:12:30   closed 32, kept 0
+        // next 32 checkouts   open fresh connections
+        // requests failed     0
+    cost:
+      before: { text: "16 of 32 dead conns kept · 16 failed requests", value: 0.8 }
+      after: { text: "0 dead conns handed out", value: 0.06 }
+    lens:
+      need: 2
+      needLabel: By convention
+      note: "`forEach` and `for...of` visit array indexes in order, so a `splice` inside the loop shifts the next element into an index already visited. A `Map` behaves better: entries deleted before they are reached are skipped. TypeScript's `readonly` arrays stop writes through one name, but another name may still write."
+      seenIn: "`Array.prototype.filter`, `toSpliced` (ES2023), and `ReadonlyArray<T>` for parameters that must not be changed."
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { rust: "`retain` takes `&mut self.idle`. For the length of that call nothing else may read or write the Vec, so `retain` can move elements and shrink it freely.", go: "`slices.DeleteFunc` does the whole walk itself. It reads each element once and compacts the slice as it goes, so no index is skipped.", python: "The only write to `self.idle` is one assignment, after the loop. Until then the list is only read.", typescript: "The only write to `this.idle` is one assignment, after the loop. Until then the array is only read." }
+    nodes: [evict, idle, excl]
+    edges: [evict>idle, idle>excl]
+    role: excl
+  - text: { rust: "For each element, `retain` lends the closure a `&Conn`. The closure can read `idle_since` but cannot change the Vec; it only answers keep or remove.", go: "The callback only reads the connection and answers keep or delete. It never touches `p.idle`.", python: "The loop walks the list and only reads it, so the iterator's position always means what it thinks it means.", typescript: "The loop walks the array and only reads it, so each index is visited exactly once." }
+    nodes: [excl, shared, rule]
+    edges: [idle>shared, shared>rule]
+    role: shared
+  - text: { rust: "Each removed `Conn` is dropped inside `retain`, and its `Drop` closes the socket. The survivors are shifted down in a single pass.", go: "Stale connections are closed inside the callback. Since Go 1.22 `DeleteFunc` also zeroes the old tail, so closed conns are not kept reachable by the backing array.", python: "Stale connections are closed and simply not copied into `keep`.", typescript: "Stale connections are closed and simply not pushed into `keep`." }
+    nodes: [excl, drop]
+    edges: [excl>drop]
+    role: drop
+  - text: { rust: "When `retain` returns, the `&mut` ends. Reading `self.idle.len()` for the metric is a fresh shared borrow, and nothing conflicts.", go: "The metric reads the new length after the one write.", python: "The metric reads the length of the new list.", typescript: "The metric reads the length of the new array." }
+    nodes: [evict, idle]
+    edges: [evict>idle]
+    role: read
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: "`let a = &mut cfg; let b = &mut cfg; a.reload(); b.reload();` Does it compile?"
+    options:
+      - text: No. `a` is still used after `b` is created, so two mutable borrows of `cfg` would be alive at once.
+        correct: true
+        why: Right. This is E0499. One `&mut` at a time is what lets each writer assume nobody else changes the value under it.
+      - text: Yes. Each `reload` runs on its own line, so they never overlap.
+        why: The borrows overlap even if the calls do not. `a` lives from its creation to its last use, which is after `b` was created.
+      - text: Yes, as long as `cfg` was declared with `let mut`.
+        why: Declaring with `let mut` lets you borrow mutably at all. It does not let you hold two mutable borrows at the same time.
+  engineer:
+    question: "Why does the compiler reject `self.idle.remove(i)` inside `for conn in self.idle.iter()`, even when removing would never reallocate?"
+    options:
+      - text: The loop's iterator holds a shared borrow of the whole Vec until the loop ends, and `remove` needs a mutable one.
+        correct: true
+        why: Right. The checker reasons about borrows, not about capacity. It is exactly the case that skips elements in Python and TypeScript and is undefined behaviour in C++.
+      - text: "`remove` might panic if `i` is out of bounds."
+        why: A possible panic does not stop code compiling. The error is E0502, a borrow conflict.
+      - text: Loops in Rust cannot call methods on the collection they iterate.
+        why: They can call methods that take `&self`, such as `len()`. Only methods that need `&mut self` conflict with the iterator's shared borrow.
+  deep:
+    question: "rustc tells LLVM that a `&mut T` function argument is `noalias`. What does that allow?"
+    options:
+      - text: The optimiser may keep a value read through it in a register across writes through other pointers, because no other live reference can point at the same memory.
+        correct: true
+        why: Right. Aliasing XOR mutability is a promise about memory, not only about threads, and the compiler cashes it in. C needs `restrict` for the same optimisation, and nothing checks it there.
+      - text: The reference is checked for null at runtime.
+        why: References are never null in safe Rust, so there is nothing to check. `noalias` is about overlapping memory.
+      - text: The value may be moved to another thread without synchronisation.
+        why: That is what the `Send` trait governs. `noalias` lets the optimiser reorder and cache loads and stores.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Shared reference
+      example: "&self.idle, &Conn"
+      job: Read access. Any number may exist at once, and while one is alive nobody may write.
+    - role: Mutable reference
+      example: "&mut self.idle"
+      job: Exclusive access. Only one exists at a time, and no shared reference may be used while it is alive.
+    - role: Borrow checker
+      example: "E0499, E0502, E0505"
+      job: Proves at compile time that the two kinds never overlap and that no reference outlives its value.
+    - role: Owner
+      example: "Pool owns idle"
+      job: Cannot be moved, or written through directly, while it is borrowed.
+  useWhen:
+    - A function needs to read or change a value but not keep it. Pass `&T` or `&mut T` instead of moving.
+    - Iterating a collection. Borrow it, and do edits in one exclusive call such as `retain`, `drain` or `entry`.
+    - Splitting work over disjoint parts of a value, such as two struct fields or two halves of a slice.
+  avoidWhen:
+    - The reference must outlive the current call or be stored long term. Own the data, or share it with `Rc` or `Arc`.
+    - Several parts of the program must mutate one value in turns that the compiler cannot see. Use `RefCell`, `Mutex` or message passing.
+  tradeoffs:
+    - Some correct programs are rejected. You reorder, split borrows, or restructure the data.
+    - The rule removes data races and iterator invalidation from safe code, at compile time, with no runtime cost.
+    - Graph-shaped data with back pointers fights the rule. Arenas with indexes are the usual answer.
+  lookalikes:
+    - name: Reader-writer lock
+      how: The same rule (many readers or one writer), checked at runtime for data shared across threads.
+    - name: RefCell
+      how: The same rule checked at runtime in one thread. A conflict panics instead of failing to compile.
+    - name: C restrict
+      how: A promise that pointers do not alias, which lets the compiler optimise. Nothing checks it.
+---
+
+## [concept] References and the borrow checker
+
+**A reference lets code use a value without owning it. At any moment a value has either any number of shared references or exactly one mutable one, and a borrow lasts until its last use.**
+
+The rule is often called aliasing XOR mutability: you may have many names for a value, or you may change it, but not both at the same time.
+
+<Depth level={2}>
+`&v` creates a <Term id="shared-reference">shared reference</Term> and `&mut v` a <Term id="mutable-reference">mutable reference</Term>; creating one is a <Term id="borrow">borrow</Term>. The owner stays the owner, but while a shared borrow is alive the owner cannot be changed or moved, and while a mutable borrow is alive the owner cannot be used at all. The Rust Book puts it as two rules: either one mutable reference or any number of immutable ones, and references must always be valid. The same rule makes a <Term id="data-race">data race</Term> impossible in safe code.
+</Depth>
+
+<Depth level={3}>
+Since Rust 2018 the checker uses <Term id="non-lexical-lifetimes">non-lexical lifetimes</Term>: a borrow is live from where it is created to its last use, computed on the function's control-flow graph, not to the end of the block. That is why moving one line, or deleting one use, can make an error disappear. A conflict is reported where the second borrow starts, with a note pointing at the later use of the first.
+</Depth>
+
+## [problem] Sweep stale connections
+
+A database connection pool keeps idle connections in a list. Every 30 seconds a sweeper walks the list and closes connections that have been idle too long, because the database and the load balancer drop idle sockets after a few minutes.
+
+The sweep removes each stale connection as it finds it. In testing there is usually one stale connection at a time, and it is always removed.
+
+<Depth level={2}>
+The mental model behind the code is that the list is a thing you can walk and edit at the same time. The loop and the removal both act on one list, through two names: the loop's position in it, and the list itself.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The index loop recomputes `len(p.idle)` each time, so it never runs off the end. After a removal, though, the next connection has moved into slot `i`, and `i++` steps over it.</Lang>
+<Lang only="python">A list iterator keeps an integer index. `remove` shifts every later element down by one, so the next element moves into the index the iterator has already passed.</Lang>
+<Lang only="typescript">`forEach` decides how many indexes to visit before it starts and visits them in order. `splice` shifts the rest of the array down, so the next connection lands on an index already visited.</Lang>
+<Lang only="rust">The Rust version never runs. The `for` loop's iterator holds a shared borrow of `self.idle`, and `remove` needs a mutable one while the iterator is still in use.</Lang>
+</Depth>
+
+## [pain] The failover
+
+**What happened:** after a database failover, half the stale connections survived the pool's eviction sweep, and the next requests failed with connection reset.
+
+The marked lines are the whole story. When every connection is stale, each removal shifts the next one into the slot just checked, and the loop steps over it. The sweep removes every other connection. 32 stale connections become 16, and the next 16 requests are handed a dead socket.
+
+<Depth level={2}>
+This is <Term id="iterator-invalidation">iterator invalidation</Term>: the collection changed under a loop that was walking it. In Python, Go and TypeScript it is a silent logic error. In C++ it is undefined behaviour, because the iterator may point into storage the removal moved or freed. Nothing failed in testing, because tests rarely have two stale connections next to each other.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">The compiler reports E0502: cannot borrow `self.idle` as mutable because it is also borrowed as immutable. Its notes point at the `for` line twice: once where the iterator borrows `self.idle`, and once where the next turn of the loop uses that borrow again. The bug never ships, so the cost meter shows one compile error.</Lang>
+<Lang only="go">No tool flags this. The race detector only looks at concurrent access from different goroutines, and here a single goroutine does everything in order.</Lang>
+<Lang only="python">Python raises `RuntimeError` for a dict or set that changes size during iteration, but lists do not check. The loop just ends early.</Lang>
+<Lang only="typescript">No error is thrown. The loop visits the indexes it planned to visit, over an array that has shifted under it.</Lang>
+</Depth>
+
+## [morph] Many readers or one writer
+
+Drag the slider. The list that everyone edits at will becomes an owner that lends out either shared readers or one exclusive writer, never both at once.
+
+The code changes in one way. The walk only reads, and the edit happens in one exclusive step.
+
+<Depth level={2}>
+<Lang only="rust">`retain` takes `&mut self` once and does the walk and the removal inside, where it can do both safely. The closure gets `&Conn` for each element. Removed elements are dropped inside `retain`, so their sockets close.</Lang>
+<Lang only="go">`slices.DeleteFunc` is the same idea in Go: the library owns the walk and the compaction, and your callback only answers keep or delete.</Lang>
+<Lang only="python">Building `keep` and assigning it once separates the read from the write. A list comprehension does the same in one line if closing is not needed.</Lang>
+<Lang only="typescript">Building `keep` and assigning it once separates the read from the write. `filter` does the same in one line if closing is not needed.</Lang>
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">The closure reads `self.max_idle` while `retain` holds `&mut self.idle`. That compiles because Rust 2021 closures capture the field `self.max_idle`, not the whole `self`, and two different fields can be borrowed separately.</Lang>
+<Lang only="go">Before Go 1.22, `DeleteFunc` left the removed pointers in the backing array past the new length, keeping closed connections reachable until the slice was reused. Now it zeroes them.</Lang>
+<Lang only="python">Assigning a new list does not change the old one, so any other code that kept a reference to the old list still sees all 32 connections. Here nothing does.</Lang>
+<Lang only="typescript">Assigning a new array leaves the old one unchanged, so any other code that kept a reference to it still sees all 32 connections. Here nothing does.</Lang>
+</Depth>
+
+## [walk] Follow one sweep
+
+One sweep through the pool, with the borrows it takes. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="rust">`retain` keeps a read index and a write index into the same buffer. It can do that because it holds the only `&mut`, so no outside reference can see the buffer while elements are half-shifted. If the closure panics, a guard inside `retain` still shifts the remaining elements and fixes the length, so the Vec stays valid during unwinding.</Lang>
+<Lang only="go">`DeleteFunc` finds the first element to delete, then copies each kept element down over the deleted ones, in place. It returns the shortened slice; the caller must assign it, or keep using a slice with the old length.</Lang>
+<Lang only="python">The `for` loop calls `next()` on a list iterator, which reads the element at its index and adds one. Building a second list costs one pointer per kept connection.</Lang>
+<Lang only="typescript">`for...of` uses the array's iterator, which reads `length` afresh each step. Because nothing changes the array during the loop, that makes no difference here.</Lang>
+</Depth>
+
+## [again] The same failover, again
+
+All 32 idle connections are stale, exactly as before. The sweep removes all 32. The next requests open fresh connections, and none of them fails.
+
+<Depth level={2}>
+A test that would have caught the original bug: fill the pool with connections that are all stale, run the sweep, and assert the pool is empty. Tests with one stale connection cannot see it.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">If the sweep also needed to log each removed connection, `retain` still works: the closure can log before returning `false`. If it needs to keep the removed connections, `Vec::extract_if` (stable since Rust 1.87) moves them out as it goes.</Lang>
+<Lang only="go">If the sweep also needed the removed connections, collect them in the callback; the callback runs once per element in order.</Lang>
+<Lang only="python">If the sweep also needed the removed connections, build a second list in the same loop.</Lang>
+<Lang only="typescript">If the sweep also needed the removed connections, push them to a second array in the same loop.</Lang>
+</Depth>
+
+## [play] Run the borrow checker
+
+The playground is a borrow checker over a timeline. Each column is a reference, and each cell marks where it is created and where it is used. The checker draws each borrow from creation to last use and flags the lines where a mutable borrow overlaps another.
+
+Predict first, then add, remove and flip borrows until the program compiles. Then run a rejected version without the checker and see what it would have done.
+
+## [lens] How each language meets it
+
+Only Rust checks aliasing and mutation together. Go, Python and TypeScript let any name write through any reference, and leave the rest to discipline and tests.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+The habit carries across languages: walk a collection read-only, and make the change in one step, with a new collection or a library call that owns the walk. Rust makes the habit mandatory. Elsewhere, <Term id="aliasing">aliasing</Term> a mutable collection is legal, and the bug shows up only in production data.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="borrowing" />
+
+### When a borrow ends
+
+A borrow is alive from where it is created to its last use, on every path through the function. Deleting the last use, or moving it above the conflicting line, ends the borrow earlier. Two-phase borrows let `v.push(v.len())` compile: the mutable borrow for `push` is reserved first and only activated after the argument `v.len()` has been evaluated. Borrowing two different fields of a struct at once is fine, and so is `split_at_mut` for two halves of one slice, because the parts cannot overlap.

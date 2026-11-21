@@ -1,0 +1,16 @@
+# Terms introduced by the rust/borrowing lesson.
+- id: borrow
+  term: Borrow
+  short: Creating a reference to a value with & or &mut. The owner keeps ownership, and is restricted while the borrow is alive.
+- id: shared-reference
+  term: Shared reference
+  short: A Rust &T. Read access to a value; any number may exist at once, and the value cannot change while one is in use.
+- id: mutable-reference
+  term: Mutable reference
+  short: A Rust &mut T. Exclusive access to a value; while it is in use, no other reference to that value may be used.
+- id: non-lexical-lifetimes
+  term: Non-lexical lifetimes
+  short: The borrow checker's rule since Rust 2018 that a borrow lasts until its last use, computed on the control-flow graph, not until the end of the block.
+- id: iterator-invalidation
+  term: Iterator invalidation
+  short: Changing a collection while an iterator walks it, so the iterator skips elements, repeats them, or points into storage that moved.
