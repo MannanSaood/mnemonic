@@ -1,0 +1,13 @@
+# Terms introduced by design-patterns/template-method.
+- id: template-method-role
+  term: Template method
+  short: A method that runs the steps of an algorithm in a fixed order and leaves some of those steps to subclasses or implementors.
+- id: primitive-operation
+  term: Primitive operation
+  short: In Template Method, a step the base declares but does not implement. Every concrete class must supply it.
+- id: hook-method
+  term: Hook
+  short: In Template Method, an optional step with a default (often empty) body. A subclass may override it to add behaviour at that point.
+- id: hollywood-principle
+  term: Hollywood principle
+  short: The base class or framework calls your code at fixed points; your code does not call it. Often put as "don't call us, we'll call you."

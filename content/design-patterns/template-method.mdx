@@ -1,0 +1,664 @@
+---
+title: Template Method
+track: design-patterns
+group: Behavioral
+order: 49
+summary: Write the order of an algorithm's steps once, and let each variant fill in only the steps that differ.
+intent: Variants that share a sequence of steps should share the sequence too, so a fix to a shared step reaches all of them.
+changeRequest: Finance found duplicate transactions in the ledger. Every importer must skip rows whose transaction id it has already loaded.
+languages: [go, python, typescript, rust]
+glossary: [template-method-role, primitive-operation, hook-method, hollywood-principle, interface, open-closed]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/composition-over-inheritance]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: template-method
+  scenarios:
+    - try: "Month 1: fix the duplicate bug only in the CSV importer, as the ticket says, in both codebases."
+      notice: "In the copied design, JSON and Bank keep posting duplicates. The template design has one validate, so every importer got the fix."
+    - try: "Month 4: in the template design, add the Bank override but not the hook call in run()."
+      notice: "The balance check never runs and nothing warns you. A hook works only if the template calls it."
+    - try: "Month 5: start the Stripe importer as a copy of the Bank importer."
+      notice: "It inherits Bank's fixes, Bank's gaps and Bank's balance check, which rejects every payout. The templated Stripe importer writes parse and gets every shared fix."
+    - try: "Play all five months and read the totals."
+      notice: "The template wins every month but one. A check only Bank needs costs it an extra edit, in code every importer runs."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: scheduler, sub: 3 jobs }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: scheduler, sub: picks a format }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 398, h: 244, title: three importers, sub: each a full copy of the pipeline }
+      after:  { x: 140, y: 24, w: 170, h: 60, title: { go: "Import()", python: Importer.run, typescript: Importer.run, rust: "Importer::run" }, sub: open · parse · validate · load }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 24, w: 180, h: 60, title: "" }
+      after:  { x: 370, y: 24, w: 180, h: 60, title: { go: Format, python: parse, typescript: parse, rust: fn parse }, sub: { go: interface · 1 method, python: abstractmethod, typescript: protected abstract, rust: required method } }
+    - id: csv
+      kind: concrete
+      before: { x: 166, y: 64, w: 366, h: 40, title: { go: ImportCSV, python: import_csv, typescript: importCsv, rust: import_csv }, sub: open · parse · validate · load }
+      after:  { x: 300, y: 196, w: 76, h: 40, title: CSV }
+    - id: json
+      kind: concrete
+      before: { x: 166, y: 110, w: 366, h: 40, title: { go: ImportJSON, python: import_json, typescript: importJson, rust: import_json }, sub: open · parse · validate · load }
+      after:  { x: 386, y: 196, w: 76, h: 40, title: JSON }
+    - id: bank
+      kind: concrete
+      before: { x: 166, y: 156, w: 366, h: 40, title: { go: ImportStatement, python: import_statement, typescript: importStatement, rust: import_statement }, sub: "copied, then drifted" }
+      after:  { x: 472, y: 196, w: 76, h: 40, title: Statement }
+    - id: dedupe
+      kind: concrete
+      appears: change
+      before: { x: 166, y: 204, w: 366, h: 40, title: dedupe × 3 copies }
+      after:  { x: 12, y: 120, w: 110, h: 44, title: dedupe, sub: once }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: context, to: strategy, label: calls }
+    - { from: csv, to: strategy, kind: implements }
+    - { from: json, to: strategy, kind: implements, label: implements }
+    - { from: bank, to: strategy, kind: implements }
+    - { from: dedupe, to: context }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: csv_import.go · json_import.go · statement_import.go
+      source: |
+        // csv_import.go
+        func ImportCSV(path string, l *Ledger) error {
+            raw, err := os.ReadFile(path)
+            if err != nil {
+                return err
+            }
+            var ok []Row
+            for _, r := range parseCSV(raw) {
+                if r.Amount != 0 && !r.Date.IsZero() {
+                    ok = append(ok, r)
+                }
+            }
+            return l.Insert(toEntries(ok))
+        }
+
+        // json_import.go
+        func ImportJSON(path string, l *Ledger) error {
+            raw, err := os.ReadFile(path)
+            if err != nil {
+                return err
+            }
+            var ok []Row
+            for _, r := range parseJSON(raw) {
+                if r.Amount != 0 && !r.Date.IsZero() {
+                    ok = append(ok, r)
+                }
+            }
+            return l.Insert(toEntries(ok))
+        }
+
+        // statement_import.go
+        func ImportStatement(path string, l *Ledger) error {
+            raw, err := os.ReadFile(path)
+            if err != nil {
+                return fmt.Errorf("statement %s: %w", path, err)
+            }
+            var ok []Row
+            for _, r := range parseCAMT(raw) {
+                if r.Amount != 0 {
+                    ok = append(ok, r)
+                }
+            }
+            return l.Insert(toEntries(ok))
+        }
+      roles: { context: [1, 44], csv: [2, 14], json: [17, 29], bank: [32, 44] }
+      change:
+        - { after: 7, add: ['    seen := map[string]bool{}'] }
+        - { line: 9, replace: '        if r.Amount != 0 && !r.Date.IsZero() && !seen[r.TxID] {' }
+        - { after: 9, add: ['            seen[r.TxID] = true'] }
+        - { after: 22, add: ['    seen := map[string]bool{}'] }
+        - { line: 24, replace: '        if r.Amount != 0 && !r.Date.IsZero() && !seen[r.TxID] {' }
+        - { after: 24, add: ['            seen[r.TxID] = true'] }
+        - { after: 37, add: ['    seen := map[string]bool{}'] }
+        - { line: 39, replace: '        if r.Amount != 0 && !seen[r.TxID] {' }
+        - { after: 39, add: ['            seen[r.TxID] = true'] }
+    after:
+      file: importer.go · csv.go · scheduler.go
+      source: |
+        // importer.go: the order of the steps lives here, once
+        type Format interface {
+            Parse(raw []byte) ([]Row, error)
+        }
+
+        func Import(path string, f Format, l *Ledger) error {
+            raw, err := os.ReadFile(path)
+            if err != nil {
+                return fmt.Errorf("open %s: %w", path, err)
+            }
+            rows, err := f.Parse(raw)
+            if err != nil {
+                return err
+            }
+            return l.Insert(toEntries(validate(rows)))
+        }
+
+        func validate(rows []Row) []Row {
+            var ok []Row
+            for _, r := range rows {
+                if r.Amount != 0 && !r.Date.IsZero() {
+                    ok = append(ok, r)
+                }
+            }
+            return ok
+        }
+
+        // csv.go: a format knows only its own syntax
+        type CSV struct{}
+
+        func (CSV) Parse(raw []byte) ([]Row, error) { /* … */ }
+
+        // scheduler.go
+        err := Import("statement.xml", CAMT{}, ledger)
+      roles: { strategy: [2, 4], context: [6, 26], csv: [28, 31], client: [34, 34], run: [6, 16], parse: [11, 11], validate: [18, 26] }
+    again:
+      file: importer.go
+      source: |
+        // importer.go, validate after the change: the only edit
+        func validate(rows []Row) []Row {
+            var ok []Row
+            seen := map[string]bool{}
+            for _, r := range rows {
+                if r.Amount != 0 && !r.Date.IsZero() && !seen[r.TxID] {
+                    seen[r.TxID] = true
+                    ok = append(ok, r)
+                }
+            }
+            return ok
+        }
+    cost:
+      before: { text: 9 lines · 3 files, value: 0.85 }
+      after: { text: 3 lines · 1 function, value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Go has no inheritance, so the template is a plain function that takes the varying step as an interface. With one varying step, a func value such as `func([]byte) ([]Row, error)` is lighter still. Optional hooks become optional interfaces that the function checks with a type assertion.'
+      seenIn: '`sort.Sort(data)` runs a fixed algorithm and asks `data` for `Len`, `Less` and `Swap`. `io.Copy` checks whether its arguments implement `WriterTo` or `ReaderFrom` and uses them if so: an optional hook.'
+
+  python:
+    before:
+      file: csv_import.py · json_import.py · statement_import.py
+      source: |
+        # csv_import.py
+        def import_csv(path: str, ledger: Ledger) -> None:
+            with open(path, encoding="utf-8") as f:
+                rows = parse_csv(f)
+            ok = []
+            for r in rows:
+                if r.amount and r.date:
+                    ok.append(r)
+            ledger.insert(to_entries(ok))
+
+        # json_import.py
+        def import_json(path: str, ledger: Ledger) -> None:
+            with open(path, encoding="utf-8") as f:
+                rows = parse_json(f)
+            ok = []
+            for r in rows:
+                if r.amount and r.date:
+                    ok.append(r)
+            ledger.insert(to_entries(ok))
+
+        # statement_import.py
+        def import_statement(path: str, ledger: Ledger) -> None:
+            with open(path, "rb") as f:
+                rows = parse_camt(f)
+            ok = [r for r in rows if r.amount]
+            ledger.insert(to_entries(ok))
+      roles: { context: [1, 26], csv: [2, 9], json: [12, 19], bank: [22, 26] }
+      change:
+        - { after: 5, add: ['    seen: set[str] = set()'] }
+        - { line: 7, replace: '        if r.amount and r.date and r.tx_id not in seen:' }
+        - { after: 7, add: ['            seen.add(r.tx_id)'] }
+        - { after: 15, add: ['    seen: set[str] = set()'] }
+        - { line: 17, replace: '        if r.amount and r.date and r.tx_id not in seen:' }
+        - { after: 17, add: ['            seen.add(r.tx_id)'] }
+        - { line: 25, replace: '    ok, seen = [], set()' }
+        - { after: 25, add: ['    for r in rows:', '        if r.amount and r.tx_id not in seen:', '            seen.add(r.tx_id)', '            ok.append(r)'] }
+    after:
+      file: importer.py · csv_importer.py · scheduler.py
+      source: |
+        from abc import ABC, abstractmethod
+
+        class Importer(ABC):
+            def run(self, path: str, ledger: Ledger) -> None:
+                with open(path, "rb") as f:
+                    rows = self.parse(f)
+                ok = self.validate(rows)
+                self.before_load(ok)
+                ledger.insert(to_entries(ok))
+
+            @abstractmethod
+            def parse(self, f: BinaryIO) -> list[Row]: ...
+
+            def validate(self, rows: list[Row]) -> list[Row]:
+                return [r for r in rows if r.amount and r.date]
+
+            def before_load(self, rows: list[Row]) -> None:
+                """Hook: does nothing unless a subclass overrides it."""
+
+        class CsvImporter(Importer):
+            def parse(self, f: BinaryIO) -> list[Row]: ...
+
+        # scheduler.py
+        StatementImporter().run("statement.xml", ledger)
+      roles: { strategy: [11, 12], context: [3, 18], csv: [20, 21], client: [24, 24], run: [4, 9], parse: [6, 6], validate: [14, 15], hook: [17, 18] }
+    again:
+      file: importer.py
+      source: |
+        # importer.py, validate after the change: the only edit
+            def validate(self, rows: list[Row]) -> list[Row]:
+                seen: set[str] = set()
+                ok = []
+                for r in rows:
+                    if r.amount and r.date and r.tx_id not in seen:
+                        seen.add(r.tx_id)
+                        ok.append(r)
+                return ok
+    cost:
+      before: { text: 11 lines · 3 files, value: 0.85 }
+      after: { text: 1 method · 1 file, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`abc.ABC` with `@abstractmethod` marks the primitive step: a subclass that leaves out `parse` cannot be instantiated. Nothing stops a subclass from overriding `run` itself; decorate it with `@typing.final` and mypy or pyright will flag the override.'
+      seenIn: '`unittest.TestCase.run` calls `setUp`, the test method and `tearDown`. `socketserver.BaseRequestHandler` calls `setup`, `handle` and `finish`. `logging.Handler.handle` filters, locks, then calls your `emit`.'
+
+  typescript:
+    before:
+      file: csvImport.ts · jsonImport.ts · statementImport.ts
+      source: |
+        // csvImport.ts
+        export async function importCsv(path: string, ledger: Ledger) {
+          const raw = await readFile(path, "utf8");
+          const ok: Row[] = [];
+          for (const r of parseCsv(raw)) {
+            if (r.amount !== 0 && r.date) ok.push(r);
+          }
+          await ledger.insert(toEntries(ok));
+        }
+
+        // jsonImport.ts
+        export async function importJson(path: string, ledger: Ledger) {
+          const raw = await readFile(path, "utf8");
+          const ok: Row[] = [];
+          for (const r of parseJson(raw)) {
+            if (r.amount !== 0 && r.date) ok.push(r);
+          }
+          await ledger.insert(toEntries(ok));
+        }
+
+        // statementImport.ts
+        export async function importStatement(path: string, ledger: Ledger) {
+          const raw = await readFile(path);
+          const ok = parseCamt(raw).filter((r) => r.amount !== 0);
+          await ledger.insert(toEntries(ok));
+        }
+      roles: { context: [1, 26], csv: [2, 9], json: [12, 19], bank: [22, 26] }
+      change:
+        - { after: 4, add: ['  const seen = new Set<string>();'] }
+        - { line: 6, replace: '    if (r.amount !== 0 && r.date && !seen.has(r.txId)) {' }
+        - { after: 6, add: ['      seen.add(r.txId);', '      ok.push(r);', '    }'] }
+        - { after: 14, add: ['  const seen = new Set<string>();'] }
+        - { line: 16, replace: '    if (r.amount !== 0 && r.date && !seen.has(r.txId)) {' }
+        - { after: 16, add: ['      seen.add(r.txId);', '      ok.push(r);', '    }'] }
+        - { line: 24, replace: '  const seen = new Set<string>();' }
+        - { after: 24, add: ['  const ok = parseCamt(raw).filter((r) => {', '    if (r.amount === 0 || seen.has(r.txId)) return false;', '    seen.add(r.txId);', '    return true;', '  });'] }
+    after:
+      file: importer.ts · csvImporter.ts · scheduler.ts
+      source: |
+        export abstract class Importer {
+          async run(path: string, ledger: Ledger): Promise<void> {
+            const raw = await readFile(path);
+            const rows = this.parse(raw);
+            const ok = this.validate(rows);
+            await this.beforeLoad(ok);
+            await ledger.insert(toEntries(ok));
+          }
+
+          protected abstract parse(raw: Buffer): Row[];
+
+          protected validate(rows: Row[]): Row[] {
+            return rows.filter((r) => r.amount !== 0 && r.date);
+          }
+
+          protected async beforeLoad(_rows: Row[]): Promise<void> {}
+        }
+
+        export class CsvImporter extends Importer {
+          protected parse(raw: Buffer): Row[] { /* … */ }
+        }
+
+        // scheduler.ts
+        await new StatementImporter().run("statement.xml", ledger);
+      roles: { strategy: [10, 10], context: [1, 17], csv: [19, 21], client: [24, 24], run: [2, 8], parse: [4, 4], validate: [12, 14], hook: [16, 16] }
+    again:
+      file: importer.ts
+      source: |
+        // importer.ts, validate after the change: the only edit
+          protected validate(rows: Row[]): Row[] {
+            const seen = new Set<string>();
+            return rows.filter((r) => {
+              if (r.amount === 0 || !r.date || seen.has(r.txId)) return false;
+              seen.add(r.txId);
+              return true;
+            });
+          }
+    cost:
+      before: { text: 16 lines · 3 files, value: 0.9 }
+      after: { text: 1 method · 1 file, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'An `abstract class` with a `protected abstract` step is the classic form, and the compiler rejects a subclass that forgets `parse`. TypeScript has no `final`, so a subclass can still override `run`. Without classes, the same idea is a function that takes an object of steps: `runImport(path, { parse })`.'
+      seenIn: 'Node streams: a `Transform` subclass implements `_transform` (and optionally `_flush`), and the stream machinery calls them in order. A `Readable` implements `_read`.'
+
+  rust:
+    before:
+      file: csv_import.rs · json_import.rs · statement_import.rs
+      source: |
+        // csv_import.rs
+        pub fn import_csv(path: &Path, ledger: &mut Ledger) -> Result<(), ImportError> {
+            let raw = fs::read(path)?;
+            let ok: Vec<Row> = parse_csv(&raw)?
+                .into_iter()
+                .filter(|r| r.amount != 0 && r.date.is_some())
+                .collect();
+            ledger.insert(to_entries(ok))
+        }
+
+        // json_import.rs
+        pub fn import_json(path: &Path, ledger: &mut Ledger) -> Result<(), ImportError> {
+            let raw = fs::read(path)?;
+            let ok: Vec<Row> = parse_json(&raw)?
+                .into_iter()
+                .filter(|r| r.amount != 0 && r.date.is_some())
+                .collect();
+            ledger.insert(to_entries(ok))
+        }
+
+        // statement_import.rs
+        pub fn import_statement(path: &Path, ledger: &mut Ledger) -> Result<(), ImportError> {
+            let raw = fs::read(path).map_err(ImportError::Statement)?;
+            let ok: Vec<Row> = parse_camt(&raw)?.into_iter().filter(|r| r.amount != 0).collect();
+            ledger.insert(to_entries(ok))
+        }
+      roles: { context: [1, 26], csv: [2, 9], json: [12, 19], bank: [22, 26] }
+      change:
+        - { after: 3, add: ['    let mut seen = HashSet::new();'] }
+        - { line: 6, replace: '        .filter(|r| r.amount != 0 && r.date.is_some() && seen.insert(r.tx_id.clone()))' }
+        - { after: 13, add: ['    let mut seen = HashSet::new();'] }
+        - { line: 16, replace: '        .filter(|r| r.amount != 0 && r.date.is_some() && seen.insert(r.tx_id.clone()))' }
+        - { after: 23, add: ['    let mut seen = HashSet::new();'] }
+        - { line: 24, replace: '    let ok: Vec<Row> = parse_camt(&raw)?.into_iter().filter(|r| r.amount != 0 && seen.insert(r.tx_id.clone())).collect();' }
+    after:
+      file: importer.rs · csv.rs · scheduler.rs
+      source: |
+        pub trait Importer {
+            fn parse(&self, raw: &[u8]) -> Result<Vec<Row>, ImportError>;
+
+            fn validate(&self, rows: Vec<Row>) -> Vec<Row> {
+                rows.into_iter().filter(|r| r.amount != 0 && r.date.is_some()).collect()
+            }
+
+            fn before_load(&self, _rows: &[Row]) -> Result<(), ImportError> {
+                Ok(()) // hook: a default that does nothing
+            }
+
+            fn run(&self, path: &Path, ledger: &mut Ledger) -> Result<(), ImportError> {
+                let raw = fs::read(path)?;
+                let rows = self.validate(self.parse(&raw)?);
+                self.before_load(&rows)?;
+                ledger.insert(to_entries(rows))
+            }
+        }
+
+        struct Csv;
+
+        impl Importer for Csv {
+            fn parse(&self, raw: &[u8]) -> Result<Vec<Row>, ImportError> { /* … */ }
+        }
+
+        // scheduler.rs
+        Statement.run(Path::new("statement.xml"), &mut ledger)?;
+      roles: { strategy: [2, 2], context: [1, 18], csv: [20, 24], client: [27, 27], run: [12, 17], parse: [14, 14], validate: [4, 6], hook: [8, 10] }
+    again:
+      file: importer.rs
+      source: |
+        // importer.rs, validate after the change: the only edit
+            fn validate(&self, rows: Vec<Row>) -> Vec<Row> {
+                let mut seen = HashSet::new();
+                rows.into_iter()
+                    .filter(|r| r.amount != 0 && r.date.is_some() && seen.insert(r.tx_id.clone()))
+                    .collect()
+            }
+    cost:
+      before: { text: 6 lines · 3 files, value: 0.75 }
+      after: { text: 2 lines · 1 method, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A trait with one required method and several provided (default) methods is Template Method with no base class. Defaults are hooks. An implementor can override any provided method, `run` included; when the order must not change, make `run` a free function `fn run(i: &impl Importer, …)` instead.'
+      seenIn: 'Implement `Iterator::next` and you get `map`, `filter`, `fold` and dozens more, all written in terms of `next`. `std::io::Read` asks for `read` and provides `read_to_end` and `read_exact`; `std::io::Write` asks for `write` and `flush` and provides `write_all`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'The scheduler calls `Import` with a path and a format: here, `CAMT{}` for a bank statement.', python: 'The scheduler builds a `StatementImporter` and calls `run`. It never calls the steps itself.', typescript: 'The scheduler builds a `StatementImporter` and calls `run`. It never calls the steps itself.', rust: 'The scheduler calls `run` on `Statement`. It never calls the steps itself.' }
+    nodes: [client]
+    edges: [client>context]
+    role: client
+  - text: The template owns the order. It opens the file, then calls parse, validate, transform and load, always in that sequence.
+    nodes: [context]
+    edges: []
+    role: run
+  - text: { go: 'Parse is the only step that differs, so it is the only one that goes through the `Format` interface. `CAMT` turns XML into rows.', python: '`self.parse(f)` finds `parse` on the subclass. The base calls down into it: the Hollywood principle.', typescript: '`this.parse(raw)` finds `parse` on the subclass. The base calls down into it: the Hollywood principle.', rust: '`self.parse(&raw)` calls the one method `Statement` had to write. The trait''s provided methods call down into it.' }
+    nodes: [strategy, bank]
+    edges: [context>strategy, bank>strategy]
+    role: parse
+  - text: Validate, transform and load exist once, in the template. A fix made there reaches every importer, including ones written next year.
+    nodes: [context]
+    edges: []
+    role: validate
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: Which of these situations calls for a Template Method?
+    options:
+      - text: Three report exporters all open a file, write a header, write the rows and close it. Only the way one row is written differs.
+        correct: true
+        why: Right. The sequence is the same for all three and only one step varies. Write the sequence once and let each exporter supply its row writer.
+      - text: A checkout must pay through Stripe, PayPal or Adyen, chosen from config for each region.
+        why: That is Strategy. The whole payment step is swapped, and the caller picks which one at runtime.
+      - text: An infrastructure tool needs cost estimates, validation and rendering over a fixed set of resource types, without editing those types.
+        why: That is Visitor. It adds new operations over a set of types. Template Method fixes one operation's steps and varies some of them.
+  engineer:
+    question: Bank statements must have their opening balance checked before loading. The other importers have no balances. What is the cleanest change?
+    options:
+      - text: Add a before_load hook with an empty default to the base, call it in run, and override it in the statement importer.
+        correct: true
+        why: Right. The order stays in one place, the other importers are untouched, and the extension point is named. The cost is an edit to the shared run method.
+      - text: Override run in the statement importer, copy its body and add the check in the middle.
+        why: That re-creates a copy of the pipeline. The next fix to the shared run will miss bank statements, which is the drift the pattern removed.
+      - text: In the base run, check whether self is a statement importer and call the balance check if so.
+        why: Now the base knows its subclasses by name. Each special case adds another branch to code that every importer runs.
+  deep:
+    question: In Python, a developer overrides the hook as before_lod, a typo for before_load. What happens when the statement importer runs?
+    options:
+      - text: The import succeeds. run calls the base's empty before_load, and the balance check never runs.
+        correct: true
+        why: Right. ABC only checks that abstract methods exist; before_load is not abstract, so the typo is just a new, unused method. `@typing.override` (Python 3.12) lets a type checker catch it. Rust rejects a method that is not in the trait, and TypeScript catches it with the `override` keyword and `noImplicitOverride`.
+      - text: Creating a StatementImporter raises TypeError, because ABC sees a method the base does not declare.
+        why: No. ABC raises TypeError only when an abstract method is missing. Extra methods are allowed.
+      - text: run raises AttributeError when it reaches before_load.
+        why: No. The base class defines before_load, so the lookup finds the empty default.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Abstract class (template)
+      example: { go: "Import() function", python: "Importer (ABC)", typescript: "Importer (abstract class)", rust: "Importer (trait with provided run)" }
+      job: Owns the order of the steps and the steps every variant shares.
+    - role: Primitive operation
+      example: parse
+      job: A step every variant must supply. The template calls it.
+    - role: Hook
+      example: before_load
+      job: An optional step with a default, usually empty. Variants may override it.
+    - role: Concrete class
+      example: "CSV, JSON, Statement"
+      job: Supplies the primitive steps, and overrides hooks when it needs to.
+    - role: Client
+      example: the scheduler
+      job: Calls the template method. Never calls the steps one by one.
+  useWhen:
+    - Several variants run the same steps in the same order and differ in one or two of them.
+    - Copies of a pipeline have started to drift, and fixes land in one copy but not the others.
+    - A framework must keep control of the order, such as setup before a test and teardown after it.
+  avoidWhen:
+    - The variants differ in more steps than they share. The template becomes a list of hooks, and the order it enforces means little.
+    - You need to swap the behaviour at runtime or combine variants. Pass the step in as a function or strategy instead.
+    - There are only two variants and little shared code. A small helper function is enough.
+  tradeoffs:
+    - The order of steps is fixed for every variant. A variant that needs a different order or an extra step forces an edit to the template.
+    - With inheritance, subclasses depend on the base's internals, and a change to the base can break them (the fragile base class problem).
+    - Readers must jump between the base and the subclass to follow one run.
+    - Hooks fail silently when misnamed or when the template never calls them.
+  lookalikes:
+    - name: Strategy
+      how: Swaps a whole step by passing in an object, chosen at runtime. Template Method varies part of an algorithm through inheritance or a trait, fixed when the type is written.
+    - name: Factory Method
+      how: A factory method is often one of the steps a template method calls. It is a template step whose job is to create an object.
+    - name: Composition over inheritance
+      how: The Go form of this pattern, a function that takes an interface of steps, is Template Method built by composition. It keeps the fixed order without a base class.
+---
+
+## [concept] Template Method
+
+**Write the order of an algorithm's steps once, and let each variant fill in only the steps that differ.**
+
+The base owns the sequence. Each variant supplies the few steps that are its own, and gets the rest, including every future fix to them, for free.
+
+<Depth level={2}>
+The method that runs the sequence is the <Term id="template-method-role">template method</Term>. The steps every variant must write are <Term id="primitive-operation">primitive operations</Term>. Steps a variant may change but does not have to are <Term id="hook-method">hooks</Term>, with a default that usually does nothing. Control is inverted: the base calls the variant's code, not the other way round. This is the <Term id="hollywood-principle">Hollywood principle</Term>.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Template Method as a class behavioral pattern, because it varies behaviour through subclassing. It contrasts it with Strategy: a template uses inheritance to vary part of an algorithm, a strategy uses delegation to vary all of it. The catalogue also says the template method itself should not be overridden, and that a good template asks subclasses for as few primitive operations as possible. Languages without class inheritance get the same shape another way: a Go function that takes an <Term id="interface">interface</Term>, or a Rust trait with default methods.
+</Depth>
+
+## [problem] Three importers, written one after another
+
+A finance service imports transactions from partners. The CSV importer came first. When a partner sent JSON, someone copied it and swapped the parser. Bank statements came later, copied again.
+
+Read the three. They all open a file, parse it, validate the rows, convert them to ledger entries and load them. Only the parse call differs. And the statement copy has already drifted: it no longer checks the date.
+
+<Depth level={2}>
+Nobody chose to drop the date check. The statement importer was copied from an older version, or someone simplified it while fixing something else. Copies drift because each one is maintained on its own, by whoever got the ticket.
+</Depth>
+
+<Depth level={3}>
+The copies are also tested separately. A test that a row with a missing date is rejected exists for CSV and JSON, and passes. The same test was never written for statements, so nothing shows that the copies disagree.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** Finance found duplicate transactions in the ledger. Every importer must skip rows whose transaction id it has already loaded.
+
+The ticket names the CSV importer, because that is where the duplicate was spotted. The fix belongs in all three copies, and the statement copy needs a different edit, because it has drifted.
+
+<Depth level={2}>
+Fix CSV and the ticket closes. Tests pass. Next month the same duplicates arrive through a bank statement, and someone opens a new ticket for a bug that was already fixed once. Each copy turns one bug into several, found one at a time.
+</Depth>
+
+<Depth level={3}>
+Search does not save you either. The copies use different names and shapes (a loop in one, a filter or comprehension in another), so a grep for the old condition finds some of them and not all.
+</Depth>
+
+## [morph] Pull the shared steps into one template
+
+Drag the slider. The three pipelines collapse into one template method. Each importer shrinks to the one step that is really its own: parse.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Make the varying steps as few as possible. Here only parse varies; validate, transform and load are shared. Every step you make overridable is one more way for an importer to drift, so start with none and add a hook when a real importer needs one.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go has no inheritance, so there is no base class. The template is a plain function, `Import`, and the varying step is a one-method interface. Nobody can override `Import`, so the order is truly fixed. An optional hook is a second interface the function checks with a type assertion, the way `io.Copy` looks for `WriterTo`.</Lang>
+<Lang only="python">`Importer` is an abstract base class. Python raises `TypeError` when you instantiate a subclass that has not implemented `parse`, so a forgotten step fails when the importer is created, not halfway through a file.</Lang>
+<Lang only="typescript">`Importer` is an abstract class and `parse` is `protected abstract`. The compiler rejects a concrete subclass that does not implement it, and callers outside the class hierarchy cannot call the steps directly.</Lang>
+<Lang only="rust">`Importer` is a trait. `parse` is a required method; `validate`, `before_load` and `run` are provided methods with default bodies. The compiler rejects an `impl Importer` that leaves out `parse`.</Lang>
+</Depth>
+
+## [walk] Follow one bank statement
+
+One statement through the template, from the scheduler to the ledger. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`f.Parse(raw)` is a call through an interface: Go loads the method from the <Term id="itab">itab</Term> and calls it indirectly. `validate` is an ordinary function call that the compiler can inline.</Lang>
+<Lang only="python">`self.parse` is looked up on the instance's class first, following the method resolution order, so the subclass's `parse` wins. The lookup happens on every call; there is no table built ahead of time.</Lang>
+<Lang only="typescript">`run` lives on `Importer.prototype` and `parse` on `StatementImporter.prototype`. `this.parse` walks the prototype chain from the instance and finds the subclass's method first.</Lang>
+<Lang only="rust">Called on a concrete `Statement`, `run` is compiled for that type, and its call to `parse` is static and can be inlined. Through a `&dyn Importer`, the provided methods sit in the vtable next to the required one, and every call goes through it.</Lang>
+</Depth>
+
+## [again] Duplicates, the second time
+
+The same request after the refactor. There is one validate, so there is one edit, and every importer gets it, including importers nobody has written yet.
+
+<Depth level={2}>
+The ticket can still name only CSV. It does not matter where the bug was spotted, because there is no other copy to forget.
+</Depth>
+
+<Depth level={3}>
+Test the template once with a fake importer whose parse returns rows you choose: duplicates, missing dates, zero amounts. Each real importer then only needs tests for its own parse.
+</Depth>
+
+## [play] Run five months of tickets
+
+Two codebases take the same tickets side by side: copied importers on one side, a template on the other. Each ticket names the importer where the bug was spotted, and at month end every partner's file goes through both.
+
+Fix each ticket, ship, and watch which importers still post bad data.
+
+## [lens] How each language writes it
+
+Python and TypeScript usually reach for an abstract base class. Go has no inheritance and passes the steps in. Rust uses a trait with default methods.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="template-method" />
+
+### When the template is just a function
+
+If only one step varies, you may not need a class at all. A function that takes the varying step as a function argument, `run_import(path, parse=parse_csv)`, is Template Method without inheritance. It keeps the order in one place and is easier to read. Move to a base class or trait when there are several steps to supply, or hooks with defaults.
