@@ -1,0 +1,7 @@
+# Terms introduced by design-patterns/interfaces-and-polymorphism
+- id: polymorphism
+  term: Polymorphism
+  short: One call site, many behaviours. The same method call runs different code depending on the value it is made on.
+- id: duck-typing
+  term: Duck typing
+  short: A value is accepted if it has the methods the code calls when it calls them. Nothing is checked ahead of time.

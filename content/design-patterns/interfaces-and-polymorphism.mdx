@@ -1,0 +1,570 @@
+---
+title: Interfaces and polymorphism
+track: design-patterns
+group: Principles
+order: 10
+summary: Let callers depend on a small interface, so any implementation can be plugged in and the caller never checks which one it got.
+intent: The code that sends a notification should not need to know which channels exist.
+changeRequest: The Brazil launch needs WhatsApp as a notification channel.
+languages: [go, python, typescript, rust]
+glossary: [interface, polymorphism, dynamic-dispatch, duck-typing, structural-typing, itab]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: interfaces-and-polymorphism
+  scenarios:
+    - try: "Predict, then plug WhatsApp into both services."
+      notice: "The interface service sends at once and holds the 03:12 message for morning. The type-check service fails until you add a case."
+    - try: "In the type-check service, add WhatsApp's case but not the quiet-hours entry."
+      notice: "Nothing errors. A customer gets a message at 03:12. Type checks spread one fact (WhatsApp wakes people) across places you must remember."
+    - try: "Plug in Slack, which has send but no wakesPeople."
+      notice: "Go, TypeScript and Rust reject it before it ships. Switch the language to Python and it ships, then fails at runtime on every message."
+    - try: "Plug in the fake."
+      notice: "The interface service runs it with no edits and sends nothing real. The type-check service needs a test-only case in production code."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: user, sub: channel name }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: main, sub: builds the map }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: Notifications, sub: { go: "switch u.Channel (×2)", python: "if / elif (×2)", typescript: "if + switch", rust: "matches! + match" } }
+      after:  { x: 168, y: 30, w: 150, h: 56, title: Notifications, sub: { go: "map[string]Notifier", python: "dict[str, Notifier]", typescript: "Map<string, Notifier>", rust: "HashMap<…, Box<dyn …>>" } }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 30, w: 180, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 180, h: 56, title: Notifier, sub: { go: Send · WakesPeople, python: send · wakes_people, typescript: send · wakesPeople, rust: send · wakes_people } }
+    - id: email
+      kind: concrete
+      before: { x: 188, y: 88, w: 222, h: 32, title: { go: case "email", python: '== "email"', typescript: case "email", rust: '"email" =>' } }
+      after:  { x: 280, y: 204, w: 62, h: 40, title: Email }
+    - id: sms
+      kind: concrete
+      before: { x: 188, y: 128, w: 222, h: 32, title: { go: case "sms", python: '== "sms"', typescript: case "sms", rust: '"sms" =>' } }
+      after:  { x: 350, y: 204, w: 62, h: 40, title: SMS }
+    - id: push
+      kind: concrete
+      before: { x: 188, y: 168, w: 222, h: 32, title: { go: case "push", python: '== "push"', typescript: case "push", rust: '"push" =>' } }
+      after:  { x: 420, y: 204, w: 62, h: 40, title: Push }
+    - id: whatsapp
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 214, w: 222, h: 32, title: { go: case "whatsapp", python: '== "whatsapp"', typescript: case "whatsapp", rust: '"whatsapp" =>' } }
+      after:  { x: 490, y: 204, w: 66, h: 40, title: WhatsApp }
+  edges:
+    - { from: client, to: context, label: plugs in }
+    - { from: context, to: strategy, label: calls }
+    - { from: email, to: strategy, kind: implements }
+    - { from: sms, to: strategy, kind: implements, label: implements }
+    - { from: push, to: strategy, kind: implements }
+    - { from: whatsapp, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: notify.go
+      source: |
+        // notify.go
+        func (s *Service) Notify(u User, m Message, t time.Time) error {
+            switch u.Channel {
+            case "sms", "push": // these wake people up
+                if quietHours(t) {
+                    return s.later.Enqueue(u, m)
+                }
+            }
+
+            switch u.Channel {
+            case "email":
+                return s.email.SendEmail(u.Email, m.Subject, m.Body)
+            case "sms":
+                return s.sms.SendSMS(u.Phone, m.Short())
+            case "push":
+                return s.push.SendPush(u.DeviceToken, m.Subject)
+            default:
+                return fmt.Errorf("unknown channel %q", u.Channel)
+            }
+        }
+      roles: { context: [2, 20], email: [11, 12], sms: [13, 14], push: [15, 16], quiet: [3, 8] }
+      change:
+        - { line: 4, replace: '    case "sms", "push", "whatsapp": // these wake people up' }
+        - { after: 16, add: ['    case "whatsapp":', '        return s.whatsapp.SendTemplate(u.Phone, m.TemplateID, m.Params)'] }
+    after:
+      file: notify.go · main.go
+      source: |
+        type Notifier interface {
+            Send(u User, m Message) error
+            WakesPeople() bool
+        }
+
+        type Service struct {
+            channels map[string]Notifier
+            later    Queue
+        }
+
+        func (s *Service) Notify(u User, m Message, t time.Time) error {
+            n, ok := s.channels[u.Channel]
+            if !ok {
+                return fmt.Errorf("unknown channel %q", u.Channel)
+            }
+            if n.WakesPeople() && quietHours(t) {
+                return s.later.Enqueue(u, m)
+            }
+            return n.Send(u, m)
+        }
+
+        // main.go: the one place that names channels
+        svc := &Service{later: q, channels: map[string]Notifier{
+            "email": ses.New(cfg), "sms": twilio.New(cfg), "push": fcm.New(cfg),
+        }}
+      roles: { strategy: [1, 4], context: [6, 20], client: [22, 25], lookup: [12, 15], quiet: [16, 18], dispatch: [19, 19] }
+    again:
+      file: whatsapp.go
+      source: |
+        // whatsapp.go: a new type; Notify does not change
+        type WhatsApp struct{ api *whatsapp.Client }
+
+        func (w WhatsApp) Send(u User, m Message) error {
+            return w.api.SendTemplate(u.Phone, m.TemplateID, m.Params)
+        }
+
+        func (WhatsApp) WakesPeople() bool { return true }
+
+        // main.go gains one entry: "whatsapp": WhatsApp{api: wa},
+    cost:
+      before: { text: 3 lines · 2 places in Notify, value: 0.7 }
+      after: { text: 1 new type · 1 map entry, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Go interfaces are satisfied implicitly: `WhatsApp` never mentions `Notifier`. Keep them small, and define them where they are used (here, next to `Service`), not next to the implementations. A one-method interface is the most common kind in Go.'
+      seenIn: '`io.Writer` and `io.Reader` (files, sockets, buffers, gzip streams all fit). `http.Handler`. The built-in `error` interface, which is one method, `Error() string`.'
+
+  python:
+    before:
+      file: notify.py
+      source: |
+        # notify.py
+        class NotificationService:
+            def notify(self, user: User, msg: Message, now: datetime) -> None:
+                if user.channel in ("sms", "push"):  # these wake people up
+                    if quiet_hours(now):
+                        self.later.enqueue(user, msg)
+                        return
+
+                if user.channel == "email":
+                    self.email.send_email(user.email, msg.subject, msg.body)
+                elif user.channel == "sms":
+                    self.sms.send_sms(user.phone, msg.short())
+                elif user.channel == "push":
+                    self.push.send_push(user.device_token, msg.subject)
+                else:
+                    raise ValueError(f"unknown channel {user.channel!r}")
+      roles: { context: [2, 16], email: [9, 10], sms: [11, 12], push: [13, 14], quiet: [4, 7] }
+      change:
+        - { line: 4, replace: '        if user.channel in ("sms", "push", "whatsapp"):  # these wake people up' }
+        - { after: 14, add: ['        elif user.channel == "whatsapp":', '            self.whatsapp.send_template(user.phone, msg.template_id, msg.params)'] }
+    after:
+      file: notify.py · main.py
+      source: |
+        from typing import Protocol
+
+        class Notifier(Protocol):
+            wakes_people: bool
+            def send(self, user: User, msg: Message) -> None: ...
+
+        class NotificationService:
+            def __init__(self, channels: dict[str, Notifier], later: Queue):
+                self.channels = channels
+                self.later = later
+
+            def notify(self, user: User, msg: Message, now: datetime) -> None:
+                notifier = self.channels[user.channel]  # KeyError if unknown
+                if notifier.wakes_people and quiet_hours(now):
+                    self.later.enqueue(user, msg)
+                    return
+                notifier.send(user, msg)
+
+        # main.py: the one place that names channels
+        service = NotificationService(
+            {"email": SesEmail(cfg), "sms": TwilioSms(cfg), "push": FcmPush(cfg)}, later)
+      roles: { strategy: [3, 5], context: [7, 17], client: [19, 21], lookup: [13, 13], quiet: [14, 16], dispatch: [17, 17] }
+    again:
+      file: whatsapp.py
+      source: |
+        # whatsapp.py: a new class; notify() does not change
+        class WhatsApp:
+            wakes_people = True
+
+            def __init__(self, api: WhatsAppClient):
+                self.api = api
+
+            def send(self, user: User, msg: Message) -> None:
+                self.api.send_template(user.phone, msg.template_id, msg.params)
+    cost:
+      before: { text: 3 lines · 2 places in notify, value: 0.7 }
+      after: { text: 1 new class · 1 dict entry, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Python has always worked this way: any object with a `send` method can be called. A `Protocol` writes the expectation down so mypy or pyright can check it. Nothing checks it at runtime, so a missing attribute surfaces only when that line runs.'
+      seenIn: '"File-like objects": `json.dump(obj, fp)` writes to anything with a `write` method. `len(x)` calls `x.__len__()`. `with` works on any object with `__enter__` and `__exit__`.'
+
+  typescript:
+    before:
+      file: notify.ts
+      source: |
+        // notify.ts
+        async notify(user: User, msg: Message, now: Date): Promise<void> {
+          if (user.channel === "sms" || user.channel === "push") {
+            // these wake people up
+            if (quietHours(now)) return this.later.enqueue(user, msg);
+          }
+
+          switch (user.channel) {
+            case "email":
+              return this.email.sendEmail(user.email, msg.subject, msg.body);
+            case "sms":
+              return this.sms.sendSms(user.phone, short(msg));
+            case "push":
+              return this.push.sendPush(user.deviceToken, msg.subject);
+            default:
+              throw new Error(`unknown channel ${user.channel}`);
+          }
+        }
+      roles: { context: [2, 18], email: [9, 10], sms: [11, 12], push: [13, 14], quiet: [3, 6] }
+      change:
+        - { line: 3, replace: '  if (user.channel === "sms" || user.channel === "push" || user.channel === "whatsapp") {' }
+        - { after: 14, add: ['    case "whatsapp":', '      return this.whatsapp.sendTemplate(user.phone, msg.templateId, msg.params);'] }
+    after:
+      file: notify.ts · main.ts
+      source: |
+        interface Notifier {
+          readonly wakesPeople: boolean;
+          send(user: User, msg: Message): Promise<void>;
+        }
+
+        class NotificationService {
+          constructor(
+            private readonly channels: Map<string, Notifier>,
+            private readonly later: Queue,
+          ) {}
+
+          async notify(user: User, msg: Message, now: Date): Promise<void> {
+            const n = this.channels.get(user.channel);
+            if (!n) throw new Error(`unknown channel ${user.channel}`);
+            if (n.wakesPeople && quietHours(now)) return this.later.enqueue(user, msg);
+            return n.send(user, msg);
+          }
+        }
+
+        // main.ts: the one place that names channels
+        const service = new NotificationService(new Map<string, Notifier>([
+          ["email", new SesEmail(cfg)], ["sms", new TwilioSms(cfg)], ["push", new FcmPush(cfg)],
+        ]), later);
+      roles: { strategy: [1, 4], context: [6, 18], client: [20, 23], lookup: [13, 14], quiet: [15, 15], dispatch: [16, 16] }
+    again:
+      file: whatsapp.ts
+      source: |
+        // whatsapp.ts: a new class; notify() does not change
+        export class WhatsApp implements Notifier {
+          readonly wakesPeople = true;
+          constructor(private readonly api: WhatsAppClient) {}
+
+          send(user: User, msg: Message): Promise<void> {
+            return this.api.sendTemplate(user.phone, msg.templateId, msg.params);
+          }
+        }
+    cost:
+      before: { text: 3 lines · 2 places in notify, value: 0.7 }
+      after: { text: 1 new class · 1 map entry, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Types are structural, so `implements Notifier` is optional: any object with `wakesPeople` and `send` of the right types fits, including a plain object literal in a test. Writing `implements` moves the error to the class, where it is easier to read.'
+      seenIn: '`for…of` works on any object with a `[Symbol.iterator]()` method. `JSON.stringify` calls `toJSON()` when an object has one. `await` accepts any object with a `then` method.'
+
+  rust:
+    before:
+      file: notify.rs
+      source: |
+        // notify.rs
+        fn notify(&self, user: &User, msg: &Message, now: DateTime<Utc>) -> Result<(), NotifyError> {
+            if matches!(user.channel.as_str(), "sms" | "push") && quiet_hours(now) {
+                return self.later.enqueue(user, msg); // these wake people up
+            }
+
+            match user.channel.as_str() {
+                "email" => self.email.send_email(&user.email, &msg.subject, &msg.body),
+                "sms" => self.sms.send_sms(&user.phone, &msg.short()),
+                "push" => self.push.send_push(&user.device_token, &msg.subject),
+                other => Err(NotifyError::UnknownChannel(other.into())),
+            }
+        }
+      roles: { context: [2, 13], email: [8, 8], sms: [9, 9], push: [10, 10], quiet: [3, 5] }
+      change:
+        - { line: 3, replace: '    if matches!(user.channel.as_str(), "sms" | "push" | "whatsapp") && quiet_hours(now) {' }
+        - { after: 10, add: ['        "whatsapp" => self.whatsapp.send_template(&user.phone, &msg.template_id, &msg.params),'] }
+    after:
+      file: notify.rs · main.rs
+      source: |
+        trait Notifier {
+            fn send(&self, user: &User, msg: &Message) -> Result<(), NotifyError>;
+            fn wakes_people(&self) -> bool;
+        }
+
+        struct NotificationService {
+            channels: HashMap<String, Box<dyn Notifier>>,
+            later: Queue,
+        }
+
+        impl NotificationService {
+            fn notify(&self, user: &User, msg: &Message, now: DateTime<Utc>) -> Result<(), NotifyError> {
+                let n = self.channels.get(&user.channel)
+                    .ok_or_else(|| NotifyError::UnknownChannel(user.channel.clone()))?;
+                if n.wakes_people() && quiet_hours(now) {
+                    return self.later.enqueue(user, msg);
+                }
+                n.send(user, msg)
+            }
+        }
+
+        // main.rs: the one place that names channels
+        let mut channels: HashMap<String, Box<dyn Notifier>> = HashMap::new();
+        channels.insert("email".into(), Box::new(SesEmail::new(&cfg)));
+        channels.insert("sms".into(), Box::new(TwilioSms::new(&cfg)));
+        channels.insert("push".into(), Box::new(FcmPush::new(&cfg)));
+      roles: { strategy: [1, 4], context: [6, 20], client: [22, 26], lookup: [13, 14], quiet: [15, 17], dispatch: [18, 18] }
+    again:
+      file: whatsapp.rs
+      source: |
+        // whatsapp.rs: a new type; notify() does not change
+        struct WhatsApp { api: whatsapp::Client }
+
+        impl Notifier for WhatsApp {
+            fn send(&self, user: &User, msg: &Message) -> Result<(), NotifyError> {
+                self.api.send_template(&user.phone, &msg.template_id, &msg.params)
+            }
+            fn wakes_people(&self) -> bool { true }
+        }
+    cost:
+      before: { text: 2 lines · 2 places in notify, value: 0.6 }
+      after: { text: 1 new type · 1 insert, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Traits are opt-in: `impl Notifier for WhatsApp` is where the compiler checks every method. Use `Box<dyn Notifier>` when the set is built at runtime, as in this map. When one call site always gets one type, a generic `fn run(n: &impl Notifier)` is compiled per type and needs no vtable.'
+      seenIn: '`std::io::Write` (files, `TcpStream`, `Vec<u8>`). `Iterator`, which every `for` loop uses. `std::fmt::Display`, which `println!("{}", x)` calls.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: '`main` builds the map from channel names to notifiers. This is the only place that knows which channels exist.'
+    nodes: [client]
+    edges: [client>context]
+    role: client
+  - text: A message arrives for a user on SMS. The service looks the name up and gets back some Notifier. It does not know, or ask, which type.
+    nodes: [context]
+    edges: []
+    role: lookup
+  - text: { go: 'It asks `n.WakesPeople()`. SMS answers yes, and it is 03:12, so the message waits in the queue. Email would have answered no.', python: 'It reads `notifier.wakes_people`. SMS says yes, and it is 03:12, so the message waits in the queue. Email would have said no.', typescript: 'It reads `n.wakesPeople`. SMS says yes, and it is 03:12, so the message waits in the queue. Email would have said no.', rust: 'It calls `n.wakes_people()`. SMS answers yes, and it is 03:12, so the message waits in the queue. Email would have answered no.' }
+    nodes: [context, strategy, sms]
+    edges: [context>strategy, sms>strategy]
+    role: quiet
+  - text: In the afternoon, the same line calls send, and SMS's own code runs. One call site, a different behaviour per value. That is polymorphism, and it replaced both switches.
+    nodes: [strategy, sms]
+    edges: [context>strategy, sms>strategy]
+    role: dispatch
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A report exporter has `if format == "csv" … elif format == "xlsx" … elif format == "pdf"` in three functions. What does polymorphism change?
+    options:
+      - text: Each format becomes a type with the same methods, and the three functions call those methods without checking the format.
+        correct: true
+        why: Right. The branch moves into the types, once. The three functions stop naming formats, so a new format edits none of them.
+      - text: The three if-chains move into one shared helper function that all three call.
+        why: That removes duplication, but the helper still names every format. A new format still edits it, and the callers still depend on the full list.
+      - text: Each format gets its own copy of the three functions, chosen by a flag at startup.
+        why: That duplicates the callers instead of the variants. Polymorphism keeps one caller and many implementations.
+  engineer:
+    question: Your Notifier interface has Send and WakesPeople. A teammate wants to add RetryPolicy, SupportsAttachments and Cost, because some channels need them. What is the better response?
+    options:
+      - text: Keep Notifier to what notify() calls. Code that needs attachments or cost should depend on its own small interface.
+        correct: true
+        why: Right. A small interface is easy to implement, fake and read. Every method you add is a method every channel, and every test fake, must provide.
+      - text: Add all three, with defaults that return zero values, so existing channels still compile.
+        why: Defaults hide the question of whether a channel really supports a feature. Callers then cannot tell "no" from "nobody implemented this".
+      - text: Add them, and use a type check in notify() for the channels that support them.
+        why: That brings back the type checks the interface removed. The caller starts naming channels again.
+  deep:
+    question: A new Slack notifier has send but not wakesPeople. When is the mistake caught?
+    options:
+      - text: In Go, TypeScript and Rust when the code compiles, where Slack is stored as a Notifier. In Python only when the missing attribute is read at runtime, unless a type checker runs first.
+        correct: true
+        why: Right. Static languages check the method set where the value is converted to the interface type. Python's Protocol is a hint for mypy or pyright; the interpreter finds out on the line that reads it.
+      - text: In all four languages, at runtime, the first time Slack is used.
+        why: Go, TypeScript and Rust refuse to compile the conversion. Only Python waits for runtime.
+      - text: In all four languages, at compile time, because every one of them has an interface or Protocol type.
+        why: Python does not check Protocols when the program runs. Without mypy or pyright, the missing attribute is an AttributeError at runtime.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Caller
+      example: NotificationService.notify
+      job: Calls methods on the interface. Never asks which type it holds.
+    - role: Interface
+      example: { go: "Notifier (interface)", python: "Notifier (Protocol)", typescript: "Notifier (interface)", rust: "Notifier (trait)" }
+      job: The few methods the caller needs, named once.
+    - role: Implementation
+      example: "Email, SMS, Push, WhatsApp"
+      job: One way of doing those methods each. Can have more methods; the caller does not see them.
+    - role: Wiring
+      example: main
+      job: The one place that knows the concrete types and plugs them in.
+  useWhen:
+    - The same decision about a type is made in more than one place (here, quiet hours and sending).
+    - New implementations are expected, or you want a fake in tests.
+    - Callers only need a few operations from a richer object.
+  avoidWhen:
+    - There is one implementation and no test that needs another. An interface with one implementation is indirection with nothing on the other side.
+    - The set of cases is closed and owned by you, and you want the compiler to force every caller to handle each one. An enum with an exhaustive match does that better.
+  tradeoffs:
+    - You read one more name (the interface) to find the code that runs.
+    - Calls through an interface are indirect and usually not inlined.
+    - The interface is a contract. Changing it changes every implementation and every fake.
+  lookalikes:
+    - name: Strategy
+      how: Strategy is this idea applied to one step that varies, chosen by the caller. Interfaces and polymorphism are the mechanism under it and most other patterns.
+    - name: Enum with exhaustive match
+      how: The opposite trade. Adding a case edits every match, but the compiler finds them all. Good for closed sets such as order states; poor for open sets such as channels.
+    - name: Adapter
+      how: Makes an existing type with the wrong methods fit an interface, by wrapping it. Useful when the implementation is a library you cannot edit.
+---
+
+## [concept] Interfaces and polymorphism
+
+**Let callers depend on a small <Term id="interface">interface</Term>, so any implementation can be plugged in and the caller never checks which one it got.**
+
+The caller writes one call. Each implementation runs its own code behind it. That is <Term id="polymorphism">polymorphism</Term>, and it replaces the type checks that would otherwise spread through the caller.
+
+<Depth level={2}>
+An interface is a promise about methods: "whatever you give me can `send` and can tell me whether it `wakesPeople`". The caller programs against that promise. A new implementation only has to keep it. It never has to be known to the caller, and it can have extra methods the caller ignores.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* book states this as its first principle of reusable design: program to an interface, not an implementation. Its argument is about dependencies. A caller that names concrete classes depends on all of them, and on their number. A caller that names one interface depends on that alone. Something still has to create the concrete objects, which is why that book follows the principle with the creational patterns.
+</Depth>
+
+## [problem] A notifier that knows every channel
+
+A notification service sends password resets, shipping updates and login alerts. Each user picks a channel: email, SMS or push. SMS and push wake people up, so at night they wait in a queue until morning.
+
+Read it once. The list of channels appears twice: in the quiet-hours check, and in the switch that sends.
+
+<Depth level={2}>
+Each branch calls a different client with different arguments, so the switch is not just noise. But both checks are questions about the channel ("do you wake people?", "how do you send?") that the caller answers on the channel's behalf.
+</Depth>
+
+<Depth level={3}>
+Testing `Notify` means building a Service with real email, SMS and push clients, or adding a "fake" case to the switch. Neither is good. The first sends real messages or needs network stubs. The second puts test code in production.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the Brazil launch needs WhatsApp as a notification channel.
+
+Two places change, and only one of them fails loudly if you forget it. Miss the send switch and WhatsApp users get an error. Miss the quiet-hours list and everything compiles, every test passes, and customers get WhatsApp messages at three in the morning.
+
+<Depth level={2}>
+This is the cost of type checks: one fact about WhatsApp (it wakes people) lives in the caller, far from WhatsApp's code. Every new channel has to visit every place the caller branches, and the caller grows with each one.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">A Rust enum with an exhaustive `match` would catch the forgotten arm. Here the channel is a string from the user's settings, so `matches!` and the catch-all arm `other =>` hide the gap.</Lang>
+<Lang only="go">Go's `switch` has no exhaustiveness check, and a string switch has nothing to check against anyway. The forgotten case falls through to the default, silently in the quiet-hours switch.</Lang>
+<Lang only="python">Python cannot warn here. `user.channel in ("sms", "push")` is simply false for `"whatsapp"`.</Lang>
+<Lang only="typescript">If `channel` were a union type, `switch` plus a `never` check could catch the missing case. The `||` chain in the quiet-hours check would still be wrong without a warning.</Lang>
+</Depth>
+
+## [morph] Ask the channel instead
+
+Drag the slider. Both checks collapse into two methods on one interface. Each channel answers the questions about itself.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+`notify` now depends on `Notifier` and on the map it was given, nothing else. Each channel can be tested alone, and `notify` can be tested with a fake that records messages. The map is built in `main`, the one place that has to know concrete types.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`WhatsApp` never says it implements `Notifier`. Having both methods is enough, and the compiler checks it where the value is put in the `map[string]Notifier`.</Lang>
+<Lang only="python">`Notifier` is a `Protocol`: a description for type checkers. At runtime, `notify` calls whatever is in the dict. That is <Term id="duck-typing">duck typing</Term>, written down.</Lang>
+<Lang only="typescript">TypeScript checks shape, not ancestry (<Term id="structural-typing">structural typing</Term>). A test can pass `{ wakesPeople: false, send: async () => {} }` and it fits.</Lang>
+<Lang only="rust">Each type opts in with `impl Notifier for …`. The map stores `Box<dyn Notifier>`, so channels of different types and sizes can live in one collection.</Lang>
+</Depth>
+
+## [walk] Follow one message
+
+One SMS, sent at 03:12 and again in the afternoon. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">A call through an interface loads the method address from the <Term id="itab">itab</Term> stored with the value and calls it indirectly: <Term id="dynamic-dispatch">dynamic dispatch</Term>. The itab for each (type, interface) pair is built once and cached.</Lang>
+<Lang only="python">`notifier.send(...)` looks up `send` on the object's class at runtime and calls it. There is no table to check against, so a wrong object fails on this line, not earlier.</Lang>
+<Lang only="typescript">The interface is erased at compile time. At runtime `n.send` is a property lookup; V8's inline caches keep it fast while a call site sees only a few object shapes.</Lang>
+<Lang only="rust">`Box<dyn Notifier>` is a fat pointer: one pointer to the data, one to a vtable with `send` and `wakes_people`. Each call goes through the vtable: <Term id="dynamic-dispatch">dynamic dispatch</Term>.</Lang>
+</Depth>
+
+## [again] WhatsApp, the second time
+
+The same request, after the refactor. You write one new type that answers both questions, and add one entry to the map in `main`. `notify` does not change, so it cannot forget the quiet hours.
+
+<Depth level={2}>
+The fact that WhatsApp wakes people now lives in WhatsApp's own file, next to the code that sends. The compiler (or, in Python, a type checker) makes sure it is answered at all.
+</Depth>
+
+<Depth level={3}>
+Tests split the same way. WhatsApp gets its own tests against the provider's sandbox. `notify` is tested once with a fake notifier, and those tests never change when a channel is added.
+</Depth>
+
+## [play] Plug channels into two notifiers
+
+Two copies of the notification service take the same plugs: one talks to an interface, one checks the channel name. Each plug ships at once, and three customers on that channel get a message, one of them at 03:12.
+
+Plug in WhatsApp, a half-finished Slack notifier and a test fake. Watch which service has to change, and which customers notice.
+
+## [lens] How each language writes it
+
+Every language here has a way to say "anything with these methods". They differ on when the promise is checked.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+In the playground, switching to Python changes how the half-finished Slack notifier fails.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="interfaces-and-polymorphism" />
+
+### Small interfaces
+
+Define an interface where it is used, with only the methods that caller needs. The notifier needs `send` and `wakesPeople`, so that is the interface, even if the Twilio client has forty methods. Small interfaces are easy to implement, easy to fake and hard to misuse. If another caller needs more, give it its own interface.
