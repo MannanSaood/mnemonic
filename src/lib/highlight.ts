@@ -1,5 +1,5 @@
 import { createCssVariablesTheme, createHighlighter, type Highlighter } from "shiki";
-import type { Lang, Tok } from "./types";
+import type { Lang, Tok } from "./types.ts";
 
 // Colours come from CSS variables (--shiki-token-*), so code follows the light/dark theme
 // without highlighting twice.

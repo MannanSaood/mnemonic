@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 import YAML from "yaml";
-import { PLAYGROUND_NAMES } from "../playgrounds/names";
 import {
   DEPTH_NAMES,
   LANGS,
@@ -18,10 +17,18 @@ import {
   type StepKey,
   type TopicMeta,
   type Track,
-} from "./types";
-import { highlightLines } from "./highlight";
+} from "./types.ts";
+import { highlightLines } from "./highlight.ts";
 
 const CONTENT = path.join(process.cwd(), "content");
+const PLAYGROUNDS = path.join(process.cwd(), "src", "playgrounds");
+
+/** Playgrounds are folders src/playgrounds/<name>/ with a View.tsx (registered automatically). */
+export function playgroundNames(): string[] {
+  return fs.readdirSync(PLAYGROUNDS, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && fs.existsSync(path.join(PLAYGROUNDS, d.name, "View.tsx")))
+    .map((d) => d.name);
+}
 
 export interface StepSource { key: StepKey; title: string; mdx: string }
 export interface Topic { meta: TopicMeta; steps: StepSource[]; reference: string }
@@ -35,8 +42,18 @@ export function getTracks(): Track[] {
 let glossaryCache: Record<string, GlossaryEntry> | null = null;
 export function getGlossary(): Record<string, GlossaryEntry> {
   if (glossaryCache) return glossaryCache;
-  const list = YAML.parse(fs.readFileSync(path.join(CONTENT, "glossary.yaml"), "utf8")) as GlossaryEntry[];
-  glossaryCache = Object.fromEntries(list.map((g) => [g.id, g]));
+  // content/glossary.yaml plus one optional file per lesson in content/glossary/*.yaml
+  const files = [path.join(CONTENT, "glossary.yaml")];
+  const dir = path.join(CONTENT, "glossary");
+  if (fs.existsSync(dir)) for (const f of fs.readdirSync(dir).sort()) if (f.endsWith(".yaml")) files.push(path.join(dir, f));
+  glossaryCache = {};
+  for (const f of files) {
+    for (const g of (YAML.parse(fs.readFileSync(f, "utf8")) ?? []) as GlossaryEntry[]) {
+      if (glossaryCache[g.id] && glossaryCache[g.id].short !== g.short)
+        throw new Error(`[content] glossary term "${g.id}" is defined twice with different text (${path.relative(process.cwd(), f)})`);
+      glossaryCache[g.id] = g;
+    }
+  }
   return glossaryCache;
 }
 
@@ -134,12 +151,25 @@ function validate(file: string, meta: TopicMeta, steps: StepSource[], prose: str
     if (c.options.filter((o) => o.correct).length !== 1) fail(rel, `checks.${d} needs exactly one option with correct: true`);
   }
   // playgrounds: the lesson's own, and any <Playground model="..."> in the prose
-  const names = PLAYGROUND_NAMES as readonly string[];
+  const names = playgroundNames();
   if (!meta.playground?.model) fail(rel, "playground.model is missing: every lesson has a playground");
   if (!names.includes(meta.playground.model)) fail(rel, `unknown playground "${meta.playground.model}" (known: ${names.join(", ")})`);
   if (!meta.playground.scenarios?.length) fail(rel, "playground.scenarios needs at least one scenario");
   for (const m of prose.matchAll(/<Playground\s+model="([^"]+)"/g))
     if (!names.includes(m[1])) fail(rel, `unknown playground "${m[1]}" in the prose`);
+  // glossary terms and lens names used in the prose
+  const gl = getGlossary();
+  for (const m of prose.matchAll(/<Term\s+id="([^"]+)"/g)) if (!gl[m[1]]) fail(rel, `unknown glossary term "${m[1]}" (add it to content/glossary/<topic>.yaml)`);
+  for (const m of prose.matchAll(/<Lang\s+only="([^"]+)"/g)) if (!meta.languages.includes(m[1] as Lang)) fail(rel, `<Lang only="${m[1]}"> is not one of this topic's languages`);
+  for (const id of meta.glossary ?? []) if (!gl[id]) fail(rel, `glossary list names unknown term "${id}"`);
+  // code: before.change must point at real lines, and every walk step needs real nodes and edges
+  for (const lang of meta.languages) {
+    const n = meta.code[lang].before.source.replace(/\n$/, "").split("\n").length;
+    for (const op of meta.code[lang].before.change)
+      if ((op.after ?? op.line ?? 0) < 1 || (op.after ?? op.line ?? 0) > n) fail(rel, `code.${lang}.before.change points at line ${op.after ?? op.line}, outside 1..${n}`);
+  }
+  const edgeIds = new Set(meta.diagram.edges.map((e) => `${e.from}>${e.to}`));
+  for (const w of meta.walk) for (const e of w.edges) if (!edgeIds.has(e)) fail(rel, `walk names edge "${e}", which is not in diagram.edges`);
 }
 
 let prereqWarned = false;

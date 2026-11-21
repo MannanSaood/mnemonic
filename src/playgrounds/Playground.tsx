@@ -1,15 +1,10 @@
 "use client";
-// <Playground model="..." /> renders a registered playground. Usable in MDX anywhere.
-import type { ComponentType } from "react";
-import type { PlaygroundName } from "./names";
-import StrategyCheckout from "./strategy-checkout/View";
-
-const REGISTRY: Record<PlaygroundName, ComponentType> = {
-  "strategy-checkout": StrategyCheckout,
-};
+// <Playground model="..." /> renders the playground in src/playgrounds/<model>/View.tsx.
+// Usable in MDX anywhere. The registry is generated from the folders (scripts/gen-registry.mjs).
+import { REGISTRY } from "./registry.generated";
 
 export function Playground({ model }: { model: string }) {
-  const View = REGISTRY[model as PlaygroundName];
+  const View = REGISTRY[model];
   if (!View) return <p className="pg-empty">Unknown playground “{model}”.</p>;
   return <View />;
 }

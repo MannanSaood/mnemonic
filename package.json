@@ -4,10 +4,16 @@
   "private": true,
   "description": "Free interactive guides to software design and systems topics.",
   "scripts": {
+    "gen": "node scripts/gen-registry.mjs",
+    "predev": "node scripts/gen-registry.mjs",
     "dev": "next dev",
+    "prebuild": "node scripts/gen-registry.mjs",
     "build": "next build && pagefind --site out --output-subdir pagefind",
     "start": "npx serve out",
+    "pretypecheck": "node scripts/gen-registry.mjs",
     "typecheck": "tsc --noEmit",
+    "precheck": "node scripts/gen-registry.mjs",
+    "check": "node --experimental-strip-types --no-warnings scripts/check.ts",
     "test": "node --experimental-strip-types --no-warnings --test tests/*.test.ts"
   },
   "dependencies": {

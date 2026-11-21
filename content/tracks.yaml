@@ -3,7 +3,7 @@
   title: Software design and design patterns
   summary: Principles, the 23 classic patterns, and when not to use them, in Go, Python, TypeScript and Rust.
   status: live
-  groups: [Behavioral, Creational, Structural]
+  groups: [Principles, Creational, Structural, Behavioral]
 - id: go-internals
   title: Go internals
   summary: The scheduler, the garbage collector, interfaces and maps, as the runtime sees them.
