@@ -1,0 +1,712 @@
+---
+title: "Bytecode and a stack virtual machine"
+track: compilers
+group: Execution
+order: 12
+summary: Compile the syntax tree once into a flat list of instructions, then run it in one loop with an instruction pointer and a value stack.
+intent: Know what a compiler to bytecode produces, how a stack VM runs it, and why and and or become jumps.
+changeRequest: Every alert rule must now run against every series, every 10 seconds, 200 rules across 50,000 series.
+languages: [go, python, typescript, rust]
+glossary: [bytecode, stack-machine, instruction-pointer, jump-patching, abstract-syntax-tree, short-circuit-evaluation]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [compilers/syntax-trees-and-tree-walkers, compilers/scope-and-name-resolution]
+skills: [compilers, language-implementation]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: bytecode-and-stack-vm
+  scenarios:
+    - try: Answer the prediction, then step the Guarded ratio on the idle service.
+      notice: "requests > 0 leaves false on the stack. JUMP_IF_FALSE_OR_POP at 3 jumps straight to RETURN at 9, so 5 of 10 instructions run and the division never does."
+    - try: Set requests to 400 and errors to 30, and run it again.
+      notice: "Now the jump falls through: the VM pops true and runs the right side. Ten instructions, at most two values on the stack, the same answer as the tree walker."
+    - try: Switch to AND/OR instructions and run the Guarded ratio on the idle service.
+      notice: "Without the jump both sides run before AND can combine them, and DIV fails with division by zero. The tree walker short-circuits and never divides. Jumps are how bytecode keeps that."
+    - try: Look at the comparison table for the Mixed and/or rule.
+      notice: The walker makes one recursive call per node and one map lookup per metric name. The VM runs instructions from an array and reads metrics from slots by index. Multiply by 10 million evaluations every 10 seconds.
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: alert loop, sub: "eval(tree, metrics)" }
+      after:  { x: 12, y: 30, w: 112, h: 48, title: alert loop, sub: "run(chunk, slots)" }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: tree walker, sub: one call per node }
+      after:  { x: 150, y: 30, w: 150, h: 56, title: VM loop, sub: "ip · stack" }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 30, w: 110, h: 56, title: "" }
+      after:  { x: 330, y: 30, w: 220, h: 56, title: chunk, sub: "code · consts · slots" }
+    - id: compiler
+      kind: concrete
+      before: { x: 170, y: 64, w: 230, h: 32, title: "type switch per node" }
+      after:  { x: 12, y: 190, w: 124, h: 52, title: compiler, sub: once, at save }
+    - id: stack
+      kind: concrete
+      before: { x: 170, y: 106, w: 230, h: 32, title: "map lookup per name" }
+      after:  { x: 146, y: 190, w: 124, h: 52, title: value stack, sub: pop 2 · push 1 }
+    - id: jump
+      kind: concrete
+      before: { x: 170, y: 148, w: 230, h: 32, title: "and: return if false" }
+      after:  { x: 280, y: 190, w: 124, h: 52, title: jumps, sub: "and · or" }
+    - id: scale
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 206, w: 230, h: 32, title: "10M evals every 10 s" }
+      after:  { x: 414, y: 190, w: 134, h: 52, title: 10M runs, sub: one flat loop each }
+  edges:
+    - { from: client, to: context, label: runs }
+    - { from: context, to: strategy, label: reads }
+    - { from: compiler, to: strategy, label: emits }
+    - { from: stack, to: context, label: operands }
+    - { from: jump, to: context, label: moves ip }
+    - { from: scale, to: client }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: eval.go
+      source: |
+        // eval.go: walk the rule's tree for every series, every cycle
+        func eval(e Expr, metrics map[string]Value) (Value, error) {
+            switch e := e.(type) {
+            case *Leaf:
+                if e.Tok.Kind == Name {
+                    return metrics[e.Tok.Text], nil
+                }
+                return e.Value, nil
+            case *Binary:
+                l, err := eval(e.Left, metrics)
+                if err != nil {
+                    return nil, err
+                }
+                if e.Op == "and" && l == false || e.Op == "or" && l == true {
+                    return l, nil // short-circuit
+                }
+                r, err := eval(e.Right, metrics)
+                if err != nil {
+                    return nil, err
+                }
+                return apply(e.Op, l, r)
+            }
+            return nil, fmt.Errorf("unknown node %T", e)
+        }
+
+        // every 10 seconds:
+        for _, rule := range rules {
+            for _, s := range series {
+                fire, err := eval(rule.Tree, s.Metrics)
+                // ...
+            }
+        }
+      roles: { client: [26, 32], context: [2, 24], compiler: [3, 4], stack: [5, 6], jump: [14, 16], scale: [26, 29] }
+      change:
+        - { line: 26, replace: "// every 10 seconds, now 200 rules × 50,000 series = 10,000,000 evals:" }
+        - { after: 29, add: ["        // each eval: a call and a type switch per node, a map lookup per name"] }
+        - { after: 32, add: ["// the cycle overruns 10 s, and alerts fire late"] }
+    after:
+      file: vm.go
+      source: |
+        // vm.go: compile each rule once to bytecode, then run it in a loop
+        type Instr struct {
+            Op  Op  // OpConst, OpLoad, OpGt, OpDiv, ..., OpJumpIfFalseOrPop, OpReturn
+            Arg int // constant index, slot index or jump target
+        }
+
+        type Chunk struct {
+            Code   []Instr
+            Consts []Value
+            Slots  []string // metric names, turned into indexes at compile time
+        }
+
+        func (c *Chunk) compile(e Expr) {
+            switch e := e.(type) {
+            case *Leaf:
+                if e.Tok.Kind == Name {
+                    c.emit(OpLoad, c.slot(e.Tok.Text))
+                } else {
+                    c.emit(OpConst, c.constant(e.Value))
+                }
+            case *Binary:
+                c.compile(e.Left)
+                if jumpOp, ok := shortCircuit[e.Op]; ok { // "and", "or"
+                    j := c.emit(jumpOp, -1)
+                    c.compile(e.Right)
+                    c.Code[j].Arg = len(c.Code) // patch: jump to just past the right side
+                    return
+                }
+                c.compile(e.Right)
+                c.emit(binaryOps[e.Op], 0)
+            }
+        }
+
+        func run(c *Chunk, slots []Value) (Value, error) {
+            stack := make([]Value, 0, 16)
+            for ip := 0; ; {
+                in := c.Code[ip]
+                ip++
+                switch in.Op {
+                case OpConst:
+                    stack = append(stack, c.Consts[in.Arg])
+                case OpLoad:
+                    stack = append(stack, slots[in.Arg])
+                case OpJumpIfFalseOrPop, OpJumpIfTrueOrPop:
+                    if stack[len(stack)-1] == (in.Op == OpJumpIfTrueOrPop) {
+                        ip = in.Arg // already decided: keep the value, skip the right side
+                    } else {
+                        stack = stack[:len(stack)-1]
+                    }
+                case OpReturn:
+                    return stack[len(stack)-1], nil
+                default: // binary: pop two, push one
+                    a, b := stack[len(stack)-2], stack[len(stack)-1]
+                    v, err := apply(in.Op, a, b)
+                    if err != nil {
+                        return nil, err
+                    }
+                    stack = append(stack[:len(stack)-2], v)
+                }
+            }
+        }
+      roles: { strategy: [2, 11], context: [34, 61], client: [34, 34], compiler: [13, 32], stack: [52, 58], jump: [44, 49], scale: [36, 39], compile: [13, 20], patch: [21, 28], loop: [36, 39], stackop: [52, 58], skip: [44, 49] }
+    again:
+      file: vm.go
+      source: |
+        // Saving a rule runs compile once. Every cycle only runs the loop:
+        //   0 LOAD requests · 1 CONST 0 · 2 GT · 3 JUMP_IF_FALSE_OR_POP 9 · 4 LOAD errors
+        //   5 LOAD requests · 6 DIV · 7 CONST 0.05 · 8 GT · 9 RETURN
+        // On an idle service: 5 instructions, one jump over the division, no name lookups.
+    cost:
+      before: { text: 10M tree walks · cycle overruns, value: 0.85 }
+      after: { text: compiled once · flat loop, value: 0.3 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: 'Go compiles ahead of time to machine code, so Go programs have no bytecode VM of their own. You meet this design inside libraries that run small languages: they compile a pattern or an expression once into a program of instructions and run that many times.'
+      seenIn: '`regexp/syntax.Compile` turns a parsed pattern into a `*syntax.Prog`, a list of instructions whose `String()` prints them, and `regexp` runs it. `expr-lang/expr` compiles expressions to bytecode for its own VM (`expr.Compile`, then `expr.Run`). `go build -gcflags=-S` prints the machine code Go itself produces.'
+
+  python:
+    before:
+      file: evaluate.py
+      source: |
+        # evaluate.py: walk the rule's tree for every series, every cycle
+        def evaluate(e: Expr, metrics: dict[str, Value]) -> Value:
+            match e:
+                case Leaf(tok) if tok.kind == "NAME":
+                    return metrics[tok.text]
+                case Leaf():
+                    return e.value
+                case Binary(op="and", left=l, right=r):
+                    return evaluate(l, metrics) and evaluate(r, metrics)
+                case Binary(op="or", left=l, right=r):
+                    return evaluate(l, metrics) or evaluate(r, metrics)
+                case Binary(op=op, left=l, right=r):
+                    return OPERATORS[op](evaluate(l, metrics), evaluate(r, metrics))
+            raise TypeError(f"unknown node {e!r}")
+
+        # every 10 seconds:
+        for rule in rules:
+            for s in series:
+                fire = evaluate(rule.tree, s.metrics)
+      roles: { client: [16, 19], context: [2, 14], compiler: [3, 3], stack: [4, 5], jump: [8, 11], scale: [16, 19] }
+      change:
+        - { line: 16, replace: "# every 10 seconds, now 200 rules × 50,000 series = 10,000,000 evals:" }
+        - { after: 19, add: ["        # each eval: a call and a match per node, a dict lookup per name", "# the cycle overruns 10 s, and alerts fire late"] }
+    after:
+      file: vm.py
+      source: |
+        # vm.py: compile each rule once to bytecode, then run it in a loop
+        from dataclasses import dataclass, field
+        from enum import Enum, auto
+
+        class Op(Enum):
+            CONST = auto()                 # push consts[arg]
+            LOAD = auto()                  # push slots[arg]
+            BINARY = auto()                # pop b, pop a, push arg(a, b)
+            JUMP_IF_FALSE_OR_POP = auto()  # top false: jump to arg, keep it; else pop it
+            JUMP_IF_TRUE_OR_POP = auto()
+            RETURN = auto()
+
+        @dataclass
+        class Chunk:
+            code: list[tuple[Op, object]] = field(default_factory=list)
+            consts: list[Value] = field(default_factory=list)
+            slots: list[str] = field(default_factory=list)  # metric names, indexed at compile time
+
+            def compile(self, e: Expr) -> None:
+                match e:
+                    case Leaf(tok) if tok.kind == "NAME":
+                        self.code.append((Op.LOAD, self.slot(tok.text)))
+                    case Leaf():
+                        self.code.append((Op.CONST, self.constant(e.value)))
+                    case Binary(op="and" | "or" as op, left=l, right=r):
+                        self.compile(l)
+                        jump = len(self.code)
+                        self.code.append((Op.JUMP_IF_FALSE_OR_POP if op == "and" else Op.JUMP_IF_TRUE_OR_POP, None))
+                        self.compile(r)
+                        self.code[jump] = (self.code[jump][0], len(self.code))  # patch: just past the right side
+                    case Binary(op=op, left=l, right=r):
+                        self.compile(l)
+                        self.compile(r)
+                        self.code.append((Op.BINARY, OPERATORS[op]))  # operator.gt, operator.truediv, ...
+
+        def run(chunk: Chunk, slots: list[Value]) -> Value:
+            stack: list[Value] = []
+            ip = 0
+            while True:
+                op, arg = chunk.code[ip]
+                ip += 1
+                match op:
+                    case Op.CONST:
+                        stack.append(chunk.consts[arg])
+                    case Op.LOAD:
+                        stack.append(slots[arg])
+                    case Op.BINARY:
+                        b = stack.pop()
+                        stack.append(arg(stack.pop(), b))
+                    case Op.JUMP_IF_FALSE_OR_POP | Op.JUMP_IF_TRUE_OR_POP:
+                        if stack[-1] is (op is Op.JUMP_IF_TRUE_OR_POP):
+                            ip = arg  # already decided: keep the value, skip the right side
+                        else:
+                            stack.pop()
+                    case Op.RETURN:
+                        return stack.pop()
+      roles: { strategy: [13, 17], context: [36, 56], client: [36, 36], compiler: [19, 34], stack: [47, 49], jump: [50, 54], scale: [39, 42], compile: [19, 24], patch: [25, 30], loop: [39, 42], stackop: [47, 49], skip: [50, 54] }
+    again:
+      file: vm.py
+      source: |
+        # Saving a rule runs compile once. Every cycle only runs the loop:
+        #   LOAD requests · CONST 0 · BINARY gt · JUMP_IF_FALSE_OR_POP 9 · LOAD errors
+        #   LOAD requests · BINARY truediv · CONST 0.05 · BINARY gt · RETURN
+        # On an idle service: 5 instructions, one jump over the division, no name lookups.
+    cost:
+      before: { text: 10M tree walks · cycle overruns, value: 0.85 }
+      after: { text: compiled once · measure first, value: 0.45 }
+    lens:
+      need: 3
+      needLabel: Built in
+      note: 'CPython already is a bytecode compiler and a stack VM written in C. A VM loop written in Python runs on top of that one, so it is often no faster than the tree walker. Two faster routes keep the rule as data: compile the tree into nested closures, or build an `ast.Expression` from your own tree and pass it to `compile()`, so CPython''s VM runs the rule. Build the AST yourself; never paste rule text into `eval`.'
+      seenIn: '`dis.dis("requests > 0 and errors / requests > 0.05")` shows `COMPARE_OP`, a conditional jump over the right side and `BINARY_OP` for the division. Python 3.11 added the specializing adaptive interpreter (PEP 659), which rewrites instructions into type-specialized forms as the program runs.'
+
+  typescript:
+    before:
+      file: evaluate.ts
+      source: |
+        // evaluate.ts: walk the rule's tree for every series, every cycle
+        function evaluate(e: Expr, metrics: Map<string, Value>): Value {
+          switch (e.kind) {
+            case "leaf":
+              return e.token.kind === "name" ? metrics.get(e.token.text)! : e.value;
+            case "binary": {
+              const l = evaluate(e.left, metrics);
+              if ((e.op === "and" && l === false) || (e.op === "or" && l === true)) return l;
+              return apply(e.op, l, evaluate(e.right, metrics));
+            }
+          }
+        }
+
+        // every 10 seconds:
+        for (const rule of rules) {
+          for (const s of series) {
+            const fire = evaluate(rule.tree, s.metrics);
+          }
+        }
+      roles: { client: [14, 19], context: [2, 12], compiler: [3, 3], stack: [5, 5], jump: [8, 8], scale: [14, 17] }
+      change:
+        - { line: 14, replace: "// every 10 seconds, now 200 rules × 50,000 series = 10,000,000 evals:" }
+        - { after: 17, add: ["    // each eval: a call and a switch per node, a Map lookup per name"] }
+        - { after: 19, add: ["// the cycle overruns 10 s, and alerts fire late"] }
+    after:
+      file: vm.ts
+      source: |
+        // vm.ts: compile each rule once to bytecode, then run it in a loop
+        type Jump = { op: "jumpIfFalseOrPop" | "jumpIfTrueOrPop"; target: number };
+        type Instr =
+          | { op: "const"; arg: number } // push consts[arg]
+          | { op: "load"; arg: number } // push slots[arg]
+          | { op: "binary"; fn: (a: Value, b: Value) => Value }
+          | Jump
+          | { op: "return" };
+
+        interface Chunk { code: Instr[]; consts: Value[]; slots: string[] }
+
+        function compile(e: Expr, c: Chunk): void {
+          if (e.kind === "leaf") {
+            if (e.token.kind === "name") c.code.push({ op: "load", arg: slotOf(c, e.token.text) });
+            else c.code.push({ op: "const", arg: c.consts.push(e.value) - 1 });
+            return;
+          }
+          compile(e.left, c);
+          if (e.op === "and" || e.op === "or") {
+            const jump: Jump = { op: e.op === "and" ? "jumpIfFalseOrPop" : "jumpIfTrueOrPop", target: -1 };
+            c.code.push(jump);
+            compile(e.right, c);
+            jump.target = c.code.length; // patch: just past the right side
+            return;
+          }
+          compile(e.right, c);
+          c.code.push({ op: "binary", fn: OPERATORS[e.op] });
+        }
+
+        export function run(c: Chunk, slots: Value[]): Value {
+          const stack: Value[] = [];
+          for (let ip = 0; ; ) {
+            const ins = c.code[ip++];
+            switch (ins.op) {
+              case "const": stack.push(c.consts[ins.arg]); break;
+              case "load": stack.push(slots[ins.arg]); break;
+              case "binary": { const b = stack.pop()!; stack.push(ins.fn(stack.pop()!, b)); break; }
+              case "jumpIfFalseOrPop":
+              case "jumpIfTrueOrPop":
+                if (stack[stack.length - 1] === (ins.op === "jumpIfTrueOrPop")) ip = ins.target; // skip the right side
+                else stack.pop();
+                break;
+              case "return": return stack.pop()!;
+            }
+          }
+        }
+      roles: { strategy: [2, 10], context: [30, 46], client: [30, 30], compiler: [12, 28], stack: [37, 37], jump: [38, 42], scale: [32, 34], compile: [12, 17], patch: [19, 25], loop: [32, 34], stackop: [37, 37], skip: [38, 42] }
+    again:
+      file: vm.ts
+      source: |
+        // Saving a rule runs compile once. Every cycle only runs the loop:
+        //   load requests · const 0 · binary gt · jumpIfFalseOrPop 9 · load errors
+        //   load requests · binary div · const 0.05 · binary gt · return
+        // On an idle service: 5 instructions, one jump over the division, no name lookups.
+    cost:
+      before: { text: 10M tree walks · cycle overruns, value: 0.85 }
+      after: { text: compiled once · flat loop, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: The engine does it
+      note: 'Node.js already compiles your JavaScript to bytecode: V8''s Ignition interpreter runs a register machine with an accumulator, and hot functions are recompiled to machine code by its optimizing compilers. A VM written in JavaScript runs on top of that, so measure it against the simplest alternative, a tree compiled once into nested closures, which V8 optimizes well.'
+      seenIn: '`node --print-bytecode --print-bytecode-filter=name script.js` prints Ignition bytecode for one function. Generating source text for `new Function` is faster still, and it is an injection risk unless every piece is escaped.'
+
+  rust:
+    before:
+      file: eval.rs
+      source: |
+        // eval.rs: walk the rule's tree for every series, every cycle
+        pub fn eval(e: &Expr, metrics: &HashMap<String, Value>) -> Result<Value, EvalError> {
+            match e {
+                Expr::Name(name) => metrics.get(*name).cloned().ok_or(EvalError::Unknown),
+                Expr::Lit(v) => Ok(v.clone()),
+                Expr::Binary(op, l, r) => {
+                    let l = eval(l, metrics)?;
+                    if matches!((*op, &l), ("and", Value::Bool(false)) | ("or", Value::Bool(true))) {
+                        return Ok(l); // short-circuit
+                    }
+                    apply(op, l, eval(r, metrics)?)
+                }
+            }
+        }
+
+        // every 10 seconds:
+        for rule in &rules {
+            for s in &series {
+                let fire = eval(&rule.tree, &s.metrics)?;
+            }
+        }
+      roles: { client: [16, 21], context: [2, 14], compiler: [3, 3], stack: [4, 4], jump: [8, 10], scale: [16, 19] }
+      change:
+        - { line: 16, replace: "// every 10 seconds, now 200 rules × 50,000 series = 10,000,000 evals:" }
+        - { after: 19, add: ["        // each eval: a call and a match per node, a hash lookup per name"] }
+        - { after: 21, add: ["// the cycle overruns 10 s, and alerts fire late"] }
+    after:
+      file: vm.rs
+      source: |
+        // vm.rs: compile each rule once to bytecode, then run it in a loop
+        #[derive(Clone, Copy)]
+        pub enum Instr {
+            Const(u16),            // push consts[i]
+            Load(u16),             // push slots[i]
+            Binary(BinOp),         // pop b, pop a, push a op b
+            JumpIfFalseOrPop(u32), // top false: jump, keeping it; else pop it
+            JumpIfTrueOrPop(u32),
+            Return,
+        }
+
+        impl Chunk {
+            fn compile(&mut self, e: &Expr) {
+                match e {
+                    Expr::Name(n) => { let s = self.slot(n); self.code.push(Instr::Load(s)) }
+                    Expr::Lit(v) => { let k = self.constant(v.clone()); self.code.push(Instr::Const(k)) }
+                    Expr::Binary(op @ ("and" | "or"), l, r) => {
+                        self.compile(l);
+                        let j = self.code.len();
+                        self.code.push(Instr::Return); // placeholder, patched below
+                        self.compile(r);
+                        let past = self.code.len() as u32;
+                        self.code[j] = if *op == "and" { Instr::JumpIfFalseOrPop(past) } else { Instr::JumpIfTrueOrPop(past) };
+                    }
+                    Expr::Binary(op, l, r) => {
+                        self.compile(l);
+                        self.compile(r);
+                        self.code.push(Instr::Binary(BinOp::from(*op)));
+                    }
+                }
+            }
+        }
+
+        pub fn run(c: &Chunk, slots: &[Value]) -> Result<Value, EvalError> {
+            let mut stack: Vec<Value> = Vec::with_capacity(16);
+            let mut ip = 0;
+            loop {
+                let ins = c.code[ip];
+                ip += 1;
+                match ins {
+                    Instr::Const(i) => stack.push(c.consts[i as usize].clone()),
+                    Instr::Load(i) => stack.push(slots[i as usize].clone()),
+                    Instr::Binary(op) => {
+                        let b = stack.pop().unwrap();
+                        let a = stack.pop().unwrap();
+                        stack.push(op.apply(a, b)?);
+                    }
+                    Instr::JumpIfFalseOrPop(t) | Instr::JumpIfTrueOrPop(t) => {
+                        let jump_on = matches!(ins, Instr::JumpIfTrueOrPop(_));
+                        if stack.last() == Some(&Value::Bool(jump_on)) {
+                            ip = t as usize; // already decided: keep the value, skip the right side
+                        } else {
+                            stack.pop();
+                        }
+                    }
+                    Instr::Return => return Ok(stack.pop().unwrap()),
+                }
+            }
+        }
+      roles: { strategy: [2, 10], context: [34, 59], client: [34, 34], compiler: [12, 32], stack: [43, 47], jump: [48, 55], scale: [37, 40], compile: [13, 16], patch: [17, 24], loop: [37, 40], stackop: [43, 47], skip: [48, 55] }
+    again:
+      file: vm.rs
+      source: |
+        // Saving a rule runs compile once. Every cycle only runs the loop:
+        //   Load(requests) · Const(0) · Binary(Gt) · JumpIfFalseOrPop(9) · Load(errors)
+        //   Load(requests) · Binary(Div) · Const(0.05) · Binary(Gt) · Return
+        // On an idle service: 5 instructions, one jump over the division, no name lookups.
+    cost:
+      before: { text: 10M tree walks · cycle overruns, value: 0.85 }
+      after: { text: compiled once · flat loop, value: 0.25 }
+    lens:
+      need: 2
+      needLabel: For embedded languages
+      note: 'An enum of instructions that is `Copy` and a few bytes long packs tightly in a `Vec`, and the `match` in the loop usually compiles to a jump table. Rust itself compiles to machine code through MIR and LLVM, so you write a VM like this only for a language you embed, such as rules, queries or scripts.'
+      seenIn: 'Miri interprets Rust''s MIR to find undefined behaviour (`cargo miri test`), and rustc evaluates `const` items with a MIR interpreter too. `regex-automata` runs compiled NFA programs with its `PikeVM`. Wasmtime compiles WebAssembly, a stack-machine bytecode, to native code.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: When the rule is saved, the compiler walks the tree once, in post-order. Each operand becomes a push. Each metric name gets a slot number, so the VM will never look a name up.
+    nodes: [compiler, strategy]
+    edges: [compiler>strategy]
+    role: compile
+  - text: For and, the compiler emits a conditional jump with no target yet, compiles the right side, and then patches the target to the instruction just past it.
+    nodes: [compiler, jump, strategy]
+    edges: [compiler>strategy]
+    role: patch
+  - text: "Every cycle, the alert loop calls run for each series. The VM reads the instruction at ip, moves ip forward and does what the opcode says. There is no recursion: the whole evaluation is one loop over an array."
+    nodes: [client, context, strategy]
+    edges: [client>context, context>strategy]
+    role: loop
+  - text: "GT pops two values and pushes one boolean. Operands wait on the stack instead of in the call frames of a recursive walk."
+    nodes: [stack, context]
+    edges: [stack>context]
+    role: stackop
+  - text: "On an idle service requests > 0 leaves false on top. JUMP_IF_FALSE_OR_POP sees it and jumps to RETURN, so the division never runs. Five instructions, the same answer the tree walker gives."
+    nodes: [jump, context]
+    edges: [jump>context]
+    role: skip
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: In a stack VM, what does the instruction GT do?
+    options:
+      - text: It pops two values, compares them, and pushes true or false.
+        correct: true
+        why: Right. Operands come from the top of the stack and the result goes back on it, so the instruction needs no operand of its own.
+      - text: It jumps to another instruction if the comparison is true.
+        why: Jumps are separate instructions. GT only computes a boolean, and a later jump instruction may look at it.
+      - text: It walks the left and right children of a comparison node.
+        why: That is the tree walker. Bytecode has no children to walk; the operands were pushed by earlier instructions.
+  engineer:
+    question: How must and compile so that requests > 0 and errors / requests > 0.05 never divides by zero?
+    options:
+      - text: As a conditional jump after the left side that skips the right side when the left is false, with its target patched once the right side is compiled.
+        correct: true
+        why: Right. The jump is the bytecode form of short-circuit evaluation. Its target is only known after the right side is emitted, hence the patch.
+      - text: As an AND instruction after both sides, like the other binary operators.
+        why: Then both sides run before AND looks at them, and the division runs on an idle service. That is the break-it mode in the playground.
+      - text: As a check inside DIV that returns 0 when the divisor is 0.
+        why: That hides a real error everywhere else, and it still evaluates code the rule says not to evaluate.
+  deep:
+    question: Python 3.11 made its bytecode VM substantially faster without becoming a register machine or adding a JIT. What was the main technique?
+    options:
+      - text: A specializing adaptive interpreter. Instructions are rewritten in place into versions specialized for the types actually seen, such as adding two ints.
+        correct: true
+        why: Right. That is PEP 659. Generic instructions such as BINARY_OP check types on every run; the specialized forms skip most of that while the types stay the same.
+      - text: It switched the VM from a stack to registers.
+        why: CPython is still a stack VM. Register VMs, such as Lua's, run fewer instructions, but that change was not part of 3.11.
+      - text: It compiles bytecode to machine code the first time a function runs.
+        why: That is a JIT. CPython 3.13 added an experimental one, disabled by default, after the 3.11 speedups.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Compiler
+      example: { go: "Chunk.compile", python: "Chunk.compile", typescript: "compile(e, c)", rust: "Chunk::compile" }
+      job: Walks the tree once, in post-order, and emits instructions.
+    - role: Chunk
+      example: code · consts · slots
+      job: The compiled program, its constant table and the names behind each slot.
+    - role: Instruction pointer
+      example: ip
+      job: Index of the next instruction. Jumps set it.
+    - role: Value stack
+      example: "[]Value · list · Value[] · Vec<Value>"
+      job: Holds operands and intermediate results. Binary instructions pop two and push one.
+    - role: Dispatch loop
+      example: run(chunk, slots)
+      job: Fetch, advance ip, switch on the opcode, repeat until RETURN.
+  useWhen:
+    - The same program runs many times on different inputs, such as rules per series, queries per row or scripts per frame.
+    - Profiles show tree walking itself (calls, type dispatch, pointer chasing, lookups by name) as the cost.
+    - You want a serializable, cacheable compiled form.
+  avoidWhen:
+    - Programs run once or rarely. Compiling costs more than it saves.
+    - Your host language is itself a bytecode VM written in C, such as CPython. Compile to closures or to its own bytecode instead of stacking a VM on a VM.
+  tradeoffs:
+    - Bytecode is flat and compact, but debugging needs a disassembler and a map from instructions back to source spans.
+    - A stack VM is the simplest to compile for. A register VM runs fewer, larger instructions and needs a register allocator in the compiler.
+    - Every operator now exists twice, as a compiler case and as a VM case, and the two must agree. Test the VM against the tree walker.
+  lookalikes:
+    - name: Tree-walking interpreter
+      how: Evaluates the AST directly. Simpler, and fine until evaluation is hot.
+    - name: Closure compilation
+      how: Turns each node into a function that calls its children's functions. No VM, and often fast in JavaScript and Python.
+    - name: JIT compiler
+      how: Translates bytecode or a tree to machine code at runtime, usually only for hot code.
+---
+
+## [concept] A flat list and a loop
+
+**Compile the syntax tree once into a flat list of instructions, then run it in one loop with an <Term id="instruction-pointer">instruction pointer</Term> and a value stack.**
+
+`requests > 0 and errors / requests > 0.05` becomes ten instructions: push `requests`, push `0`, compare, jump if false, push `errors`, push `requests`, divide, push `0.05`, compare, return. The VM runs them in order, except where a jump says otherwise.
+
+<Depth level={2}>
+The list is <Term id="bytecode">bytecode</Term>, and the VM is a <Term id="stack-machine">stack machine</Term>. Each instruction takes its operands from the top of a stack and pushes its result, so `GT` needs no arguments. The compiler produces this order by walking the <Term id="abstract-syntax-tree">tree</Term> in post-order: left child, right child, then the operator. A chunk holds three things: the instructions, a table of constants they refer to by index, and the slots for metric names.
+</Depth>
+
+<Depth level={3}>
+Crafting Interpreters builds the same language twice, as a tree walker in Java and as a bytecode VM in C, and the VM is much faster. Part of that is C. The rest is the design: a contiguous array instead of objects linked by pointers, a switch instead of a virtual call per node, and names resolved before the program runs.
+</Depth>
+
+## [problem] A tree walk per series
+
+The alerting service evaluates each rule by walking its tree: a recursive function switches on the node type, recurses into the children, and looks each metric up by name in the series' map.
+
+At launch, rules ran per service, a few hundred evaluations every 10 seconds. The walker was clear and correct, and nobody profiled it.
+
+<Depth level={2}>
+Every evaluation repeats work that never changes between series: the same type switches, the same pointer chases to the same children, the same map lookups of the same names. Only the metric values differ.
+</Depth>
+
+<Depth level={3}>
+Each node is a separate heap object, so a walk jumps around memory. Each visit is a call with a stack frame. Each name is hashed and compared on every lookup. None of this is slow once. All of it is paid on every evaluation.
+</Depth>
+
+## [pain] Every rule, every series
+
+**Change request:** every alert rule must now run against every series, every 10 seconds, 200 rules across 50,000 series.
+
+That is 10 million evaluations per cycle, and each one walks the whole tree again. The marked lines are the loop that now runs 10 million times and the walk inside it. The evaluator's CPU climbs, the cycle overruns its 10 seconds, and alerts fire late.
+
+<Depth level={2}>
+Adding machines spreads the work but does not reduce it. Caching results does not help either, because every series has different values. The repeated part is the interpretation of the rule's structure, and that can be done once.
+</Depth>
+
+<Depth level={3}>
+Profile before rewriting. If the time goes to fetching metrics or to allocation, bytecode will not fix it. If it goes to the walk itself (calls, type dispatch, hashing names), compiling the rule once is the standard fix.
+</Depth>
+
+## [morph] Compile once, run a loop
+
+Drag the slider. The tree walker splits in two: a compiler that runs once when a rule is saved, and a VM loop that runs for every series. The rule's structure is interpreted once, into a chunk of instructions.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Names turn into slot numbers at compile time. The engine fills a slot array from each series once, and the VM reads it by index. `and` and `or` do not become instructions that combine two values. They become jumps, because the right side must not run when the left side has already decided the answer.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">An instruction is an opcode and an int, so the code is one contiguous slice. The `switch` in `run` is the dispatch loop. Go compiles a dense switch on a small integer type into a jump table or a binary search, so dispatch costs a few machine instructions.</Lang>
+<Lang only="python">Each instruction is a tuple, and binary operators carry the function from the `operator` module, so the loop calls `operator.truediv` directly. Keep in mind that this loop is itself run by CPython's VM. Measure it against the tree walker before you ship it.</Lang>
+<Lang only="typescript">The instruction union is discriminated by `op`, so the `switch` in `run` narrows each case and the compiler checks the operands. Binary instructions hold the operator's function itself, a small step toward closure compilation.</Lang>
+<Lang only="rust">`Instr` is a small `Copy` enum, so `c.code[ip]` copies it out without borrowing the chunk, and the `match` usually compiles to a jump table. The placeholder pushed before the jump is overwritten once the target is known, which is <Term id="jump-patching">jump patching</Term>.</Lang>
+</Depth>
+
+## [walk] Compile and run the guarded ratio
+
+`requests > 0 and errors / requests > 0.05`, compiled once and run on an idle service. Step through it with the numbered buttons.
+
+<Depth level={3}>
+The jump keeps the value it tested when it jumps and pops it when it falls through. So after `and` the stack holds exactly one boolean either way, which is the stack effect a binary operator would have. The compiler can track the stack depth of every instruction this way and size the stack before running. CPython stores that maximum per code object as `co_stacksize`.
+</Depth>
+
+## [again] Every rule, every series, compiled
+
+The same load, with the rules compiled. Saving a rule runs the compiler once. Each of the 10 million evaluations per cycle runs a short loop over an array, reads metrics by slot, and skips the right side of `and` and `or` with a jump. There is no recursion and no lookup by name.
+
+<Depth level={2}>
+Keep the tree walker. It is the reference implementation: run both on recorded series in tests and compare the answers, exactly as the playground does. Keep a source span on each instruction too, so a runtime error such as division by zero points at the right part of the rule.
+</Depth>
+
+<Depth level={3}>
+Beyond this point the gains come from fewer instructions and cheaper dispatch. A register VM, as in Lua since version 5.0, does more work per instruction. Superinstructions fuse common pairs such as `LOAD` then `CONST` then `GT`. Specialization, as in CPython 3.11, rewrites generic instructions for the types it actually sees.
+</Depth>
+
+## [play] Step a VM
+
+Pick a rule and set the service's metrics. Then step the VM one instruction at a time and watch the instruction pointer, the stack and the part of the rule each instruction came from. Compare its counts with the tree walker, then compile `and` without a jump and see what breaks.
+
+## [lens] Who runs bytecode for you
+
+Python and Node.js already run your code on bytecode VMs, so a VM written in them sits on top of another one. Go and Rust compile to machine code, and the pattern shows up in the libraries that run small languages inside them.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+`dis.dis` in Python and `node --print-bytecode` in Node.js show you the bytecode your own code turns into. Reading it once makes the rest of this lesson concrete.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="bytecode-and-stack-vm" />
+
+### The instruction set used here
+
+| Opcode | Operand | Stack effect |
+|---|---|---|
+| `CONST` | constant index | push 1 |
+| `LOAD` | slot index | push 1 |
+| `GT`, `DIV`, `EQ`, … | none | pop 2, push 1 |
+| `NOT`, `NEG` | none | pop 1, push 1 |
+| `JUMP_IF_FALSE_OR_POP` | target | keep 1 and jump, or pop 1 |
+| `JUMP_IF_TRUE_OR_POP` | target | keep 1 and jump, or pop 1 |
+| `RETURN` | none | pop 1 and stop |
+
+The two conditional jumps are modelled on instructions CPython used for `and` and `or` before version 3.12.

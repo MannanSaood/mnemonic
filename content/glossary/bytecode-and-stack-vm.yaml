@@ -1,0 +1,13 @@
+# Terms introduced by compilers/bytecode-and-stack-vm.
+- id: bytecode
+  term: Bytecode
+  short: A compact list of instructions for a virtual machine, produced once by a compiler and run many times. Each instruction is an opcode and maybe an operand.
+- id: stack-machine
+  term: Stack machine
+  short: A machine whose instructions take operands from the top of a value stack and push results back, so they need no register names.
+- id: instruction-pointer
+  term: Instruction pointer
+  short: The index of the next instruction to run. A jump is an instruction that sets it.
+- id: jump-patching
+  term: Jump patching
+  short: Emitting a jump with a placeholder target, compiling the code it jumps over, then writing the real target in once it is known.
