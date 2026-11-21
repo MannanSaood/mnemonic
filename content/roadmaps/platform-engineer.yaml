@@ -1,0 +1,26 @@
+# A goal profile. The roadmap is computed from it: every lesson whose main skill is one of these,
+# at the depth asked for here, plus their prerequisites, in prerequisite order.
+title: Platform engineer (Go)
+summary: Long-running Go services and agents that manage infrastructure across clouds and Kubernetes.
+goals:
+  - skill: design
+    depth: engineer
+    why: Platform code lives for years and is extended by many people; designs must keep each change local.
+  - skill: extensibility
+    depth: engineer
+    why: New clouds, providers and plugins are added as new implementations behind existing interfaces.
+  - skill: concurrency
+    depth: deep
+    why: Agents run many long-lived workers that start, stop and restart concurrently, and bugs appear only under load.
+  - skill: go-runtime
+    depth: engineer
+    why: Goroutines, interfaces and the garbage collector explain performance and leaks in long-running processes.
+  - skill: testing
+    depth: engineer
+    why: Every change lands with tests, often using fakes for clouds and remote APIs.
+  - skill: distributed-systems
+    depth: engineer
+    why: A controller keeps a model of many machines consistent over unreliable networks.
+  - skill: kubernetes
+    depth: overview
+    why: Workloads run on Kubernetes as well as on plain machines.
