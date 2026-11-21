@@ -1,0 +1,492 @@
+---
+title: Writeback, fsync and durability
+track: linux
+group: Files and memory
+order: 16
+summary: write() returns as soon as your data is in the page cache. The kernel writes it to disk seconds later. fsync is how you wait for the disk before you promise anything.
+intent: Only reply "saved" after the data, the file and the name are all on the disk.
+changeRequest: Run the job scheduler on edge sites, where the power fails a few times a year.
+languages: [go, python, typescript, rust]
+glossary: [dirty-page, writeback, fsync, fdatasync, atomic-rename, group-commit]
+
+prerequisites: [linux/the-page-cache-and-readahead]
+skills: [linux, storage]
+depths: [overview, engineer, deep]
+
+playground:
+  model: writeback-fsync-and-durability
+  scenarios:
+    - try: "Keep the default recipe (temp file, fsync, rename) and pull the plug right after the reply."
+      notice: "data.json still holds v1, though the client was told saved. The rename was waiting for the next journal commit."
+    - try: "Switch to overwrite in place with no fsync and pull the plug at every moment."
+      notice: "Three of the eight moments leave a 0-byte file. The truncate reached the disk before the data did."
+    - try: "Turn on all three: temp file, fsync the file, fsync the directory. Pull the plug at every moment."
+      notice: "Every crash leaves v1 (no reply was sent) or v2. The reply now waits about 8 ms."
+    - try: "Turn off fsync of the file but keep the directory fsync."
+      notice: "The rename is durable but the data is not, so the new name points at an empty file."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 118, h: 48, title: save handler, sub: replies 204 }
+      after:  { x: 12, y: 30, w: 118, h: 48, title: save handler, sub: replies after fsync }
+    - id: context
+      kind: context
+      before: { x: 160, y: 14, w: 260, h: 246, title: data.json, sub: write() = on disk }
+      after:  { x: 160, y: 30, w: 160, h: 52, title: page cache, sub: dirty pages }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 350, y: 30, w: 196, h: 52, title: "" }
+      after:  { x: 350, y: 30, w: 196, h: 52, title: fsync, sub: wait for the disk }
+    - id: tmp
+      kind: concrete
+      before: { x: 180, y: 72, w: 220, h: 32, title: truncate + write }
+      after:  { x: 12, y: 130, w: 140, h: 44, title: data.json.tmp, sub: new data, fsynced }
+    - id: dir
+      kind: concrete
+      before: { x: 180, y: 114, w: 220, h: 32, title: return 204 }
+      after:  { x: 172, y: 130, w: 150, h: 44, title: directory, sub: rename + fsync }
+    - id: disk
+      kind: concrete
+      before: { x: 180, y: 156, w: 220, h: 32, title: disk, sub: later }
+      after:  { x: 350, y: 130, w: 196, h: 44, title: disk + journal, sub: commit 5 s · data 30 s }
+    - id: crash
+      kind: concrete
+      appears: change
+      before: { x: 180, y: 212, w: 220, h: 32, title: power cut }
+      after:  { x: 172, y: 214, w: 374, h: 44, title: power cut, sub: v1 before the reply · v2 after · never empty }
+  edges:
+    - { from: client, to: context, label: write }
+    - { from: client, to: strategy, label: then }
+    - { from: strategy, to: disk, label: flush + wait }
+    - { from: context, to: disk }
+    - { from: tmp, to: dir, label: rename }
+    - { from: dir, to: disk }
+    - { from: crash, to: disk }
+
+code:
+  go:
+    before:
+      file: store.go
+      source: |
+        func (s *Store) Save(w http.ResponseWriter, r *http.Request) {
+            snapshot, _ := json.Marshal(s.jobs)
+            if err := os.WriteFile("data.json", snapshot, 0o644); err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            w.WriteHeader(http.StatusNoContent) // "saved"
+        }
+      roles: { client: [1, 8], context: [3, 3], tmp: [3, 3], dir: [7, 7], disk: [3, 3] }
+      change:
+        - { line: 3, replace: '    if err := os.WriteFile("data.json", snapshot, 0o644); err != nil { // after a power cut: 0 bytes' }
+        - { line: 7, replace: '    w.WriteHeader(http.StatusNoContent) // "saved", yet lost by the power cut' }
+    after:
+      file: store.go
+      source: |
+        func (s *Store) Save(w http.ResponseWriter, r *http.Request) {
+            snapshot, _ := json.Marshal(s.jobs)
+            if err := writeFileDurable("data.json", snapshot); err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            w.WriteHeader(http.StatusNoContent) // only now is it saved
+        }
+
+        func writeFileDurable(path string, data []byte) error {
+            tmp := path + ".tmp"
+            f, err := os.Create(tmp)
+            if err != nil {
+                return err
+            }
+            if _, err := f.Write(data); err != nil {
+                f.Close()
+                return err
+            }
+            if err := f.Sync(); err != nil { // data and inode on disk
+                f.Close()
+                return err
+            }
+            if err := f.Close(); err != nil {
+                return err
+            }
+            if err := os.Rename(tmp, path); err != nil { // atomic switch
+                return err
+            }
+            d, err := os.Open(filepath.Dir(path))
+            if err != nil {
+                return err
+            }
+            defer d.Close()
+            return d.Sync() // the rename itself on disk
+        }
+      roles: { client: [1, 8], context: [16, 16], strategy: [20, 20], tmp: [11, 19], dir: [27, 35], disk: [20, 20], write: [16, 16], fsync: [20, 23], rename: [27, 27], dirsync: [30, 35], reply: [7, 7] }
+    again:
+      file: store.go
+      source: |
+        // the same power cut, at any moment during or after Save:
+        // data.json is v1 (no 204 was sent) or v2 (a 204 was sent). Never empty.
+    cost:
+      before: { text: empty file or lost saves, value: 0.9 }
+      after: { text: +8 ms per save · nothing lost, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`os.WriteFile` truncates and writes; it never syncs. `File.Sync` is `fsync` (and `F_FULLFSYNC` on macOS). For `fdatasync`, use `golang.org/x/sys/unix.Fdatasync`. Check the errors from `Sync` and `Close`: a failed writeback may only show up there.'
+      seenIn: 'etcd syncs its write-ahead log before it acknowledges a write. bbolt calls `fdatasync` on Linux at every commit. Prometheus writes its TSDB block metadata with a temp file, fsync and rename.'
+
+  python:
+    before:
+      file: store.py
+      source: |
+        @app.post("/jobs")
+        def save_jobs():
+            jobs.update(request.json)
+            with open("data.json", "w") as f:
+                json.dump(jobs, f)
+            return "", 204  # "saved"
+      roles: { client: [1, 6], context: [4, 5], tmp: [4, 5], dir: [6, 6], disk: [4, 4] }
+      change:
+        - { line: 4, replace: '    with open("data.json", "w") as f:  # after a power cut: 0 bytes' }
+        - { line: 6, replace: '    return "", 204  # "saved", yet lost by the power cut' }
+    after:
+      file: store.py
+      source: |
+        @app.post("/jobs")
+        def save_jobs():
+            jobs.update(request.json)
+            write_file_durable("data.json", json.dumps(jobs).encode())
+            return "", 204  # only now is it saved
+
+        def write_file_durable(path: str, data: bytes) -> None:
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()  # Python's buffer -> page cache
+                os.fsync(f.fileno())  # page cache -> disk
+            os.replace(tmp, path)  # atomic switch
+            dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)  # the rename itself on disk
+            finally:
+                os.close(dir_fd)
+      roles: { client: [1, 5], context: [10, 11], strategy: [12, 12], tmp: [8, 12], dir: [13, 18], disk: [12, 12], write: [10, 11], fsync: [12, 12], rename: [13, 13], dirsync: [14, 18], reply: [5, 5] }
+    again:
+      file: store.py
+      source: |
+        # the same power cut, at any moment during or after save_jobs:
+        # data.json is v1 (no 204 was sent) or v2 (a 204 was sent). Never empty.
+    cost:
+      before: { text: empty file or lost saves, value: 0.9 }
+      after: { text: +8 ms per save · nothing lost, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`open(path, "w")` truncates first. A file object has its own buffer above the page cache, so call `f.flush()` before `os.fsync(f.fileno())`; fsync alone would sync pages that do not have your data yet. `os.replace` is the atomic rename on POSIX systems; `os.fdatasync` exists on Unix.'
+      seenIn: 'SQLite (the `sqlite3` module) syncs its journal and database at every commit, and syncs the directory after creating a journal file. `shelve` and `dbm` do not fsync by themselves.'
+
+  typescript:
+    before:
+      file: store.ts
+      source: |
+        app.post("/jobs", async (req, res) => {
+          jobs.update(req.body);
+          await writeFile("data.json", JSON.stringify(jobs));
+          res.sendStatus(204); // "saved"
+        });
+      roles: { client: [1, 5], context: [3, 3], tmp: [3, 3], dir: [4, 4], disk: [3, 3] }
+      change:
+        - { line: 3, replace: '  await writeFile("data.json", JSON.stringify(jobs)); // after a power cut: 0 bytes' }
+        - { line: 4, replace: '  res.sendStatus(204); // "saved", yet lost by the power cut' }
+    after:
+      file: store.ts
+      source: |
+        app.post("/jobs", async (req, res) => {
+          jobs.update(req.body);
+          await writeFileDurable("data.json", JSON.stringify(jobs));
+          res.sendStatus(204); // only now is it saved
+        });
+
+        async function writeFileDurable(path: string, data: string): Promise<void> {
+          const tmp = `${path}.tmp`;
+          const fh = await open(tmp, "w");
+          try {
+            await fh.writeFile(data);
+            await fh.sync(); // data and inode on disk
+          } finally {
+            await fh.close();
+          }
+          await rename(tmp, path); // atomic switch
+          const dir = await open(dirname(path), "r");
+          try {
+            await dir.sync(); // the rename itself on disk
+          } finally {
+            await dir.close();
+          }
+        }
+      roles: { client: [1, 5], context: [11, 11], strategy: [12, 12], tmp: [8, 15], dir: [16, 22], disk: [12, 12], write: [11, 11], fsync: [12, 12], rename: [16, 16], dirsync: [17, 22], reply: [4, 4] }
+    again:
+      file: store.ts
+      source: |
+        // the same power cut, at any moment during or after the handler:
+        // data.json is v1 (no 204 was sent) or v2 (a 204 was sent). Never empty.
+    cost:
+      before: { text: empty file or lost saves, value: 0.9 }
+      after: { text: +8 ms per save · nothing lost, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`fs.writeFile` opens with `"w"` (truncate) and never syncs. `filehandle.sync()` is `fsync`, `filehandle.datasync()` is `fdatasync`; both run on the libuv thread pool. Opening a directory with `"r"` and syncing it works on Linux and macOS, not on Windows.'
+      seenIn: 'npm''s `write-file-atomic` writes a temp file, fsyncs it by default and renames it into place.'
+
+  rust:
+    before:
+      file: store.rs
+      source: |
+        fn save_jobs(jobs: &Jobs) -> io::Result<()> {
+            let snapshot = serde_json::to_vec(jobs)?;
+            fs::write("data.json", snapshot)?;
+            Ok(()) // the handler replies 204: "saved"
+        }
+      roles: { client: [1, 5], context: [3, 3], tmp: [3, 3], dir: [4, 4], disk: [3, 3] }
+      change:
+        - { line: 3, replace: '    fs::write("data.json", snapshot)?; // after a power cut: 0 bytes' }
+        - { line: 4, replace: '    Ok(()) // "saved", yet lost by the power cut' }
+    after:
+      file: store.rs
+      source: |
+        fn save_jobs(jobs: &Jobs) -> io::Result<()> {
+            let snapshot = serde_json::to_vec(jobs)?;
+            write_file_durable(Path::new("data.json"), &snapshot)?;
+            Ok(()) // only now is it saved
+        }
+
+        fn write_file_durable(path: &Path, data: &[u8]) -> io::Result<()> {
+            let tmp = path.with_extension("json.tmp");
+            let mut f = File::create(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?; // data and inode on disk
+            drop(f);
+            fs::rename(&tmp, path)?; // atomic switch
+            let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            File::open(dir)?.sync_all()?; // the rename itself on disk
+            Ok(())
+        }
+      roles: { client: [1, 5], context: [10, 10], strategy: [11, 11], tmp: [8, 12], dir: [13, 15], disk: [11, 11], write: [10, 10], fsync: [11, 11], rename: [13, 13], dirsync: [14, 15], reply: [4, 4] }
+    again:
+      file: store.rs
+      source: |
+        // the same power cut, at any moment during or after save_jobs:
+        // data.json is v1 (no 204 was sent) or v2 (a 204 was sent). Never empty.
+    cost:
+      before: { text: empty file or lost saves, value: 0.9 }
+      after: { text: +8 ms per save · nothing lost, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`fs::write` creates or truncates and writes; it never syncs. `File::sync_all` is `fsync` and `sync_data` is `fdatasync`. Dropping a `File` closes it and ignores any error, so sync before the drop if the error matters.'
+      seenIn: '`tempfile::NamedTempFile::persist` gives you the atomic rename; you still call `sync_all` on the file before it and on the directory after it. Databases written in Rust, such as redb, fsync on commit by default.'
+
+walk:
+  - text: The handler writes the snapshot to data.json.tmp. write() copies it into the page cache and returns. The pages are dirty; nothing is on the disk yet.
+    nodes: [client, context, tmp]
+    edges: [client>context]
+    role: write
+  - text: fsync writes the dirty pages and the file's inode to the disk, asks the device to flush its write cache, and waits. Now the temp file survives a power cut.
+    nodes: [strategy, disk, tmp]
+    edges: [client>strategy, strategy>disk]
+    role: fsync
+  - text: rename points data.json at the new file in one step. A reader sees v1 or v2, never a mix. But the change lives in the directory, still only in memory.
+    nodes: [tmp, dir]
+    edges: [tmp>dir]
+    role: rename
+  - text: fsync on the directory commits the rename to the journal and waits. From here on, a power cut leaves v2.
+    nodes: [dir, disk]
+    edges: [dir>disk]
+    role: dirsync
+  - text: Only now does the handler reply. Anything it promised is on the disk.
+    nodes: [client]
+    edges: []
+    role: reply
+
+checks:
+  overview:
+    question: write() returned success. Is the data on the disk?
+    options:
+      - text: Not yet. It is in the page cache as dirty pages, and reaches the disk at writeback or when you call fsync.
+        correct: true
+        why: Right. write() returns once the kernel has your bytes in RAM. The disk write happens up to about 30 seconds later, unless you fsync.
+      - text: Yes. write() returns only after the disk confirms.
+        why: That is what O_SYNC or fsync give you. A plain write() returns as soon as the data is in the page cache.
+      - text: Yes, once close() returns.
+        why: close() does not wait for the disk. It may report an earlier error, but it does not write anything out.
+  engineer:
+    question: Which sequence replaces config.json so that a power cut leaves the old or the new version, and a reply of "saved" means the new one?
+    options:
+      - text: Write config.json.tmp, fsync it, rename it over config.json, fsync the directory, then reply.
+        correct: true
+        why: Right. fsync the data before the rename so the name never points at missing data, and fsync the directory so the rename is on disk before you promise anything.
+      - text: Open config.json with truncate, write, fsync, then reply.
+        why: Between the truncate and the end of the fsync, a crash can leave a 0-byte file. Both versions are gone.
+      - text: Write config.json.tmp, rename it over config.json, fsync config.json, then reply.
+        why: The rename can reach the disk before the data does, which gives an empty file. And fsync on the file does not make the directory entry durable.
+  deep:
+    question: fsync returned EIO. The program retries fsync and it returns 0. Is the data safe?
+    options:
+      - text: No. Linux reports a writeback error once to each open file description, and the failed pages may already be marked clean. The retry has nothing left to write.
+        correct: true
+        why: Right. This is why PostgreSQL, since its early-2019 releases, stops and recovers from its write-ahead log when fsync fails instead of retrying it.
+      - text: Yes. The second fsync wrote the pages that failed the first time.
+        why: After a failed writeback the kernel does not keep retrying those pages. The success of the second call says nothing new was written and failed.
+      - text: Only if the program also calls sync() for the whole system.
+        why: sync() reports no per-file error and has the same problem. The data that failed is not waiting to be written any more.
+
+reference:
+  roles:
+    - role: Dirty pages
+      example: the new snapshot in the page cache
+      job: Hold written data until writeback or fsync puts it on the disk.
+    - role: Flusher threads
+      example: one per backing device
+      job: Write dirty pages in the background, when they are older than dirty_expire_centisecs or too much memory is dirty.
+    - role: fsync
+      example: { go: f.Sync(), python: os.fsync, typescript: fh.sync(), rust: sync_all() }
+      job: Writes one file's data and metadata and flushes the device cache, then returns.
+    - role: Journal
+      example: ext4 or XFS log
+      job: Commits metadata such as renames and sizes atomically, every few seconds or on fsync.
+  useWhen:
+    - You reply, acknowledge or move on based on data being saved. fsync before the acknowledgement.
+    - You replace a whole file. Temp file, fsync, rename, fsync the directory.
+    - Many small writes need durability. Batch them and fsync once (group commit).
+  avoidWhen:
+    - Data you can rebuild, such as caches and temp output. Skip fsync and let writeback handle it.
+    - Tiny writes one at a time on a hot path. Each fsync costs milliseconds; batch instead.
+  tradeoffs:
+    - fsync takes milliseconds on SSDs, more on disks without a battery-backed or power-loss-protected cache.
+    - Durability depends on the device honouring cache flushes.
+    - Writers that fill dirty memory past dirty_ratio are throttled inside write() itself.
+    - Errors from writeback show up only at fsync or close, and only once.
+  lookalikes:
+    - name: O_SYNC and O_DSYNC
+      how: Open flags that make every write() wait like an fsync or fdatasync. Simpler, but every small write pays the full cost.
+    - name: sync_file_range
+      how: Starts or waits for writeback of a range, but does not flush metadata or the device cache. Not a durability guarantee.
+    - name: syncfs and sync
+      how: Flush a whole file system or all of them. Coarse, and they report errors poorly.
+---
+
+## [concept] Writeback, fsync and durability
+
+**`write()` returns as soon as your data is in the page cache. The kernel writes it to the disk later, in the background. <Term id="fsync">fsync</Term> is how you wait for the disk.**
+
+Until then the data is in <Term id="dirty-page">dirty pages</Term> in RAM, and a power cut loses it.
+
+<Depth level={2}>
+Background <Term id="writeback">writeback</Term> runs in flusher threads, one per backing device. They wake every `dirty_writeback_centisecs` (5 s by default) and write pages that have been dirty longer than `dirty_expire_centisecs` (30 s). They also start when dirty memory passes `dirty_background_ratio` (10% of available memory). Past `dirty_ratio` (20%), a process that keeps writing is made to wait inside `write()` itself. Metadata takes a different path: on ext4 the journal commits every 5 seconds by default (the `commit=` mount option).
+</Depth>
+
+<Depth level={3}>
+Flusher threads per device replaced `pdflush` in Linux 2.6.32. Since 4.13, writeback errors are recorded per file with a sequence counter (`errseq_t`) and reported once to each file descriptor that might have written the data. `fsync` also sends a cache-flush command (or writes with FUA) so the device's own volatile write cache cannot hold the data back.
+</Depth>
+
+## [problem] A scheduler that saves on every change
+
+A job scheduler keeps its schedule in `data.json`. Every change through the API rewrites the file, and the handler replies 204 when the write returns.
+
+It works. In years of testing, every save was there after a restart.
+
+<Depth level={2}>
+A restart is not a power cut. When the process exits, its writes are already in the page cache, and the kernel finishes writing them out. Only a crash of the whole machine, or a power cut, loses dirty pages.
+</Depth>
+
+<Depth level={3}>
+The convenience functions all truncate the file first: Go's `os.WriteFile`, Python's `open(path, "w")`, Node's `fs.writeFile`, Rust's `fs::write`. The truncate is metadata, the new contents are data, and the two reach the disk at different times.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** run the job scheduler on edge sites, where the power fails a few times a year.
+
+After the first outage, one site's `data.json` has 0 bytes and the scheduler refuses to start. At another, the last minute of changes is gone, though every API call got its 204.
+
+<Depth level={2}>
+The 0-byte file is the truncate reaching the disk in a journal commit while the new data was still dirty in RAM. The lost changes are writes that were in the page cache when the reply went out, with up to 30 seconds to wait before writeback.
+</Depth>
+
+<Depth level={3}>
+ext4 hides part of this. With its default `auto_da_alloc` option it starts writing the data when a file is truncated to zero and rewritten, or renamed over an existing file. That is a heuristic for one file system, added after exactly these bug reports in 2009. XFS and others give no such help, and the heuristic still does not make anything durable before you reply.
+</Depth>
+
+## [morph] From "write means on disk" to dirty pages and fsync
+
+Drag the slider. The file stops being something `write()` updates on the disk. It becomes dirty pages in the page cache, a directory entry, and a disk that gets each of them at a different time.
+
+The code gains the recipe: write a temp file, fsync it, rename it over the old one, fsync the directory, then reply.
+
+<Depth level={2}>
+Each step closes one gap. fsync on the temp file makes its data durable before any name points at it. The <Term id="atomic-rename">atomic rename</Term> means there is never a moment with a half-written `data.json`. fsync on the directory makes the rename itself durable. <Term id="fdatasync">fdatasync</Term> can replace the first fsync when timestamps do not matter.
+</Depth>
+
+<Depth level={3}>
+The fsync(2) man page says it directly: syncing a file does not sync the directory entry that names it. On ext4 an fsync of the file commits the journal transaction that is open at that moment, which often happens to include an earlier rename. The rename in this recipe comes after the fsync, so it waits for the next commit unless you sync the directory.
+</Depth>
+
+## [walk] Follow one save
+
+One save through the page cache, the journal and the disk. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`os.Rename` is `rename(2)` on Linux, atomic when both names are in the same file system. Across file systems it fails with `EXDEV`, so keep the temp file in the same directory as the target.</Lang>
+<Lang only="python">`os.replace` is `rename(2)` on Linux. Keep the temp file next to the target: a rename across file systems fails with `OSError` (`EXDEV`).</Lang>
+<Lang only="typescript">`fs.rename` is `rename(2)`. It fails with `EXDEV` across file systems, which is why the temp file lives in the same directory and not in `os.tmpdir()`.</Lang>
+<Lang only="rust">`fs::rename` is `rename(2)` on Linux. A temp file from `std::env::temp_dir()` is often on another file system; create it next to the target instead.</Lang>
+</Depth>
+
+## [again] The same power cut, after the fix
+
+The same outage. Wherever it lands, `data.json` holds v1 (and no 204 was sent, so the client retries) or v2 (and the 204 is true). It is never empty.
+
+The price is about 8 ms per save on a typical SSD, mostly the two waits for the disk.
+
+<Depth level={2}>
+If saves are frequent, batch them: collect the changes that arrive within a few milliseconds, write them in one file, fsync once, and reply to all of them. That is <Term id="group-commit">group commit</Term>, and it is how databases make thousands of commits per second durable.
+</Depth>
+
+<Depth level={3}>
+Check every error. A failed `fsync` must fail the save, and the safe reaction is to stop trusting the in-memory state and recover from what is on disk. Retrying the fsync can return success with the data gone.
+</Depth>
+
+## [play] Pull the plug
+
+A crash lab for one save. Choose how the service writes `data.json`, then cut the power after any step, or at every moment at once, and see what is on the disk after the reboot.
+
+Find the crash that empties the file, the one that loses a reply even with fsync, and the recipe that survives them all.
+
+## [lens] How each language syncs a file
+
+Every language exposes the same three calls: fsync, rename and a way to open a directory. None of the one-line write helpers use them.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Python adds a buffer of its own above the page cache, so it needs a `flush()` before the fsync. Node runs fsync on the libuv thread pool. Go and Rust call `fsync` directly on the calling thread.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="writeback-fsync-and-durability" />
+
+### Watching writeback
+
+`grep -E 'Dirty|Writeback' /proc/meminfo` shows how much data is waiting. `/proc/sys/vm/dirty_*` holds the thresholds and intervals. `sync` writes everything dirty and waits; it is a tool for operators, not a substitute for fsync in a program, because it reports no per-file errors.

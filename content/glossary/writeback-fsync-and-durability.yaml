@@ -1,0 +1,19 @@
+# Terms introduced by the writeback, fsync and durability lesson.
+- id: dirty-page
+  term: Dirty page
+  short: A page in the page cache that holds data written by a program but not yet written to the disk. A power cut loses it.
+- id: writeback
+  term: Writeback
+  short: The kernel writing dirty pages to disk in the background, when they are old enough (30 s by default) or when too much memory is dirty.
+- id: fsync
+  term: fsync
+  short: The syscall that writes a file's dirty data and metadata to the device, flushes the device's write cache, and returns only when that is done.
+- id: fdatasync
+  term: fdatasync
+  short: Like fsync, but skips metadata that is not needed to read the data back, such as timestamps. A size change is still written.
+- id: atomic-rename
+  term: Atomic rename
+  short: rename() over an existing name switches the name to the new file in one step. Readers, and a disk after a crash, see the old file or the new one, never a mix.
+- id: group-commit
+  term: Group commit
+  short: Making many writes durable with one fsync, so its milliseconds are shared. Databases batch concurrent transactions this way.
