@@ -88,3 +88,48 @@ export function PgMeter({ cost }: { cost: { text: string; value: number; good: b
     </div>
   );
 }
+
+/**
+ * Predict first: the reader commits to an answer before acting. Shows the explanation once
+ * `revealed` is true (usually after the reader has run the experiment), and says whether the
+ * prediction was right.
+ */
+export function PgPredict<T extends string>({ question, options, value, onChange, revealed, answer, explain }: {
+  question: string;
+  options: { value: T; label: string }[];
+  value: T | null;
+  onChange: (v: T) => void;
+  revealed: boolean;
+  answer: T;
+  explain: ReactNode;
+}) {
+  return (
+    <div className={"pg-predict" + (revealed && value ? (value === answer ? " right" : " wrong") : "")}>
+      <span className="label">Predict first</span>
+      <p className="pg-q">{question}</p>
+      <div className="pg-choice" role="radiogroup" aria-label={question}>
+        {options.map((o) => (
+          <button key={o.value} role="radio" aria-checked={value === o.value} onClick={() => onChange(o.value)} disabled={revealed}>{o.label}</button>
+        ))}
+      </div>
+      {revealed && (
+        <p className="pg-explain" aria-live="polite">
+          <b>{value === null ? "" : value === answer ? "You called it. " : "Not quite. "}</b>{explain}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Small "Inspired by" line at the bottom of a playground. */
+export function PgSources({ links }: { links: { title: string; href: string }[] }) {
+  return (
+    <p className="pg-sources">
+      Inspired by{" "}
+      {links.map((l, i) => (
+        <span key={l.href}>{i > 0 && (i === links.length - 1 ? " and " : ", ")}<a href={l.href} target="_blank" rel="noreferrer">{l.title}</a></span>
+      ))}
+      . Our own model and visuals.
+    </p>
+  );
+}

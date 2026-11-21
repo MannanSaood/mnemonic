@@ -338,3 +338,10 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
   .pg-sides { grid-template-columns: 1fr; }
   .pg-stats { grid-template-columns: 1fr 1fr; }
 }
+.pg-predict { border: 1px dashed var(--accent); background: var(--bg); padding: 10px 12px; display: grid; gap: 8px; }
+.pg-predict.right { border-style: solid; border-color: var(--good); }
+.pg-predict.wrong { border-style: solid; border-color: var(--pain); }
+.pg-q { margin: 0; font-weight: 600; }
+.pg-explain { margin: 0; font-size: .98rem; }
+.pg-choice button:disabled { cursor: default; }
+.pg-sources { margin: 0; font-size: .82rem; color: var(--ink-2); }

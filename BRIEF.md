@@ -84,6 +84,14 @@ Ciechanowski, Josh Comeau and Red Blob Games. Notes: `design/research.md`.
      shows up through the reader's own actions, and end with a result that uses the reader's
      own numbers and states the takeaway.
   Record the outcomes and the sources in `design/research.md` under that topic.
+- **Playground standard (user, 2026-11-21):** "find something on internet which depicts it
+  well and you make it into a playground. Think like an innovator trying to make these
+  playgrounds serve a purpose for a user." Research the best existing visualisations first;
+  one purpose line ("after this, the reader can answer..."); a predict, act, observe, explain
+  loop; break-it controls, side-by-side or counterfactual runs, metrics that matter, guided
+  challenges; minimal, direct controls; an "Inspired by" line crediting sources (never copy);
+  and the 30-second test: someone who skipped the text gets the insight within 30 seconds.
+  Full checklist: `docs/AUTHORING.md`.
 - **Built from the visualiser kit:** a model (plain TypeScript state plus pure step
   functions, testable without a browser) + controls (buttons, choices, toggles, sliders,
   drag) + a view, all from shared pieces in `src/playgrounds/kit`. Models are registered by
