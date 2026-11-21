@@ -1,0 +1,19 @@
+# Terms introduced by the Consistent hashing lesson.
+- id: consistent-hashing
+  term: Consistent hashing
+  short: A way to map keys to servers so that adding or removing a server moves only about 1/N of the keys, instead of nearly all of them.
+- id: hash-ring
+  term: Hash ring
+  short: The hash space bent into a circle. Servers and keys are hashed onto it, and each key belongs to the next server point clockwise.
+- id: virtual-node
+  term: Virtual node
+  short: One of many points a single server places on a hash ring. Many small arcs per server even out the load and spread a failed server's keys over all survivors.
+- id: rendezvous-hashing
+  term: Rendezvous hashing
+  short: Also called highest random weight. Each key scores every server with hash(key, server) and picks the highest. No ring to store, but a lookup touches every server.
+- id: jump-consistent-hash
+  term: Jump consistent hash
+  short: A stateless function from a key and a bucket count to a bucket number, with minimal movement. Buckets can only be added or removed at the end of the numbering.
+- id: hash-slot
+  term: Hash slot
+  short: A fixed partition of the key space, such as one of Redis Cluster's 16,384 slots. Keys map to slots by hash; slots are assigned and moved between nodes explicitly.

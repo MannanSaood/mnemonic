@@ -1,0 +1,575 @@
+---
+title: Consistent hashing
+track: system-design
+group: Building blocks
+order: 7
+summary: Place servers and keys on a ring so that adding or removing a server moves only a small slice of the keys, and give each server many points so the slices are even.
+intent: Growing or shrinking a cache fleet should cost you about one server's worth of misses, not the whole cache.
+changeRequest: The sale starts Friday. Add a fifth cache server so the fleet has room for the extra traffic.
+languages: [go, python, typescript, rust]
+glossary: [consistent-hashing, hash-ring, virtual-node, rendezvous-hashing, jump-consistent-hash, hash-slot]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [system-design/replication-and-sharding]
+skills: [distributed-systems, scalability]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: consistent-hashing
+  scenarios:
+    - try: "Predict, then press Add cache-e."
+      notice: "hash % N moves about 800 of the 1,000 keys. The ring moves only 19, all to cache-e. But cache-e landed on a tiny arc, so it holds almost nothing."
+    - try: "Set points per server to 200, then add a server again."
+      notice: "Every server's bar sits near the fair-share tick, and the join moves close to the 1/N minimum, all of it to the new server."
+    - try: "Go back to 1 point per server and press Kill on cache-d."
+      notice: "All of cache-d's keys land on one neighbour, which now carries double. With 200 points the same keys spread over every survivor."
+    - try: "Kill a server with hash % N in mind."
+      notice: "Removing one server from the list shifts every server after it, so most keys move even though only one server is gone."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 100, w: 112, h: 56, title: App server, sub: get user:42 }
+      after:  { x: 12, y: 100, w: 112, h: 56, title: App server, sub: get user:42 }
+    - id: context
+      kind: context
+      before: { x: 146, y: 18, w: 260, h: 236, title: Router, sub: server list + modulo }
+      after:  { x: 146, y: 24, w: 132, h: 56, title: Router, sub: ring lookup }
+    - id: hash
+      kind: concrete
+      before: { x: 166, y: 104, w: 220, h: 44, title: hash % 4 }
+      after:  { x: 146, y: 112, w: 132, h: 44, title: hash(key) }
+    - id: vnodes
+      kind: concrete
+      appears: after
+      before: { x: 146, y: 196, w: 132, h: 44, title: "" }
+      after:  { x: 146, y: 196, w: 132, h: 44, title: 160 pts each }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 302, y: 86, w: 112, h: 84, title: "" }
+      after:  { x: 302, y: 86, w: 112, h: 84, title: Hash ring, sub: sorted points }
+    - id: caches
+      kind: concrete
+      before: { x: 436, y: 40, w: 114, h: 56, title: cache-a…d, sub: 4 servers }
+      after:  { x: 436, y: 40, w: 114, h: 56, title: cache-a…d, sub: own arcs }
+    - id: newnode
+      kind: concrete
+      appears: change
+      before: { x: 436, y: 160, w: 114, h: 56, title: cache-e, sub: "% 5 moves 80%" }
+      after:  { x: 436, y: 160, w: 114, h: 56, title: cache-e, sub: takes ~1/5 }
+  edges:
+    - { from: client, to: context, label: key }
+    - { from: context, to: strategy, label: lookup }
+    - { from: hash, to: strategy, label: point }
+    - { from: vnodes, to: strategy, label: places }
+    - { from: strategy, to: caches, label: owner }
+    - { from: strategy, to: newnode, label: new arcs }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: cache_router.go
+      source: |
+        // cache_router.go
+        var cacheNodes = []string{"cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211"}
+
+        // nodeFor picks the memcached server that holds key.
+        func nodeFor(key string) string {
+            h := crc32.ChecksumIEEE([]byte(key))
+            return cacheNodes[h%uint32(len(cacheNodes))] // depends on how many nodes there are
+        }
+      roles: { caches: [2, 2], context: [4, 8], hash: [6, 7] }
+      change:
+        - { line: 2, replace: 'var cacheNodes = []string{"cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211", "cache-e:11211"}' }
+    after:
+      file: ring.go
+      source: |
+        // ring.go: a consistent hash ring with virtual nodes
+        type Ring struct {
+            points []uint32          // sorted positions on the ring
+            owner  map[uint32]string // position -> server
+            vnodes int
+        }
+
+        func NewRing(vnodes int, servers ...string) *Ring {
+            r := &Ring{owner: map[uint32]string{}, vnodes: vnodes}
+            for _, s := range servers {
+                r.Add(s)
+            }
+            return r
+        }
+
+        // Add puts vnodes points for server on the ring. Only keys in the arcs it takes move.
+        func (r *Ring) Add(server string) {
+            for i := range r.vnodes {
+                p := crc32.ChecksumIEEE([]byte(server + "#" + strconv.Itoa(i)))
+                r.owner[p] = server
+                r.points = append(r.points, p)
+            }
+            slices.Sort(r.points)
+        }
+
+        // Remove takes server's points off. Each of its arcs falls to the next point clockwise.
+        func (r *Ring) Remove(server string) {
+            r.points = slices.DeleteFunc(r.points, func(p uint32) bool { return r.owner[p] == server })
+        }
+
+        // Get returns the owner of the first point at or after hash(key), wrapping at the top.
+        func (r *Ring) Get(key string) string {
+            h := crc32.ChecksumIEEE([]byte(key))
+            i, _ := slices.BinarySearch(r.points, h)
+            if i == len(r.points) {
+                i = 0
+            }
+            return r.owner[r.points[i]]
+        }
+
+        var ring = NewRing(160, "cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211")
+
+        func nodeFor(key string) string { return ring.Get(key) }
+      roles: { strategy: [2, 6], vnodes: [16, 24], add: [16, 24], remove: [26, 29], hash: [33, 33], lookup: [34, 38], context: [31, 39], client: [43, 43], caches: [41, 41], newnode: [17, 22] }
+    again:
+      file: ring_test.go
+      source: |
+        // ring_test.go: a fifth server takes about a fifth of the keys, and only from the others
+        func TestJoinMovesAFifth(t *testing.T) {
+            r := NewRing(160, "a", "b", "c", "d")
+            key := func(i int) string { return "user:" + strconv.Itoa(i) }
+            before := make([]string, 10_000)
+            for i := range before {
+                before[i] = r.Get(key(i))
+            }
+            r.Add("e")
+            moved := 0
+            for i, old := range before {
+                if now := r.Get(key(i)); now != old {
+                    if now != "e" {
+                        t.Fatalf("%s moved from %s to %s", key(i), old, now)
+                    }
+                    moved++
+                }
+            }
+            if moved < 1_500 || moved > 2_500 {
+                t.Fatalf("moved %d of 10000 keys", moved)
+            }
+        }
+    cost:
+      before: { text: 4 → 5 servers · ~80% of keys miss, value: 0.8 }
+      after: { text: 4 → 5 servers · ~20% move, all to the new one, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A ring is a sorted `[]uint32` and `slices.BinarySearch`, so many teams write their own. `golang/groupcache/consistenthash` is the classic small one: `New(replicas, fn)`, `Add`, `Get`, and no `Remove`. `buraksezer/consistent` adds bounded loads, so no member takes more than a set factor of the average.'
+      seenIn: '`golang/groupcache/consistenthash`. `buraksezer/consistent`. `hash/crc32` and `hash/fnv` as cheap ring hashes. `slices.BinarySearch` for the lookup.'
+
+  python:
+    before:
+      file: cache_router.py
+      source: |
+        # cache_router.py
+        CACHE_NODES = ["cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211"]
+
+        def node_for(key: str) -> str:
+            """Pick the memcached server that holds key."""
+            h = zlib.crc32(key.encode())
+            return CACHE_NODES[h % len(CACHE_NODES)]  # depends on how many nodes there are
+      roles: { caches: [2, 2], context: [4, 7], hash: [6, 7] }
+      change:
+        - { line: 2, replace: 'CACHE_NODES = ["cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211", "cache-e:11211"]' }
+    after:
+      file: cache_router.py
+      source: |
+        # cache_router.py
+        from uhashring import HashRing
+
+        # 160 points per server; each key belongs to the next point clockwise
+        ring = HashRing(
+            nodes=["cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211"],
+            vnodes=160,
+        )
+
+        def node_for(key: str) -> str:
+            # hash the key, then binary-search the sorted points, wrapping at the top
+            return ring.get_node(key)
+
+        def on_node_joined(name: str) -> None:
+            ring.add_node(name)  # takes arcs from its neighbours, about 1/N of the keys
+
+        def on_node_failed(name: str) -> None:
+            ring.remove_node(name)  # each of its arcs falls to the next point clockwise
+      roles: { strategy: [5, 8], vnodes: [7, 7], caches: [6, 6], context: [10, 12], client: [10, 10], hash: [11, 11], lookup: [11, 12], add: [14, 15], newnode: [14, 15], remove: [17, 18] }
+    again:
+      file: test_cache_router.py
+      source: |
+        # test_cache_router.py: a fifth server takes about a fifth of the keys, and only from the others
+        def test_join_moves_a_fifth():
+            ring = HashRing(nodes=["a", "b", "c", "d"], vnodes=160)
+            keys = [f"user:{i}" for i in range(10_000)]
+            before = {k: ring.get_node(k) for k in keys}
+            ring.add_node("e")
+            moved = [k for k in keys if ring.get_node(k) != before[k]]
+            assert all(ring.get_node(k) == "e" for k in moved)
+            assert 1_500 < len(moved) < 2_500
+    cost:
+      before: { text: 4 → 5 servers · ~80% of keys miss, value: 0.8 }
+      after: { text: 4 → 5 servers · ~20% move, all to the new one, value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Library
+      note: '`uhashring` is a pure-Python ring with per-node `vnodes` and weights, and a `hash_fn="ketama"` mode that matches libmemcached''s ketama placement. `pymemcache`''s `HashClient` spreads keys over servers with rendezvous hashing instead of a ring.'
+      seenIn: '`uhashring.HashRing`. `pymemcache.client.hash.HashClient`. `bisect.bisect_left` if you write the ring yourself.'
+
+  typescript:
+    before:
+      file: cache-router.ts
+      source: |
+        // cache-router.ts
+        const CACHE_NODES = ["cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211"];
+
+        export function nodeFor(key: string): string {
+          const h = crc32(key); // node:zlib, unsigned 32-bit
+          return CACHE_NODES[h % CACHE_NODES.length]; // depends on how many nodes there are
+        }
+      roles: { caches: [2, 2], context: [4, 7], hash: [5, 6] }
+      change:
+        - { line: 2, replace: 'const CACHE_NODES = ["cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211", "cache-e:11211"];' }
+    after:
+      file: ring.ts
+      source: |
+        // ring.ts: a consistent hash ring with virtual nodes
+        import { crc32 } from "node:zlib";
+
+        export class HashRing {
+          private points: { pos: number; server: string }[] = []; // sorted by pos
+
+          constructor(private vnodes: number, servers: string[]) {
+            servers.forEach((s) => this.add(s));
+          }
+
+          add(server: string): void {
+            for (let i = 0; i < this.vnodes; i++) this.points.push({ pos: crc32(`${server}#${i}`), server });
+            this.points.sort((a, b) => a.pos - b.pos); // only keys in the arcs it takes move
+          }
+
+          remove(server: string): void {
+            this.points = this.points.filter((p) => p.server !== server); // arcs fall to the next point
+          }
+
+          get(key: string): string {
+            const h = crc32(key);
+            let lo = 0, hi = this.points.length;
+            while (lo < hi) {
+              const mid = (lo + hi) >>> 1;
+              if (this.points[mid].pos < h) lo = mid + 1; else hi = mid;
+            }
+            return this.points[lo % this.points.length].server; // wrap past the top
+          }
+        }
+
+        export const ring = new HashRing(160, ["cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211"]);
+        export const nodeFor = (key: string) => ring.get(key);
+      roles: { strategy: [4, 5], vnodes: [11, 14], add: [11, 14], newnode: [11, 14], remove: [16, 18], context: [20, 28], hash: [21, 21], lookup: [22, 27], caches: [31, 31], client: [32, 32] }
+    again:
+      file: ring.test.ts
+      source: |
+        // ring.test.ts: a fifth server takes about a fifth of the keys, and only from the others
+        test("a join moves about a fifth", () => {
+          const ring = new HashRing(160, ["a", "b", "c", "d"]);
+          const keys = Array.from({ length: 10_000 }, (_, i) => `user:${i}`);
+          const before = new Map(keys.map((k) => [k, ring.get(k)]));
+          ring.add("e");
+          const moved = keys.filter((k) => ring.get(k) !== before.get(k));
+          assert.ok(moved.every((k) => ring.get(k) === "e"));
+          assert.ok(moved.length > 1_500 && moved.length < 2_500);
+        });
+    cost:
+      before: { text: 4 → 5 servers · ~80% of keys miss, value: 0.8 }
+      after: { text: 4 → 5 servers · ~20% move, all to the new one, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Node has no ring in the standard library, but `zlib.crc32` (Node 22.2 and later) gives a fast 32-bit hash, and a sorted array plus binary search does the rest. The `hashring` package implements libketama''s placement. Redis clients such as `ioredis` do not use a ring for Redis Cluster: they compute the key''s hash slot.'
+      seenIn: '`hashring` (ketama-compatible). `zlib.crc32`. `ioredis` `Cluster`, which routes by `CRC16(key) mod 16384`.'
+
+  rust:
+    before:
+      file: cache_router.rs
+      source: |
+        // cache_router.rs
+        const CACHE_NODES: &[&str] = &["cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211"];
+
+        /// Pick the memcached server that holds `key`.
+        fn node_for(key: &str) -> &'static str {
+            let h = crc32fast::hash(key.as_bytes());
+            CACHE_NODES[h as usize % CACHE_NODES.len()] // depends on how many nodes there are
+        }
+      roles: { caches: [2, 2], context: [4, 8], hash: [6, 7] }
+      change:
+        - { line: 2, replace: 'const CACHE_NODES: &[&str] = &["cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211", "cache-e:11211"];' }
+    after:
+      file: cache_router.rs
+      source: |
+        // cache_router.rs
+        use hashring::HashRing;
+
+        /// One point on the ring: a server plus a replica number, so each server lands in many places.
+        #[derive(Debug, Clone, Copy, Hash, PartialEq)]
+        struct VNode {
+            server: &'static str,
+            replica: u16,
+        }
+
+        const VNODES: u16 = 160;
+
+        fn add_server(ring: &mut HashRing<VNode>, server: &'static str) {
+            for replica in 0..VNODES {
+                ring.add(VNode { server, replica }); // takes arcs from its neighbours only
+            }
+        }
+
+        fn remove_server(ring: &mut HashRing<VNode>, server: &'static str) {
+            for replica in 0..VNODES {
+                ring.remove(&VNode { server, replica }); // each arc falls to the next point clockwise
+            }
+        }
+
+        fn node_for(ring: &HashRing<VNode>, key: &str) -> Option<&'static str> {
+            ring.get(&key).map(|v| v.server) // hash the key, take the first point clockwise
+        }
+
+        fn build_ring() -> HashRing<VNode> {
+            let mut ring = HashRing::new();
+            for s in ["cache-a:11211", "cache-b:11211", "cache-c:11211", "cache-d:11211"] {
+                add_server(&mut ring, s);
+            }
+            ring
+        }
+      roles: { vnodes: [4, 11], add: [13, 17], newnode: [13, 17], remove: [19, 23], context: [25, 27], client: [25, 25], hash: [26, 26], lookup: [26, 26], strategy: [29, 35], caches: [31, 31] }
+    again:
+      file: tests/cache_router.rs
+      source: |
+        // tests/cache_router.rs: a fifth server takes about a fifth of the keys, and only from the others
+        #[test]
+        fn join_moves_a_fifth() {
+            let mut ring = build_ring();
+            let keys: Vec<String> = (0..10_000).map(|i| format!("user:{i}")).collect();
+            let before: Vec<_> = keys.iter().map(|k| node_for(&ring, k)).collect();
+            add_server(&mut ring, "cache-e:11211");
+            let moved: Vec<_> = keys.iter().zip(&before).filter(|(k, old)| node_for(&ring, k) != **old).collect();
+            assert!(moved.iter().all(|(k, _)| node_for(&ring, k) == Some("cache-e:11211")));
+            assert!((1_500..2_500).contains(&moved.len()));
+        }
+    cost:
+      before: { text: 4 → 5 servers · ~80% of keys miss, value: 0.8 }
+      after: { text: 4 → 5 servers · ~20% move, all to the new one, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The `hashring` crate is deliberately small: it has no virtual nodes, so you add them as distinct values, as here. Written by hand, a ring is a `BTreeMap<u32, Server>` and a lookup is `map.range(h..).next()`, falling back to `map.iter().next()` to wrap.'
+      seenIn: '`hashring::HashRing`. `BTreeMap::range` for a hand-written ring. `crc32fast` and `xxhash-rust` for the hash.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: An app server asks the router where user:42 lives. The router hashes the key to a 32-bit number, a point on the ring.
+    nodes: [client, context, hash]
+    edges: [client>context, hash>strategy]
+    role: hash
+  - text: It binary-searches the sorted server points for the first one at or after that number, wrapping past the top. That point's server owns the key.
+    nodes: [context, strategy, caches]
+    edges: [context>strategy, strategy>caches]
+    role: lookup
+  - text: Each server put 160 points on the ring when it joined, so it owns 160 small arcs scattered around the circle, not one big one.
+    nodes: [vnodes, strategy]
+    edges: [vnodes>strategy]
+    role: vnodes
+  - text: cache-e joins. Its 160 points split 160 arcs. Only keys in the front part of those arcs move, all of them to cache-e. No key moves between the old servers.
+    nodes: [newnode, strategy]
+    edges: [strategy>newnode]
+    role: add
+  - text: Later cache-b dies. Each of its arcs falls to whichever point comes next, and those belong to different servers, so its keys spread over all the survivors.
+    nodes: [strategy, caches]
+    edges: [strategy>caches]
+    role: remove
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: What does consistent hashing give you that hash(key) % N does not?
+    options:
+      - text: Adding or removing a server moves only a small share of the keys.
+        correct: true
+        why: Right. With modulo, every key's server depends on N, so changing N moves almost all of them. On a ring, only the arcs that change hands move.
+      - text: Every server gets exactly the same number of keys.
+        why: A ring alone can be quite uneven. Virtual nodes bring it close to even, but never exactly.
+      - text: Lookups become faster.
+        why: Modulo is one division. A ring lookup is a binary search, which is a little slower.
+  engineer:
+    question: A ring has 10 servers, each with 200 virtual nodes. An 11th server joins. About what share of the keys move?
+    options:
+      - text: About 9%, all of them to the new server.
+        correct: true
+        why: Right. The new server takes about 1/11 of the ring, and keys only move into it. With modulo, about 10/11 would move.
+      - text: About 50%.
+        why: Nothing on a ring moves except what the new server takes, and that is about one share in eleven.
+      - text: About 91%.
+        why: That is what hash % N does going from 10 to 11.
+  deep:
+    question: A cache ring gives each server one point. One server dies at peak. What happens next?
+    options:
+      - text: All its keys move to its clockwise neighbour, which suddenly carries about twice its load.
+        correct: true
+        why: Right. With one point the dead server owned one arc, and the whole arc falls to the next point. With many points per server its arcs fall to many different servers.
+      - text: Its keys spread evenly over all the survivors.
+        why: Only with many virtual nodes. One point means one arc and one heir.
+      - text: Most keys on the ring move, like with modulo.
+        why: On a ring only the dead server's keys move. That part works with one point too.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Hash function
+      example: { go: "crc32.ChecksumIEEE", python: "md5 or ketama in uhashring", typescript: "zlib.crc32", rust: "the hasher inside hashring" }
+      job: Maps both server points and keys onto the same circular space, spread evenly.
+    - role: Ring
+      example: a sorted array of points, or a balanced tree
+      job: Answers "first point at or after h" in O(log points).
+    - role: Virtual nodes
+      example: 100 to 200 points per server
+      job: Split each server's share into many small arcs, so load is even and a failure is shared.
+    - role: Membership
+      example: a config push, a service registry, gossip
+      job: Tells every router which servers are on the ring. Routers that disagree send the same key to different servers.
+  useWhen:
+    - Spreading cache keys or connections over a set of servers that grows, shrinks and fails.
+    - Partitioning data in a store whose nodes come and go, with replicas on the next distinct servers clockwise.
+    - Sticky routing in a load balancer, so a client keeps hitting the server that has its state.
+  avoidWhen:
+    - A fixed number of shards that never changes; plain modulo is simpler.
+    - When you need to move data deliberately, shard by shard; fixed hash slots or a lookup table give you that control.
+    - Very uneven key popularity. A ring balances keys, not traffic; one hot key still lands on one server.
+  tradeoffs:
+    - More virtual nodes give a more even spread but a bigger table to store, ship to every router and search.
+    - Weights are easy (more points for bigger machines), but each weight change moves keys.
+    - The ring minimises movement. It does not move the data; for a cache the moved keys are misses, for a store they are a migration.
+  lookalikes:
+    - name: Rendezvous hashing
+      how: Scores every server for each key and picks the highest. Same minimal movement, no ring, but a lookup is O(N).
+    - name: Jump consistent hash
+      how: A few lines of arithmetic and no memory, but buckets are numbered and can only be added or removed at the end.
+    - name: Hash slots
+      how: A fixed number of slots (16,384 in Redis Cluster) hashed by key, with slots assigned to nodes in a table you move explicitly.
+    - name: Consistent hashing with bounded loads
+      how: A ring that caps each server at a set factor of the average and passes overflow clockwise.
+---
+
+## [concept] Consistent hashing
+
+**Put servers and keys on the same circle; each key belongs to the next server clockwise, so a server joining or leaving only affects the keys next to it.**
+
+The circle is a <Term id="hash-ring">hash ring</Term>: the output of a hash function with its ends joined. <Term id="consistent-hashing">Consistent hashing</Term> keeps most keys where they are when the fleet changes, which is what a cache fleet or a sharded store needs.
+
+<Depth level={2}>
+The ring alone does not balance load. Four servers hashed to four random points split the circle into four random arcs, and one can easily be twice the size of another. Each server therefore places many points, called <Term id="virtual-node">virtual nodes</Term>. Many small arcs per server average out to an even share, and a dead server's arcs fall to many different neighbours.
+</Depth>
+
+<Depth level={3}>
+Karger and colleagues introduced the idea in 1997 for web caches whose clients each saw a slightly different set of caches. They proved that adding a cache moves only the items that are now closest to its points, with no movement between existing caches, and they gave each cache about log(C) points to keep the load balanced. Their construction maps an item to the closest cache point; most libraries today take the next point clockwise, which behaves the same way.
+</Depth>
+
+## [problem] A cache fleet behind hash % N
+
+A web app keeps sessions and rendered fragments in four memcached servers. The client picks a server by hashing the key and taking it modulo the number of servers. Every key lands on one server, every app server agrees which, and the load is even. It has worked for two years.
+
+<Depth level={2}>
+Modulo is a fine choice while N never changes. Every key's server depends on N, so the day N changes is the day the scheme shows its cost.
+</Depth>
+
+<Depth level={3}>
+Memcached servers do not talk to each other. Where a key lives is decided entirely by the client library, so every app server must run the same function over the same server list in the same order.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the sale starts Friday. Add a fifth cache server so the fleet has room for the extra traffic.
+
+The marked line adds `cache-e` to the list. A key stays on its server only when `hash % 4` equals `hash % 5`, which holds for 4 out of every 20 hash values. About 80% of keys now point at a server that does not have them. The cache is effectively cold, and every one of those misses goes to the database on the busiest day of the year.
+
+<Depth level={2}>
+A crash is no better. Remove one server from the list and every server after it shifts down one place, so most keys move again. The usual workaround is to add servers only at night, warm them slowly, or never remove a dead one from the list. All of them are signs that the placement function is wrong.
+</Depth>
+
+<Depth level={3}>
+In general, going from N to N+1 servers keeps a key only when its hash gives the same remainder for both, so about N/(N+1) of the keys move. The more servers you have, the worse each change gets.
+</Depth>
+
+## [morph] Bend the hash space into a ring
+
+Drag the slider. The modulo disappears: the router hashes each server many times onto a ring and looks up the first point clockwise from the key.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Pick the number of points per server once, before data lives on the ring, because changing it moves keys too. 100 to 200 points per server is common. Give bigger machines more points to give them a bigger share.
+</Depth>
+
+<Depth level={3}>
+The lookup is a binary search over all points: O(log(N × V)) for N servers with V points each. With 50 servers and 200 points that is 10,000 sorted integers, about 14 comparisons. Every router holds its own copy of the ring, so the ring must be built the same way everywhere: same hash, same point names, same server list.
+</Depth>
+
+## [walk] Follow one key
+
+One key looked up, then the ring changing under it twice. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`slices.BinarySearch` returns the position where the value would be inserted, which is exactly the first point at or after the key's hash. When it returns `len(points)`, the key is past the last point and wraps to index 0.</Lang>
+<Lang only="python">`uhashring` keeps the sorted points and uses `bisect` for the lookup. Its default placement is not the same as libmemcached's ketama; pass `hash_fn="ketama"` if other clients must agree with it.</Lang>
+<Lang only="typescript">`zlib.crc32` returns an unsigned 32-bit number, so plain numeric comparison works. `>>> 1` keeps the midpoint an integer without risk of overflow.</Lang>
+<Lang only="rust">`HashRing::get` takes any `Hash` value, so the key is hashed with the same hasher as the virtual nodes. Each `VNode` value is a distinct point because its `replica` field differs.</Lang>
+</Depth>
+
+## [again] The same change again
+
+The same fifth server with the ring: about a fifth of the keys move, all of them to `cache-e`, and none move between the four old servers. The database sees one server's worth of misses instead of four fifths of the cache. The test above checks both halves of that promise.
+
+<Depth level={2}>
+The moved keys are still misses. For a cache, warm the new server or add it at a quiet hour. For a store, moving keys means copying data before the new node takes over its arcs.
+</Depth>
+
+<Depth level={3}>
+Replication uses the same walk. To keep three copies, take the first three distinct physical servers clockwise from the key, skipping further points of a server you already have. The Dynamo paper (2007) and Cassandra's `num_tokens` both build on this ring with many points per node.
+</Depth>
+
+## [play] Grow and break a cache fleet
+
+1,000 keys over four cache servers. Every change you make is applied to both schemes at once, hash % N and the ring, so you can see how many keys each one moves. Change the points per server to see how even the ring is.
+
+## [lens] How each language does it
+
+None of the four standard libraries has a hash ring. Each has a fast hash and a sorted search, and the ring is about thirty lines; libraries add virtual nodes, weights and ketama compatibility.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whatever the language, every client must build an identical ring. If one client uses a different hash or point naming, it sends keys to the wrong servers and the cache quietly stops hitting.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="consistent-hashing" />
+
+### Other ways to get minimal movement
+
+<Term id="rendezvous-hashing">Rendezvous hashing</Term> (Thaler and Ravishankar) needs no ring: score every server with hash(key, server) and pick the highest. <Term id="jump-consistent-hash">Jump consistent hash</Term> (Lamping and Veach, 2014) needs no memory at all, but buckets are numbered, so you can only add or remove the last one. Redis Cluster uses fixed <Term id="hash-slot">hash slots</Term>, CRC16(key) mod 16384, and moves whole slots between nodes when the cluster changes.
