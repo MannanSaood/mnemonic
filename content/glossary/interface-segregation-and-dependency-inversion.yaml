@@ -1,0 +1,9 @@
+- id: interface-segregation
+  term: Interface segregation principle
+  short: No code should be forced to depend on methods it does not use (Robert C. Martin). Give each client an interface of only what it needs.
+- id: dependency-inversion
+  term: Dependency inversion principle
+  short: High-level policy should not depend on low-level details; both should depend on abstractions, and the abstraction belongs to the policy side.
+- id: role-interface
+  term: Role interface
+  short: A small interface named after what one client needs from a collaborator, as opposed to a header interface that lists everything the collaborator can do.

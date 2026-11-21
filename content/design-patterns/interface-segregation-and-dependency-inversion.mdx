@@ -1,0 +1,628 @@
+---
+title: Interface segregation and dependency inversion
+track: design-patterns
+group: Principles
+order: 16
+summary: Give each client a small interface of only what it uses, and let the business code own that interface so the database code depends on it.
+intent: A change to one client's needs, or to the database layer, should stop at the code that asked for it.
+changeRequest: Admins need a BulkBan, and local development moves signup to an in-memory user store.
+languages: [go, python, typescript, rust]
+glossary: [interface-segregation, dependency-inversion, role-interface, dependency-injection, interface]
+
+prerequisites: [design-patterns/dependency-injection]
+skills: [design, testing]
+depths: [overview, engineer, deep]
+
+playground:
+  model: interface-segregation-and-dependency-inversion
+  scenarios:
+    - try: "Answer the prediction, then ship Admins need BulkBan in the starting design."
+      notice: "All four services' test fakes break and all four rebuild, for a method only the admin console calls."
+    - try: "Switch to Only the methods it uses and ship BulkBan again."
+      notice: "Only the admin fake changes. But every service still rebuilds, because the small interfaces still live in package postgres."
+    - try: "Ship the driver upgrade, then switch Who owns the interface to The code that uses it and ship it again."
+      notice: "The business code stops rebuilding, and SignupService no longer needs an edit for a database upgrade. The arrows across the boundary now point up."
+    - try: "Ship all four requests in the design with both switches on, and read the grid."
+      notice: "Each principle fixes a different ripple. Only both together keep every change at the code that asked for it."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 8, y: 30, w: 84, h: 48, title: main, sub: wires }
+      after:  { x: 8, y: 196, w: 84, h: 48, title: main, sub: wires }
+    - id: context
+      kind: context
+      before: { x: 106, y: 14, w: 206, h: 132, title: SignupService, sub: package signup }
+      after:  { x: 106, y: 30, w: 150, h: 52, title: SignupService, sub: package signup }
+    - id: strategy
+      kind: strategy
+      before: { x: 330, y: 14, w: 222, h: 100, title: UserRepository, sub: 10 methods · package postgres }
+      after:  { x: 300, y: 30, w: 152, h: 52, title: UserStore, sub: 2 methods · signup }
+    - id: driver
+      kind: concrete
+      before: { x: 120, y: 92, w: 178, h: 34, title: { go: pgconn.PgError, python: UniqueViolation, typescript: 'code "23505"', rust: sqlx::Error } }
+      after:  { x: 444, y: 196, w: 108, h: 48, title: { go: pgx, python: psycopg, typescript: pg, rust: sqlx }, sub: driver }
+    - id: pg
+      kind: concrete
+      before: { x: 330, y: 140, w: 222, h: 48, title: PgUserRepository, sub: package postgres }
+      after:  { x: 300, y: 196, w: 116, h: 48, title: PgUserRepo, sub: package postgres }
+    - id: mem
+      kind: concrete
+      appears: change
+      before: { x: 330, y: 204, w: 222, h: 48, title: MemStore, sub: must implement all 11 }
+      after:  { x: 170, y: 130, w: 110, h: 44, title: MemStore, sub: 2 methods }
+  edges:
+    - { from: client, to: context, label: injects }
+    - { from: context, to: strategy, label: uses }
+    - { from: pg, to: strategy, kind: implements }
+    - { from: mem, to: strategy, kind: implements }
+    - { from: pg, to: driver }
+
+code:
+  go:
+    before:
+      file: postgres/users.go · signup/service.go
+      source: |
+        // postgres/users.go
+        package postgres
+
+        type UserRepository interface {
+            FindByID(ctx context.Context, id int64) (User, error)
+            FindByEmail(ctx context.Context, email string) (User, error)
+            Create(ctx context.Context, u User) error
+            UpdatePassword(ctx context.Context, id int64, hash []byte) error
+            Ban(ctx context.Context, id int64, reason string) error
+            List(ctx context.Context, page Page) ([]User, error)
+            Search(ctx context.Context, q string) ([]User, error)
+            CountSignups(ctx context.Context, since time.Time) (int, error)
+            ExportAll(ctx context.Context, id int64) (Export, error)
+            Delete(ctx context.Context, id int64) error
+        }
+
+        // signup/service.go
+        import "github.com/jackc/pgx/v5/pgconn"
+
+        type Service struct{ users postgres.UserRepository }
+
+        func (s *Service) Register(ctx context.Context, email string, pw []byte) error {
+            err := s.users.Create(ctx, postgres.User{Email: email, Hash: hash(pw)})
+            var pgErr *pgconn.PgError
+            if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+                return ErrEmailTaken
+            }
+            return err
+        }
+      roles: { strategy: [4, 15], context: [17, 29], driver: [24, 27] }
+      change:
+        - { after: 14, add: ['    BulkBan(ctx context.Context, ids []int64, reason string) error'] }
+        - { after: 18, add: ['import "example.com/app/memstore"'] }
+        - { after: 27, add: ['    if errors.Is(err, memstore.ErrDuplicate) {', '        return ErrEmailTaken', '    }'] }
+    after:
+      file: signup/service.go · postgres/users.go · main.go
+      source: |
+        // signup/service.go: the service owns the interface it needs
+        package signup
+
+        var ErrEmailTaken = errors.New("email already registered")
+
+        type UserStore interface {
+            FindByEmail(ctx context.Context, email string) (User, error)
+            Create(ctx context.Context, u User) error // ErrEmailTaken on a duplicate
+        }
+
+        type Service struct{ users UserStore }
+
+        func (s *Service) Register(ctx context.Context, email string, pw []byte) error {
+            return s.users.Create(ctx, User{Email: email, Hash: hash(pw)})
+        }
+
+        // postgres/users.go: the adapter imports signup, never the reverse
+        func (r *UserRepo) Create(ctx context.Context, u signup.User) error {
+            _, err := r.pool.Exec(ctx, insertUser, u.Email, u.Hash)
+            var pgErr *pgconn.PgError
+            if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+                return signup.ErrEmailTaken
+            }
+            return err
+        }
+
+        // main.go
+        svc := &signup.Service{users: postgres.NewUserRepo(pool)}
+      roles: { strategy: [6, 9], context: [1, 15], pg: [17, 25], driver: [20, 23], client: [27, 28], wire: [28, 28], call: [14, 14], translate: [20, 23], own: [17, 18] }
+    again:
+      file: memstore/users.go
+      source: |
+        // memstore/users.go: a new adapter; signup does not change
+        type Users struct {
+            mu      sync.Mutex
+            byEmail map[string]signup.User
+        }
+
+        func (m *Users) Create(_ context.Context, u signup.User) error {
+            m.mu.Lock()
+            defer m.mu.Unlock()
+            if _, ok := m.byEmail[u.Email]; ok {
+                return signup.ErrEmailTaken
+            }
+            m.byEmail[u.Email] = u
+            return nil
+        }
+        // FindByEmail likewise. BulkBan goes into admin's own AdminStore; signup never sees it.
+    cost:
+      before: { text: 1 new method in every fake · signup edited for a database choice, value: 0.85 }
+      after: { text: 1 new file · signup untouched, value: 0.12 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Go''s implicit interfaces make this the default style: define a small interface where it is used, accept it as a parameter, return concrete types. The adapter never has to mention `signup.UserStore` to satisfy it.'
+      seenIn: '`database/sql/driver` is owned by the standard library and implemented by every driver, so `database/sql` never imports a driver. `io.Reader` and `io.Writer` are the smallest possible role interfaces.'
+
+  python:
+    before:
+      file: postgres/users.py · signup/service.py
+      source: |
+        # postgres/users.py
+        class UserRepository(Protocol):
+            def find_by_id(self, user_id: int) -> User: ...
+            def find_by_email(self, email: str) -> User | None: ...
+            def create(self, user: User) -> None: ...
+            def update_password(self, user_id: int, pw_hash: bytes) -> None: ...
+            def ban(self, user_id: int, reason: str) -> None: ...
+            def list_page(self, page: Page) -> list[User]: ...
+            def search(self, query: str) -> list[User]: ...
+            def count_signups(self, since: datetime) -> int: ...
+            def export_all(self, user_id: int) -> Export: ...
+            def delete(self, user_id: int) -> None: ...
+
+        # signup/service.py
+        from psycopg.errors import UniqueViolation
+
+        class SignupService:
+            def __init__(self, users: UserRepository):
+                self.users = users
+
+            def register(self, email: str, password: str) -> None:
+                try:
+                    self.users.create(User(email=email, pw_hash=hash_pw(password)))
+                except UniqueViolation:
+                    raise EmailTaken(email)
+      roles: { strategy: [2, 12], context: [14, 25], driver: [24, 25] }
+      change:
+        - { after: 12, add: ['    def bulk_ban(self, user_ids: list[int], reason: str) -> None: ...'] }
+        - { after: 15, add: ['from memstore.users import DuplicateEmail'] }
+        - { after: 25, add: ['        except DuplicateEmail:', '            raise EmailTaken(email)'] }
+    after:
+      file: signup/service.py · postgres/users.py · main.py
+      source: |
+        # signup/service.py: the service owns the interface it needs
+        class EmailTaken(Exception): ...
+
+        class UserStore(Protocol):
+            def find_by_email(self, email: str) -> User | None: ...
+            def create(self, user: User) -> None: ...  # raises EmailTaken on a duplicate
+
+        class SignupService:
+            def __init__(self, users: UserStore):
+                self.users = users
+
+            def register(self, email: str, password: str) -> None:
+                self.users.create(User(email=email, pw_hash=hash_pw(password)))
+
+        # postgres/users.py: the adapter imports signup, never the reverse
+        class PgUserRepository:
+            def create(self, user: User) -> None:
+                try:
+                    self.conn.execute(INSERT_USER, (user.email, user.pw_hash))
+                except UniqueViolation:
+                    raise EmailTaken(user.email)
+
+        # main.py
+        service = SignupService(PgUserRepository(conn))
+      roles: { strategy: [4, 6], context: [1, 13], pg: [15, 21], driver: [18, 21], client: [23, 24], wire: [24, 24], call: [13, 13], translate: [20, 21], own: [15, 16] }
+    again:
+      file: memstore/users.py
+      source: |
+        # memstore/users.py: a new adapter; signup does not change
+        class MemUsers:
+            def __init__(self) -> None:
+                self.by_email: dict[str, User] = {}
+
+            def find_by_email(self, email: str) -> User | None:
+                return self.by_email.get(email)
+
+            def create(self, user: User) -> None:
+                if user.email in self.by_email:
+                    raise EmailTaken(user.email)
+                self.by_email[user.email] = user
+        # bulk_ban goes into the admin console's own AdminStore; signup never sees it.
+    cost:
+      before: { text: 1 new method on the fat Protocol · signup edited for a database choice, value: 0.8 }
+      after: { text: 1 new file · signup untouched, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Duck typing already lets any object with the right methods stand in, so segregation pays off mostly in type checking and in fakes. Inversion still matters a lot: an `except psycopg...` inside business code ties it to one database.'
+      seenIn: '`os.PathLike` is a one-method protocol that `open()` and `pathlib` accept from any library. `typing.SupportsIndex` and `collections.abc.Iterable` are role interfaces in the standard library.'
+
+  typescript:
+    before:
+      file: postgres/users.ts · signup/service.ts
+      source: |
+        // postgres/users.ts
+        export interface UserRepository {
+          findById(id: number): Promise<User>;
+          findByEmail(email: string): Promise<User | null>;
+          create(user: User): Promise<void>;
+          updatePassword(id: number, hash: string): Promise<void>;
+          ban(id: number, reason: string): Promise<void>;
+          list(page: Page): Promise<User[]>;
+          search(query: string): Promise<User[]>;
+          countSignups(since: Date): Promise<number>;
+          exportAll(id: number): Promise<Export>;
+          delete(id: number): Promise<void>;
+        }
+
+        // signup/service.ts
+        import type { UserRepository } from "../postgres/users";
+
+        export class SignupService {
+          constructor(private readonly users: UserRepository) {}
+
+          async register(email: string, password: string): Promise<void> {
+            try {
+              await this.users.create({ email, hash: await hashPw(password) });
+            } catch (err) {
+              if ((err as { code?: string }).code === "23505") throw new EmailTaken(email);
+              throw err;
+            }
+          }
+        }
+      roles: { strategy: [2, 13], context: [15, 29], driver: [25, 25] }
+      change:
+        - { after: 12, add: ['  bulkBan(ids: number[], reason: string): Promise<void>;'] }
+        - { after: 16, add: ['import { DuplicateEmailError } from "../memstore/users";'] }
+        - { after: 25, add: ['      if (err instanceof DuplicateEmailError) throw new EmailTaken(email);'] }
+    after:
+      file: signup/service.ts · postgres/users.ts · main.ts
+      source: |
+        // signup/service.ts: the service owns the interface it needs
+        export class EmailTaken extends Error {}
+
+        export interface UserStore {
+          findByEmail(email: string): Promise<User | null>;
+          create(user: User): Promise<void>; // rejects with EmailTaken on a duplicate
+        }
+
+        export class SignupService {
+          constructor(private readonly users: UserStore) {}
+
+          async register(email: string, password: string): Promise<void> {
+            await this.users.create({ email, hash: await hashPw(password) });
+          }
+        }
+
+        // postgres/users.ts: the adapter imports signup, never the reverse
+        export class PgUserRepository implements UserStore {
+          async create(user: User): Promise<void> {
+            try {
+              await this.pool.query(INSERT_USER, [user.email, user.hash]);
+            } catch (err) {
+              if ((err as { code?: string }).code === "23505") throw new EmailTaken(user.email);
+              throw err;
+            }
+          }
+          // findByEmail: SELECT … WHERE email = $1
+        }
+
+        // main.ts
+        const service = new SignupService(new PgUserRepository(pool));
+      roles: { strategy: [4, 7], context: [1, 15], pg: [17, 28], driver: [22, 25], client: [30, 31], wire: [31, 31], call: [13, 13], translate: [23, 23], own: [17, 18] }
+    again:
+      file: memstore/users.ts
+      source: |
+        // memstore/users.ts: a new adapter; signup does not change
+        export class MemUsers implements UserStore {
+          private byEmail = new Map<string, User>();
+          async findByEmail(email: string) { return this.byEmail.get(email) ?? null; }
+          async create(user: User) {
+            if (this.byEmail.has(user.email)) throw new EmailTaken(user.email);
+            this.byEmail.set(user.email, user);
+          }
+        }
+        // bulkBan goes into the admin console's own AdminStore; signup never sees it.
+    cost:
+      before: { text: 1 new method in every fake · signup edited for a database choice, value: 0.85 }
+      after: { text: 1 new file · signup untouched, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Structural typing means a fake object literal with two methods satisfies `UserStore`; no mocking library is needed. `Pick<UserRepository, "findByEmail" | "create">` is a quick role interface, but it still points at the fat type and its file.'
+      seenIn: 'DOM APIs accept any `EventListener` object with a `handleEvent` method. Utility types such as `Pick` and `Omit` exist largely to carve role interfaces out of big ones.'
+
+  rust:
+    before:
+      file: postgres/users.rs · signup/service.rs
+      source: |
+        // postgres/users.rs
+        pub trait UserRepository {
+            async fn find_by_id(&self, id: i64) -> Result<User, sqlx::Error>;
+            async fn find_by_email(&self, email: &str) -> Result<Option<User>, sqlx::Error>;
+            async fn create(&self, user: &User) -> Result<(), sqlx::Error>;
+            async fn update_password(&self, id: i64, hash: &[u8]) -> Result<(), sqlx::Error>;
+            async fn ban(&self, id: i64, reason: &str) -> Result<(), sqlx::Error>;
+            async fn list(&self, page: Page) -> Result<Vec<User>, sqlx::Error>;
+            async fn search(&self, query: &str) -> Result<Vec<User>, sqlx::Error>;
+            async fn count_signups(&self, since: DateTime<Utc>) -> Result<i64, sqlx::Error>;
+            async fn export_all(&self, id: i64) -> Result<Export, sqlx::Error>;
+            async fn delete(&self, id: i64) -> Result<(), sqlx::Error>;
+        }
+
+        // signup/service.rs
+        pub struct SignupService<R: UserRepository> { users: R }
+
+        impl<R: UserRepository> SignupService<R> {
+            pub async fn register(&self, email: &str, pw: &str) -> Result<(), SignupError> {
+                match self.users.create(&User::new(email, hash_pw(pw))).await {
+                    Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Err(SignupError::EmailTaken),
+                    other => other.map_err(SignupError::Db),
+                }
+            }
+        }
+      roles: { strategy: [2, 13], context: [15, 25], driver: [21, 22] }
+      change:
+        - { after: 12, add: ['    async fn bulk_ban(&self, ids: &[i64], reason: &str) -> Result<(), sqlx::Error>;'] }
+        - { after: 21, add: ['            // MemStore has to fake a sqlx::Error to report a duplicate', '            Err(sqlx::Error::Protocol(m)) if m == "duplicate email" => Err(SignupError::EmailTaken),'] }
+    after:
+      file: signup/service.rs · postgres/users.rs · main.rs
+      source: |
+        // signup/service.rs: the service owns the trait it needs
+        pub enum StoreError { EmailTaken, Unavailable(Box<dyn std::error::Error + Send + Sync>) }
+
+        pub trait UserStore {
+            async fn find_by_email(&self, email: &str) -> Result<Option<User>, StoreError>;
+            async fn create(&self, user: &User) -> Result<(), StoreError>;
+        }
+
+        pub struct SignupService<S: UserStore> { users: S }
+
+        impl<S: UserStore> SignupService<S> {
+            pub async fn register(&self, email: &str, pw: &str) -> Result<(), StoreError> {
+                self.users.create(&User::new(email, hash_pw(pw))).await
+            }
+        }
+
+        // postgres/users.rs: the adapter depends on signup, never the reverse
+        impl signup::UserStore for PgUserRepository {
+            async fn create(&self, u: &User) -> Result<(), StoreError> {
+                match sqlx::query(INSERT_USER).bind(&u.email).bind(&u.hash).execute(&self.pool).await {
+                    Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Err(StoreError::EmailTaken),
+                    other => other.map(|_| ()).map_err(|e| StoreError::Unavailable(e.into())),
+                }
+            }
+            // find_by_email: SELECT … WHERE email = $1
+        }
+
+        // main.rs
+        let service = SignupService { users: PgUserRepository::new(pool) };
+      roles: { strategy: [4, 7], context: [1, 15], pg: [17, 26], driver: [20, 23], client: [28, 29], wire: [29, 29], call: [13, 13], translate: [21, 21], own: [17, 18] }
+    again:
+      file: memstore/users.rs
+      source: |
+        // memstore/users.rs: a new adapter; signup does not change
+        pub struct MemUsers { by_email: Mutex<HashMap<String, User>> }
+
+        impl signup::UserStore for MemUsers {
+            async fn find_by_email(&self, email: &str) -> Result<Option<User>, StoreError> {
+                Ok(self.by_email.lock().unwrap().get(email).cloned())
+            }
+            async fn create(&self, u: &User) -> Result<(), StoreError> {
+                let mut users = self.by_email.lock().unwrap();
+                if users.contains_key(&u.email) { return Err(StoreError::EmailTaken); }
+                users.insert(u.email.clone(), u.clone());
+                Ok(())
+            }
+        }
+        // bulk_ban goes into the admin console's own AdminStore; signup never sees it.
+    cost:
+      before: { text: 1 new method on the fat trait · signup edited for a database choice, value: 0.85 }
+      after: { text: 1 new file · signup untouched, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The trait''s error type is part of its interface: a trait that returns `sqlx::Error` ties every implementation to sqlx. Own the error type next to the trait. `async fn` in traits (Rust 1.75) works with generics as here; for `dyn UserStore` you need boxed futures, for example via the `async-trait` crate.'
+      seenIn: '`serde_json::to_writer` accepts any `std::io::Write`, so it never depends on files or sockets. `tower::Service` lets middleware depend on one small trait instead of a server.'
+
+walk:
+  - text: '`main` builds the Postgres adapter and hands it to SignupService as a UserStore. It is the one place that knows both.'
+    nodes: [client, context]
+    edges: [client>context]
+    role: wire
+  - text: Register calls Create on the UserStore it was given. SignupService never mentions Postgres or the driver.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: call
+  - text: The adapter runs the INSERT. On a unique violation it returns signup's own EmailTaken error, so the driver's error type never leaves the adapter.
+    nodes: [pg, driver, strategy]
+    edges: [pg>driver, pg>strategy]
+    role: translate
+  - text: At runtime the call still flows from signup down to Postgres. In the source, the dependency now points up, from the adapter to the interface signup owns. That is the inversion.
+    nodes: [pg, strategy]
+    edges: [pg>strategy]
+    role: own
+
+checks:
+  overview:
+    question: SignupService talks to Postgres directly. Which change follows the dependency inversion principle?
+    options:
+      - text: Declare the interface SignupService needs in its own package, and make the Postgres code implement it.
+        correct: true
+        why: Right. The business code owns the abstraction, the database code depends on it, and main wires the two together.
+      - text: Wrap the Postgres driver in a class inside the signup package.
+        why: The signup package now contains the driver code, so it still depends on Postgres. Moving a dependency closer is not inverting it.
+      - text: Let SignupService build its own repository from a connection string in config.
+        why: SignupService then names the concrete repository and the driver behind it. Creating a dependency yourself is the opposite of having it handed in.
+  engineer:
+    question: GdprExporter needs FindByID, ExportAll and Delete. A teammate proposes three interfaces, Finder, Exporter and Deleter. What do you suggest?
+    options:
+      - text: One GdprStore interface with exactly those three methods, named for what the exporter needs.
+        correct: true
+        why: Right. Segregate by client. The exporter always needs all three together, so one role interface keeps its constructor and its fake simple.
+      - text: Go ahead with one interface per method.
+        why: The exporter would take three parameters that are always the same object, and nothing gets safer. Interfaces that small fit when different clients use different single methods, like io.Reader.
+      - text: Keep UserRepository and let the exporter ignore the methods it does not call.
+        why: Ignoring them does not stop depending on them. Every new method on UserRepository changes the exporter's fake and rebuilds it.
+  deep:
+    question: In the inverted design, the platform team upgrades the Postgres driver. Which packages does the build have to recompile, and why?
+    options:
+      - text: Only the Postgres adapter and main. No business package imports the adapter or the driver, so their cached builds and test results are still valid.
+        correct: true
+        why: Right. Build tools such as Go's build cache, cargo and tsc's incremental mode reuse work for packages whose imports did not change. Source dependencies, not runtime calls, decide what rebuilds.
+      - text: Everything, because main links every package into one binary.
+        why: The final link step does run, but compiling and testing each package is cached separately. Only packages that import something changed are rebuilt.
+      - text: The adapter, main and SignupService, because SignupService calls the adapter at runtime.
+        why: Runtime calls go through the interface. SignupService's source does not mention the adapter, so the compiler has no reason to rebuild it.
+
+reference:
+  roles:
+    - role: Client
+      example: SignupService, AdminConsole
+      job: Declares the small interface it needs, in its own package, and depends only on that.
+    - role: Role interface
+      example: { go: "signup.UserStore (interface)", python: "UserStore (Protocol)", typescript: "UserStore (interface)", rust: "UserStore (trait)" }
+      job: The methods one client uses, and the errors it understands. Owned by the client.
+    - role: Adapter
+      example: PgUserRepository, MemUsers
+      job: Implements the interface with a real technology and translates its errors. Depends on the client's package.
+    - role: Composition root
+      example: main
+      job: Builds the adapters and hands them to the clients. The only place that knows both sides.
+  useWhen:
+    - Several clients use different slices of one big interface, and its changes keep rippling to all of them.
+    - Business code imports a driver, an SDK or a framework type, even just for an error check.
+    - You want fast unit tests with tiny fakes, and the ability to swap the storage for local development.
+  avoidWhen:
+    - One client and one implementation, both owned by the same team, with no test pain. An interface there is just indirection.
+    - Stable platform code. Depending on the standard library's string or time types directly is fine; invert dependencies on volatile code.
+  tradeoffs:
+    - More, smaller interfaces, and some methods appear in several of them.
+    - Adapters must translate errors and types at the boundary, which is code to write and test.
+    - The wiring in main grows with every adapter.
+  lookalikes:
+    - name: Dependency injection
+      how: The mechanism of passing a collaborator in. DIP is about who owns the abstraction and which way the source dependency points. You can inject a concrete Postgres type and still violate DIP.
+    - name: Adapter
+      how: The pattern the database code uses here. It makes Postgres fit the interface signup owns.
+    - name: Liskov substitution
+      how: Once the interfaces are small, each implementation can keep every promise it makes, which is what makes them substitutable.
+---
+
+## [concept] Interface segregation and dependency inversion
+
+**Give each client an interface of only what it uses. Then let the business code own that interface, so the database code depends on it, not the other way round.**
+
+The <Term id="interface-segregation">interface segregation principle</Term> says no code should be forced to depend on methods it does not use. The <Term id="dependency-inversion">dependency inversion principle</Term> says high-level policy should not depend on low-level details; both should depend on abstractions, and the abstraction belongs with the policy.
+
+<Depth level={2}>
+Together they decide where a change stops. A small <Term id="role-interface">role interface</Term> per client means a new method for the admin console touches only the admin console. An interface owned by the business code means a driver upgrade touches only the database adapter. Each principle fixes one ripple, and you usually want both.
+</Depth>
+
+<Depth level={3}>
+Robert C. Martin published both in *C++ Report* in 1996. The interface segregation principle came from consulting for Xerox, where one Job class served every kind of job in a new printer system. Stapling and printing code depended on each other's methods, and even a small change meant an hour-long redeployment. Dependency inversion is named after the structured design of the time, where high-level modules imported low-level ones; in the inverted design, the source-code dependency points against the flow of control. In *Clean Architecture* that one-way crossing becomes the Dependency Rule.
+</Depth>
+
+## [problem] One fat repository, and a driver in the business code
+
+Four services share one UserRepository with ten methods. It lives in package postgres, next to its implementation. SignupService uses two of the ten methods, and it checks the driver's error to spot a duplicate email.
+
+Read it once. SignupService imports package postgres for the interface, and the driver for the error.
+
+<Depth level={2}>
+Every service that holds a UserRepository depends on all ten methods. Every test fake for any of them implements all ten, even when the test calls one.
+</Depth>
+
+<Depth level={3}>
+The driver check is the subtle part. SQLSTATE 23505 is Postgres's unique-violation code, and the business rule "an email can register only once" is now written in terms of one database's error format.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** admins need a BulkBan, and local development moves signup to an in-memory user store.
+
+BulkBan goes into UserRepository, so every implementation and every fake must add it, including the ones for signup, which will never call it. The in-memory store reports duplicates its own way, so SignupService learns a second error from a second store.
+
+<Depth level={2}>
+Neither request came from signup, and signup's code changes for both. That is the cost of depending on more than you use, and on details you do not own.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The new store must implement all eleven methods to be a UserRepository, nine of them as stubs that panic. Go would let a fake embed the interface to skip methods, but a nil embedded interface panics when an unexpected method is called.</Lang>
+<Lang only="python">mypy rejects the in-memory store as a UserRepository until it has all eleven methods, so it grows stubs that raise NotImplementedError.</Lang>
+<Lang only="typescript">The in-memory store must declare all eleven methods to satisfy UserRepository, and every test fake object literal grows a `bulkBan` it never calls.</Lang>
+<Lang only="rust">The trait's methods return `sqlx::Error`, so the in-memory store must invent sqlx errors to report anything. The driver's types leaked into a trait that was meant to hide it.</Lang>
+</Depth>
+
+## [morph] Small interfaces, owned by the code that uses them
+
+Drag the slider. The ten-method interface becomes a two-method UserStore that lives in package signup. The Postgres repository implements it and translates the driver's error into signup's own. The driver check leaves the business code.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Owning the interface means owning its words: its method names, its types and its errors. `EmailTaken` belongs to signup, and every store, Postgres or in-memory, speaks it.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The adapter imports `signup` for `User` and `ErrEmailTaken`, and satisfies `signup.UserStore` without naming it. Go's convention, define interfaces where they are used, is the inversion by default.</Lang>
+<Lang only="python">A Protocol is structural, so `PgUserRepository` matches `UserStore` without importing it. It still imports `EmailTaken`, which is the dependency that points from postgres to signup.</Lang>
+<Lang only="typescript">`implements UserStore` is optional because of structural typing; it is there so the compiler checks the adapter where it is written.</Lang>
+<Lang only="rust">The adapter crate implements a trait from the signup crate for its own type, which the orphan rule allows. The error type is now `StoreError`, owned by signup.</Lang>
+</Depth>
+
+## [walk] Follow one sign-up
+
+One sign-up through the inverted design, from main's wiring to the driver and back. Step through it with the numbered buttons.
+
+<Depth level={3}>
+At runtime nothing changed: one call through an interface, then the INSERT. The difference is entirely in the import graph, which is what compilers, build caches and test runners follow.
+</Depth>
+
+## [again] The same request, the second time
+
+The in-memory store is a new file that implements two methods and returns `EmailTaken` like Postgres does. BulkBan goes into the admin console's own interface. SignupService, its interface and its tests do not change.
+
+<Depth level={2}>
+The test for the duplicate-email path is now four lines: a fake whose `Create` returns `EmailTaken`, and an assertion. It needs no database and no driver.
+</Depth>
+
+<Depth level={3}>
+The four role interfaces overlap with each other. That is fine: the Postgres adapter implements all of them, and each client sees only its own. Martin's Xerox fix had the same shape, one Job class behind an interface per kind of job.
+</Depth>
+
+## [play] Ship four requests through four designs
+
+Two switches make four designs: what each service sees, and who owns the interface. Ship four real requests and watch how far each one ripples through the import graph.
+
+Turn on one principle at a time. The grid shows the same request in all four designs, so you can see what each one buys on its own.
+
+## [lens] How each language writes it
+
+The principles are the same everywhere. How much ceremony they need is not: Go's implicit interfaces make consumer-owned interfaces natural, while Rust's traits make the error type part of the boundary.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="interface-segregation-and-dependency-inversion" />
+
+### Injection is not inversion
+
+<Term id="dependency-injection">Dependency injection</Term> hands a collaborator in from outside. Dependency inversion decides who owns the type of that collaborator. Injecting a concrete `PgUserRepository`, or an interface that lives in package postgres, is injection without inversion: the business code still imports the database code. The test is simple. Look at the import lines of the business code. If a driver or a database package appears there, the dependency has not been inverted.
