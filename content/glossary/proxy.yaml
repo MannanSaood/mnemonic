@@ -1,0 +1,19 @@
+# Terms introduced by the Proxy lesson.
+- id: subject-role
+  term: Subject
+  short: In Proxy, the interface that both the real object and its proxy implement, so callers cannot tell them apart.
+- id: real-subject
+  term: Real subject
+  short: In Proxy, the object that does the actual work, such as the client that calls a remote API. The proxy stands in front of it.
+- id: virtual-proxy
+  term: Virtual proxy
+  short: A proxy that delays creating or connecting the expensive real object until the first call that needs it.
+- id: protection-proxy
+  term: Protection proxy
+  short: A proxy that checks the caller's permissions before passing a request on to the real object.
+- id: remote-proxy
+  term: Remote proxy
+  short: A local object that stands for one in another process or on another machine, and turns method calls into network requests.
+- id: time-to-live
+  term: TTL (time to live)
+  short: How long a cached value is trusted. After it runs out, the next request goes to the source again.

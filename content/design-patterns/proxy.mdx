@@ -1,0 +1,619 @@
+---
+title: Proxy
+track: design-patterns
+group: Structural
+order: 36
+summary: Put a stand-in with the same interface in front of an object, so you can control every call to it without changing the callers.
+intent: Callers keep calling the same method. Something in between decides whether, when and how the real object is reached.
+changeRequest: The rates vendor now bills per call, and finance wants every paid call counted.
+languages: [go, python, typescript, rust]
+glossary: [subject-role, real-subject, virtual-proxy, protection-proxy, remote-proxy, time-to-live, interface, dependency-injection]
+
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+playground:
+  model: proxy
+  scenarios:
+    - try: "Run the two minutes with no proxy, then add CachedRates and run again."
+      notice: "Vendor calls fall from 190 to 6, checkout drops from 300 ms to 16 ms on average, and the code in the Callers box never changed."
+    - try: "Switch on the EUR/USD jump, then compare TTL 10 s, 60 s and 600 s."
+      notice: "Every second of TTL saves calls and buys stale answers. The callers cannot tell, because the proxy answers through the same interface."
+    - try: "Add GuardedRates, run, then move it after the cache and run again."
+      notice: "With the guard first, the export script gets nothing. With the cache first, it gets cached rates the guard would have refused. Order in a chain of proxies is behaviour."
+    - try: "Switch on the outage and find a TTL that gets checkout through it with 0 errors."
+      notice: "A 60 s cache rides out a 15 s outage. A 10 s cache expires in the middle of it."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: main, sub: builds fx client }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: main, sub: wires the chain }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 250, title: Callers ×3, sub: each holds the fx client }
+      after:  { x: 150, y: 30, w: 140, h: 52, title: Callers, sub: unchanged }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 340, y: 30, w: 200, h: 52, title: "" }
+      after:  { x: 340, y: 30, w: 200, h: 52, title: RateSource, sub: { go: "Rate(ctx, pair)", python: rate(pair), typescript: rate(pair), rust: rate(pair) } }
+    - id: proxy
+      kind: concrete
+      before: { x: 170, y: 90, w: 230, h: 34, title: cache copied ×2 }
+      after:  { x: 196, y: 150, w: 130, h: 44, title: CachedRates, sub: proxy }
+    - id: real
+      kind: concrete
+      before: { x: 170, y: 140, w: 230, h: 34, title: fx.rate() ×3 }
+      after:  { x: 420, y: 150, w: 120, h: 44, title: fx client, sub: real subject }
+    - id: counting
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 200, w: 230, h: 34, title: count++ ×3 }
+      after:  { x: 330, y: 216, w: 150, h: 44, title: CountingRates, sub: second proxy }
+  edges:
+    - { from: client, to: context, label: injects }
+    - { from: context, to: strategy, label: calls }
+    - { from: proxy, to: strategy, kind: implements, label: implements }
+    - { from: real, to: strategy, kind: implements }
+    - { from: counting, to: strategy, kind: implements }
+    - { from: proxy, to: real, label: wraps }
+
+code:
+  go:
+    before:
+      file: checkout.go · invoices.go · reports.go
+      source: |
+        // checkout.go
+        func (c *Checkout) rate(ctx context.Context, pair string) (float64, error) {
+            c.mu.Lock()
+            defer c.mu.Unlock()
+            if r, ok := c.cache[pair]; ok && time.Since(r.at) < time.Minute {
+                return r.value, nil
+            }
+            v, err := c.fx.Rate(ctx, pair)
+            if err != nil {
+                return 0, err
+            }
+            c.cache[pair] = cached{v, time.Now()}
+            return v, nil
+        }
+
+        // invoices.go: the same cache, copied
+        func (j *InvoiceJob) rate(ctx context.Context, pair string) (float64, error) {
+            j.mu.Lock()
+            defer j.mu.Unlock()
+            if r, ok := j.cache[pair]; ok && time.Since(r.at) < time.Minute {
+                return r.value, nil
+            }
+            v, err := j.fx.Rate(ctx, pair)
+            if err != nil {
+                return 0, err
+            }
+            j.cache[pair] = cached{v, time.Now()}
+            return v, nil
+        }
+
+        // reports.go: no cache here; nobody added one
+        v, err := r.fx.Rate(ctx, pair)
+      roles: { context: [2, 14], proxy: [5, 7], real: [8, 8] }
+      change:
+        - { after: 8, add: ['    vendorCalls.Add(1)'] }
+        - { after: 23, add: ['    vendorCalls.Add(1)'] }
+        - { after: 32, add: ['vendorCalls.Add(1)'] }
+    after:
+      file: rates.go · main.go
+      source: |
+        type RateSource interface {
+            Rate(ctx context.Context, pair string) (float64, error)
+        }
+
+        // CachedRates stands in for any RateSource, with the same method.
+        type CachedRates struct {
+            inner RateSource
+            ttl   time.Duration
+            mu    sync.Mutex
+            cache map[string]cached
+        }
+
+        func (c *CachedRates) Rate(ctx context.Context, pair string) (float64, error) {
+            c.mu.Lock()
+            defer c.mu.Unlock()
+            if r, ok := c.cache[pair]; ok && time.Since(r.at) < c.ttl {
+                return r.value, nil
+            }
+            v, err := c.inner.Rate(ctx, pair)
+            if err != nil {
+                return 0, err
+            }
+            c.cache[pair] = cached{v, time.Now()}
+            return v, nil
+        }
+
+        // main.go: every caller gets the proxy, typed as RateSource
+        var rates RateSource = &CachedRates{inner: fx.New(key), ttl: time.Minute, cache: map[string]cached{}}
+        checkout, invoices, reports := NewCheckout(rates), NewInvoiceJob(rates), NewReports(rates)
+      roles: { strategy: [1, 3], proxy: [6, 25], real: [28, 28], client: [28, 29], context: [29, 29], wire: [28, 29], call: [13, 13], hit: [14, 18], miss: [19, 22], store: [23, 24] }
+    again:
+      file: counting.go
+      source: |
+        // counting.go: a second proxy; nothing above changes
+        type CountingRates struct {
+            inner RateSource
+            calls *atomic.Int64
+        }
+
+        func (c CountingRates) Rate(ctx context.Context, pair string) (float64, error) {
+            c.calls.Add(1)
+            return c.inner.Rate(ctx, pair)
+        }
+
+        // main.go: one line changes, behind the cache so only paid calls count
+        // inner: CountingRates{inner: fx.New(key), calls: &vendorCalls},
+    cost:
+      before: { text: 3 lines · 3 files, value: 0.7 }
+      after: { text: 1 new type · 1 line in main, value: 0.18 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A small interface, a struct that holds the real one, the same method. Callers that accept the interface take a proxy without knowing. For a lazily created value with no interface around it, `sync.OnceValue` (Go 1.21) is the light version of a virtual proxy.'
+      seenIn: '`httputil.NewSingleHostReverseProxy` returns a handler that stands in for another server. gRPC client stubs are remote proxies: a method call on a local value becomes a network request. `golang.org/x/sync/singleflight` is the usual companion of a caching proxy, so concurrent misses share one call.'
+
+  python:
+    before:
+      file: checkout.py · invoices.py · reports.py
+      source: |
+        # checkout.py
+        class Checkout:
+            def _rate(self, pair: str) -> float:
+                hit = self._cache.get(pair)
+                if hit and time.monotonic() - hit[1] < 60:
+                    return hit[0]
+                value = self._fx.rate(pair)
+                self._cache[pair] = (value, time.monotonic())
+                return value
+
+        # invoices.py: the same cache, copied
+        class InvoiceJob:
+            def _rate(self, pair: str) -> float:
+                hit = self._cache.get(pair)
+                if hit and time.monotonic() - hit[1] < 60:
+                    return hit[0]
+                value = self._fx.rate(pair)
+                self._cache[pair] = (value, time.monotonic())
+                return value
+
+        # reports.py: no cache here; nobody added one
+        value = self._fx.rate(pair)
+      roles: { context: [2, 9], proxy: [4, 6], real: [7, 7] }
+      change:
+        - { after: 7, add: ['        VENDOR_CALLS.inc()'] }
+        - { after: 17, add: ['        VENDOR_CALLS.inc()'] }
+        - { after: 22, add: ['VENDOR_CALLS.inc()'] }
+    after:
+      file: rates.py · main.py
+      source: |
+        from typing import Protocol
+
+        class RateSource(Protocol):
+            def rate(self, pair: str) -> float: ...
+
+        class CachedRates:
+            """A proxy: the same method as the real client, plus a cache."""
+            def __init__(self, inner: RateSource, ttl: float = 60.0):
+                self._inner = inner
+                self._ttl = ttl
+                self._cache: dict[str, tuple[float, float]] = {}
+
+            def rate(self, pair: str) -> float:
+                hit = self._cache.get(pair)
+                if hit and time.monotonic() - hit[1] < self._ttl:
+                    return hit[0]
+                value = self._inner.rate(pair)
+                self._cache[pair] = (value, time.monotonic())
+                return value
+
+        # main.py: every caller gets the proxy
+        rates = CachedRates(FxClient(api_key), ttl=60)
+        checkout, invoices, reports = Checkout(rates), InvoiceJob(rates), Reports(rates)
+      roles: { strategy: [3, 4], proxy: [6, 19], real: [22, 22], client: [22, 23], context: [23, 23], wire: [22, 23], call: [13, 13], hit: [14, 16], miss: [17, 17], store: [18, 19] }
+    again:
+      file: counting.py
+      source: |
+        # counting.py: a second proxy; nothing above changes
+        class CountingRates:
+            def __init__(self, inner: RateSource, counter: Counter):
+                self._inner, self._counter = inner, counter
+
+            def rate(self, pair: str) -> float:
+                self._counter.inc()
+                return self._inner.rate(pair)
+
+        # main.py: one line changes, behind the cache so only paid calls count
+        rates = CachedRates(CountingRates(FxClient(api_key), VENDOR_CALLS), ttl=60)
+    cost:
+      before: { text: 3 lines · 3 files, value: 0.7 }
+      after: { text: 1 new class · 1 line in main, value: 0.18 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Any object with a `rate` method fits; the `Protocol` only tells the type checker. A generic proxy can forward every attribute with `__getattr__`, but special methods such as `__len__` are looked up on the type and skip it. For a single pure function, `functools.lru_cache` is a ready-made caching layer, though it has no TTL.'
+      seenIn: '`weakref.proxy(obj)` stands in for an object without keeping it alive. Django wraps `request.user` in a `SimpleLazyObject`, so the user is loaded only when something touches it. `multiprocessing` managers hand out proxy objects for values that live in the manager process.'
+
+  typescript:
+    before:
+      file: checkout.ts · invoices.ts · reports.ts
+      source: |
+        // checkout.ts
+        private async rate(pair: string): Promise<number> {
+          const hit = this.cache.get(pair);
+          if (hit && Date.now() - hit.at < 60_000) return hit.value;
+          const value = await this.fx.rate(pair);
+          this.cache.set(pair, { value, at: Date.now() });
+          return value;
+        }
+
+        // invoices.ts: the same cache, copied
+        private async rate(pair: string): Promise<number> {
+          const hit = this.cache.get(pair);
+          if (hit && Date.now() - hit.at < 60_000) return hit.value;
+          const value = await this.fx.rate(pair);
+          this.cache.set(pair, { value, at: Date.now() });
+          return value;
+        }
+
+        // reports.ts: no cache here; nobody added one
+        const value = await this.fx.rate(pair);
+      roles: { context: [2, 8], proxy: [3, 4], real: [5, 5] }
+      change:
+        - { after: 5, add: ['  vendorCalls.inc();'] }
+        - { after: 14, add: ['  vendorCalls.inc();'] }
+        - { after: 20, add: ['vendorCalls.inc();'] }
+    after:
+      file: rates.ts · main.ts
+      source: |
+        interface RateSource {
+          rate(pair: string): Promise<number>;
+        }
+
+        // A proxy: the same method as the real client, plus a cache.
+        class CachedRates implements RateSource {
+          private cache = new Map<string, { value: number; at: number }>();
+          constructor(private readonly inner: RateSource, private readonly ttlMs = 60_000) {}
+
+          async rate(pair: string): Promise<number> {
+            const hit = this.cache.get(pair);
+            if (hit && Date.now() - hit.at < this.ttlMs) return hit.value;
+            const value = await this.inner.rate(pair);
+            this.cache.set(pair, { value, at: Date.now() });
+            return value;
+          }
+        }
+
+        // main.ts: every caller gets the proxy
+        const rates: RateSource = new CachedRates(new FxClient(apiKey));
+        const checkout = new Checkout(rates), invoices = new InvoiceJob(rates), reports = new Reports(rates);
+      roles: { strategy: [1, 3], proxy: [6, 17], real: [20, 20], client: [20, 21], context: [21, 21], wire: [20, 21], call: [10, 10], hit: [11, 12], miss: [13, 13], store: [14, 15] }
+    again:
+      file: counting.ts
+      source: |
+        // counting.ts: a second proxy; nothing above changes
+        class CountingRates implements RateSource {
+          constructor(private readonly inner: RateSource, private readonly calls: Counter) {}
+
+          rate(pair: string): Promise<number> {
+            this.calls.inc();
+            return this.inner.rate(pair);
+          }
+        }
+
+        // main.ts: one line changes, behind the cache so only paid calls count
+        const rates: RateSource = new CachedRates(new CountingRates(new FxClient(apiKey), vendorCalls));
+    cost:
+      before: { text: 3 lines · 3 files, value: 0.7 }
+      after: { text: 1 new class · 1 line in main, value: 0.18 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'For a typed proxy, write a class with the same interface; structural typing means `implements` is optional. JavaScript also has a built-in `Proxy` with handler traps such as `get` and `apply`, for generic proxies that intercept any property. Class methods that read private `#fields` throw when called through one.'
+      seenIn: 'Vue 3 builds its reactivity on `Proxy`: reading a field records a dependency, writing one triggers updates. Immer hands you a `Proxy` draft that records your changes. Generated API clients, such as gRPC-Web stubs, are remote proxies.'
+
+  rust:
+    before:
+      file: checkout.rs · invoices.rs · reports.rs
+      source: |
+        // checkout.rs
+        fn rate(&self, pair: &str) -> Result<f64, FxError> {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(&(value, at)) = cache.get(pair) {
+                if at.elapsed() < Duration::from_secs(60) {
+                    return Ok(value);
+                }
+            }
+            let value = self.fx.rate(pair)?;
+            cache.insert(pair.to_string(), (value, Instant::now()));
+            Ok(value)
+        }
+
+        // invoices.rs: the same cache, copied
+        fn rate(&self, pair: &str) -> Result<f64, FxError> {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(&(value, at)) = cache.get(pair) {
+                if at.elapsed() < Duration::from_secs(60) {
+                    return Ok(value);
+                }
+            }
+            let value = self.fx.rate(pair)?;
+            cache.insert(pair.to_string(), (value, Instant::now()));
+            Ok(value)
+        }
+
+        // reports.rs: no cache here; nobody added one
+        let value = self.fx.rate(pair)?;
+      roles: { context: [2, 12], proxy: [3, 8], real: [9, 9] }
+      change:
+        - { after: 9, add: ['    VENDOR_CALLS.fetch_add(1, Ordering::Relaxed);'] }
+        - { after: 22, add: ['    VENDOR_CALLS.fetch_add(1, Ordering::Relaxed);'] }
+        - { after: 28, add: ['VENDOR_CALLS.fetch_add(1, Ordering::Relaxed);'] }
+    after:
+      file: rates.rs · main.rs
+      source: |
+        trait RateSource {
+            fn rate(&self, pair: &str) -> Result<f64, FxError>;
+        }
+
+        // A proxy: the same trait as the real client, plus a cache.
+        struct CachedRates<S: RateSource> {
+            inner: S,
+            ttl: Duration,
+            cache: Mutex<HashMap<String, (f64, Instant)>>,
+        }
+
+        impl<S: RateSource> RateSource for CachedRates<S> {
+            fn rate(&self, pair: &str) -> Result<f64, FxError> {
+                let mut cache = self.cache.lock().unwrap();
+                if let Some(&(value, at)) = cache.get(pair) {
+                    if at.elapsed() < self.ttl {
+                        return Ok(value);
+                    }
+                }
+                let value = self.inner.rate(pair)?;
+                cache.insert(pair.to_string(), (value, Instant::now()));
+                Ok(value)
+            }
+        }
+
+        // main.rs: every caller shares the proxy
+        let rates: Arc<dyn RateSource + Send + Sync> = Arc::new(CachedRates { inner: FxClient::new(key), ttl: Duration::from_secs(60), cache: Mutex::default() });
+        let (checkout, invoices) = (Checkout::new(rates.clone()), InvoiceJob::new(rates.clone()));
+      roles: { strategy: [1, 3], proxy: [6, 24], real: [27, 27], client: [27, 28], context: [28, 28], wire: [27, 28], call: [13, 13], hit: [14, 19], miss: [20, 20], store: [21, 22] }
+    again:
+      file: counting.rs
+      source: |
+        // counting.rs: a second proxy; nothing above changes
+        struct CountingRates<S: RateSource> {
+            inner: S,
+            calls: AtomicU64,
+        }
+
+        impl<S: RateSource> RateSource for CountingRates<S> {
+            fn rate(&self, pair: &str) -> Result<f64, FxError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.inner.rate(pair)
+            }
+        }
+
+        // main.rs: one line changes, behind the cache so only paid calls count
+        // inner: CountingRates { inner: FxClient::new(key), calls: AtomicU64::new(0) },
+    cost:
+      before: { text: 3 lines · 3 files, value: 0.7 }
+      after: { text: 1 new type · 1 line in main, value: 0.18 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A generic `CachedRates<S: RateSource>` adds no runtime indirection: the compiler makes one copy per inner type and can inline the forwarding call. Use `Arc<dyn RateSource>` when main picks the chain from config at runtime. Smart pointers are the language''s built-in proxies, through `Deref`.'
+      seenIn: '`Rc` and `Arc` are smart references in the original sense: they count references and free the value when the count reaches zero. `std::sync::LazyLock` creates its value on first access. A `MutexGuard` stands in for the protected data while the lock is held.'
+
+walk:
+  - text: { go: '`main` wraps the real fx client in a `CachedRates` and hands it to every caller as a `RateSource`.', python: '`main` wraps the real `FxClient` in a `CachedRates` and hands it to every caller.', typescript: '`main` wraps the real `FxClient` in a `CachedRates` and hands it to every caller, typed as `RateSource`.', rust: '`main` wraps the real `FxClient` in a `CachedRates`, puts it in an `Arc<dyn RateSource>` and shares it with every caller.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: wire
+  - text: Checkout asks for EUR/USD. It calls the same method it always called; the method it reaches is the proxy's.
+    nodes: [context, strategy, proxy]
+    edges: [context>strategy, proxy>strategy]
+    role: call
+  - text: The proxy has a fresh answer for EUR/USD, so it returns it from memory. The vendor never hears about this request.
+    nodes: [proxy]
+    edges: []
+    role: hit
+  - text: On a miss, the proxy forwards the call to the real client, which pays for one vendor request.
+    nodes: [proxy, real]
+    edges: [proxy>real, real>strategy]
+    role: miss
+  - text: The proxy keeps the answer with the time it arrived, and returns it. The next caller within the TTL gets it for free.
+    nodes: [proxy]
+    edges: []
+    role: store
+
+checks:
+  overview:
+    question: Which of these is a Proxy?
+    options:
+      - text: An object with the same interface as a remote billing client, which caches answers and refuses callers that lack a permission.
+        correct: true
+        why: Right. Same interface as the real object, and it controls access to it. Callers cannot tell the difference.
+      - text: A wrapper that turns an old SOAP client's methods into the REST-shaped interface the rest of the code expects.
+        why: That is Adapter. An adapter changes the interface. A proxy keeps it exactly the same.
+      - text: A single Deploy() method that runs build, test, upload and migrate in the right order.
+        why: That is Facade. A facade offers a simpler interface over many objects. A proxy stands in for one object with that object's own interface.
+  engineer:
+    question: You put two proxies in front of the rates vendor, an access check and a 60 s cache. In which order should a request meet them?
+    options:
+      - text: Access check first, then the cache.
+        correct: true
+        why: Right. The check runs on every request, cached or not. Put the cache first and a cache hit answers before the check ever runs.
+      - text: Cache first, because hits are cheaper and the check is slow.
+        why: Then any caller gets a cached rate as long as someone allowed fetched it recently. The check only protects the misses.
+      - text: It does not matter. Both proxies implement the same interface, so the result is the same either way.
+        why: The interface lets you stack them in any order, which is exactly why the order is your decision. Each proxy decides whether the next one is reached.
+  deep:
+    question: A generic proxy forwards every call it does not know, with Python's `__getattr__` or a JavaScript `Proxy`. Why can it still behave differently from the real object?
+    options:
+      - text: Some operations never reach the forwarding hook. Python looks up special methods such as `__len__` on the type, and a JavaScript method that reads a private `#field` checks the object itself, which is the proxy.
+        correct: true
+        why: Right. `len(proxy)` fails unless the proxy class defines `__len__`, and a class method that reads `this.#secret` through a `Proxy` throws a TypeError. Explicit proxies with the real methods avoid both.
+      - text: The hook runs only for the first call; later calls go to the real object directly.
+        why: No. The hook runs on every attribute lookup that the proxy itself cannot satisfy, every time.
+      - text: Wrapping copies the real object, so later changes to it are not seen through the proxy.
+        why: No. The proxy holds a reference to the real object, not a copy. Changes to it are visible through the proxy.
+
+reference:
+  roles:
+    - role: Subject
+      example: { go: "RateSource (interface)", python: "RateSource (Protocol)", typescript: "RateSource (interface)", rust: "RateSource (trait)" }
+      job: The interface callers use. Both the proxy and the real object implement it.
+    - role: Proxy
+      example: CachedRates, CountingRates
+      job: Holds a reference to the real subject and decides whether, when and how to call it.
+    - role: Real subject
+      example: the fx vendor client
+      job: Does the actual work, here a paid network call.
+    - role: Client
+      example: checkout, invoice job, reports
+      job: Calls the subject. Never knows whether it holds a proxy.
+  useWhen:
+    - The real object is slow, remote, paid or expensive to create, and callers should not each handle that.
+    - Access needs a check, a count, a log or a cache on every call, in one place.
+    - You cannot or should not edit the real object, such as a vendor SDK.
+  avoidWhen:
+    - Only one caller exists and the extra behaviour is a line or two. Put it in that caller.
+    - Callers need to know they are getting cached or delayed data. Hiding it behind the same interface makes stale answers invisible.
+  tradeoffs:
+    - Callers cannot tell a cached or lazy answer from a live one, so staleness and first-call latency are hidden too.
+    - One more type and one more hop on every call.
+    - With several proxies in a chain, their order decides the behaviour, and the order lives in the wiring code.
+  lookalikes:
+    - name: Decorator
+      how: Same structure, a wrapper with the same interface. A decorator adds behaviour the caller wants; a proxy controls access to the real object and often manages its lifetime.
+    - name: Adapter
+      how: Changes the interface of the object it wraps. A proxy keeps the interface identical.
+    - name: Facade
+      how: A new, simpler interface over many objects. A proxy stands in for one object with that object's own interface.
+---
+
+## [concept] Proxy
+
+**Put a stand-in with the same interface in front of an object, so you can control every call to it without changing the callers.**
+
+The callers keep calling the same method. The stand-in decides whether the real object is reached, when, and how often.
+
+<Depth level={2}>
+Three roles. The <Term id="subject-role">subject</Term> is the <Term id="interface">interface</Term> callers use (`RateSource`). The <Term id="real-subject">real subject</Term> does the work (the vendor's client). The **proxy** implements the same interface and holds the real subject. Because the types match, `main` can hand callers a proxy instead of the real thing, through <Term id="dependency-injection">dependency injection</Term>, and no caller changes.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Proxy as an object structural pattern, also known as Surrogate. It names four common kinds: a <Term id="remote-proxy">remote proxy</Term> for an object in another address space, a <Term id="virtual-proxy">virtual proxy</Term> that creates an expensive object on demand, a <Term id="protection-proxy">protection proxy</Term> that checks access rights, and a smart reference that does extra work on access, such as counting references. It also describes copy-on-write as an optimisation a proxy can hide.
+</Depth>
+
+## [problem] Three callers, one slow vendor
+
+A shop converts prices with a paid exchange-rates API. Each call takes about 300 ms. Checkout and the invoice job each wrapped the client in a small cache. The reports page calls the vendor directly.
+
+Read it once. The cache logic exists twice, and the third caller has none.
+
+<Depth level={2}>
+Each caller holds the vendor's client type directly. Nothing stops the next caller from skipping the cache, and the two copies can drift: someone changes the TTL in one and forgets the other.
+</Depth>
+
+<Depth level={3}>
+Each copy also has its own map, so the same rate is fetched once per caller. Two caches of the same data, filled separately, double the vendor bill and can disagree about the current rate.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the rates vendor now bills per call, and finance wants every paid call counted.
+
+The count has to go wherever the vendor is called, and that is in three files. Miss one and the dashboard under-reports the bill without any error.
+
+<Depth level={2}>
+Every new caller has to know to cache, and now also to count. The rule lives in people's heads, so it fails the first time someone new adds a fourth caller.
+</Depth>
+
+<Depth level={3}>
+Tests cannot catch the missing counter either. Each caller's tests pass, because each caller works. The bug is a missing line in code that nobody looks at.
+</Depth>
+
+## [morph] Move the extra work into a stand-in
+
+Drag the slider. The two copies of the cache leave the callers and become one `CachedRates` type that implements the same interface as the vendor client.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Callers now depend on `RateSource`. `main` decides what sits behind it: the bare client in tests against the sandbox, the client wrapped in a cache in production. The callers' code is the same in both.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go interfaces are satisfied implicitly, so the vendor's `*fx.Client` fits `RateSource` as long as its `Rate` method has the same signature. You can put a proxy in front of a third-party type without touching it.</Lang>
+<Lang only="python">The `Protocol` is checked by tools such as mypy. At runtime any object with a `rate` method works, including the vendor's client and every proxy.</Lang>
+<Lang only="typescript">Structural typing means the vendor's `FxClient` fits `RateSource` because it has a `rate` method of the right shape. It never has to declare it.</Lang>
+<Lang only="rust">The vendor's client fits only after `impl RateSource for FxClient`. Because `RateSource` is your trait, you are allowed to implement it for their type.</Lang>
+</Depth>
+
+## [walk] Follow one request
+
+One rate request through the proxy. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The `Mutex` is held across the vendor call, so a second request for any pair waits for the first. That keeps the example short. In production, release the lock before the call and use `singleflight` so concurrent misses for the same pair share one request.</Lang>
+<Lang only="python">Two threads that miss at the same time both call the vendor; the dict survives it, but you pay twice. A per-key lock, or an `asyncio` task stored in the cache, makes concurrent misses share one call.</Lang>
+<Lang only="typescript">Two requests that miss during the same 300 ms both call the vendor. Store the `Promise` in the map instead of the value, and the second request awaits the first one's call.</Lang>
+<Lang only="rust">The `Mutex` is held across the vendor call, so a second request for any pair waits. With async code, holding a `std::sync::MutexGuard` across an `.await` is a known mistake; use an async-aware cache or release the lock first.</Lang>
+</Depth>
+
+## [again] Counting, the second time
+
+The same request after the refactor. Counting is one more proxy. Put it between the cache and the client, and it sees exactly the calls that reach the vendor, which are the ones you pay for.
+
+<Depth level={2}>
+Each proxy does one job and implements the same interface, so they stack. The order is a decision: a counter in front of the cache would count every request, paid or not.
+</Depth>
+
+<Depth level={3}>
+No caller was edited, and none can forget to count: there is no longer a way for them to reach the vendor except through the chain that `main` built.
+</Depth>
+
+## [play] Put proxies on the wire
+
+The same two minutes of traffic, replayed on every run: checkout asks for a rate every second, the invoice job sends a batch at 1:00, and a runaway export script without permission fires at 1:30.
+
+Add, remove and reorder proxies between the callers and the vendor, then compare your runs. The callers' code never changes.
+
+## [lens] How each language writes it
+
+The idea is the same in every language: one more object with the same interface. Some languages also have proxies built in.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="proxy" />
+
+### The kinds of proxy
+
+They share one shape and differ in what they decide. A **caching** proxy answers from memory until the <Term id="time-to-live">TTL</Term> runs out. A **virtual** proxy creates or connects the real object on first use. A **protection** proxy checks who is asking. A **remote** proxy turns a method call into a network request. A **smart reference** counts or logs each access. Several can sit in one chain, and the order they sit in is part of the behaviour.
