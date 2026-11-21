@@ -1,0 +1,24 @@
+- id: circuit-breaker
+  term: Circuit breaker
+  short: A guard around calls to a dependency that stops calling it for a while once too many calls fail, failing fast instead, then lets a few trial calls through to see if it has recovered.
+- id: exponential-backoff
+  term: Exponential backoff
+  short: Waiting longer before each retry, usually doubling the wait each time up to a cap.
+- id: jitter
+  term: Jitter
+  short: Randomness added to a wait, so that clients that failed at the same moment do not all retry at the same moment.
+- id: retry-storm
+  term: Retry storm
+  short: Load on a struggling service multiplied by its callers' retries, which can keep it overloaded after the original cause has gone.
+- id: retry-budget
+  term: Retry budget
+  short: A cap on retries as a share of normal traffic, often a token bucket, so retries cannot multiply load during an outage.
+- id: metastable-failure
+  term: Metastable failure
+  short: An overload that sustains itself after its trigger is removed, usually because retries or backlogs keep demand above capacity.
+- id: graceful-degradation
+  term: Graceful degradation
+  short: Serving a reduced but useful response, such as a page without recommendations, when a dependency is failing.
+- id: deadline-propagation
+  term: Deadline propagation
+  short: Passing the caller's remaining time along with a request, so downstream services stop work nobody is waiting for.

@@ -1,0 +1,545 @@
+---
+title: Timeouts, retries, circuit breakers
+track: distributed-systems
+group: Failure and retries
+order: 4
+summary: Bound every call, retry rarely and with randomised spacing, and stop calling a dependency that is failing, so one slow service cannot take the rest down.
+intent: A slow dependency should cost you a degraded feature, not your whole service, and your retries should never be what keeps it down.
+changeRequest: Recommendation calls sometimes hang and take the product page with them. Add a timeout, and retry so the carousel still shows.
+languages: [go, python, typescript, rust]
+glossary: [circuit-breaker, exponential-backoff, jitter, retry-storm, retry-budget, metastable-failure, graceful-degradation, deadline-propagation]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [distributed-systems/reliable-links-and-idempotency]
+skills: [resiliency]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: resiliency-patterns
+  scenarios:
+    - try: "Run the default settings (1 s timeout, 3 retries at once) with a 15 s slowdown."
+      notice: "Calls to the dependency jump to four times the user traffic. When it recovers at 25 s, users still get errors to the end of the minute."
+    - try: "Switch the backoff to Exp + jitter and run again."
+      notice: "The peaks change shape, but the storm stays. New users keep arriving, so spacing retries out does not reduce the total."
+    - try: "Press No timeout and run."
+      notice: "No retries and no storm, but every waiting user holds a worker. The pool fills and the API turns users away."
+    - try: "Press Full kit and run, then try a 300 ms timeout."
+      notice: "The breaker opens within a second, users get a page without recommendations, and the dependency recovers almost at once."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 52, title: Product API, sub: 100 req/s }
+      after:  { x: 12, y: 30, w: 112, h: 52, title: Product API, sub: 100 req/s }
+    - id: context
+      kind: context
+      before: { x: 150, y: 18, w: 270, h: 236, title: Recs call, sub: wait and repeat }
+      after:  { x: 150, y: 30, w: 140, h: 56, title: Recs client, sub: per-call policy }
+    - id: timeout
+      kind: concrete
+      before: { x: 170, y: 90, w: 230, h: 40, title: no deadline }
+      after:  { x: 150, y: 204, w: 90, h: 40, title: timeout 1s }
+    - id: retry
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 150, w: 230, h: 40, title: retry ×3 at once }
+      after:  { x: 250, y: 204, w: 100, h: 40, title: 1 retry · jitter }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 320, y: 30, w: 130, h: 56, title: "" }
+      after:  { x: 320, y: 30, w: 130, h: 56, title: Breaker, sub: closed · open · half }
+    - id: dep
+      kind: concrete
+      before: { x: 446, y: 110, w: 104, h: 56, title: Recs service, sub: 150/s }
+      after:  { x: 460, y: 120, w: 90, h: 56, title: Recs service, sub: 150/s }
+    - id: fallback
+      kind: concrete
+      appears: after
+      before: { x: 360, y: 204, w: 90, h: 40, title: "" }
+      after:  { x: 360, y: 204, w: 90, h: 40, title: fallback }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: context, to: dep, label: waits on }
+    - { from: timeout, to: context, label: bounds }
+    - { from: retry, to: context, label: repeats }
+    - { from: context, to: strategy, label: guarded by }
+    - { from: strategy, to: fallback, label: when open }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: product_page.go
+      source: |
+        // product_page.go
+        func (h *ProductPage) recommendations(ctx context.Context, id string) []Item {
+            items, err := h.recs.ForProduct(ctx, id) // no deadline: waits as long as recs does
+            if err != nil {
+                return nil
+            }
+            return items
+        }
+      roles: { client: [2, 2], context: [2, 8], timeout: [3, 3], dep: [3, 3] }
+      change:
+        - { line: 3, replace: '    items, err := retry(3, func() ([]Item, error) { // retry at once, up to 3 times' }
+        - { after: 3, add: ['        ctx, cancel := context.WithTimeout(ctx, time.Second)', '        defer cancel()', '        return h.recs.ForProduct(ctx, id)', '    })'] }
+    after:
+      file: product_page.go · retry.go
+      source: |
+        var recsBreaker = gobreaker.NewCircuitBreaker[[]Item](gobreaker.Settings{
+            Name:        "recommendations",
+            MaxRequests: 3,               // probes allowed while half-open
+            Timeout:     5 * time.Second, // how long it stays open
+            ReadyToTrip: func(c gobreaker.Counts) bool {
+                return c.Requests >= 5 && c.TotalFailures*2 >= c.Requests
+            },
+        })
+
+        func (h *ProductPage) recommendations(ctx context.Context, id string) []Item {
+            items, err := recsBreaker.Execute(func() ([]Item, error) {
+                return withRetry(ctx, 2, func(ctx context.Context) ([]Item, error) {
+                    ctx, cancel := context.WithTimeout(ctx, time.Second)
+                    defer cancel()
+                    return h.recs.ForProduct(ctx, id)
+                })
+            })
+            if err != nil {
+                return nil // fallback: render the page without the carousel
+            }
+            return items
+        }
+
+        // retry.go: attempts in total, full jitter between them
+        func withRetry[T any](ctx context.Context, attempts int, f func(context.Context) (T, error)) (T, error) {
+            for i := 0; ; i++ {
+                v, err := f(ctx)
+                if err == nil || i == attempts-1 {
+                    return v, err
+                }
+                select {
+                case <-time.After(rand.N(200 * time.Millisecond << i)):
+                case <-ctx.Done():
+                    return v, ctx.Err()
+                }
+            }
+        }
+      roles: { strategy: [1, 8], trip: [5, 7], probe: [3, 4], client: [10, 10], context: [10, 22], breaker: [11, 11], timeout: [13, 14], dep: [15, 15], retry: [12, 12], fallback: [18, 20] }
+    again:
+      file: product_page_test.go
+      source: |
+        // product_page_test.go: recs never answers; the page still renders, fast
+        func TestHangingRecsDegrade(t *testing.T) {
+            page := &ProductPage{recs: hangingRecs{}}
+            start := time.Now()
+            items := page.recommendations(t.Context(), "sku-42")
+            if len(items) != 0 || time.Since(start) > 2500*time.Millisecond {
+                t.Fatalf("got %d items after %v", len(items), time.Since(start))
+            }
+        }
+    cost:
+      before: { text: 15 s slowdown · outage outlives it, value: 0.9 }
+      after: { text: 15 s of pages without recs, value: 0.2 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: '`context.WithTimeout` is the idiom: every call takes a `ctx`, and its deadline reaches everything downstream that honours it. `http.Client` has no timeout unless you set `Timeout` or the request carries a deadline. Breakers come from libraries such as `sony/gobreaker`.'
+      seenIn: '`http.Client{Timeout: …}`. gRPC deadlines, which travel to the server with the call. `sony/gobreaker`. `cenkalti/backoff`. `math/rand/v2`''s `rand.N` for jitter.'
+
+  python:
+    before:
+      file: product_page.py
+      source: |
+        # product_page.py
+        def fetch_recommendations(product_id: str) -> list[Item]:
+            r = http.get(f"/recs/{product_id}", timeout=None)  # wait as long as it takes
+            r.raise_for_status()
+            return [Item(**x) for x in r.json()]
+
+        def recommendations(product_id: str) -> list[Item]:
+            try:
+                return fetch_recommendations(product_id)
+            except httpx.HTTPError:
+                return []
+      roles: { client: [7, 7], context: [2, 11], timeout: [3, 3], dep: [3, 3] }
+      change:
+        - { after: 1, add: ['@retry(stop=stop_after_attempt(4), retry=retry_if_exception_type(httpx.TransportError))'] }
+        - { line: 3, replace: '    r = http.get(f"/recs/{product_id}", timeout=1.0)' }
+    after:
+      file: product_page.py
+      source: |
+        # product_page.py
+        recs_breaker = pybreaker.CircuitBreaker(fail_max=5, reset_timeout=5)
+
+        @recs_breaker
+        @retry(stop=stop_after_attempt(2),                            # one retry, no more
+               wait=wait_random_exponential(multiplier=0.2, max=2),   # full jitter
+               retry=retry_if_exception_type(httpx.TransportError),
+               reraise=True)
+        def fetch_recommendations(product_id: str) -> list[Item]:
+            r = http.get(f"/recs/{product_id}", timeout=1.0)  # per attempt
+            r.raise_for_status()
+            return [Item(**x) for x in r.json()]
+
+        def recommendations(product_id: str) -> list[Item]:
+            try:
+                return fetch_recommendations(product_id)
+            except (pybreaker.CircuitBreakerError, httpx.HTTPError):
+                return []  # fallback: render the page without the carousel
+      roles: { strategy: [2, 4], trip: [2, 2], probe: [2, 2], breaker: [4, 4], retry: [5, 8], timeout: [10, 10], dep: [10, 10], context: [4, 12], client: [14, 14], fallback: [17, 18] }
+    again:
+      file: test_product_page.py
+      source: |
+        # test_product_page.py: recs never answers; the page still renders, fast
+        def test_hanging_recs_degrade(hanging_recs):
+            start = time.monotonic()
+            items = recommendations("sku-42")
+            assert items == []
+            assert time.monotonic() - start < 2.5
+    cost:
+      before: { text: 15 s slowdown · outage outlives it, value: 0.9 }
+      after: { text: 15 s of pages without recs, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`requests` has no timeout unless you pass `timeout=`; `httpx` defaults to 5 seconds. `tenacity` gives retries, with `wait_random_exponential` for full jitter, and `pybreaker` gives a breaker. In asyncio code, `asyncio.timeout()` (Python 3.11+) bounds any await.'
+      seenIn: '`tenacity`. `pybreaker`. `asyncio.timeout`. botocore''s retry modes (`legacy`, `standard`, `adaptive`), where `standard` adds a retry quota.'
+
+  typescript:
+    before:
+      file: product-page.ts
+      source: |
+        // product-page.ts
+        async function recommendations(productId: string): Promise<Item[]> {
+          try {
+            const res = await fetch(`${RECS}/recs/${productId}`); // no timeout
+            return await okJson<Item[]>(res);
+          } catch {
+            return [];
+          }
+        }
+      roles: { client: [2, 2], context: [2, 9], timeout: [4, 4], dep: [4, 4] }
+      change:
+        - { line: 4, replace: '    const res = await withRetries(3, () => fetch(`${RECS}/recs/${productId}`, { signal: AbortSignal.timeout(1_000) }));' }
+    after:
+      file: product-page.ts
+      source: |
+        // product-page.ts
+        import { ConsecutiveBreaker, ExponentialBackoff, TimeoutStrategy, circuitBreaker, handleAll, retry, timeout, wrap } from "cockatiel";
+
+        const recsPolicy = wrap(
+          circuitBreaker(handleAll, { halfOpenAfter: 5_000, breaker: new ConsecutiveBreaker(5) }),
+          retry(handleAll, { maxAttempts: 1, backoff: new ExponentialBackoff({ initialDelay: 200 }) }),
+          timeout(1_000, TimeoutStrategy.Aggressive), // per attempt
+        );
+
+        async function recommendations(productId: string): Promise<Item[]> {
+          try {
+            return await recsPolicy.execute(({ signal }) =>
+              fetch(`${RECS}/recs/${productId}`, { signal }).then(okJson<Item[]>));
+          } catch {
+            return []; // fallback: breaker open, or still failing after one retry
+          }
+        }
+      roles: { strategy: [5, 5], trip: [5, 5], probe: [5, 5], retry: [6, 6], timeout: [7, 7], context: [4, 8], client: [10, 10], breaker: [12, 13], dep: [13, 13], fallback: [14, 16] }
+    again:
+      file: product-page.test.ts
+      source: |
+        // product-page.test.ts: recs never answers; the page still renders, fast
+        test("hanging recs degrade", async () => {
+          mockRecs.hang();
+          const start = performance.now();
+          assert.deepEqual(await recommendations("sku-42"), []);
+          assert.ok(performance.now() - start < 2_500);
+        });
+    cost:
+      before: { text: 15 s slowdown · outage outlives it, value: 0.9 }
+      after: { text: 15 s of pages without recs, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`fetch` waits as long as the server does. `AbortSignal.timeout(ms)` bounds one call, and `AbortSignal.any()` combines it with the caller''s signal so cancellation flows down. `cockatiel` composes timeout, retry and breaker policies with `wrap`; its exponential backoff is jittered by default.'
+      seenIn: '`cockatiel`. `opossum`, a circuit breaker for Node. `AbortSignal.timeout` and `AbortSignal.any`. The retry strategies in the AWS SDK for JavaScript v3.'
+
+  rust:
+    before:
+      file: product_page.rs
+      source: |
+        // product_page.rs
+        async fn recommendations(&self, id: &str) -> Vec<Item> {
+            // no timeout: waits as long as the recommendations service does
+            self.recs.for_product(id).await.unwrap_or_default()
+        }
+      roles: { client: [2, 2], context: [2, 5], timeout: [3, 3], dep: [4, 4] }
+      change:
+        - { line: 3, replace: '    let call = || async { timeout(Duration::from_secs(1), self.recs.for_product(id)).await.map_err(|_| RecsError::Timeout)? };' }
+        - { line: 4, replace: '    call.retry(ConstantBuilder::default().with_delay(Duration::ZERO).with_max_times(3)).await.unwrap_or_default()' }
+    after:
+      file: product_page.rs · breaker.rs
+      source: |
+        // product_page.rs
+        async fn recommendations(&self, id: &str) -> Vec<Item> {
+            if !self.breaker.allow() {
+                return Vec::new(); // open: fail fast with the fallback
+            }
+            let call = || async {
+                timeout(Duration::from_secs(1), self.recs.for_product(id))
+                    .await
+                    .map_err(|_| RecsError::Timeout)?
+            };
+            let result = call
+                .retry(ExponentialBuilder::default()
+                    .with_min_delay(Duration::from_millis(200))
+                    .with_max_times(1)
+                    .with_jitter())
+                .await;
+            self.breaker.record(result.is_ok());
+            result.unwrap_or_default() // fallback: render the page without the carousel
+        }
+
+        // breaker.rs: the three states as an enum
+        enum State { Closed { failures: u32 }, Open { until: Instant }, HalfOpen }
+
+        impl Breaker {
+            fn allow(&self) -> bool {
+                let mut s = self.state.lock().unwrap();
+                match *s {
+                    State::Open { until } if Instant::now() < until => false,
+                    State::Open { .. } => { *s = State::HalfOpen; true } // let a probe through
+                    _ => true,
+                }
+            }
+            fn record(&self, ok: bool) {
+                let mut s = self.state.lock().unwrap();
+                *s = match (&*s, ok) {
+                    (_, true) => State::Closed { failures: 0 },
+                    (State::Closed { failures }, false) if *failures < 4 => State::Closed { failures: failures + 1 },
+                    _ => State::Open { until: Instant::now() + Duration::from_secs(5) },
+                };
+            }
+        }
+      roles: { client: [2, 2], context: [2, 19], breaker: [3, 5], timeout: [7, 9], dep: [7, 7], retry: [11, 15], fallback: [17, 18], strategy: [21, 41], probe: [29, 29], trip: [33, 40] }
+    again:
+      file: tests/product_page.rs
+      source: |
+        // tests/product_page.rs: recs never answers; the page still renders, fast
+        #[tokio::test]
+        async fn hanging_recs_degrade() {
+            let page = ProductPage::new(HangingRecs);
+            let start = Instant::now();
+            assert!(page.recommendations("sku-42").await.is_empty());
+            assert!(start.elapsed() < Duration::from_millis(2500));
+        }
+    cost:
+      before: { text: 15 s slowdown · outage outlives it, value: 0.9 }
+      after: { text: 15 s of pages without recs, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`tokio::time::timeout` wraps any future. `tower` has `Timeout`, `Retry` (with a `Policy` you write, and retry budgets) and load-shedding layers you stack with `ServiceBuilder`. It has no breaker, so teams use a small state machine like this one or a crate.'
+      seenIn: '`tokio::time::timeout`. `tower::timeout::Timeout` and `tower::retry::Retry`. `backon` for retries with jitter. `tonic` request timeouts, sent to the server as the `grpc-timeout` header.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A product page asks for recommendations. The breaker is closed, so the call goes through.
+    nodes: [client, context, strategy]
+    edges: [client>context, context>strategy]
+    role: breaker
+  - text: The attempt gets one second. The recommendations service is slow today, and the deadline passes.
+    nodes: [timeout, context, dep]
+    edges: [timeout>context, context>dep]
+    role: timeout
+  - text: One retry, after a random wait of up to 200 ms, so pages that failed together do not retry together. It times out too.
+    nodes: [retry, context]
+    edges: [retry>context]
+    role: retry
+  - text: Half the recent calls have failed, so the breaker opens. For five seconds every page gets the fallback at once, and the service gets no calls from us.
+    nodes: [strategy, fallback]
+    edges: [context>strategy, strategy>fallback]
+    role: fallback
+  - text: After five seconds the breaker lets a few probe calls through. They succeed, it closes, and the carousel is back.
+    nodes: [strategy, dep]
+    edges: [context>strategy, context>dep]
+    role: probe
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: Why add random jitter to the wait between retries?
+    options:
+      - text: So that clients that failed at the same moment do not all retry at the same moment.
+        correct: true
+        why: Right. Without jitter, a burst of failures comes back as a burst of retries, again and again.
+      - text: So that each retry has a better chance of succeeding on its own.
+        why: Randomness does not make one call more likely to succeed. It spreads many calls out over time.
+      - text: To reduce the total number of retries.
+        why: Jitter changes when retries happen, not how many. Limiting the count or using a budget reduces the total.
+  engineer:
+    question: Three services call each other in a chain, and each makes up to 3 attempts per call. The database at the bottom is down. How many calls can one user request cause there?
+    options:
+      - text: "27"
+        correct: true
+        why: Right. Each layer multiplies by 3, so 3 × 3 × 3. That is why you retry at one layer, usually the one closest to the user or the one that knows the call is safe.
+      - text: "9"
+        why: That counts two layers. The top service's 3 attempts each cause 3 in the middle, and each of those 3 at the bottom.
+      - text: "3"
+        why: Only if the upper layers never retry. Retries at every layer multiply.
+  deep:
+    question: A dependency slowed down for 15 seconds and is healthy again, but the system stays down until someone turns retries off. What happened?
+    options:
+      - text: Retries and a backlog of abandoned requests keep demand above capacity, so every answer arrives after its caller gave up and is retried again.
+        correct: true
+        why: Right. That is a metastable failure. The trigger is gone; the overload sustains itself. Cutting load (breakers, budgets, shedding, dropping expired work) breaks the loop.
+      - text: The dependency is still slow, and nobody noticed.
+        why: The scenario says it is healthy. The load it receives is what changed.
+      - text: The timeouts are too long, so callers wait too much.
+        why: Longer timeouts hold workers longer, but they would reduce retries, not cause the loop.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Timeout
+      example: { go: "context.WithTimeout", python: "timeout=1.0", typescript: "AbortSignal.timeout / timeout()", rust: "tokio::time::timeout" }
+      job: Bounds how long one attempt may hold a worker. Set from the dependency's latency percentiles.
+    - role: Retry policy
+      example: one retry, exponential backoff with full jitter
+      job: Hides brief, isolated failures. Must be capped, spaced out and only used for safe-to-repeat calls.
+    - role: Circuit breaker
+      example: { go: "sony/gobreaker", python: "pybreaker", typescript: "cockatiel circuitBreaker", rust: "a small enum state machine" }
+      job: Stops calling a dependency that is failing, fails fast instead, and probes for recovery.
+    - role: Fallback
+      example: the page without recommendations
+      job: What users get while the dependency is unavailable.
+  useWhen:
+    - Every network call. A timeout is never optional; the default in most clients is to wait forever or for a long time.
+    - Retries for brief, isolated failures of idempotent calls, at one layer of the stack.
+    - A breaker and fallback for dependencies whose failure should cost a feature, not the whole page.
+  avoidWhen:
+    - Retrying calls that are not safe to repeat, unless they carry an idempotency key.
+    - Retrying at every layer of a deep call chain.
+    - A breaker on a dependency you cannot do without, where failing fast just fails faster; there, shed load or queue instead.
+  tradeoffs:
+    - A timeout too short fails calls that would have succeeded; too long and a slowdown fills your worker pool. AWS picks it from the latency percentile that matches an acceptable false-timeout rate, such as p99.9.
+    - Backoff spreads retries out but does not reduce them when new requests keep arriving. Only fewer retries, or less load, does that.
+    - A breaker adds a mode that is hard to test and can delay recovery. A retry budget is a simpler alternative many teams prefer.
+    - Each mechanism needs metrics, or the first sign of it working is an angry user.
+  lookalikes:
+    - name: Bulkhead
+      how: Gives each dependency its own pool of workers or connections, so one slow dependency cannot use them all.
+    - name: Load shedding
+      how: The server's side of the same problem. It rejects some requests early to keep the rest fast.
+    - name: Rate limiting
+      how: Caps how fast a caller may send, whether or not anything is failing.
+    - name: Idempotency keys
+      how: Make a retry safe. They say nothing about whether a retry is wise.
+---
+
+## [concept] Timeouts, retries, circuit breakers
+
+**Every call to another service needs a bound on how long it may wait, a limit on how often it is repeated, and a way to stop calling when the other side is failing.**
+
+Timeouts protect your workers. Retries hide brief failures. A <Term id="circuit-breaker">circuit breaker</Term> protects the dependency, and a <Term id="graceful-degradation">fallback</Term> protects your users.
+
+<Depth level={2}>
+The order matters. Without a timeout nothing ever fails, so retries never fire and a breaker never trips: requests just pile up. Retries without limits turn a dependency's bad minute into a <Term id="retry-storm">retry storm</Term>. Space them with <Term id="exponential-backoff">exponential backoff</Term> and <Term id="jitter">jitter</Term>, cap them, or give them a <Term id="retry-budget">budget</Term>.
+</Depth>
+
+<Depth level={3}>
+The worst outcome is a <Term id="metastable-failure">metastable failure</Term>: the slowdown ends, but the load it caused does not. The dependency spends its recovered capacity on requests whose callers gave up long ago, those callers retry, and the loop holds itself up. Something has to cut the load: a breaker, a budget, load shedding, or servers that drop work whose <Term id="deadline-propagation">deadline</Term> has passed.
+</Depth>
+
+## [problem] A product page that waits on recommendations
+
+Every product page calls a recommendations service for its carousel. The call has no timeout, and errors fall back to an empty list. It has worked for a year.
+
+<Depth level={2}>
+The error handling looks defensive, but it only covers errors. A call that hangs never errors. It holds one of the API's workers for as long as the recommendations service takes.
+</Depth>
+
+<Depth level={3}>
+Default clients differ. Go's `http.DefaultClient` and Python's `requests` wait forever, `fetch` waits as long as the server does, and `httpx` gives up after 5 seconds. Few defaults match what a product page can afford.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** recommendation calls sometimes hang and take the product page with them. Add a timeout, and retry so the carousel still shows.
+
+The marked lines add a 1 second timeout and three immediate retries. Pages stop hanging. Then the recommendations database has a 15-second slowdown, and the whole product API is down for far longer than that. Every page made four calls instead of one, at the moment the service could handle fewest.
+
+<Depth level={2}>
+The retries tripled the load on a service that was already behind, and the queue it built kept every answer late after it recovered. Late answers look like timeouts, so the retries never stopped. Spacing the retries out would not have saved it: new pages keep arriving, so the total stays the same.
+</Depth>
+
+<Depth level={3}>
+AWS gives the multiplication rule: with five layers that each retry three times, a failing database at the bottom can see 243 times the load. Retries also count when no one wrote them: load balancers, SDKs and clients all retry by default.
+</Depth>
+
+## [morph] Bound it, cap it, and let it break
+
+Drag the slider. Each attempt gets a deadline, there is one retry with a random wait, and a breaker sits in front of the call with a fallback behind it.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Pick the timeout from data: the dependency's p99 or p99.9 latency, plus room for the network. Retry once, at one layer. Trip the breaker on a failure rate over a window, not on a single error, and keep it open long enough for the dependency to drain its queue.
+</Depth>
+
+<Depth level={3}>
+The breaker is a small state machine. Closed: calls pass and failures are counted. Open: calls fail at once until a timer runs out. Half-open: a few probe calls pass; success closes it, failure opens it again. Its weakness is the open state itself, a mode that is rarely exercised, which is why the AWS Builders' Library prefers a local token-bucket retry budget.
+</Depth>
+
+## [walk] Follow one slow call
+
+One product page during the slowdown, through the timeout, the retry and the breaker. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The context deadline also reaches the server if the client sends it: gRPC does, as a timeout header. With `net/http` the deadline stops your side waiting; the server only learns when the connection closes.</Lang>
+<Lang only="python">`tenacity` re-raises the last error with `reraise=True`, so the breaker counts one failure per page, not one per attempt. Without it the breaker would see a `RetryError`.</Lang>
+<Lang only="typescript">`TimeoutStrategy.Aggressive` rejects at the deadline even if the function ignores its signal; `Cooperative` waits for the function to honour the abort. Passing `signal` to `fetch` makes both stop the request.</Lang>
+<Lang only="rust">Dropping the future that `timeout` returns cancels the call: tokio futures are cancelled by being dropped. Any work the server already started still runs.</Lang>
+</Depth>
+
+## [again] The same slowdown again
+
+The same 15-second slowdown with the new code: pages render without the carousel for a few seconds, the breaker gives the dependency room, and the carousel is back seconds after the service recovers. The test above hangs the dependency on purpose and asserts the page still answers within 2.5 seconds.
+
+<Depth level={2}>
+Measure it. Count calls by outcome (ok, timeout, breaker open, fallback served) and alert on the breaker opening. A fallback that hides an outage for a week is its own incident.
+</Depth>
+
+<Depth level={3}>
+The dependency can help too. If it drops requests whose deadline has passed, and sheds load when its queue is long, it never spends capacity on callers who have left.
+</Depth>
+
+## [play] Brown out a dependency
+
+An API with 100 users a second calls a dependency that can handle 150 calls a second. You choose the client's settings, slow the dependency down, and run one minute. Every run is kept, so you can compare settings on the same outage.
+
+## [lens] How each language does it
+
+Go builds timeouts into every call through `context`. Python, TypeScript and Rust each have a per-call timeout and a library ecosystem for retries and breakers. None of the four retries for you, except in SDKs that choose to.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whatever the language, put the policy in one place, a wrapped client or middleware, so every call to the same dependency uses the same timeout, retry count and breaker.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="resiliency-patterns" />
+
+### Backoff with jitter, in one line
+
+Full jitter waits a random time between zero and the exponential backoff: `sleep = random(0, min(cap, base × 2^attempt))`. Marc Brooker's simulations for AWS found it does about as well as more elaborate schemes and much better than backoff without jitter. Backoff of any kind reduces total work only when a fixed set of clients waits for each answer before sending again. When new requests keep arriving, the way out of overload is less load.
