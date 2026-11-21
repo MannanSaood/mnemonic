@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 
 interface Hit { url: string; title: string; excerpt: string }
 interface PFResult { data: () => Promise<{ url: string; meta: { title?: string }; excerpt: string }> }
-interface PF { search: (q: string) => Promise<{ results: PFResult[] }> }
+interface PF { search: (q: string) => Promise<{ results: PFResult[] }>; options?: (o: { baseUrl: string }) => Promise<void> }
 
 const base = process.env.NEXT_PUBLIC_BASE_PATH || "";
 
@@ -31,6 +31,8 @@ export function Search() {
       if (!pf.current) {
         const url = `${base}/pagefind/pagefind.js`;
         pf.current = (await import(/* webpackIgnore: true */ url)) as PF;
+        // Results must link under the site's base path (for example /mnemonic on GitHub Pages).
+        await pf.current.options?.({ baseUrl: `${base}/` });
       }
       const res = await pf.current.search(term);
       const data = await Promise.all(res.results.slice(0, 8).map((r) => r.data()));

@@ -1,8 +1,8 @@
 "use client";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { usePrefs } from "@/components/Prefs";
 import type { Lang } from "@/lib/types";
-import { PgButton, PgFrame, useModel } from "../kit";
+import { PgButton, PgFrame, PgPredict, PgSources, useModel } from "../kit";
 import {
   NAME, init, requestCost, requestDone, sideDone, step,
   type Action, type Event, type Place, type Provider, type Side, type SideState, type State,
@@ -193,6 +193,22 @@ export default function StrategyCheckout() {
   const { lang } = usePrefs();
   const { state: st, dispatch, reduced } = useModel(step, init);
   const done = requestDone(st);
+  // Predict first, per request; the answer is revealed when the request is done.
+  const [guess, setGuess] = useState<Record<number, string | null>>({});
+  const PREDICT = [
+    {
+      question: "In the branch design you will edit three places, and each edit ships on its own. Will any customer notice before you finish?",
+      options: [{ value: "no", label: "No, it only matters once all three are done" }, { value: "yes", label: "Yes, some customers hit the half-done code" }, { value: "tests", label: "Only if the tests fail" }],
+      answer: "yes",
+      explain: "Each edit is live the moment it ships. Offer Klarna before Pay or Refund can handle it, and real customers fall into the gap. Only one order of edits avoids it, and you have to know it.",
+    },
+    {
+      question: "PayPal changed one call. Which design needs fewer edits to fix it?",
+      options: [{ value: "branch", label: "Branch design" }, { value: "strategy", label: "Strategy design" }, { value: "same", label: "The same" }],
+      answer: "same",
+      explain: "The change is inside one provider, and that code lives in one place in both designs. Strategy only pays off when the list of providers changes.",
+    },
+  ];
   const req = REQUESTS[Math.min(st.request, 1)];
 
   return (
@@ -203,6 +219,9 @@ export default function StrategyCheckout() {
           <h3>{req.title}</h3>
           <p>{req.why}</p>
           <p className="pg-rule"><b>{req.task}</b> Every change you make ships to production immediately, and customers keep using both checkouts while you work.</p>
+          <PgPredict question={PREDICT[st.request].question} options={PREDICT[st.request].options}
+            value={guess[st.request] ?? null} onChange={(v) => setGuess((g) => ({ ...g, [st.request]: v }))}
+            revealed={done} answer={PREDICT[st.request].answer} explain={PREDICT[st.request].explain} />
           {done && (
             <div className="pg-result" aria-live="polite">
               <span className="label">What this request cost</span>
@@ -244,6 +263,10 @@ export default function StrategyCheckout() {
           </section>
         ))}
       </div>
+      <PgSources links={[
+        { title: "Jake Lazaroff's interactive CRDT intro (two live peers side by side)", href: "https://jakelazaroff.com/words/an-interactive-intro-to-crdts/" },
+        { title: "refactoring.guru on Strategy", href: "https://refactoring.guru/design-patterns/strategy" },
+      ]} />
     </PgFrame>
   );
 }
