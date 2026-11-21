@@ -1,0 +1,448 @@
+---
+title: "fork, clone, exec and copy-on-write"
+track: linux
+group: Processes and memory
+order: 4
+summary: fork copies a process's page tables and shares its memory copy-on-write, exec replaces the program, and clone's flags decide what a new task shares. To run another program from a big process, spawn it.
+intent: Creating a process costs in proportion to the parent's address space unless the child borrows it, so a big process should spawn helpers instead of forking them.
+changeRequest: Run the PDF converter as an unprivileged user, from a service with 8 GiB of cache.
+languages: [go, python, typescript, rust]
+glossary: [fork, execve, clone, vfork, posix-spawn, copy-on-write, overcommit, oom-killer, page-table]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [linux/tasks-and-task-struct, operating-systems/process-api-fork-exec-wait]
+skills: [linux, os]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: fork-clone-exec-and-cow
+  scenarios:
+    - try: "Predict, then press fork() on the service."
+      notice: "RAM grows by 16 MiB of page tables, not 8 GiB. Every cell is now striped: shared copy-on-write by both processes. The service stalled 80 ms while the tables were copied."
+    - try: "Press keep serving on the service, then exec pdftotext in the child."
+      notice: "Each write by the parent copies a cell, because the child still shares it. exec drops the child's copy, the stripes vanish, and the copies were wasted work."
+    - try: "Reset, fork, and press keep serving until something happens."
+      notice: "The copies pile up until the host runs out of RAM, and the OOM killer takes the service, the biggest process."
+    - try: "Reset, switch on strict overcommit, and try fork(), then spawn pdftotext."
+      notice: "fork fails with ENOMEM: the kernel must promise the child another 8 GiB. The spawn works, stalls the service 0.1 ms and copies nothing."
+
+# ---------------------------------------------------------------- diagram
+# before: "start a child, drop privileges, run the tool". after: the child borrows memory until exec.
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 8, y: 60, w: 120, h: 56, title: Upload handler, sub: convert(pdf) }
+      after:  { x: 8, y: 40, w: 110, h: 50, title: Handler, sub: convert(pdf) }
+    - id: parent
+      kind: context
+      before: { x: 150, y: 18, w: 400, h: 236, title: Service process, sub: 8 GiB of heap }
+      after:  { x: 150, y: 40, w: 110, h: 50, title: Service, sub: 8 GiB heap }
+    - id: spawn
+      kind: strategy
+      appears: after
+      before: { x: 290, y: 40, w: 124, h: 50, title: "" }
+      after:  { x: 290, y: 40, w: 124, h: 50, title: vfork + exec, sub: CLONE_VM · VFORK }
+    - id: helper
+      kind: concrete
+      before: { x: 170, y: 84, w: 360, h: 44, title: "fork(): child", sub: a copy of the service }
+      after:  { x: 434, y: 40, w: 120, h: 50, title: Helper, sub: { go: unshare → pdftotext, python: setpriv → pdftotext, typescript: setpriv → pdftotext, rust: setpriv → pdftotext } }
+    - id: pt
+      kind: concrete
+      before: { x: 170, y: 146, w: 360, h: 44, title: drop privileges, sub: in the child, before exec }
+      after:  { x: 290, y: 170, w: 124, h: 50, title: Page tables, sub: borrowed, not copied }
+  edges:
+    - { from: app, to: parent }
+    - { from: parent, to: spawn }
+    - { from: spawn, to: helper, label: exec }
+    - { from: parent, to: pt }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: convert.go
+      source: |
+        // convert.go: turn an uploaded PDF into text with an untrusted tool
+        func convert(ctx context.Context, src, dst string) error {
+            cmd := exec.CommandContext(ctx, "pdftotext", src, dst)
+            // sandbox: new user and network namespaces, so the tool has no network
+            cmd.SysProcAttr = &syscall.SysProcAttr{
+                Cloneflags:  syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET,
+                UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
+                GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
+            }
+            return cmd.Run()
+        }
+      roles: { app: [2, 11], parent: [10, 10], helper: [3, 3], pt: [5, 9] }
+      change:
+        - { after: 6, add: ['        // CLONE_NEWUSER: os/exec cannot use CLONE_VFORK, so it forks for real'] }
+        - { after: 10, add: ['    // 80 ms stall per upload; sometimes "fork/exec: cannot allocate memory"'] }
+    after:
+      file: convert.go
+      source: |
+        func convert(ctx context.Context, src, dst string) error {
+            // unshare (util-linux) builds the namespaces after the spawn
+            cmd := exec.CommandContext(ctx, "unshare", "--user", "--map-root-user", "--net",
+                "--", "pdftotext", src, dst)
+            // no CLONE_NEWUSER in SysProcAttr, so os/exec spawns with
+            // CLONE_VM|CLONE_VFORK: the page tables are not copied
+            return cmd.Run()
+        }
+      roles: { app: [1, 8], parent: [7, 7], spawn: [5, 7], helper: [2, 4], pt: [5, 6], call: [1, 1], exec: [3, 4], drop: [2, 4] }
+    again:
+      file: convert.go
+      source: |
+        // per upload: fork stall 80 ms -> spawn 0.1 ms
+        // strict overcommit: no ENOMEM; the child never commits 8 GiB
+    cost:
+      before: { text: "80 ms stall per upload · ENOMEM", value: 0.85 }
+      after: { text: "0.1 ms per spawn · nothing copied", value: 0.05 }
+    lens:
+      need: 1
+      needLabel: Rare
+      note: 'Go has no `fork`: a copy of a running Go program would have one thread and a runtime that expects many. `os/exec` and `syscall.ForkExec` create the child with `CLONE_VM|CLONE_VFORK`, which copies nothing, and fall back to a real fork only when you ask for `CLONE_NEWUSER`. Goroutines run on runtime threads made with `clone`, so they never copy memory either.'
+      seenIn: '`exec.Command`, `os.StartProcess`, `syscall.ForkExec`. `SysProcAttr.Credential`, `Setsid` and `Pdeathsig` keep the cheap path.'
+
+  python:
+    before:
+      file: convert.py
+      source: |
+        # convert.py: turn an uploaded PDF into text with an untrusted tool
+        def sandbox() -> None:
+            # runs in the child, between fork and exec
+            resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+            os.setgid(65534)
+            os.setuid(65534)
+
+        def convert(src: str, dst: str) -> None:
+            subprocess.run(["pdftotext", src, dst], preexec_fn=sandbox,
+                           check=True, timeout=30)
+      roles: { app: [8, 10], parent: [9, 10], helper: [9, 9], pt: [2, 6] }
+      change:
+        - { after: 9, add: ['                   # preexec_fn: no vfork, a real fork of the 8 GiB parent'] }
+        - { after: 10, add: ['# 80 ms stall per upload; sometimes OSError: [Errno 12] Cannot allocate memory'] }
+    after:
+      file: convert.py
+      source: |
+        # setpriv and prlimit (util-linux) drop privileges after the spawn
+        SANDBOX = ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--",
+                   "prlimit", "--as=1073741824", "--"]
+
+        def convert(src: str, dst: str) -> None:
+            # no preexec_fn, so subprocess can use vfork: nothing is copied
+            subprocess.run([*SANDBOX, "pdftotext", src, dst],
+                           check=True, timeout=30)
+      roles: { app: [5, 8], parent: [7, 8], spawn: [6, 7], helper: [1, 3], pt: [6, 6], call: [5, 5], exec: [7, 8], drop: [1, 3] }
+    again:
+      file: convert.py
+      source: |
+        # per upload: fork stall 80 ms -> spawn 0.1 ms
+        # strict overcommit: no ENOMEM; the child never commits 8 GiB
+    cost:
+      before: { text: "80 ms stall per upload · ENOMEM", value: 0.85 }
+      after: { text: "0.1 ms per spawn · nothing copied", value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`os.fork()` is a real fork, and since 3.12 it warns when other threads are running. `subprocess` uses `vfork` when it safely can; `preexec_fn` forces a full fork. `multiprocessing` defaults to `forkserver` on Linux since 3.14, after years of `fork`. `os.posix_spawn` exists since 3.8.'
+      seenIn: '`subprocess.run`, `os.posix_spawn`, `multiprocessing.get_context("forkserver")`. `gc.freeze()` before forking workers, as preforking servers do.'
+
+  typescript:
+    before:
+      file: convert.ts
+      source: |
+        // convert.ts: turn an uploaded PDF into text with an untrusted tool
+        import { execFile } from "node:child_process";
+        import { promisify } from "node:util";
+        const run = promisify(execFile);
+
+        export async function convert(src: string, dst: string): Promise<void> {
+          // run the tool as nobody
+          await run("pdftotext", [src, dst], { uid: 65534, gid: 65534, timeout: 30_000 });
+        }
+      roles: { app: [6, 9], parent: [8, 8], helper: [8, 8], pt: [7, 8] }
+      change:
+        - { after: 8, add: ['  // uid and gid: libuv cannot use posix_spawn, so it calls fork()'] }
+        - { after: 9, add: ['// 80 ms stall per upload; sometimes spawn ENOMEM'] }
+    after:
+      file: convert.ts
+      source: |
+        import { execFile } from "node:child_process";
+        import { promisify } from "node:util";
+        const run = promisify(execFile);
+
+        // setpriv (util-linux) drops privileges after the spawn
+        const SANDBOX = ["--reuid=65534", "--regid=65534", "--clear-groups", "--"];
+
+        export async function convert(src: string, dst: string): Promise<void> {
+          // no uid or gid options, so libuv can use posix_spawn
+          await run("setpriv", [...SANDBOX, "pdftotext", src, dst], { timeout: 30_000 });
+        }
+      roles: { app: [8, 11], parent: [10, 10], spawn: [9, 10], helper: [5, 6], pt: [9, 9], call: [8, 8], exec: [10, 10], drop: [5, 6] }
+    again:
+      file: convert.ts
+      source: |
+        // per upload: fork stall 80 ms -> spawn 0.1 ms
+        // strict overcommit: no ENOMEM; the child never commits 8 GiB
+    cost:
+      before: { text: "80 ms stall per upload · ENOMEM", value: 0.85 }
+      after: { text: "0.1 ms per spawn · nothing copied", value: 0.05 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Node cannot fork a running process. `child_process` goes through libuv''s `uv_spawn`, which uses `posix_spawn` where it can and `fork` otherwise, for example for the `uid` and `gid` options. `child_process.fork()` starts a brand-new Node process with an IPC channel; despite its name, it shares no memory with the parent.'
+      seenIn: '`child_process.spawn` and `execFile`. `child_process.fork()` and `cluster` workers, which are new processes. `worker_threads`, real threads with separate V8 heaps.'
+
+  rust:
+    before:
+      file: convert.rs
+      source: |
+        // convert.rs: turn an uploaded PDF into text with an untrusted tool
+        use std::os::unix::process::CommandExt;
+
+        fn convert(src: &Path, dst: &Path) -> io::Result<ExitStatus> {
+            Command::new("pdftotext")
+                .arg(src)
+                .arg(dst)
+                .uid(65534) // run the tool as nobody
+                .gid(65534)
+                .status()
+        }
+      roles: { app: [4, 11], parent: [10, 10], helper: [5, 7], pt: [8, 9] }
+      change:
+        - { after: 9, add: ['        // uid and gid: std cannot use posix_spawn, so it forks'] }
+        - { after: 11, add: ['// 80 ms stall per upload; sometimes "Cannot allocate memory (os error 12)"'] }
+    after:
+      file: convert.rs
+      source: |
+        // setpriv (util-linux) drops privileges after the spawn
+        const SANDBOX: &[&str] = &["--reuid=65534", "--regid=65534", "--clear-groups", "--"];
+
+        fn convert(src: &Path, dst: &Path) -> io::Result<ExitStatus> {
+            // no uid, gid or pre_exec, so std spawns with posix_spawn
+            Command::new("setpriv")
+                .args(SANDBOX)
+                .arg("pdftotext")
+                .arg(src)
+                .arg(dst)
+                .status()
+        }
+      roles: { app: [4, 12], parent: [11, 11], spawn: [5, 6], helper: [1, 2], pt: [5, 5], call: [4, 4], exec: [6, 8], drop: [1, 2] }
+    again:
+      file: convert.rs
+      source: |
+        // per upload: fork stall 80 ms -> spawn 0.1 ms
+        // strict overcommit: no ENOMEM; the child never commits 8 GiB
+    cost:
+      before: { text: "80 ms stall per upload · ENOMEM", value: 0.85 }
+      after: { text: "0.1 ms per spawn · nothing copied", value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`std::process::Command` spawns with `posix_spawn` when it can (glibc 2.24 and later), which glibc implements as a vfork-style `clone`. Options that must run code in the child, such as `uid`, `gid` and `pre_exec`, make it fall back to fork and exec. A raw `libc::fork()` in a threaded program is unsafe: only the calling thread survives in the child.'
+      seenIn: '`Command::spawn` and `status`. `CommandExt::pre_exec` (unsafe) and `CommandExt::exec`, which replaces the current process. `nix::unistd::fork`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The upload handler calls `convert`. The service has 8 GiB of heap mapped, about two million pages.
+    nodes: [app, parent]
+    edges: [app>parent]
+    role: call
+  - text: { go: '`os/exec` calls `clone` with `CLONE_VM|CLONE_VFORK`. The child runs on the parent''s memory and page tables; nothing is copied, and the calling thread waits.', python: '`subprocess` calls `vfork`. The child runs on the parent''s memory and page tables; nothing is copied, and the calling thread waits.', typescript: 'libuv calls `posix_spawn`, which glibc runs as `clone(CLONE_VM|CLONE_VFORK)`. The child runs on the parent''s memory and page tables; nothing is copied.', rust: '`Command` calls `posix_spawn`, which glibc runs as `clone(CLONE_VM|CLONE_VFORK)`. The child runs on the parent''s memory and page tables; nothing is copied.' }
+    nodes: [parent, spawn, pt]
+    edges: [parent>spawn, parent>pt]
+    role: spawn
+  - text: { go: 'The child immediately calls `execve("unshare", …)`. The kernel gives it a new, small address space and the parent carries on. The PID stays the same.', python: 'The child immediately calls `execve("setpriv", …)`. The kernel gives it a new, small address space and the parent carries on. The PID stays the same.', typescript: 'The child immediately calls `execve("setpriv", …)`. The kernel gives it a new, small address space and the parent carries on. The PID stays the same.', rust: 'The child immediately calls `execve("setpriv", …)`. The kernel gives it a new, small address space and the parent carries on. The PID stays the same.' }
+    nodes: [spawn, helper]
+    edges: [spawn>helper]
+    role: exec
+  - text: { go: '`unshare` creates the user and network namespaces for itself, then execs `pdftotext`. The sandboxing costs a few hundred kilobytes, not 8 GiB.', python: '`setpriv` drops to user 65534, `prlimit` caps its memory, and both exec `pdftotext`. The sandboxing costs a few hundred kilobytes, not 8 GiB.', typescript: '`setpriv` drops to user 65534 and execs `pdftotext`. The sandboxing costs a few hundred kilobytes, not 8 GiB.', rust: '`setpriv` drops to user 65534 and execs `pdftotext`. The sandboxing costs a few hundred kilobytes, not 8 GiB.' }
+    nodes: [helper]
+    edges: []
+    role: drop
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A process calls execve("/usr/bin/pdftotext", …). What happens to it?
+    options:
+      - text: It keeps its PID and its open descriptors, and its program and memory are replaced by pdftotext's.
+        correct: true
+        why: Right. exec does not create a process. fork (or clone) creates one; exec changes what runs in it.
+      - text: The kernel starts a new process for pdftotext next to it.
+        why: No. exec replaces the program in the same process. To get a second process you fork or spawn first.
+      - text: pdftotext is loaded into the process next to the old program, which keeps running.
+        why: No. The old program's memory and threads are gone after a successful exec. Only a failed exec returns.
+  engineer:
+    question: "A 20 GiB service shells out with fork and exec, and fork fails with ENOMEM although free shows 6 GiB available. vm.overcommit_memory is 2. Why?"
+    options:
+      - text: In strict mode the kernel must commit the child's copy of all private writable memory at fork time, 20 GiB more, even though exec would throw it away a moment later.
+        correct: true
+        why: Right. Strict overcommit counts what could be written, not what is used. A vfork-style spawn commits only the new program's memory.
+      - text: fork copies the 20 GiB immediately, and only 6 GiB is free.
+        why: No. fork copies page tables and shares the pages. The failure is the commit accounting, not a copy.
+      - text: The child inherited the parent's memory limit and hit it.
+        why: Limits do not explain ENOMEM from fork itself. The kernel refuses before the child exists.
+  deep:
+    question: Why is calling malloc in a forked child of a multithreaded program, before exec, dangerous?
+    options:
+      - text: Only the thread that called fork exists in the child. If another thread held the allocator's lock at that moment, the lock stays held forever and malloc deadlocks.
+        correct: true
+        why: Right. The child gets a copy of every lock in its state at fork time, with no thread left to release it. Only async-signal-safe calls are safe until exec.
+      - text: The child shares the parent's heap, so both processes would allocate from the same memory.
+        why: No. After fork the heap is copy-on-write, so the child's allocations land in its own copies.
+      - text: malloc is not linked into the child until it calls exec.
+        why: No. The child runs the parent's program, libraries included, until it execs.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: fork
+      example: "fork(), clone with SIGCHLD only"
+      job: A new process with copied page tables and copy-on-write memory.
+    - role: vfork-style spawn
+      example: "posix_spawn, vfork, clone(CLONE_VM | CLONE_VFORK)"
+      job: A new process that borrows the parent's memory until it execs.
+    - role: Thread
+      example: "clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD …)"
+      job: A new task in the same process, sharing memory, files and signal handlers.
+    - role: exec
+      example: execve()
+      job: Replaces the program in the calling process. Keeps the PID and non-close-on-exec descriptors.
+    - role: Copy-on-write
+      example: the page-fault handler
+      job: Copies a shared private page on the first write by either side.
+  useWhen:
+    - Running another program from a large process. Spawn it (posix_spawn, or your language's default command API).
+    - The child must keep the parent's memory, as for a Redis-style snapshot or a preforked worker. Then fork, and keep writes after fork rare.
+    - You need to share memory between tasks. Use threads (clone with CLONE_VM).
+  avoidWhen:
+    - Forking a multithreaded process and doing real work in the child before exec.
+    - Running setup code between fork and exec in a big process (preexec hooks, uid or gid options). Move it into a small wrapper you spawn.
+  tradeoffs:
+    - fork costs time in proportion to the mapped memory, for the page tables, and can fail under strict overcommit.
+    - After fork, every write by either side to a shared page costs a fault and a 4 KiB copy (2 MiB with transparent huge pages).
+    - A vfork-style child shares the parent's memory, so it must do almost nothing before exec.
+    - A wrapper program (setpriv, unshare, prlimit) adds one more exec per spawn, about a millisecond.
+  lookalikes:
+    - name: Threads
+      how: clone with CLONE_VM. The new task shares the address space, so nothing is copied and nothing is protected.
+    - name: child_process.fork() in Node
+      how: Starts a new Node process from scratch with an IPC channel. It does not copy the parent.
+    - name: Process pools with forkserver
+      how: Fork from a small, clean server process instead of from the big parent, so each fork is cheap and starts from a known state.
+---
+
+## [concept] fork, clone, exec and copy-on-write
+
+**<Term id="fork">fork</Term> copies a process's <Term id="page-table">page tables</Term>, not its memory: every private page becomes <Term id="copy-on-write">copy-on-write</Term> in both processes. <Term id="execve">exec</Term> replaces the program in a process. <Term id="clone">clone</Term>'s flags decide what a new task shares.**
+
+So fork is cheap for a small process and not for a big one, and running another program from a big process should borrow its memory instead of copying its tables.
+
+<Depth level={2}>
+Three calls make every process and thread. `clone` creates a task; with no sharing flags it is a fork, with `CLONE_VM` and friends it is a thread, with `CLONE_VM|CLONE_VFORK` it is a <Term id="vfork">vfork</Term>: the child borrows the parent's memory and the parent waits until the child execs. `execve` loads a new program into the calling process. <Term id="posix-spawn">posix_spawn</Term> is the two together, done the cheap way.
+</Depth>
+
+<Depth level={3}>
+glibc's `fork()` is `clone` with only `SIGCHLD` as flags, and its `posix_spawn` (since 2.24) uses `clone(CLONE_VM|CLONE_VFORK)` on a separate stack. `clone3`, added in Linux 5.3, takes the same choices in a struct and can return a pidfd for the child.
+</Depth>
+
+## [problem] Running a converter as nobody
+
+A document service keeps 8 GiB of parsed documents in memory. For each upload it runs `pdftotext`, an external tool, and it must not run that tool with the service's own privileges.
+
+The obvious way: ask the process API to start the child and drop privileges in it before exec. Every language offers an option for that. It works in tests, where the service's heap is small.
+
+<Depth level={2}>
+The picture behind it: starting a child process costs about the same whatever the parent's size, and a little setup in the child before exec is free.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`SysProcAttr` with `CLONE_NEWUSER` asks the kernel for a new user namespace as the child is created, which is how Go programs sandbox without root.</Lang>
+<Lang only="python">`preexec_fn` runs a Python function in the child between fork and exec, which is how setrlimit and setuid calls get into the child.</Lang>
+<Lang only="typescript">The `uid` and `gid` options of `child_process` switch the child's user before exec.</Lang>
+<Lang only="rust">`CommandExt::uid` and `gid` switch the child's user before exec.</Lang>
+</Depth>
+
+## [pain] Stalls on every upload, and ENOMEM
+
+In production each upload stalls the whole service for about 80 ms, and p99 latency follows the upload rate. On hosts with strict overcommit, some uploads fail outright with "cannot allocate memory", while `free` shows gigabytes available.
+
+The marked lines are the cause. Setup that runs in the child, before exec, rules out the cheap spawn, so the runtime makes a real fork of an 8 GiB process.
+
+<Depth level={2}>
+A real fork copies page tables for every mapped page: 16 MiB of entries for 8 GiB, in roughly 80 ms on a physical host and much longer on some virtual machines. While it runs, the parent is busy in the kernel. Until the child execs, every page the service writes is shared, so each write faults and copies.
+</Depth>
+
+<Depth level={3}>
+The ENOMEM comes from commit accounting. With `vm.overcommit_memory=2`, the kernel promises memory only up to a limit, and a fork must commit the child's copy of all private writable memory. The child would exec a millisecond later, but the kernel cannot know that.
+</Depth>
+
+## [morph] From "start a child" to "borrow, then exec"
+
+Drag the slider. The big "service process" block splits: the service, a vfork-style spawn that borrows its page tables, and a small helper that does the sandboxing after exec.
+
+Hover a box to see its code.
+
+<Depth level={2}>
+The fix moves the setup out of the gap between fork and exec. The service spawns a tiny wrapper (`setpriv`, `prlimit` or `unshare` from util-linux) with no options that need code in the child, so the runtime can use its vfork-style path. The wrapper drops privileges for itself and execs the real tool.
+</Depth>
+
+<Depth level={3}>
+A vfork-style child runs on the parent's memory and stack, so it can do almost nothing before exec. That is why runtimes only use it when they need no user code in the child, and why options such as `preexec_fn`, `pre_exec` or uid switches push them back to a real fork.
+</Depth>
+
+## [walk] Follow one spawn
+
+One upload, from the handler to the tool running as nobody. Step through it with the numbered buttons.
+
+<Depth level={3}>
+Inside `execve` the kernel opens the file, reads the ELF header, drops the old address space, maps the program's segments and the dynamic loader, builds a new stack with argv and the environment, and starts at the loader's entry point. Descriptors without close-on-exec stay open, caught signals are reset to their defaults, and every other thread of the process is gone.
+</Depth>
+
+## [again] The same upload, spawned
+
+The same request after the change. Each upload stalls the service for a fraction of a millisecond, nothing is copied, and strict overcommit has nothing to refuse, because the child never claims the parent's memory.
+
+<Depth level={2}>
+When you do need fork, for a child that must see the parent's memory, keep the parent's writes low until the child is done. Redis's snapshot child is the classic case: while it writes the snapshot, every page the parent changes is copied, and a write-heavy instance can nearly double its memory.
+</Depth>
+
+<Depth level={3}>
+Transparent huge pages make copy-on-write coarser: a write to one byte of a shared 2 MiB page copies all of it. That is why Redis recommends disabling them.
+</Depth>
+
+## [play] Fork, write, exec and spawn
+
+Fork the 8 GiB service, write to shared memory from either side, exec, and compare with a spawn. Then break it: write until the OOM killer acts, or switch on strict overcommit.
+
+## [lens] How each language starts processes
+
+Every runtime's process API ends in `clone` and `execve`. What differs is whether you can fork at all, and which options push the runtime off its cheap path.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={3}>
+<Lang only="go">The Go runtime's threads cannot be copied safely, so Go has no `syscall.Fork`. To get a worker with its own memory you exec a new process, often the same binary with a flag.</Lang>
+<Lang only="python">Preforking servers, such as gunicorn with `--preload`, fork workers from a parent that has loaded the app, to share its memory. CPython's reference counts write to every object they touch, so the sharing fades as workers run; `gc.freeze()` before forking keeps the collector from speeding that up.</Lang>
+<Lang only="typescript">Each `cluster` worker or `child_process.fork()` child is a fresh Node process that loads your code again; nothing is shared with the parent. `worker_threads` share the process but each has its own V8 heap.</Lang>
+<Lang only="rust">`std` never forks for you unless you ask for code in the child. Crates such as `nix` expose `fork()` as `unsafe`, with the same rule as C: only async-signal-safe calls until exec.</Lang>
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="fork-clone-exec-and-cow" />
+
+### What a fork keeps and what exec resets
+
+After fork the child has copies of the parent's descriptors (sharing their file offsets), memory (copy-on-write), signal handlers and working directory, but only the thread that called fork, no pending signals, no timers and no memory locks. After exec the process keeps its PID, parent, descriptors without close-on-exec, and resource limits; it loses its memory, its other threads, its caught signal handlers and its `atexit` handlers. Mark descriptors close-on-exec (`O_CLOEXEC`, the default in Go, Python and Rust) so helpers do not inherit sockets and files they should not see.

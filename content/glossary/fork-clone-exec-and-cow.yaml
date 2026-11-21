@@ -1,0 +1,25 @@
+# Terms introduced by the fork, clone and exec lesson.
+- id: fork
+  term: fork()
+  short: Creates a child process that is a copy of the caller. On Linux it copies the page tables and shares every private page copy-on-write; it returns 0 in the child and the child's PID in the parent.
+- id: execve
+  term: execve()
+  short: Replaces the program running in the calling process with a new one. The PID and open descriptors (unless close-on-exec) stay; the old memory, threads and signal handlers go.
+- id: clone
+  term: clone()
+  short: Linux's general call for creating tasks. Its flags choose what the new task shares with the caller (memory, file table, signal handlers, thread group, namespaces); fork, vfork and threads are all clone with different flags.
+- id: vfork
+  term: vfork
+  short: Creating a child that borrows the parent's memory instead of copying page tables, while the parent waits until the child calls exec or exits. clone with CLONE_VM and CLONE_VFORK does the same.
+- id: posix-spawn
+  term: posix_spawn
+  short: A libc call that creates a process and runs a new program in one step. glibc implements it with a vfork-style clone, so the caller's memory is never copied.
+- id: overcommit
+  term: Overcommit
+  short: The kernel promising more memory than it has, betting that not all of it will be written. vm.overcommit_memory chooses the policy; in strict mode (2), a fork of a large process can fail with ENOMEM.
+- id: oom-killer
+  term: OOM killer
+  short: The kernel's last resort when RAM runs out. It picks the process whose death frees the most memory, usually the biggest, and kills it with SIGKILL.
+- id: copy-on-write
+  term: Copy-on-write
+  short: Sharing a page read-only between processes (after fork) or mappings (MAP_PRIVATE) and copying it only when one of them writes. The write faults, the kernel copies 4 KiB, and the writer gets its own page.
