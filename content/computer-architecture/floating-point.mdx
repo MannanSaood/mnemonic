@@ -1,0 +1,559 @@
+---
+title: Floating point
+track: computer-architecture
+group: Data
+order: 3
+summary: A float stores a number as sign, exponent and mantissa bits, so most decimals like 0.10 are stored as the nearest binary fraction. Every operation rounds again, which is why money in floats drifts and equality checks fail.
+intent: Know what a float really holds, so you keep money and other exact quantities out of floats and compare computed floats the right way.
+changeRequest: Finance wants every day's invoice totals reconciled to the cent against the payment provider's settlement report.
+languages: [go, python, typescript, rust]
+glossary: [ieee-754, significand, exponent-bias, ulp, round-to-nearest-even, catastrophic-cancellation, nan, subnormal-number, minor-unit]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [computer-architecture/integers-and-twos-complement]
+skills: [architecture]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: floating-point
+  scenarios:
+    - try: "Predict, then press +10 with the defaults: $0 opening balance, $0.10 per add."
+      notice: "The float64 total is 0.9999999999999999 and fails the equality check. The integer-cents column says $1.00, exactly."
+    - try: "Set the opening balance to $300,000 and each add to $0.01, then press +1,000."
+      notice: "The float32 total does not move at all. Click it: neighbouring float32 values are 0.03125 apart here, so a cent rounds away."
+    - try: "Set the opening balance to $20 trillion and press +1,000 with $0.01."
+      notice: "Now float64 drifts too, by more than a dollar, and the last deposit recovered by subtraction reads 0.01171875 instead of 0.01."
+    - try: "In the inspector, type 2^24 + 1 in float32, then flip the lowest exponent bit of 1.5."
+      notice: "float32 cannot hold 16,777,217; it stores 16,777,216. Flipping an exponent bit halves or doubles the value."
+
+# ---------------------------------------------------------------- diagram
+# before: "a price is a decimal number". after: the float64 encoding, rounding, and integer cents.
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 8, y: 110, w: 120, h: 52, title: Invoice, sub: "price \"19.99\"" }
+      after:  { x: 8, y: 110, w: 120, h: 52, title: Invoice, sub: "price \"19.99\"" }
+    - id: value
+      kind: context
+      before: { x: 150, y: 18, w: 400, h: 236, title: Invoice math, sub: decimals, as on paper }
+      after:  { x: 150, y: 30, w: 118, h: 52, title: { go: float64, python: float, typescript: number, rust: f64 }, sub: 64 bits }
+    - id: round
+      kind: strategy
+      appears: after
+      before: { x: 290, y: 30, w: 120, h: 52, title: "" }
+      after:  { x: 290, y: 30, w: 120, h: 52, title: Round to nearest, sub: every operation }
+    - id: fields
+      kind: concrete
+      before: { x: 170, y: 64, w: 360, h: 38, title: 19.99 stored as 19.99 }
+      after:  { x: 432, y: 30, w: 120, h: 52, title: Sign exp mant, sub: 1 · 11 · 52 bits }
+    - id: reconcile
+      kind: concrete
+      before: { x: 170, y: 112, w: 360, h: 38, title: total == settled }
+      after:  { x: 432, y: 120, w: 120, h: 52, title: Reconcile, sub: "== on the total" }
+    - id: tax
+      kind: concrete
+      before: { x: 170, y: 160, w: 360, h: 38, title: tax = subtotal × 1.0825 }
+      after:  { x: 290, y: 200, w: 120, h: 52, title: Tax, sub: round once }
+    - id: cents
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 208, w: 360, h: 38, title: + reconcile to the cent }
+      after:  { x: 150, y: 200, w: 118, h: 52, title: { go: int64 cents, python: Decimal, typescript: integer cents, rust: i64 cents }, sub: exact }
+  edges:
+    - { from: app, to: value, label: parse }
+    - { from: value, to: round }
+    - { from: round, to: fields, label: nearest }
+    - { from: fields, to: reconcile, label: "== fails" }
+    - { from: app, to: cents, label: parse }
+    - { from: cents, to: tax }
+    - { from: tax, to: reconcile, label: "== exact" }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: invoice.go
+      source: |
+        // invoice.go
+        type LineItem struct {
+            Description string
+            UnitPrice   float64 // dollars, e.g. 19.99
+            Quantity    int
+        }
+
+        func InvoiceTotal(items []LineItem, taxRate float64) float64 {
+            var subtotal float64
+            for _, it := range items {
+                subtotal += it.UnitPrice * float64(it.Quantity)
+            }
+            return subtotal * (1 + taxRate)
+        }
+
+        func Reconcile(total, settled float64) bool {
+            return total == settled
+        }
+      roles: { app: [8, 14], value: [4, 4], fields: [4, 4], round: [11, 11], tax: [13, 13], reconcile: [16, 18], cents: [17, 17] }
+      change:
+        - { after: 11, add: ['        // two items at 0.10 and 0.20: subtotal 0.30000000000000004'] }
+        - { after: 17, add: ['    // settlement says 0.30: flagged as a mismatch'] }
+    after:
+      file: invoice.go
+      source: |
+        // invoice.go: money as integer cents
+        type Cents int64
+
+        type LineItem struct {
+            Description string
+            UnitPrice   Cents // 1999 means $19.99
+            Quantity    int64
+        }
+
+        // ParseCents turns "19.99" into 1999 without a float.
+        func ParseCents(s string) (Cents, error) {
+            whole, frac, _ := strings.Cut(s, ".")
+            if len(frac) > 2 {
+                return 0, fmt.Errorf("more than two decimals: %q", s)
+            }
+            n, err := strconv.ParseInt(whole+(frac+"00")[:2], 10, 64)
+            return Cents(n), err
+        }
+
+        func InvoiceTotal(items []LineItem, taxBasisPoints int64) Cents {
+            var subtotal Cents
+            for _, it := range items {
+                subtotal += it.UnitPrice * Cents(it.Quantity)
+            }
+            tax := (int64(subtotal)*taxBasisPoints + 5_000) / 10_000 // round half up, once
+            return subtotal + Cents(tax)
+        }
+
+        func Reconcile(total, settled Cents) bool {
+            return total == settled
+        }
+      roles: { app: [20, 27], value: [6, 6], round: [25, 25], fields: [2, 2], reconcile: [29, 31], tax: [25, 26], cents: [2, 8], parse: [11, 18], sum: [20, 24], exact: [2, 8], compare: [29, 31] }
+    again:
+      file: reconcile log
+      source: |
+        // daily reconcile: 48,211 invoices, 0 mismatches
+        // revenue equals the settlement report to the cent
+    cost:
+      before: { text: "1,900 mismatches a day · cents of drift", value: 0.8 }
+      after: { text: "0 mismatches · exact to the cent", value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Go has `float32` and `float64` and no decimal type in the standard library, so integer minor units are the usual choice for money. `math/big.Rat` is exact but slow; third-party decimal packages such as `shopspring/decimal` are common. `==` on floats compiles without a warning.'
+      seenIn: 'Payment APIs such as Stripe take amounts as integers in the smallest currency unit. `math.Float64bits` shows the bits; `math.Nextafter` gives the neighbouring float.'
+
+  python:
+    before:
+      file: invoice.py
+      source: |
+        # invoice.py
+        @dataclass
+        class LineItem:
+            description: str
+            unit_price: float  # dollars, e.g. 19.99
+            quantity: int
+
+        def invoice_total(items: list[LineItem], tax_rate: float) -> float:
+            subtotal = 0.0
+            for it in items:
+                subtotal += it.unit_price * it.quantity
+            return subtotal * (1 + tax_rate)
+
+        def reconcile(total: float, settled: float) -> bool:
+            return total == settled
+      roles: { app: [8, 12], value: [5, 5], fields: [5, 5], round: [11, 11], tax: [12, 12], reconcile: [14, 15], cents: [15, 15] }
+      change:
+        - { after: 11, add: ['        # two items at 0.10 and 0.20: subtotal 0.30000000000000004'] }
+        - { after: 15, add: ['    # settlement says 0.30: flagged as a mismatch'] }
+    after:
+      file: invoice.py
+      source: |
+        # invoice.py: money as Decimal, never float
+        from decimal import Decimal, ROUND_HALF_UP
+
+        CENT = Decimal("0.01")
+
+        @dataclass
+        class LineItem:
+            description: str
+            unit_price: Decimal  # Decimal("19.99"), built from the string
+            quantity: int
+
+        def parse_price(s: str) -> Decimal:
+            return Decimal(s)  # never Decimal(19.99): that copies the float's error
+
+        def invoice_total(items: list[LineItem], tax_rate: Decimal) -> Decimal:
+            subtotal = sum((it.unit_price * it.quantity for it in items), Decimal(0))
+            tax = (subtotal * tax_rate).quantize(CENT, rounding=ROUND_HALF_UP)
+            return subtotal + tax
+
+        def reconcile(total: Decimal, settled: Decimal) -> bool:
+            return total == settled
+      roles: { app: [15, 18], value: [9, 9], round: [17, 17], fields: [9, 9], reconcile: [20, 21], tax: [17, 18], cents: [2, 4], parse: [12, 13], sum: [15, 16], exact: [2, 4], compare: [20, 21] }
+    again:
+      file: reconcile log
+      source: |
+        # daily reconcile: 48,211 invoices, 0 mismatches
+        # revenue equals the settlement report to the cent
+    cost:
+      before: { text: "1,900 mismatches a day · cents of drift", value: 0.8 }
+      after: { text: "0 mismatches · exact to the cent", value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`float` is an IEEE 754 double. `decimal.Decimal` does base-10 arithmetic with 28 significant digits by default and explicit rounding modes, and `fractions.Fraction` is exact. Build a Decimal from a string: `Decimal(0.1)` copies the double''s long binary value. `math.fsum` adds a list of floats with a single rounding at the end.'
+      seenIn: '`decimal.Decimal`, `math.isclose`, `math.fsum`, `float.hex()`. Django''s `DecimalField` and SQL `NUMERIC` columns store money as decimals.'
+
+  typescript:
+    before:
+      file: invoice.ts
+      source: |
+        // invoice.ts
+        interface LineItem {
+          description: string;
+          unitPrice: number; // dollars, e.g. 19.99
+          quantity: number;
+        }
+
+        export function invoiceTotal(items: LineItem[], taxRate: number): number {
+          let subtotal = 0;
+          for (const it of items) {
+            subtotal += it.unitPrice * it.quantity;
+          }
+          return subtotal * (1 + taxRate);
+        }
+
+        export function reconcile(total: number, settled: number): boolean {
+          return total === settled;
+        }
+      roles: { app: [8, 14], value: [4, 4], fields: [4, 4], round: [11, 11], tax: [13, 13], reconcile: [16, 18], cents: [17, 17] }
+      change:
+        - { after: 11, add: ['    // two items at 0.10 and 0.20: subtotal 0.30000000000000004'] }
+        - { after: 17, add: ['  // settlement says 0.30: flagged as a mismatch'] }
+    after:
+      file: invoice.ts
+      source: |
+        // invoice.ts: money as integer cents
+        type Cents = number; // a safe integer: exact up to 2^53, about $90 trillion
+
+        interface LineItem {
+          description: string;
+          unitPrice: Cents; // 1999 means $19.99
+          quantity: number;
+        }
+
+        // "19.99" -> 1999, without going through a float
+        export function parseCents(s: string): Cents {
+          const m = /^(-?)(\d+)(?:\.(\d{1,2}))?$/.exec(s);
+          if (!m) throw new Error(`not a price: ${s}`);
+          const cents = Number(m[2]) * 100 + Number((m[3] ?? "").padEnd(2, "0"));
+          return m[1] ? -cents : cents;
+        }
+
+        export function invoiceTotal(items: LineItem[], taxBasisPoints: number): Cents {
+          let subtotal = 0;
+          for (const it of items) subtotal += it.unitPrice * it.quantity;
+          const tax = Math.floor((subtotal * taxBasisPoints + 5_000) / 10_000); // round half up, once
+          return subtotal + tax;
+        }
+
+        export function reconcile(total: Cents, settled: Cents): boolean {
+          return total === settled;
+        }
+      roles: { app: [18, 23], value: [6, 6], round: [21, 21], fields: [2, 2], reconcile: [25, 27], tax: [21, 22], cents: [2, 8], parse: [11, 16], sum: [18, 20], exact: [2, 8], compare: [25, 27] }
+    again:
+      file: reconcile log
+      source: |
+        // daily reconcile: 48,211 invoices, 0 mismatches
+        // revenue equals the settlement report to the cent
+    cost:
+      before: { text: "1,900 mismatches a day · cents of drift", value: 0.8 }
+      after: { text: "0 mismatches · exact to the cent", value: 0.05 }
+    lens:
+      need: 4
+      needLabel: Essential
+      note: 'JavaScript has one number type, an IEEE 754 double, so there is no int to fall back on by accident. Whole numbers are exact up to `Number.MAX_SAFE_INTEGER` (2^53 − 1), which is why integer cents work; `bigint` goes further. `toFixed` rounds the stored value, so `(1.005).toFixed(2)` is `"1.00"`. Format with `Intl.NumberFormat` only at the edge.'
+      seenIn: '`Number.isSafeInteger`, `Number.EPSILON`, `BigInt`, `Intl.NumberFormat`. Money libraries such as dinero.js keep amounts as integers in minor units.'
+
+  rust:
+    before:
+      file: invoice.rs
+      source: |
+        // invoice.rs
+        pub struct LineItem {
+            pub description: String,
+            pub unit_price: f64, // dollars, e.g. 19.99
+            pub quantity: u32,
+        }
+
+        pub fn invoice_total(items: &[LineItem], tax_rate: f64) -> f64 {
+            let mut subtotal = 0.0;
+            for it in items {
+                subtotal += it.unit_price * f64::from(it.quantity);
+            }
+            subtotal * (1.0 + tax_rate)
+        }
+
+        pub fn reconcile(total: f64, settled: f64) -> bool {
+            total == settled
+        }
+      roles: { app: [8, 14], value: [4, 4], fields: [4, 4], round: [11, 11], tax: [13, 13], reconcile: [16, 18], cents: [17, 17] }
+      change:
+        - { after: 11, add: ['        // two items at 0.10 and 0.20: subtotal 0.30000000000000004'] }
+        - { after: 17, add: ['    // settlement says 0.30: flagged as a mismatch'] }
+    after:
+      file: invoice.rs
+      source: |
+        // invoice.rs: money as integer cents
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub struct Cents(pub i64); // Cents(1999) is $19.99
+
+        pub struct LineItem {
+            pub description: String,
+            pub unit_price: Cents,
+            pub quantity: u32,
+        }
+
+        /// "19.99" -> Cents(1999), without going through a float.
+        pub fn parse_cents(s: &str) -> Option<Cents> {
+            let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+            if frac.len() > 2 { return None; }
+            let n: i64 = format!("{whole}{frac:0<2}").parse().ok()?;
+            Some(Cents(n))
+        }
+
+        pub fn invoice_total(items: &[LineItem], tax_basis_points: i64) -> Cents {
+            let subtotal: i64 = items.iter().map(|it| it.unit_price.0 * i64::from(it.quantity)).sum();
+            let tax = (subtotal * tax_basis_points + 5_000) / 10_000; // round half up, once
+            Cents(subtotal + tax)
+        }
+
+        pub fn reconcile(total: Cents, settled: Cents) -> bool {
+            total == settled
+        }
+      roles: { app: [19, 23], value: [7, 7], round: [21, 21], fields: [3, 3], reconcile: [25, 27], tax: [21, 22], cents: [2, 3], parse: [12, 17], sum: [19, 20], exact: [2, 3], compare: [25, 27] }
+    again:
+      file: reconcile log
+      source: |
+        // daily reconcile: 48,211 invoices, 0 mismatches
+        // revenue equals the settlement report to the cent
+    cost:
+      before: { text: "1,900 mismatches a day · cents of drift", value: 0.8 }
+      after: { text: "0 mismatches · exact to the cent", value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`f64` implements `PartialEq` and `PartialOrd` but not `Eq` or `Ord`, because NaN is not equal to itself. So `Vec<f64>` has no `.sort()` and cannot be a `BTreeMap` key; use `sort_by(f64::total_cmp)`. The standard library has no decimal type; a newtype over `i64` makes cents impossible to mix up with other integers.'
+      seenIn: '`f64::to_bits`, `f64::total_cmp`, `f64::EPSILON`. The `rust_decimal` crate for base-10 decimals.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: 'The price arrives as the text "19.99". Parsed into a float64, it becomes the nearest binary fraction, 19.989999999999998436805981327779591083526611328125. The fixed code never makes that float; it parses the text into a whole number of cents.'
+    nodes: [app, value, round, fields]
+    edges: [app>value, value>round, round>fields]
+    role: parse
+  - text: 'A float64 keeps 53 significant bits, about 16 decimal digits. Every add or multiply rounds its exact result back to 53 bits. Add 0.10 ten times and the rounding errors leave 0.9999999999999999, so `==` against the settlement fails.'
+    nodes: [round, fields, reconcile]
+    edges: [fields>reconcile]
+    role: sum
+  - text: { go: 'In the fixed code, prices, quantities and the subtotal are `int64` cents. Integer adds and multiplies are exact until they overflow, near 92 quadrillion dollars.', python: 'In the fixed code, prices are `Decimal`s built from strings. Decimal adds and multiplies in base 10, so 0.10 is exactly one tenth and sums of cents stay exact.', typescript: 'In the fixed code, prices and the subtotal are whole numbers of cents. A double holds every integer up to 2^53 exactly, so these adds never round.', rust: 'In the fixed code, prices and the subtotal are `i64` cents in a `Cents` newtype. Integer adds and multiplies are exact until they overflow, near 92 quadrillion dollars.' }
+    nodes: [app, cents]
+    edges: [app>cents]
+    role: exact
+  - text: 'Tax is the one step with a real fraction. The fixed code computes it in one place and rounds it once, half up, to a whole cent. That is a business rule you can write down and test, not an accident of binary.'
+    nodes: [cents, tax]
+    edges: [cents>tax]
+    role: tax
+  - text: 'Reconcile compares two exact amounts. Equal now means equal to the cent, and a mismatch is a real one.'
+    nodes: [tax, reconcile]
+    edges: [tax>reconcile]
+    role: compare
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Why does 0.1 + 0.2 print 0.30000000000000004 in most languages?
+    options:
+      - text: Neither 0.1 nor 0.2 has an exact binary form. The stored approximations add up to a value just above the float nearest 0.3.
+        correct: true
+        why: Right. Each literal is rounded to the nearest binary fraction, the sum is rounded again, and the result lands one step above the float that prints as 0.3.
+      - text: The CPU's adder has a bug that IEEE 754 documents.
+        why: No. The addition is correctly rounded. The inputs were never exactly 0.1 and 0.2.
+      - text: The language uses 32-bit floats by default, which lack precision.
+        why: No. These are 64-bit doubles. float32 gives 0.3 for this sum by luck of rounding, and is wrong elsewhere.
+  engineer:
+    question: A service keeps prices as float64 dollars and converts to cents with int(price * 100) before charging a card. A product costs $4.35. What is charged?
+    options:
+      - text: 434 cents. 4.35 × 100 is 434.99999999999994 as a double, and the conversion truncates.
+        correct: true
+        why: Right. The nearest double to 4.35 is slightly below it. Parse prices straight into integer cents, or round, never truncate.
+      - text: 435 cents. A double has 15 to 16 significant digits, far more than needed.
+        why: The digits are there, but the value is just under 435 and the conversion cuts off the fraction.
+      - text: 435 cents, because converting a float to an integer rounds to the nearest.
+        why: In Go, Python, Rust and C, float-to-int conversion truncates toward zero.
+  deep:
+    question: A metrics job sums the same million float64 latencies on 8 threads, and the last digits of the total change from run to run. What is the cause?
+    options:
+      - text: Floating-point addition is not associative. The threads finish in a different order each run, each order rounds differently, and the totals differ.
+        correct: true
+        why: Right. (a + b) + c can differ from a + (b + c). Fix the reduction order, sum in a wider or exact accumulator, or use compensated (Kahan) summation if the digits matter.
+      - text: A data race on the accumulator.
+        why: A race could lose whole values. Small changes in the last digits with correct locking come from rounding order.
+      - text: Some latencies are NaN, and NaN makes sums random.
+        why: One NaN makes the whole sum NaN every time. It is not random.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Sign bit
+      example: bit 63 of a float64
+      job: 0 for positive, 1 for negative. There is a negative zero, equal to zero.
+    - role: Exponent
+      example: 11 bits, bias 1023
+      job: Picks the power of two, so the same number of significant bits covers tiny and huge values.
+    - role: Mantissa (significand)
+      example: 52 stored bits plus a hidden leading 1
+      job: Holds the significant digits. 53 bits is about 15 to 17 decimal digits; float32's 24 is about 7.
+    - role: Rounding
+      example: round to nearest, ties to even
+      job: Every operation computes the exact result, then rounds it to the nearest representable value.
+    - role: Integer minor units or decimal
+      example: int64 cents, Decimal
+      job: Keeps quantities that must be exact in decimal, such as money, exact.
+  useWhen:
+    - Measurements and statistics, where the input already has error and relative precision matters (latency, ratios, scores, ML, graphics).
+    - Wide ranges, from 10^-300 to 10^300 in a float64.
+    - Speed. Float arithmetic is native, vectorised and cheap.
+  avoidWhen:
+    - Money, quantities with a legal or contractual rounding rule, and anything that must match another system to the cent.
+    - Counters and IDs above 2^53 in a double, or above 2^24 in a float32.
+    - Equality checks on computed values. Compare with a tolerance suited to the scale instead.
+  tradeoffs:
+    - float64 has 16 digits where float32 has 7, at twice the memory and bandwidth. It moves errors further out; it does not remove them.
+    - Decimal types are exact for decimal fractions but slower, and still round results like 1/3.
+    - Integer minor units are fast and exact, but each currency needs its exponent and every percentage needs an explicit rounding rule.
+  lookalikes:
+    - name: Fixed point
+      how: An integer with an agreed scale, like cents or basis points. Exact and fast, with a fixed range.
+    - name: Decimal floating point
+      how: Base-10 digits with an exponent, like Python's Decimal or IEEE 754 decimal64. 0.1 is exact; 1/3 still rounds.
+    - name: Integer overflow
+      how: The integer failure mode. Integers are exact until they wrap; floats round from the start.
+---
+
+## [concept] Floating point
+
+**A float stores a number as three fields of bits: a sign, an exponent that picks a power of two, and a mantissa that holds the significant digits. It is scientific notation in binary.**
+
+Only fractions built from powers of two fit exactly. 0.5 and 0.75 do. 0.1 does not: in binary it repeats forever, like 1/3 in decimal, so the float holds the nearest value it can. Every operation then rounds its result again.
+
+<Depth level={2}>
+The rules are fixed by <Term id="ieee-754">IEEE 754</Term>, which every mainstream CPU implements. A float64 has 1 sign bit, 11 exponent bits and 52 <Term id="significand">mantissa</Term> bits; a float32 has 1, 8 and 23. Rounding is deterministic: the same operations on the same inputs give the same bits on every machine. Floats are not randomly inexact. They are exactly a different set of numbers from the decimals we write.
+</Depth>
+
+<Depth level={3}>
+A normal float64 is (−1)^sign × 1.mantissa × 2^(exponent − 1023). The leading 1 is implied, which gives 53 significant bits. The <Term id="exponent-bias">bias</Term> of 1023 keeps the field unsigned, so positive floats order the same way as their bit patterns read as integers. An exponent field of all zeros means zero or a <Term id="subnormal-number">subnormal number</Term>; all ones means infinity or <Term id="nan">NaN</Term>. The distance between neighbouring floats, one <Term id="ulp">ULP</Term>, doubles at every power of two.
+</Depth>
+
+## [problem] An invoice service in float64
+
+An invoicing service stores unit prices as floats in dollars. It multiplies by quantity, adds up the lines and applies tax. It shows totals to two decimals, and every invoice looks right.
+
+Reconciliation compares each invoice total with what the payment provider settled.
+
+<Depth level={2}>
+The author's picture: a float64 has about 16 significant digits and a price has 2, so there is plenty of precision to spare. Each invoice, printed to two decimals, confirms the picture. The precision is there; what the picture misses is that 0.10 is not one of the values a float can hold.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`float64` is the default for decimal literals in Go, so `UnitPrice: 19.99` compiles without a second thought. `fmt.Sprintf("%.2f", total)` hides every error past the second decimal.</Lang>
+<Lang only="python">A literal `19.99` is a `float`, an IEEE 754 double. `f"{total:.2f}"` rounds for display and hides every error past the second decimal.</Lang>
+<Lang only="typescript">Every number is a double, so `unitPrice: number` is the only obvious type. `total.toFixed(2)` rounds for display and hides every error past the second decimal.</Lang>
+<Lang only="rust">`f64` is the default float type, and `format!("{total:.2}")` rounds for display and hides every error past the second decimal.</Lang>
+</Depth>
+
+## [pain] Reconcile to the cent
+
+Finance turns on daily reconciliation. Thousands of invoices a day are flagged as mismatches, though each one looks equal when printed. An invoice with items at $0.10 and $0.20 totals 0.30000000000000004. The settlement says 0.30. `==` says no.
+
+The marked lines are where it happens. Every price is already off by a tiny amount before any arithmetic runs, and the sum and the tax each round again.
+
+<Depth level={2}>
+Rounding the total to cents before comparing hides most mismatches, but not all. An amount that should be exactly half a cent can land either side of it, and summing a day's revenue in floats adds up thousands of tiny errors that all lean the same way. Converting with `int(price * 100)` is worse: 4.35 × 100 is 434.99999999999994, which truncates to 434 cents.
+</Depth>
+
+<Depth level={3}>
+The error grows with the size of the number, not with the count of digits you care about. Near $300,000, neighbouring float32 values are 1/32 of a dollar apart, so adding a cent changes nothing at all. Near $20 trillion, float64 neighbours are about 0.4 cents apart, and every cent you add is stored as three of those steps. Subtracting two close large totals to recover a small amount gives that step size back as the answer: <Term id="catastrophic-cancellation">catastrophic cancellation</Term>.
+</Depth>
+
+## [morph] From decimal numbers to bits and rounding
+
+Drag the slider. The block labelled "invoice math" splits into what the hardware does: the float64 with its three fields, rounding after every operation, and the integer path the fix uses instead.
+
+Hover a box to see its code.
+
+<Depth level={2}>
+The fix keeps money in exact units from the moment it enters the system. Parse the text "19.99" straight into 1999 cents, or into a decimal type, never through a float. Do integer arithmetic. Where a percentage creates a fraction, round once, at a point the business can name, with a rule it chose (half up, half even, always down).
+</Depth>
+
+<Depth level={3}>
+Integer cents depend on the currency's exponent: the yen has none, the Kuwaiti dinar has three (ISO 4217 lists them). Store the <Term id="minor-unit">minor unit</Term> count with its currency, never a bare number. Rates such as tax or FX need more precision than cents; keep them as integers in basis points or as decimals, and round only the money result.
+</Depth>
+
+## [walk] Follow one price
+
+One price, followed through a float and then through the corrected code. Step through it with the numbered buttons.
+
+<Depth level={3}>
+IEEE 754 requires +, −, ×, ÷ and square root to be correctly rounded: the result is the exact answer rounded to the nearest representable value, with <Term id="round-to-nearest-even">ties going to the even neighbour</Term>. That is why a float sum is reproducible on one machine and one code path, and why it changes when the order of operations changes. A fused multiply-add (FMA) rounds once instead of twice, so a compiler that fuses `a*b + c` can change the last bit.
+</Depth>
+
+## [again] The same reconciliation, in cents
+
+The same day's invoices, in integer cents. Reconciliation finds zero mismatches, and the day's revenue equals the settlement report to the cent. Tax rounding happens once per invoice, in one function, with a rule finance signed off.
+
+<Depth level={2}>
+Floats still have a place at the edges: a chart of revenue, an average order value, a forecast. Convert there, after the exact total exists, and never write the float back into the ledger.
+</Depth>
+
+<Depth level={3}>
+When a sum of floats must be accurate, change the summation, not the type. Pairwise summation (NumPy's default for `sum`) keeps the error growing with log n instead of n. Kahan summation carries the rounding error of each add in a second variable and feeds it back. Python's `math.fsum` returns the correctly rounded sum of the whole list.
+</Depth>
+
+## [play] Add money three ways
+
+Add the same amount, again and again, to a float64, a float32 and an integer count of cents. Start from a large balance to break the floats, click a total to see its bits, and flip bits yourself.
+
+## [lens] How each language meets floats
+
+All four languages use the same IEEE 754 hardware. They differ in which exact types they give you and in what the type system stops you from doing.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={3}>
+<Lang only="go">Go's untyped constants are exact: `const x = 0.1 + 0.2` is computed with arbitrary precision, then rounded once, so `x == 0.3` is true while the same sum on two `float64` variables is false. `math.Float64bits(x)` shows the bits.</Lang>
+<Lang only="python">`(0.1).hex()` gives `'0x1.999999999999ap-4'`, the bits in hexadecimal. `Decimal(0.1)` shows every digit of the stored double. NumPy offers `float32` and `float16` arrays, where the same errors arrive much sooner.</Lang>
+<Lang only="typescript">`Math.fround(x)` rounds to the nearest float32, and `Float32Array` stores them. Integers past 2^53 silently lose their last bits, which is why JSON IDs from other systems are often sent as strings.</Lang>
+<Lang only="rust">`f32` and `f64` are separate types with no implicit conversion, and `as` casts from float to integer saturate (NaN becomes 0) instead of being undefined behaviour. `x.to_bits()` shows the bits.</Lang>
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="floating-point" />
+
+### Comparing floats
+
+Never use `==` on computed floats. Compare with a tolerance that fits the scale: `abs(a - b) <= rel * max(abs(a), abs(b))` for relative error, plus a small absolute floor near zero. Python has `math.isclose`. Comparing in ULPs (the distance between the bit patterns) is the precise version. NaN is the exception to everything: it is not equal to itself, so `x != x` is a NaN test.

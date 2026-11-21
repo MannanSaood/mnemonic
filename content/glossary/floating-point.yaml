@@ -1,0 +1,25 @@
+# Terms introduced by the floating point lesson.
+- id: ieee-754
+  term: IEEE 754
+  short: The standard for binary floating-point formats and arithmetic that every mainstream CPU implements. It defines float32 (binary32) and float64 (binary64), rounding, infinities and NaN, and requires basic operations to be correctly rounded.
+- id: significand
+  term: Significand (mantissa)
+  short: The field of a float that holds its significant digits. A normal float64 stores 52 bits and implies a leading 1, for 53 significant bits, about 16 decimal digits; a float32 has 24.
+- id: exponent-bias
+  term: Exponent bias
+  short: The constant subtracted from a float's stored exponent field (127 for float32, 1023 for float64). It keeps the field unsigned, so positive floats sort in the same order as their bit patterns.
+- id: ulp
+  term: ULP (unit in the last place)
+  short: The gap between a float and its neighbour. It doubles at every power of two, so large floats are far apart, and comparing floats "within n ULPs" scales with their size.
+- id: round-to-nearest-even
+  term: Round to nearest, ties to even
+  short: The default IEEE 754 rounding. The exact result goes to the nearest representable value, and an exact tie goes to the one whose last bit is 0, so rounding errors do not lean one way.
+- id: catastrophic-cancellation
+  term: Catastrophic cancellation
+  short: Subtracting two nearly equal floats. The leading digits cancel and the result is made of what is left, which is mostly earlier rounding error.
+- id: nan
+  term: NaN
+  short: Not a Number, the float result of an invalid operation such as 0/0. Its exponent bits are all ones. It is not equal to anything, itself included, and it spreads through arithmetic.
+- id: subnormal-number
+  term: Subnormal number
+  short: A float with an all-zero exponent field and no implied leading 1. Subnormals fill the gap between zero and the smallest normal float, with fewer significant bits.
