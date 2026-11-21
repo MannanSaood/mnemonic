@@ -1,0 +1,507 @@
+---
+title: Designing indexes for WHERE
+track: databases
+group: Indexes
+order: 12
+summary: A composite index is one list sorted by its columns in order. A query can seek on equality for the leading columns and then one range. Every condition after that is a filter that reads entries without narrowing the scan.
+intent: Order the columns of an index so the WHERE clause can start and stop the scan on matching entries, and spot the conditions that quietly turn into filters or a full table scan.
+changeRequest: Grow from 20 tenants to 2,000, and keep the tenant order list under 100 ms.
+languages: [go, python, typescript, rust]
+glossary: [composite-index, access-predicate, filter-predicate, leftmost-prefix, expression-index, seq-scan, skip-scan]
+
+prerequisites: [databases/b-tree-lookup-and-splits, databases/select-joins-aggregates]
+skills: [indexing, query-performance]
+depths: [overview, engineer, deep]
+
+playground:
+  model: index-design-and-where-clause
+  scenarios:
+    - try: "Run the first query as it is: tenant_id = 7 AND created_at >= '2026-12-01'."
+      notice: "Both indexes return the same 163 rows. (created_at, tenant_id) reads over 8,000 index entries to find them; (tenant_id, created_at) reads exactly 163."
+    - try: "Run the second query, the same conditions in the other order."
+      notice: "Nothing changes. The order of conditions in WHERE does not matter; the order of columns in the index does."
+    - try: "Run date(created_at) = '2026-12-24' AND tenant_id = 7."
+      notice: "Index A becomes useless and the planner reads the whole table. The index is sorted by created_at, not by date(created_at)."
+    - try: "Set index A to (status) and run status = 'shipped', then status = 'new'."
+      notice: "88% of orders are shipped, so the planner skips the index and reads the table in order. For the 2% that are new, it uses the index."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 104, h: 48, title: dashboard, sub: tenant 7 · Dec }
+      after:  { x: 12, y: 111, w: 104, h: 48, title: dashboard, sub: tenant 7 · Dec }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 260, h: 236, title: (created_at, tenant), sub: "sorted by date first" }
+      after:  { x: 140, y: 20, w: 124, h: 48, title: (tenant, created), sub: "seek (7, Dec 01)" }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 140, y: 111, w: 124, h: 48, title: "" }
+      after:  { x: 140, y: 111, w: 124, h: 48, title: access range, sub: start and stop }
+    - id: e1
+      kind: concrete
+      before: { x: 160, y: 72, w: 220, h: 32, title: Dec 01 · tenant 3 }
+      after:  { x: 290, y: 20, w: 128, h: 44, title: t7 · Dec 01, sub: first match }
+    - id: e2
+      kind: concrete
+      before: { x: 160, y: 120, w: 220, h: 32, title: Dec 01 · tenant 7 }
+      after:  { x: 290, y: 111, w: 128, h: 44, title: t7 · Dec 02, sub: next entry }
+    - id: e3
+      kind: concrete
+      before: { x: 160, y: 168, w: 220, h: 32, title: Dec 01 · tenant 9 }
+      after:  { x: 290, y: 202, w: 128, h: 44, title: t8 · Jan 01, sub: past the end · stop }
+    - id: heap
+      kind: concrete
+      before: { x: 424, y: 111, w: 124, h: 48, title: table, sub: 8,000 fetches }
+      after:  { x: 440, y: 20, w: 108, h: 44, title: table, sub: 163 fetches }
+    - id: dayfn
+      kind: concrete
+      appears: change
+      before: { x: 424, y: 202, w: 124, h: 44, title: date(col) = $1 }
+      after:  { x: 440, y: 202, w: 108, h: 44, title: ">= $1 AND <", sub: same seek }
+  edges:
+    - { from: client, to: context, label: query }
+    - { from: context, to: strategy, label: descend }
+    - { from: strategy, to: e1, label: start }
+    - { from: e1, to: e2, label: leaf chain }
+    - { from: e2, to: e3 }
+    - { from: e1, to: heap, label: fetch }
+    - { from: dayfn, to: e3 }
+
+code:
+  go:
+    before:
+      file: orders.go
+      source: |
+        // orders.go
+        const migration = `CREATE INDEX orders_created_tenant ON orders (created_at, tenant_id)`
+
+        func (s *Store) RecentOrders(ctx context.Context, tenantID int64, since time.Time) ([]Order, error) {
+            rows, err := s.db.QueryContext(ctx,
+                `SELECT id, status, total_cents, created_at FROM orders
+                 WHERE created_at >= $1 AND tenant_id = $2
+                 ORDER BY created_at DESC LIMIT 50`,
+                since, tenantID)
+            if err != nil {
+                return nil, err
+            }
+            defer rows.Close()
+            return scanOrders(rows)
+        }
+      roles: { client: [4, 15], context: [2, 2], e1: [7, 7], e2: [7, 7], e3: [7, 7], heap: [6, 6] }
+      change:
+        - { after: 2, add: ['const migration2 = `CREATE INDEX orders_tenant ON orders (tenant_id)`'] }
+    after:
+      file: orders.go
+      source: |
+        // orders.go: equality column first, then the range. The index also hands back rows in created_at order.
+        const migration = `CREATE INDEX orders_tenant_created ON orders (tenant_id, created_at)`
+
+        func (s *Store) RecentOrders(ctx context.Context, tenantID int64, since time.Time) ([]Order, error) {
+            rows, err := s.db.QueryContext(ctx,
+                `SELECT id, status, total_cents, created_at FROM orders
+                 WHERE tenant_id = $1 AND created_at >= $2
+                 ORDER BY created_at DESC LIMIT 50`,
+                tenantID, since)
+            if err != nil {
+                return nil, err
+            }
+            defer rows.Close()
+            return scanOrders(rows)
+        }
+      roles: { client: [4, 15], context: [2, 2], strategy: [7, 7], e1: [7, 7], e2: [8, 8], e3: [8, 8], heap: [6, 6], seek: [7, 7], scan: [8, 8], stop: [8, 8], fetch: [6, 6] }
+    again:
+      file: orders.go
+      source: |
+        // orders.go: orders placed on one calendar day. A half-open range on the bare column keeps the seek.
+        `SELECT id, status, total_cents, created_at FROM orders
+         WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $2 + interval '1 day'`
+    cost:
+      before: { text: reads every tenant's December to find tenant 7's, value: 0.85 }
+      after: { text: reads exactly the rows it returns, value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Nothing to add
+      note: 'pgx prepares each statement and encodes parameters in the type PostgreSQL inferred from the column, so `tenant_id = $1` stays a bigint comparison whatever Go integer type you pass. Query builders and ORMs are where a function or a cast sneaks onto a column; run `EXPLAIN` on the generated SQL in a test.'
+      seenIn: '`db.QueryContext`, `pgx.Conn.Query`, `EXPLAIN (ANALYZE, BUFFERS)` from a test helper.'
+
+  python:
+    before:
+      file: orders.py
+      source: |
+        # orders.py
+        from datetime import datetime
+        import psycopg
+
+        MIGRATION = "CREATE INDEX orders_created_tenant ON orders (created_at, tenant_id)"
+
+
+        def recent_orders(conn: psycopg.Connection, tenant_id: int, since: datetime) -> list[tuple]:
+            return conn.execute(
+                """
+                SELECT id, status, total_cents, created_at FROM orders
+                WHERE created_at >= %s AND tenant_id = %s
+                ORDER BY created_at DESC LIMIT 50
+                """,
+                (since, tenant_id),
+            ).fetchall()
+      roles: { client: [8, 16], context: [5, 5], e1: [12, 12], e2: [12, 12], e3: [12, 12], heap: [11, 11] }
+      change:
+        - { after: 5, add: ['MIGRATION_2 = "CREATE INDEX orders_tenant ON orders (tenant_id)"'] }
+    after:
+      file: orders.py
+      source: |
+        # orders.py: equality column first, then the range. The index also hands back rows in created_at order.
+        from datetime import datetime
+        import psycopg
+
+        MIGRATION = "CREATE INDEX orders_tenant_created ON orders (tenant_id, created_at)"
+
+
+        def recent_orders(conn: psycopg.Connection, tenant_id: int, since: datetime) -> list[tuple]:
+            return conn.execute(
+                """
+                SELECT id, status, total_cents, created_at FROM orders
+                WHERE tenant_id = %s AND created_at >= %s
+                ORDER BY created_at DESC LIMIT 50
+                """,
+                (tenant_id, since),
+            ).fetchall()
+      roles: { client: [8, 16], context: [5, 5], strategy: [12, 12], e1: [12, 12], e2: [13, 13], e3: [13, 13], heap: [11, 11], seek: [12, 12], scan: [13, 13], stop: [13, 13], fetch: [11, 11] }
+    again:
+      file: orders.py
+      source: |
+        # orders.py: orders placed on one calendar day. A half-open range on the bare column keeps the seek.
+        DAY = """SELECT id, status, total_cents, created_at FROM orders
+                 WHERE tenant_id = %s AND created_at >= %s AND created_at < %s"""
+        conn.execute(DAY, (tenant_id, day_start, day_start + timedelta(days=1)))
+    cost:
+      before: { text: reads every tenant's December to find tenant 7's, value: 0.85 }
+      after: { text: reads exactly the rows it returns, value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Nothing to add
+      note: 'psycopg 3 sends parameters with a type chosen from the Python value: an `int` goes as smallint, integer, bigint or numeric depending on its size, and a `Decimal` always as numeric. Comparing a bigint column with a numeric makes PostgreSQL convert the column, and the plain index no longer applies. Pass `int` for integer columns.'
+      seenIn: '`conn.execute`, `psycopg.sql.SQL` for composing queries, `cursor.execute("EXPLAIN ...")` in a test.'
+
+  typescript:
+    before:
+      file: orders.ts
+      source: |
+        // orders.ts
+        import type { Pool } from "pg";
+
+        export const migration = "CREATE INDEX orders_created_tenant ON orders (created_at, tenant_id)";
+
+        export async function recentOrders(db: Pool, tenantId: number, since: Date) {
+          const { rows } = await db.query(
+            `SELECT id, status, total_cents, created_at FROM orders
+             WHERE created_at >= $1 AND tenant_id = $2
+             ORDER BY created_at DESC LIMIT 50`,
+            [since, tenantId],
+          );
+          return rows;
+        }
+      roles: { client: [6, 14], context: [4, 4], e1: [9, 9], e2: [9, 9], e3: [9, 9], heap: [8, 8] }
+      change:
+        - { after: 4, add: ['export const migration2 = "CREATE INDEX orders_tenant ON orders (tenant_id)";'] }
+    after:
+      file: orders.ts
+      source: |
+        // orders.ts: equality column first, then the range. The index also hands back rows in created_at order.
+        import type { Pool } from "pg";
+
+        export const migration = "CREATE INDEX orders_tenant_created ON orders (tenant_id, created_at)";
+
+        export async function recentOrders(db: Pool, tenantId: number, since: Date) {
+          const { rows } = await db.query(
+            `SELECT id, status, total_cents, created_at FROM orders
+             WHERE tenant_id = $1 AND created_at >= $2
+             ORDER BY created_at DESC LIMIT 50`,
+            [tenantId, since],
+          );
+          return rows;
+        }
+      roles: { client: [6, 14], context: [4, 4], strategy: [9, 9], e1: [9, 9], e2: [10, 10], e3: [10, 10], heap: [8, 8], seek: [9, 9], scan: [10, 10], stop: [10, 10], fetch: [8, 8] }
+    again:
+      file: orders.ts
+      source: |
+        // orders.ts: orders placed on one calendar day. A half-open range on the bare column keeps the seek.
+        await db.query(
+          `SELECT id, status, total_cents, created_at FROM orders
+           WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $2::timestamptz + interval '1 day'`,
+          [tenantId, dayStart],
+        );
+    cost:
+      before: { text: reads every tenant's December to find tenant 7's, value: 0.85 }
+      after: { text: reads exactly the rows it returns, value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Nothing to add
+      note: 'node-postgres sends parameters as text with no declared type, so PostgreSQL infers each one from the column it is compared with, and the index stays usable. The risk is on the SQL side: ORMs that add `lower()` for case-insensitive matching or `::text` casts. Log the generated SQL and `EXPLAIN` it.'
+      seenIn: '`pool.query(text, values)`, `EXPLAIN (ANALYZE, BUFFERS)`, query logging in the ORM.'
+
+  rust:
+    before:
+      file: orders.rs
+      source: |
+        // orders.rs
+        use chrono::{DateTime, Utc};
+        use sqlx::PgPool;
+
+        pub const MIGRATION: &str = "CREATE INDEX orders_created_tenant ON orders (created_at, tenant_id)";
+
+        pub async fn recent_orders(db: &PgPool, tenant_id: i64, since: DateTime<Utc>) -> sqlx::Result<Vec<Order>> {
+            sqlx::query_as::<_, Order>(
+                "SELECT id, status, total_cents, created_at FROM orders
+                 WHERE created_at >= $1 AND tenant_id = $2
+                 ORDER BY created_at DESC LIMIT 50",
+            )
+            .bind(since)
+            .bind(tenant_id)
+            .fetch_all(db)
+            .await
+        }
+      roles: { client: [7, 17], context: [5, 5], e1: [10, 10], e2: [10, 10], e3: [10, 10], heap: [9, 9] }
+      change:
+        - { after: 5, add: ['pub const MIGRATION_2: &str = "CREATE INDEX orders_tenant ON orders (tenant_id)";'] }
+    after:
+      file: orders.rs
+      source: |
+        // orders.rs: equality column first, then the range. The index also hands back rows in created_at order.
+        use chrono::{DateTime, Utc};
+        use sqlx::PgPool;
+
+        pub const MIGRATION: &str = "CREATE INDEX orders_tenant_created ON orders (tenant_id, created_at)";
+
+        pub async fn recent_orders(db: &PgPool, tenant_id: i64, since: DateTime<Utc>) -> sqlx::Result<Vec<Order>> {
+            sqlx::query_as::<_, Order>(
+                "SELECT id, status, total_cents, created_at FROM orders
+                 WHERE tenant_id = $1 AND created_at >= $2
+                 ORDER BY created_at DESC LIMIT 50",
+            )
+            .bind(tenant_id)
+            .bind(since)
+            .fetch_all(db)
+            .await
+        }
+      roles: { client: [7, 17], context: [5, 5], strategy: [10, 10], e1: [10, 10], e2: [11, 11], e3: [11, 11], heap: [9, 9], seek: [10, 10], scan: [11, 11], stop: [11, 11], fetch: [9, 9] }
+    again:
+      file: orders.rs
+      source: |
+        // orders.rs: orders placed on one calendar day. A half-open range on the bare column keeps the seek.
+        sqlx::query_as::<_, Order>(
+            "SELECT id, status, total_cents, created_at FROM orders
+             WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3",
+        )
+        .bind(tenant_id).bind(day_start).bind(day_start + chrono::Duration::days(1))
+    cost:
+      before: { text: reads every tenant's December to find tenant 7's, value: 0.85 }
+      after: { text: reads exactly the rows it returns, value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Nothing to add
+      note: 'sqlx binds typed parameters: `i64` is bigint, `DateTime<Utc>` is timestamptz. The `query!` and `query_as!` macros check the SQL and the parameter types against a real database at compile time, so a type that would force a cast on the column shows up as a build error.'
+      seenIn: '`sqlx::query_as`, `sqlx::query!` (compile-time checked), `EXPLAIN` through `sqlx::query_scalar` in a test.'
+
+walk:
+  - text: The dashboard asks for tenant 7 since December 1. The equality on tenant_id and the start of the range form one search key, (7, Dec 01), and the database descends from the root to the leaf where that key would sort.
+    nodes: [client, context, strategy]
+    edges: [client>context, context>strategy]
+    role: seek
+  - text: From there it reads leaf entries in order. Every entry belongs to tenant 7 and is on or after December 1, so every entry it reads matches.
+    nodes: [strategy, e1, e2]
+    edges: [strategy>e1, e1>e2]
+    role: scan
+  - text: The scan stops at the first entry past tenant 7. With ORDER BY created_at DESC LIMIT 50 it reads the same range backwards and stops after 50 entries, with no sort step.
+    nodes: [e2, e3]
+    edges: [e2>e3]
+    role: stop
+  - text: For each entry, the database fetches the row from the table to get status and total_cents. 163 entries read, 163 rows fetched, 163 rows returned.
+    nodes: [e1, heap]
+    edges: [e1>heap]
+    role: fetch
+
+checks:
+  overview:
+    question: A table has an index on (a, b). Does it help WHERE b = 1?
+    options:
+      - text: Usually not much. b is not the leading column, so its matches are spread through the whole index
+        correct: true
+        why: Right. The index is sorted by a first. Rows with b = 1 appear once inside every value of a, so there is no single range to read. PostgreSQL 18's skip scan can help when a has only a few distinct values.
+      - text: Yes, as much as an index on (b) would
+        why: An index on (b) keeps all b = 1 entries together. In (a, b) they are scattered across every a.
+      - text: No, an index is never used for a column that is not first
+        why: The planner can still read the whole index, and PostgreSQL 18 can skip scan it. It just cannot seek straight to the matches.
+  engineer:
+    question: A queue query runs WHERE status = 'open' AND created_at > $1 ORDER BY created_at. Which single index serves it best?
+    options:
+      - text: (status, created_at)
+        correct: true
+        why: Right. Equality first, then the range. The open entries sit together in created_at order, so the scan starts at the first match, reads only matches, and returns them already sorted.
+      - text: (created_at, status)
+        why: The range on created_at comes first, so the scan reads every status in that time window and filters on status entry by entry.
+      - text: Separate indexes on status and on created_at
+        why: The planner can combine them with a bitmap, but then it has to sort the result, and each index still reads more entries than match.
+  deep:
+    question: With an index on (created_at, tenant_id) and WHERE created_at >= $1 AND tenant_id = 7, what does the tenant_id condition do?
+    options:
+      - text: It is checked on each index entry the scan reads, which saves table fetches but not index reads
+        correct: true
+        why: Right. It is an index filter. The range on created_at decides where the scan starts and stops; tenant_id is checked on every entry inside that range.
+      - text: It narrows the range of leaf pages the scan reads
+        why: Only conditions on the leading columns, up to and including the first range, set the start and stop. tenant_id comes after the range.
+      - text: It is ignored until the rows are fetched from the table
+        why: tenant_id is in the index, so it is checked there. Only columns the index does not have wait for the table row.
+
+reference:
+  roles:
+    - role: Access predicate
+      example: tenant_id = $1 AND created_at >= $2 on (tenant_id, created_at)
+      job: Sets where the index scan starts and where it stops.
+    - role: Index filter predicate
+      example: tenant_id = 7 on (created_at, tenant_id)
+      job: Checked on each index entry inside the scanned range. Saves table fetches, not index reads.
+    - role: Table filter
+      example: total_cents > 500, or any column inside a function
+      job: Checked after fetching the row. The index does nothing for it.
+    - role: Planner
+      example: PostgreSQL's cost-based optimiser
+      job: Compares the index path with a sequential scan and picks the cheaper one, using statistics.
+  useWhen:
+    - Order columns as equality first, then the one range or sort column.
+    - Put the column every query of a feature filters on (tenant_id, account_id) first, and share the index between those queries.
+    - Write conditions on the bare column (a half-open range instead of date(col) =), or index the expression itself.
+  avoidWhen:
+    - One index per column, hoping the planner combines them. It can, but a composite index in the right order reads far fewer entries.
+    - Indexes for conditions that match a large share of the table. The planner reads the table instead and the index only slows writes.
+  tradeoffs:
+    - Every index is updated by every insert and by updates to its columns. More indexes, slower writes.
+    - A column order that suits one query can be useless to another. Fewer, well-ordered indexes beat one index per query shape.
+    - Expression indexes only help queries that use exactly the same expression.
+  lookalikes:
+    - name: Covering index
+      how: Adds the selected columns to the index so the table is never read. That is the next lesson.
+    - name: Partial index
+      how: Indexes only the rows matching a condition, such as status = 'open'. Smaller, and only used by queries that imply the same condition.
+    - name: Bitmap index scan
+      how: PostgreSQL can read several indexes, combine their matches as bitmaps, and fetch rows in table order. Useful when no single index fits.
+---
+
+## [concept] Designing indexes for WHERE
+
+**A composite index is one list sorted by its first column, then by its second within each first-column value, and so on. A query can jump into that list and read a contiguous stretch only for equality on the leading columns plus one range. Everything else is checked entry by entry.**
+
+A <Term id="composite-index">composite index</Term> on (tenant_id, created_at) keeps all of tenant 7's entries together, in date order. A condition that pins tenant_id and gives a date range describes one contiguous stretch of that list. The database seeks to its start, reads to its end, and stops. Those conditions are <Term id="access-predicate">access predicates</Term>.
+
+<Depth level={2}>
+The rule is the <Term id="leftmost-prefix">leftmost prefix</Term>. Equality on the leading columns, then at most one range, can narrow the scan. Conditions on columns after the range are <Term id="filter-predicate">filter predicates</Term>: checked on every entry in the scanned stretch, which saves table fetches but not index reads. Conditions on columns the index does not have wait for the table row. Hence the habit of putting equality columns first and the range or sort column last. Selectivity is a weaker rule than this one: a very selective column used with a range still belongs after the equality columns.
+</Depth>
+
+<Depth level={3}>
+The PostgreSQL documentation states the rule exactly: equality constraints on leading columns, plus any inequality on the first column without an equality constraint, limit the portion of the index scanned; constraints on later columns are checked in the index. The order of conditions inside WHERE never matters; the planner matches them to index columns by name.
+</Depth>
+
+## [problem] An index that matches the query
+
+A multi-tenant shop has a dashboard that lists a tenant's orders since a date, newest first. Someone added an index on (created_at, tenant_id), because almost every report filters on a date range, and the query names both columns.
+
+Read the code once. The index contains both columns from the WHERE clause, and EXPLAIN shows an index scan. With 20 tenants the dashboard is fast.
+
+<Depth level={2}>
+Look at what the index scan reads. The index is sorted by created_at first, so the range "since December 1" is one stretch of the index, and it holds every tenant's December orders, mixed together. tenant_id = 7 is checked on each of them. With 20 tenants, tenant 7 is about one entry in 20.
+</Depth>
+
+<Depth level={3}>
+`EXPLAIN (ANALYZE, BUFFERS)` shows it: the index condition contains only created_at, and tenant_id shows up as a filter, or as a second part of the index condition that does not reduce the buffers read. The rows-removed or buffers numbers grow with the number of tenants, not with the result.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** grow from 20 tenants to 2,000, and keep the tenant order list under 100 ms.
+
+Every new tenant adds its December orders to the stretch every query reads. With 2,000 tenants, the dashboard reads 2,000 entries for every one it shows. The marked line is the obvious fix: add an index on tenant_id.
+
+<Depth level={2}>
+The planner may now use the tenant_id index, which reads all of a tenant's orders for every year and fetches each row from the table to check the date. For a large tenant that is worse than before. Or it combines both indexes as bitmaps, which still reads the big December stretch. Two indexes, more write cost, and neither starts and stops on the rows the query wants.
+</Depth>
+
+<Depth level={3}>
+Each index also costs every INSERT another descent and leaf write. On a table taking thousands of orders per second, an index that no query uses well is pure cost. `pg_stat_user_indexes.idx_scan` shows which indexes are never used.
+</Depth>
+
+## [morph] Put the equality column first
+
+Drag the slider. The index entries reorder from date-first to tenant-first, and the scan shrinks to one stretch.
+
+One index on (tenant_id, created_at) replaces both. The equality on tenant_id comes first, so all of tenant 7's entries are together. The range on created_at comes second, so within tenant 7 they are in date order. The scan starts at (7, December 1), reads only matches, and stops at the first entry of tenant 8.
+
+<Depth level={2}>
+The same index serves the ORDER BY created_at DESC LIMIT 50: inside tenant 7, entries are already in created_at order, so the database reads the stretch backwards and stops after 50 rows, without a sort. It also serves every query that filters on tenant_id alone, because tenant_id is its leading column.
+</Depth>
+
+<Depth level={3}>
+Since PostgreSQL 18, a B-tree <Term id="skip-scan">skip scan</Term> can use an index without a condition on its leading column, by searching once per distinct leading value. The documentation notes that the planner only does this when there are few distinct values; otherwise it prefers a sequential scan. MySQL 8.0 has a skip scan too, for queries that read only indexed columns.
+</Depth>
+
+## [walk] Follow the query through the index
+
+One seek, a short stretch of leaf entries, then the table. Use the numbered buttons.
+
+<Depth level={2}>
+When the matching stretch is a large share of the table, fetching rows one by one in index order costs more than reading the whole table in order. The planner then picks a <Term id="seq-scan">sequential scan</Term> even though a usable index exists. That is a correct decision, not a failure of the index.
+</Depth>
+
+<Depth level={3}>
+PostgreSQL's cost model charges 1 per sequentially read page and 4 per random page by default (seq_page_cost and random_page_cost), plus small CPU costs per row and per index entry. A bitmap heap scan sorts the row locations first, so its cost per page falls from 4 towards 1 as the share of table pages it touches grows.
+</Depth>
+
+## [again] The same request, one calendar day at a time
+
+Support asks for a tenant's orders on one calendar day. The natural SQL is `date(created_at) = $2`, and it turns the index back into a filter, because the index is sorted by created_at, not by date(created_at). The fix is a half-open range on the bare column: created_at from midnight up to, but not including, the next midnight. It seeks just like the dashboard query.
+
+<Depth level={2}>
+When the expression is unavoidable, such as `lower(email) = $1` for case-insensitive lookups, index the expression itself: `CREATE INDEX ON users (lower(email))`. An <Term id="expression-index">expression index</Term> only helps queries that use the same expression. MySQL supports the same idea as functional key parts since 8.0.13.
+</Depth>
+
+<Depth level={3}>
+LIKE 'abc%' is a range in disguise (from abc up to abd) and can use a B-tree. In a database whose collation is not C, PostgreSQL needs the index built with the text_pattern_ops operator class for that. LIKE '%abc' has no fixed prefix, so no B-tree can seek on it.
+</Depth>
+
+## [play] Write WHERE clauses against two indexes
+
+A 100,000-row orders table and two composite indexes you can reorder. Write a WHERE clause, or press a suggestion, and both indexes run it. Each strip is a whole index in key order: what the scan reads, what it returns, and whether the planner used the index at all.
+
+Start with the prediction, then try to break each index: a range first, a function, a condition that matches most rows.
+
+## [lens] Where the WHERE clause comes from
+
+The index rules are the same in every language. What differs is how each driver types parameters, because a parameter of the wrong type can make PostgreSQL convert the column instead of the value, and a converted column is a column inside a function.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Test query plans like code. A test that runs `EXPLAIN` on the dashboard query against a seeded database and fails on a Seq Scan or a Filter line catches the regression when someone reorders an index or an ORM upgrade changes the SQL.
+</Depth>
+
+<Depth level={3}>
+Prepared statements can switch to a generic plan after five executions in PostgreSQL, a plan made without knowing the parameter values. For skewed columns (one huge tenant, many small ones) that plan can be wrong for some values. `plan_cache_mode` controls it; the plans lesson covers it.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="index-design-and-where-clause" />
+
+### Reading an index scan in EXPLAIN
+
+In PostgreSQL's `EXPLAIN`, an Index Scan node lists an Index Cond and sometimes a Filter. The Index Cond is what the index can check; only its leading-column part limits the pages read. A Filter line means rows were fetched from the table and then thrown away, and `Rows Removed by Filter` counts them. With `BUFFERS`, the shared hit and read counts show how many pages the scan touched, which is the number to compare between two index designs.

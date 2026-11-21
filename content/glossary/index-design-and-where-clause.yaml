@@ -1,0 +1,22 @@
+# Terms introduced by databases/index-design-and-where-clause.
+- id: composite-index
+  term: Composite index
+  short: An index on several columns, sorted by the first, then by the second within each first-column value, and so on.
+- id: access-predicate
+  term: Access predicate
+  short: A condition that sets where an index scan starts and stops. Only equality on leading columns plus one range qualify.
+- id: filter-predicate
+  term: Filter predicate
+  short: A condition checked on each entry or row the scan reads. It shrinks the result, not the amount read.
+- id: leftmost-prefix
+  term: Leftmost prefix
+  short: The rule that a composite index can only seek on its columns from the left, with no gaps, ending at the first range.
+- id: expression-index
+  term: Expression index
+  short: An index on the result of an expression, such as lower(email). Queries must use the same expression to benefit.
+- id: seq-scan
+  term: Sequential scan
+  short: Reading every page of a table in order and checking each row. Cheaper than an index when many rows match.
+- id: skip-scan
+  term: Skip scan
+  short: Using a composite index without a condition on its leading column, by searching once per distinct leading value. B-tree skip scan arrived in PostgreSQL 18.
