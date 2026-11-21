@@ -1,0 +1,625 @@
+---
+title: "SLIs and SLOs: measuring what users feel"
+track: reliability
+group: SLOs
+order: 3
+summary: Count good events over valid events where users meet the service, set a target for that ratio over a window, and spend what is left over (the error budget) on change, under a policy everyone agreed in advance.
+intent: Reliability should be a number users would recognise, with an allowance for failure that decides, without an argument, when the team keeps shipping and when it stops.
+changeRequest: Product wants a reliability target for checkout, and a rule that says when we stop shipping features to fix reliability.
+languages: [go, python, typescript, rust]
+glossary: [sli, slo, sla, error-budget, error-budget-policy, rolling-window, tail-latency, histogram-bucket]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [reliability/availability-math]
+skills: [sre, observability]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: slis-and-slos
+  scenarios:
+    - try: "Predict, then place a Bad release on day 9 at the afternoon peak."
+      notice: "One 20-minute incident spends about three quarters of the month's budget. Move it to night and it costs about a fifth: the budget counts requests, not minutes."
+    - try: "Add a second bad release a few days later."
+      notice: "The budget runs out, the policy turns red, and every release after that day is frozen and costs nothing."
+    - try: "Place a Slow dependency, then switch the SLI between the three options."
+      notice: "Requests under 300 ms charges it a third of a 99% budget. Mean latency under 250 ms stays at 100% and never notices."
+    - try: "Pick Requests under 300 ms with a 99.9% target and clear the month."
+      notice: "With no incidents at all, the budget runs out mid-month: 0.3% of requests are always slow. The target was never achievable."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: users
+      kind: client
+      before: { x: 12, y: 104, w: 104, h: 56, title: Customers, sub: pay at checkout }
+      after:  { x: 12, y: 30, w: 104, h: 52, title: Customers, sub: pay at checkout }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 250, h: 236, title: Checkout API, sub: dashboard }
+      after:  { x: 12, y: 150, w: 104, h: 56, title: Checkout API, sub: middleware }
+    - id: ping
+      kind: concrete
+      before: { x: 160, y: 80, w: 210, h: 44, title: uptime ping /healthz }
+      after:  { x: 140, y: 30, w: 132, h: 44, title: requests_total, sub: by code }
+    - id: avg
+      kind: concrete
+      before: { x: 160, y: 160, w: 210, h: 44, title: average latency gauge }
+      after:  { x: 140, y: 150, w: 132, h: 44, title: duration buckets, sub: le 0.3 s }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 296, y: 86, w: 110, h: 60, title: "" }
+      after:  { x: 296, y: 86, w: 110, h: 60, title: SLI, sub: good / valid }
+    - id: slo
+      kind: concrete
+      appears: after
+      before: { x: 430, y: 18, w: 120, h: 52, title: "" }
+      after:  { x: 430, y: 18, w: 120, h: 52, title: SLO 99.9%, sub: 30-day window }
+    - id: budget
+      kind: concrete
+      appears: after
+      before: { x: 430, y: 100, w: 120, h: 52, title: "" }
+      after:  { x: 430, y: 100, w: 120, h: 52, title: Error budget, sub: 72,000 / month }
+    - id: policy
+      kind: concrete
+      appears: change
+      before: { x: 430, y: 190, w: 120, h: 56, title: Budget policy, sub: freeze at zero }
+      after:  { x: 430, y: 190, w: 120, h: 56, title: Budget policy, sub: freeze at zero }
+  edges:
+    - { from: users, to: context, label: requests }
+    - { from: context, to: ping, label: counts }
+    - { from: context, to: avg, label: observes }
+    - { from: ping, to: strategy, label: not 5xx }
+    - { from: avg, to: strategy, label: under 300 ms }
+    - { from: strategy, to: slo, label: target }
+    - { from: slo, to: budget, label: 1 − SLO }
+    - { from: budget, to: policy, label: decides }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: metrics.go
+      source: |
+        // metrics.go: what the dashboard shows
+        var latencyAvg = promauto.NewGauge(prometheus.GaugeOpts{
+            Name: "checkout_latency_avg_ms", Help: "Mean latency over the last minute.",
+        })
+
+        func instrument(next http.Handler) http.Handler {
+            var mu sync.Mutex
+            var sum time.Duration
+            var n int
+            go func() {
+                for range time.Tick(time.Minute) {
+                    mu.Lock()
+                    if n > 0 {
+                        latencyAvg.Set(float64(sum.Milliseconds()) / float64(n))
+                    }
+                    sum, n = 0, 0
+                    mu.Unlock()
+                }
+            }()
+            return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                start := time.Now()
+                next.ServeHTTP(w, r)
+                mu.Lock()
+                sum += time.Since(start)
+                n++
+                mu.Unlock()
+            })
+        }
+
+        // an external uptime checker requests this once a minute
+        func healthz(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }
+      roles: { users: [20, 20], context: [6, 28], avg: [2, 4], ping: [30, 31] }
+      change:
+        - { after: 4, add: ['// target: mean latency under 250 ms, and /healthz up 99.9% of minutes'] }
+    after:
+      file: metrics.go · slo.rules.yml
+      source: |
+        // metrics.go: count every request by outcome and bucket its latency
+        var (
+            requests = promauto.NewCounterVec(prometheus.CounterOpts{
+                Name: "checkout_requests_total", Help: "Checkout requests by status class.",
+            }, []string{"code"})
+            duration = promauto.NewHistogram(prometheus.HistogramOpts{
+                Name:    "checkout_request_duration_seconds",
+                Help:    "Checkout latency.",
+                Buckets: []float64{0.05, 0.1, 0.2, 0.3, 0.5, 1, 2.5}, // 0.3 s is the SLO threshold
+            })
+        )
+
+        func instrument(next http.Handler) http.Handler {
+            return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                start := time.Now()
+                rec := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
+                next.ServeHTTP(rec, r)
+                duration.Observe(time.Since(start).Seconds())
+                requests.WithLabelValues(fmt.Sprintf("%dxx", rec.code/100)).Inc()
+            })
+        }
+
+        // slo.rules.yml: Prometheus turns the counters into the SLI and the budget left
+        //   - record: checkout:sli_availability:ratio_30d
+        //     expr: 1 - sum(increase(checkout_requests_total{code="5xx"}[30d]))
+        //               / sum(increase(checkout_requests_total[30d]))
+        //   - record: checkout:error_budget_remaining:ratio
+        //     expr: 1 - (1 - checkout:sli_availability:ratio_30d) / (1 - 0.999)
+      roles: { users: [14, 14], context: [13, 21], ping: [3, 5], avg: [6, 10], count: [15, 19], strategy: [23, 26], slo: [28, 28], budget: [27, 28], policy: [27, 28] }
+    again:
+      file: cmd/release-gate/main.go
+      source: |
+        // cmd/release-gate/main.go: CI runs this before every feature deploy
+        func main() {
+            client, _ := api.NewClient(api.Config{Address: os.Getenv("PROM_URL")})
+            v, _, err := v1.NewAPI(client).Query(context.Background(), "checkout:error_budget_remaining:ratio", time.Now())
+            vec, ok := v.(model.Vector)
+            if err != nil || !ok || len(vec) == 0 {
+                log.Fatalf("no budget data (%v): ask the on-call before shipping", err)
+            }
+            left := float64(vec[0].Value)
+            if left <= 0 {
+                fmt.Printf("error budget spent (%.0f%% left): feature releases are frozen by policy\n", left*100)
+                os.Exit(1)
+            }
+            fmt.Printf("%.0f%% of the error budget left: ship\n", left*100)
+        }
+    cost:
+      before: { text: dashboard green · users failing, value: 0.85 }
+      after: { text: every failure counted against 72,000, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`client_golang` gives counters, histograms and `promhttp.InstrumentHandlerCounter` / `InstrumentHandlerDuration`, which do the middleware for you. Set histogram buckets explicitly: the defaults (`prometheus.DefBuckets`) jump from 0.25 to 0.5 s, so a 300 ms threshold falls between edges. With OpenTelemetry, `otelhttp` records `http.server.request.duration`.'
+      seenIn: '`prometheus/client_golang` and its `api/prometheus/v1` query client. `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`. Sloth and Pyrra, which generate SLO recording rules from a short spec.'
+
+  python:
+    before:
+      file: metrics.py
+      source: |
+        # metrics.py: what the dashboard shows
+        latency_avg = Gauge("checkout_latency_avg_ms", "Mean latency over the last minute.")
+        _window: list[float] = []
+
+        @app.middleware("http")
+        async def track_latency(request: Request, call_next):
+            start = time.perf_counter()
+            response = await call_next(request)
+            _window.append((time.perf_counter() - start) * 1000)
+            return response
+
+        async def publish_average() -> None:  # a background task, once a minute
+            if _window:
+                latency_avg.set(sum(_window) / len(_window))
+                _window.clear()
+
+        @app.get("/healthz")  # an external uptime checker requests this once a minute
+        def healthz() -> dict[str, bool]:
+            return {"ok": True}
+      roles: { users: [6, 6], context: [5, 15], avg: [2, 3], ping: [17, 19] }
+      change:
+        - { after: 3, add: ['# target: mean latency under 250 ms, and /healthz up 99.9% of minutes'] }
+    after:
+      file: metrics.py · slo.rules.yml
+      source: |
+        # metrics.py: count every request by outcome and bucket its latency
+        REQUESTS = Counter("checkout_requests", "Checkout requests by status class.", ["code"])
+        DURATION = Histogram("checkout_request_duration_seconds", "Checkout latency.",
+                             buckets=(0.05, 0.1, 0.2, 0.3, 0.5, 1, 2.5))  # 0.3 s is the SLO threshold
+
+        @app.middleware("http")
+        async def slo_metrics(request: Request, call_next):
+            start = time.perf_counter()
+            code = 500  # an exception is a server error
+            try:
+                response = await call_next(request)
+                code = response.status_code
+                return response
+            finally:
+                DURATION.observe(time.perf_counter() - start)
+                REQUESTS.labels(code=f"{code // 100}xx").inc()
+
+        # slo.rules.yml: Prometheus turns the counters into the SLI and the budget left
+        #   - record: checkout:sli_availability:ratio_30d
+        #     expr: 1 - sum(increase(checkout_requests_total{code="5xx"}[30d]))
+        #               / sum(increase(checkout_requests_total[30d]))
+        #   - record: checkout:error_budget_remaining:ratio
+        #     expr: 1 - (1 - checkout:sli_availability:ratio_30d) / (1 - 0.999)
+      roles: { users: [7, 7], context: [6, 16], ping: [2, 2], avg: [3, 4], count: [13, 16], strategy: [19, 21], slo: [23, 23], budget: [22, 23], policy: [22, 23] }
+    again:
+      file: release_gate.py
+      source: |
+        # release_gate.py: CI runs this before every feature deploy
+        import os, sys, httpx
+
+        r = httpx.get(f"{os.environ['PROM_URL']}/api/v1/query",
+                      params={"query": "checkout:error_budget_remaining:ratio"}, timeout=10)
+        result = r.json()["data"]["result"]
+        if not result:
+            sys.exit("no budget data: ask the on-call before shipping")
+        left = float(result[0]["value"][1])
+        if left <= 0:
+            sys.exit(f"error budget spent ({left:.0%} left): feature releases are frozen by policy")
+        print(f"{left:.0%} of the error budget left: ship")
+    cost:
+      before: { text: dashboard green · users failing, value: 0.85 }
+      after: { text: every failure counted against 72,000, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`prometheus_client` adds `_total` to a counter''s name, so `checkout_requests` is scraped as `checkout_requests_total`. Under gunicorn or uvicorn with several worker processes, each process has its own counters: set `PROMETHEUS_MULTIPROC_DIR` and use multiprocess mode, or every scrape sees one worker. OpenTelemetry''s ASGI instrumentation records request durations for you.'
+      seenIn: '`prometheus_client` (`Counter`, `Histogram`, `make_asgi_app`). `prometheus-fastapi-instrumentator`. `opentelemetry-instrumentation-asgi`.'
+
+  typescript:
+    before:
+      file: metrics.ts
+      source: |
+        // metrics.ts: what the dashboard shows
+        const latencyAvg = new Gauge({ name: "checkout_latency_avg_ms", help: "Mean latency over the last minute." });
+        let sum = 0, n = 0;
+
+        app.use((req, res, next) => {
+          const start = performance.now();
+          res.on("finish", () => { sum += performance.now() - start; n++; });
+          next();
+        });
+
+        setInterval(() => {
+          if (n > 0) latencyAvg.set(sum / n);
+          sum = 0; n = 0;
+        }, 60_000);
+
+        // an external uptime checker requests this once a minute
+        app.get("/healthz", (_req, res) => res.send("ok"));
+      roles: { users: [5, 5], context: [5, 14], avg: [2, 3], ping: [16, 17] }
+      change:
+        - { after: 3, add: ['// target: mean latency under 250 ms, and /healthz up 99.9% of minutes'] }
+    after:
+      file: metrics.ts · slo.rules.yml
+      source: |
+        // metrics.ts: count every request by outcome and bucket its latency
+        const requests = new Counter({
+          name: "checkout_requests_total", help: "Checkout requests by status class.", labelNames: ["code"] as const,
+        });
+        const duration = new Histogram({
+          name: "checkout_request_duration_seconds", help: "Checkout latency.",
+          buckets: [0.05, 0.1, 0.2, 0.3, 0.5, 1, 2.5], // 0.3 s is the SLO threshold
+        });
+
+        app.use((req, res, next) => {
+          const stop = duration.startTimer();
+          res.on("close", () => { // fires on finish and on aborted connections
+            stop();
+            requests.inc({ code: `${Math.floor(res.statusCode / 100)}xx` });
+          });
+          next();
+        });
+
+        // slo.rules.yml: Prometheus turns the counters into the SLI and the budget left
+        //   - record: checkout:sli_availability:ratio_30d
+        //     expr: 1 - sum(increase(checkout_requests_total{code="5xx"}[30d]))
+        //               / sum(increase(checkout_requests_total[30d]))
+        //   - record: checkout:error_budget_remaining:ratio
+        //     expr: 1 - (1 - checkout:sli_availability:ratio_30d) / (1 - 0.999)
+      roles: { users: [10, 10], context: [10, 17], ping: [2, 4], avg: [5, 8], count: [11, 15], strategy: [20, 22], slo: [24, 24], budget: [23, 24], policy: [23, 24] }
+    again:
+      file: release-gate.ts
+      source: |
+        // release-gate.ts: CI runs this before every feature deploy
+        const url = new URL("/api/v1/query", process.env.PROM_URL);
+        url.searchParams.set("query", "checkout:error_budget_remaining:ratio");
+        const body = await (await fetch(url, { signal: AbortSignal.timeout(10_000) })).json();
+        const sample = body.data.result[0];
+        if (!sample) throw new Error("no budget data: ask the on-call before shipping");
+        const left = Number(sample.value[1]);
+        if (left <= 0) {
+          console.error(`error budget spent (${(left * 100).toFixed(0)}% left): feature releases are frozen by policy`);
+          process.exit(1);
+        }
+        console.log(`${(left * 100).toFixed(0)}% of the error budget left: ship`);
+    cost:
+      before: { text: dashboard green · users failing, value: 0.85 }
+      after: { text: every failure counted against 72,000, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`prom-client` gives `Counter`, `Histogram` with `startTimer()`, and default process metrics. Each Node process counts alone; under `cluster` use its `AggregatorRegistry` or scrape each worker. Count on the response''s `close` event as well as `finish`, or requests whose client hung up never reach the SLI.'
+      seenIn: '`prom-client`. `express-prom-bundle`. `@opentelemetry/instrumentation-http`, which records `http.server.request.duration` in seconds.'
+
+  rust:
+    before:
+      file: metrics.rs
+      source: |
+        // metrics.rs: what the dashboard shows
+        static LATENCY_AVG: LazyLock<Gauge> = LazyLock::new(|| {
+            register_gauge!("checkout_latency_avg_ms", "Mean latency over the last minute.").unwrap()
+        });
+        static WINDOW: Mutex<(f64, u64)> = Mutex::new((0.0, 0));
+
+        async fn track_latency(req: Request, next: Next) -> Response {
+            let start = Instant::now();
+            let res = next.run(req).await;
+            let mut w = WINDOW.lock().unwrap();
+            w.0 += start.elapsed().as_secs_f64() * 1000.0;
+            w.1 += 1;
+            res
+        }
+
+        fn publish_average() { // called once a minute
+            let mut w = WINDOW.lock().unwrap();
+            if w.1 > 0 { LATENCY_AVG.set(w.0 / w.1 as f64); }
+            *w = (0.0, 0);
+        }
+
+        async fn healthz() -> &'static str { "ok" } // an external uptime checker requests this
+      roles: { users: [7, 7], context: [7, 20], avg: [2, 5], ping: [22, 22] }
+      change:
+        - { after: 5, add: ['// target: mean latency under 250 ms, and /healthz up 99.9% of minutes'] }
+    after:
+      file: metrics.rs · slo.rules.yml
+      source: |
+        // metrics.rs: count every request by outcome and bucket its latency
+        static REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+            register_int_counter_vec!("checkout_requests_total", "Checkout requests by status class.", &["code"]).unwrap()
+        });
+        static DURATION: LazyLock<Histogram> = LazyLock::new(|| {
+            register_histogram!("checkout_request_duration_seconds", "Checkout latency.",
+                vec![0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.5]).unwrap() // 0.3 s is the SLO threshold
+        });
+
+        async fn slo_metrics(req: Request, next: Next) -> Response {
+            let timer = DURATION.start_timer(); // records when dropped
+            let res = next.run(req).await;
+            let code = format!("{}xx", res.status().as_u16() / 100);
+            REQUESTS.with_label_values(&[code.as_str()]).inc();
+            drop(timer);
+            res
+        }
+
+        // slo.rules.yml: Prometheus turns the counters into the SLI and the budget left
+        //   - record: checkout:sli_availability:ratio_30d
+        //     expr: 1 - sum(increase(checkout_requests_total{code="5xx"}[30d]))
+        //               / sum(increase(checkout_requests_total[30d]))
+        //   - record: checkout:error_budget_remaining:ratio
+        //     expr: 1 - (1 - checkout:sli_availability:ratio_30d) / (1 - 0.999)
+      roles: { users: [10, 10], context: [10, 17], ping: [2, 4], avg: [5, 8], count: [11, 15], strategy: [20, 22], slo: [24, 24], budget: [23, 24], policy: [23, 24] }
+    again:
+      file: src/bin/release_gate.rs
+      source: |
+        // src/bin/release_gate.rs: CI runs this before every feature deploy
+        #[tokio::main]
+        async fn main() -> anyhow::Result<()> {
+            let url = format!("{}/api/v1/query", std::env::var("PROM_URL")?);
+            let body: serde_json::Value = reqwest::Client::new().get(url)
+                .query(&[("query", "checkout:error_budget_remaining:ratio")])
+                .timeout(Duration::from_secs(10)).send().await?.json().await?;
+            let left: f64 = body["data"]["result"][0]["value"][1].as_str()
+                .ok_or_else(|| anyhow::anyhow!("no budget data: ask the on-call before shipping"))?.parse()?;
+            if left <= 0.0 {
+                eprintln!("error budget spent ({:.0}% left): feature releases are frozen by policy", left * 100.0);
+                std::process::exit(1);
+            }
+            println!("{:.0}% of the error budget left: ship", left * 100.0);
+            Ok(())
+        }
+    cost:
+      before: { text: dashboard green · users failing, value: 0.85 }
+      after: { text: every failure counted against 72,000, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The `prometheus` crate gives `register_int_counter_vec!` and `register_histogram!`; its `HistogramTimer` records when dropped, which also covers early returns. The `metrics` crate with `metrics-exporter-prometheus` is the facade style: macros like `counter!` and `histogram!` and an exporter chosen at startup. As middleware this is an axum `from_fn` layer, or a tower `Layer` you can reuse across services.'
+      seenIn: '`prometheus` (tikv). `metrics` and `metrics-exporter-prometheus`. `axum::middleware::from_fn`. `opentelemetry` with `tower-http` tracing layers.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A customer pays. The middleware counts the response under its status class and puts its latency in a bucket. Nothing is averaged yet.
+    nodes: [users, context, ping, avg]
+    edges: [users>context, context>ping, context>avg]
+    role: count
+  - text: Prometheus turns counts into the SLI, good events over valid events across 30 days. A 500 is bad; a 404 is the customer's mistake and still counts as good.
+    nodes: [ping, avg, strategy]
+    edges: [ping>strategy, avg>strategy]
+    role: strategy
+  - text: The SLO says 99.9%. The error budget is the other 0.1%, here 72,000 failed checkouts a month, and the rule reports what share of it is left.
+    nodes: [strategy, slo, budget]
+    edges: [strategy>slo, slo>budget]
+    role: budget
+  - text: The policy reads the budget. Above half, ship. Below half, slow down. At zero, freeze features until the window has budget again. The release gate runs that rule before every deploy.
+    nodes: [budget, policy]
+    edges: [budget>policy]
+    role: policy
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: An SLO says 99.95% of requests succeed over 30 days. With steady traffic, how long a total outage does the error budget allow?
+    options:
+      - text: About 22 minutes.
+        correct: true
+        why: Right. 0.05% of 43,200 minutes is 21.6 minutes. Outages at busy hours cost more, because the budget counts requests.
+      - text: About 43 minutes.
+        why: That is the budget for 99.9%. Every extra nine divides it by ten; 99.95% halves it.
+      - text: About 4 minutes.
+        why: That is 99.99%. At 99.95% you may fail 1 request in 2,000.
+  engineer:
+    question: Checkout's mean latency is 120 ms and has not moved, but customers complain it is slow. Which SLI would have shown the problem?
+    options:
+      - text: The share of requests answered in under 300 ms.
+        correct: true
+        why: Right. A threshold SLI counts every slow customer. If 10% of requests take 2 seconds, it drops to 90% even when the mean barely changes.
+      - text: The 30-day mean latency with a tighter target.
+        why: A mean can stay low while a slow tail grows, because the many fast requests outweigh the few slow ones.
+      - text: CPU utilisation of the checkout servers.
+        why: Users do not feel CPU. A service can be slow at 20% CPU (waiting on a dependency) and fine at 90%.
+  deep:
+    question: Your latency SLI uses a Prometheus histogram with the default buckets (… 0.1, 0.25, 0.5, 1 …) and a 300 ms threshold. What is wrong?
+    options:
+      - text: No bucket ends at 0.3 s, so the count of requests under 300 ms can only be estimated between the 0.25 and 0.5 buckets.
+        correct: true
+        why: Right. A histogram only knows counts per bucket. Put a bucket edge exactly on the threshold and count `le="0.3"` directly.
+      - text: Histograms cannot measure latency over a 30-day window.
+        why: They can; `increase()` of the bucket counters over 30 days works, though long ranges are expensive, so teams precompute shorter windows.
+      - text: Histograms record the mean, not individual requests.
+        why: They record a count per bucket plus a sum and a count, which is enough for threshold SLIs if the edges are right.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: SLI
+      example: non-5xx responses / all requests, measured at the edge
+      job: A ratio of good events to valid events, from 0% to 100%, that tracks what users feel.
+    - role: SLO
+      example: 99.9% over a 30-day rolling window
+      job: The target for the SLI. Below it, users are unhappy enough to justify engineering time.
+    - role: Error budget
+      example: 0.1% of requests, 72,000 failures a month
+      job: The failure the SLO allows. Spent on releases, experiments and incidents alike.
+    - role: Error budget policy
+      example: freeze feature releases at zero, signed by product, dev and SRE
+      job: Says in advance what happens as the budget runs low, so nobody negotiates during an outage.
+    - role: SLA
+      example: a refund below 99.5%
+      job: A contract with consequences. Set looser than the SLO so you act before you pay.
+  useWhen:
+    - Any service with users, internal or external, whose reliability someone argues about.
+    - Deciding between reliability work and features with data instead of opinion.
+    - Alerting on what users feel instead of on causes like CPU.
+  avoidWhen:
+    - Setting a target nobody will act on. An SLO without a policy is a dashboard.
+    - Choosing SLIs users cannot feel (CPU, memory, uptime of a health check).
+    - Aiming for 100%. Users cannot tell 99.999% from 100% through their own networks, and it leaves no room to change anything.
+  tradeoffs:
+    - Measuring at the server is cheap but misses requests that never reach it; measuring at the load balancer or client sees more and costs more.
+    - A rolling window matches what users remember; a calendar window matches planning. The SRE workbook suggests four weeks rolling, so every window has the same weekends.
+    - Each extra nine divides the budget by ten and costs far more than the last.
+    - Request-based budgets make busy-hour outages expensive and quiet-hour ones cheap. That is usually right, but not for low-traffic services.
+  lookalikes:
+    - name: Uptime percentage
+      how: Measures whether a probe got an answer, not whether customers did. A service can be up and failing half its requests.
+    - name: KPI dashboards
+      how: Show many numbers with no target and no consequence. An SLO is one number with both.
+    - name: Apdex
+      how: Also a threshold-based latency score, with a satisfied, tolerating and frustrated band, usually without a budget or policy attached.
+---
+
+## [concept] SLIs and SLOs: measuring what users feel
+
+**A <Term id="sli">service level indicator</Term> is the share of events that went well for users. A <Term id="slo">service level objective</Term> is a target for that share over a window. What the target leaves over is the <Term id="error-budget">error budget</Term>, and a <Term id="error-budget-policy">policy</Term> says what happens when it runs out.**
+
+An SLI is a ratio: good events over valid events, such as checkouts that did not fail, or checkouts answered in under 300 ms. An SLO of 99.9% over 30 days lets 1 checkout in 1,000 fail. Those failures are the budget, and the team may spend it on releases and experiments as well as on accidents.
+
+<Depth level={2}>
+Pick few SLIs, close to the user: availability and latency for request/response services, freshness for pipelines, durability for storage. Measure where users meet the service, at the load balancer if you can. Express latency as a <Term id="tail-latency">threshold share</Term>, not a mean. An <Term id="sla">SLA</Term> is different: a contract with refunds, set looser than the SLO so the team reacts before money changes hands.
+</Depth>
+
+<Depth level={3}>
+Google's SRE books recommend the good-over-valid form because every SLI then looks the same to tooling: a numerator, a denominator and a threshold. The budget is simply 1 minus the SLO, in the same units as the SLI. The window matters: a <Term id="rolling-window">rolling window</Term> of four weeks keeps the number of weekends constant, and a big outage stays in the number for as long as users remember it.
+</Depth>
+
+## [problem] A dashboard that is always green
+
+The checkout API has a dashboard. A gauge shows mean latency over the last minute, and an external checker requests `/healthz` once a minute and reports uptime. Both have looked healthy for a year: 120 ms and 99.99%.
+
+<Depth level={2}>
+Both numbers measure something real. Neither measures a customer's checkout. `/healthz` answers even when the payment dependency is failing, and the mean of thousands of fast requests barely moves when a few hundred take two seconds.
+</Depth>
+
+<Depth level={3}>
+A mean over a minute is also lossy in time: averages of averages cannot be combined into a monthly number, and the gauge throws away how many requests each minute had. You cannot rebuild an SLI from it after the fact.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** product wants a reliability target for checkout, and a rule that says when we stop shipping features to fix reliability.
+
+The marked line is the first attempt: keep the mean under 250 ms and the health check up 99.9% of minutes. That month a dependency makes one checkout in five take 700 ms for eight hours, and a bad release fails every payment for 20 minutes. The mean stays under 250 ms, the health check never fails, and the target is met. Support tickets say otherwise.
+
+<Depth level={2}>
+The target measured the wrong things, so it could not say when to stop shipping. Every release meeting turned into an argument between people who saw the tickets and people who saw the dashboard.
+</Depth>
+
+<Depth level={3}>
+A target over minutes of probe uptime also weighs a 3 a.m. outage the same as one at the afternoon peak. Users do not: four times as many of them hit the afternoon one.
+</Depth>
+
+## [morph] Count good events, then budget the bad ones
+
+Drag the slider. The gauge and the probe become a counter by status class and a latency histogram with a bucket edge at the threshold. Recording rules turn them into the SLI and the budget left, and a policy reads the budget.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Start the target from what the service does today and what users need, not from a round number. Write it down with its SLI definition, window, exclusions and the reason for each, and get product, development and the on-call team to sign the policy. If one of them will not, the SLO is wrong, not the people.
+</Depth>
+
+<Depth level={3}>
+`increase()` over 30 days reads a month of samples on every evaluation, which is slow on a busy server. Teams record the ratio over short windows (5 minutes, an hour) and build long windows from those, which also gives the burn-rate alerts in the next lesson their inputs.
+</Depth>
+
+## [walk] Follow one checkout into the budget
+
+One request, from the counter to the policy. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`promhttp.InstrumentHandlerCounter` and `InstrumentHandlerDuration` wrap a handler the same way, labelling by `code` and `method`. The custom version here groups codes by class to keep the number of series small.</Lang>
+<Lang only="python">The `finally` block runs for exceptions too, with `code` still at 500, so a crash counts as a bad event instead of disappearing from the SLI.</Lang>
+<Lang only="typescript">`res.on("close")` fires once whether the response finished or the client hung up. Using only `finish` drops aborted requests from both the numerator and the denominator.</Lang>
+<Lang only="rust">The timer is dropped explicitly after the counter so the observed time includes the whole handler. If the handler panics, the drop still records the duration while the stack unwinds.</Lang>
+</Depth>
+
+## [again] The same month again
+
+The same slow dependency and the same bad release. The latency SLI charges the slow afternoon to the budget, the availability SLI charges the 53,000 failed payments, and by the second bad release the budget is gone. The release gate above then fails the CI step for feature deploys, as the policy says, until the rolling window has budget again.
+
+<Depth level={2}>
+The budget also works the other way. A team that ends every month with most of its budget unspent is either shipping too cautiously or holding a target users do not need. Both are worth a conversation.
+</Depth>
+
+<Depth level={3}>
+The budget is user-facing whoever caused the failure. A dependency's outage spends your budget too; the policy can say whether it triggers a freeze, but the SLI should not hide it.
+</Depth>
+
+## [play] Spend a month's budget
+
+A month of checkout traffic, hour by hour. Pick an SLI and a target, place releases and incidents on the days, and watch the budget burn down and the policy react.
+
+## [lens] How each language does it
+
+Each language has a Prometheus client with counters and histograms, and an OpenTelemetry SDK that records HTTP server durations. The SLI and the budget live in the monitoring system as rules, not in the service.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whatever the language, instrument once, in middleware, and label by status class rather than by user or URL, or the number of time series grows without bound.
+</Depth>
+
+<Depth level={3}>
+Check the <Term id="histogram-bucket">bucket boundaries</Term>. Prometheus client defaults and OpenTelemetry's recommended HTTP buckets both lack a 0.3 s edge. Set the boundaries explicitly (an OpenTelemetry View does this without touching the instrumentation).
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="slis-and-slos" />
+
+### Budgets in numbers
+
+| SLO | Bad events allowed | Total outage per 30 days |
+|---|---|---|
+| 99% | 1 in 100 | 7.2 hours |
+| 99.5% | 1 in 200 | 3.6 hours |
+| 99.9% | 1 in 1,000 | 43.2 minutes |
+| 99.95% | 1 in 2,000 | 21.6 minutes |
+| 99.99% | 1 in 10,000 | 4.3 minutes |
+
+Outage minutes assume steady traffic. With a request-based SLI, an outage at peak costs more than its share of the clock, and one at night less.

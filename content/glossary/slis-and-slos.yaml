@@ -1,0 +1,24 @@
+- id: sli
+  term: Service level indicator (SLI)
+  short: A measured share of events that went well for users, usually good events divided by valid events, such as requests that did not fail or that finished in under 300 ms.
+- id: slo
+  term: Service level objective (SLO)
+  short: A target for an SLI over a time window, such as 99.9% of checkout requests succeeding over 30 days.
+- id: sla
+  term: Service level agreement (SLA)
+  short: A contract that promises a level of service and states the consequences, such as refunds, if it is missed. Usually looser than the SLO behind it.
+- id: error-budget
+  term: Error budget
+  short: The failure an SLO allows, 100% minus the target. At 99.9% over a month, 1 request in 1,000 may fail, and the team may spend that allowance on releases and experiments.
+- id: error-budget-policy
+  term: Error budget policy
+  short: An agreement, made in advance by product, development and operations, about what happens as the error budget runs low, such as freezing feature releases when it reaches zero.
+- id: rolling-window
+  term: Rolling window
+  short: An SLO window that always covers the most recent period, such as the last 28 days, instead of a calendar month. Old failures leave it gradually rather than all at once.
+- id: tail-latency
+  term: Tail latency
+  short: The latency of the slowest requests, described by high percentiles such as p99 or by the share of requests slower than a threshold. A mean hides it.
+- id: histogram-bucket
+  term: Histogram bucket
+  short: One counter in a latency histogram, counting requests at or below an upper bound such as 0.3 s. Thresholds that fall between bucket edges can only be estimated.
