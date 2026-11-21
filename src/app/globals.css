@@ -41,6 +41,7 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
+html, body { overflow-x: clip; }
 body {
   margin: 0; background: var(--bg); color: var(--ink);
   font-family: var(--f-text); font-size: 1.15rem; line-height: 1.6;
@@ -203,9 +204,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 
 /* glossary term */
 .term { border-bottom: 1px dotted var(--ink-2); cursor: help; position: relative; }
-.term .tip { position: absolute; left: 0; bottom: calc(100% + 6px); width: min(300px, 70vw); background: var(--ink); color: var(--bg); font-size: .85rem; line-height: 1.45; padding: 8px 10px; opacity: 0; pointer-events: none; transform: translateY(4px); transition: opacity .15s, transform .15s; z-index: 20; font-style: normal; font-weight: 400; }
+.term .tip { display: none; position: absolute; left: 0; bottom: calc(100% + 6px); width: min(300px, 70vw); background: var(--ink); color: var(--bg); font-size: .85rem; line-height: 1.45; padding: 8px 10px; opacity: 0; pointer-events: none; transform: translateY(4px); transition: opacity .15s, transform .15s; z-index: 20; font-style: normal; font-weight: 400; }
 .term .tip b { display: block; font-family: var(--f-code); font-size: .68rem; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 2px; opacity: .8; }
-.term:hover .tip, .term:focus .tip { opacity: 1; transform: none; }
+.term:hover .tip, .term:focus .tip { display: block; opacity: 1; transform: none; }
 
 /* ---------------- reference ---------------- */
 .ref { padding: 30px 28px 40px; display: grid; grid-template-columns: minmax(0, 1fr) 220px; gap: 40px; }
