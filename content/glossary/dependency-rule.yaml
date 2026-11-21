@@ -1,0 +1,13 @@
+# Terms introduced by software-architecture/dependency-rule
+- id: dependency-rule
+  term: Dependency Rule
+  short: Source code dependencies point only inward, toward the business rules. Nothing in an inner ring names anything in an outer ring, including its data formats (Robert C. Martin, Clean Architecture).
+- id: ports-and-adapters
+  term: Ports and adapters
+  short: Alistair Cockburn's hexagonal architecture. The application defines ports (interfaces for what it offers and what it needs); adapters connect each port to a technology such as HTTP, a database or a mail server.
+- id: humble-object
+  term: Humble Object
+  short: Split code that is hard to test (UI, HTTP, a database driver) from the logic around it, and keep the hard-to-test part so thin it barely needs a test (Gerard Meszaros, xUnit Test Patterns).
+- id: use-case
+  term: Use case
+  short: In Clean Architecture, one application operation such as IssueRefund. It holds the application-specific rules, calls the entities, and talks to the outside only through ports it owns.

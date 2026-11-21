@@ -1,0 +1,774 @@
+---
+title: The Dependency Rule, ports and adapters, humble objects
+track: software-architecture
+group: Boundaries
+order: 2
+summary: Source code dependencies point inward, toward the business rules. The database, the web framework and the mail server plug in from outside, through interfaces the business code owns.
+intent: Keep the business rules free of frameworks, so that a new entry point, a new database or a test needs no change to them.
+changeRequest: Support needs a command-line tool that issues refunds, and CI must run the refund tests without Postgres.
+languages: [go, python, typescript, rust]
+glossary: [dependency-rule, ports-and-adapters, humble-object, use-case, dependency-inversion, composition-root]
+
+prerequisites: []
+skills: [architecture, design, testing]
+depths: [overview, engineer, deep]
+
+playground:
+  model: dependency-rule
+  scenarios:
+    - try: "Answer the prediction, then press Move from Postgres to DynamoDB with no shortcut imports switched on."
+      notice: "Only the Postgres adapter is replaced and main changes one line. Nothing in the two inner rings names the database, so nothing there changes."
+    - try: "Click the import line that lets the use case catch the database library's error, then move the database again."
+      notice: "One red arrow points outward. The use case is now edited for a storage decision, its unit test needs the database library, and the HTTP handler and email adapter are retested."
+    - try: "Add the import that gives the Order entity database types, and the one where the use case builds its own repository."
+      notice: "The rule now breaks at the very center, and the second import closes a cycle that Go and Cargo would refuse to build."
+    - try: "Switch on only the handler's import of the Postgres repository and move the database."
+      notice: "The rule allows it, since both are adapters, but the handler is edited too. The rule protects the business code; it does not make adapters independent of each other."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 52, title: { go: gin, python: Flask, typescript: Express, rust: actix-web }, sub: POST /refunds }
+      after:  { x: 12, y: 30, w: 112, h: 52, title: HTTP adapter, sub: humble }
+    - id: cli
+      kind: concrete
+      appears: change
+      before: { x: 12, y: 190, w: 112, h: 52, title: CLI, sub: copies the handler }
+      after:  { x: 12, y: 190, w: 112, h: 52, title: CLI adapter, sub: one new file }
+    - id: context
+      kind: context
+      before: { x: 146, y: 14, w: 250, h: 240, title: Refund handler, sub: HTTP · rule · SQL · mail }
+      after:  { x: 150, y: 30, w: 160, h: 56, title: IssueRefund, sub: use case }
+    - id: entity
+      kind: concrete
+      before: { x: 162, y: 66, w: 218, h: 40, title: 30-day rule }
+      after:  { x: 150, y: 190, w: 160, h: 52, title: Order, sub: entity · rules }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 420, y: 110, w: 130, h: 52, title: "" }
+      after:  { x: 340, y: 30, w: 208, h: 56, title: Ports, sub: Orders · Notifier }
+    - id: pg
+      kind: concrete
+      before: { x: 162, y: 124, w: 218, h: 40, title: { go: pgx query, python: SQLAlchemy query, typescript: pg query, rust: sqlx query } }
+      after:  { x: 340, y: 120, w: 208, h: 48, title: Postgres adapter, sub: implements Orders }
+    - id: mail
+      kind: concrete
+      before: { x: 162, y: 182, w: 218, h: 40, title: { go: net/smtp, python: smtplib, typescript: nodemailer, rust: lettre } }
+      after:  { x: 340, y: 196, w: 208, h: 48, title: Email adapter, sub: implements Notifier }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: cli, to: context, label: calls }
+    - { from: context, to: entity, label: applies }
+    - { from: context, to: strategy, label: owns }
+    - { from: pg, to: strategy, kind: implements }
+    - { from: mail, to: strategy, kind: implements }
+
+code:
+  go:
+    before:
+      file: httpapi/refunds.go
+      source: |
+        // httpapi/refunds.go: one handler holds the HTTP, the rule, the SQL and the email
+        func (h *Handler) CreateRefund(c *gin.Context) {
+            var req struct {
+                OrderID string `json:"order_id"`
+                Cents   int64  `json:"cents"`
+            }
+            if err := c.ShouldBindJSON(&req); err != nil {
+                c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+                return
+            }
+            var o struct{ Email string; Paid, Refunded int64; Placed time.Time }
+            err := h.pool.QueryRow(c, `SELECT email, paid_cents, refunded_cents, placed_at
+                FROM orders WHERE id = $1`, req.OrderID).Scan(&o.Email, &o.Paid, &o.Refunded, &o.Placed)
+            if err != nil {
+                c.JSON(http.StatusNotFound, gin.H{"error": "no such order"})
+                return
+            }
+            if time.Since(o.Placed) > 30*24*time.Hour || o.Refunded+req.Cents > o.Paid {
+                c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "refund not allowed"})
+                return
+            }
+            _, err = h.pool.Exec(c, `UPDATE orders SET refunded_cents = refunded_cents + $1
+                WHERE id = $2`, req.Cents, req.OrderID)
+            if err != nil {
+                c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+                return
+            }
+            _ = smtp.SendMail(h.smtpAddr, nil, "billing@shop.example", []string{o.Email}, refundMail(req.Cents))
+            c.JSON(http.StatusCreated, gin.H{"refunded_cents": req.Cents})
+        }
+      roles: { client: [3, 10], context: [1, 30], pg: [11, 17], entity: [18, 21], mail: [28, 28] }
+      change:
+        - { after: 30, add: ['', '// cmd/refund-cli/main.go: support wants the same refund without HTTP', 'func refundFromCLI(ctx context.Context, pool *pgxpool.Pool, orderID string, cents int64) error {', '    // lines 11-28 again: the same SELECT, the same 30-day rule, the same UPDATE, the same email', '}'] }
+    after:
+      file: refund/ · httpapi/ · postgres/ · cmd/api/
+      source: |
+        // refund/order.go: the entity; it imports only the standard library
+        type Order struct {
+            ID, Email      string
+            Paid, Refunded int64
+            PlacedAt       time.Time
+        }
+
+        var ErrNotAllowed = errors.New("refund not allowed")
+
+        func (o *Order) Refund(cents int64, now time.Time) error {
+            if now.Sub(o.PlacedAt) > 30*24*time.Hour || o.Refunded+cents > o.Paid {
+                return ErrNotAllowed
+            }
+            o.Refunded += cents
+            return nil
+        }
+
+        // refund/issue.go: the use case, and the ports it owns
+        type Orders interface {
+            Get(ctx context.Context, id string) (Order, error)
+            Save(ctx context.Context, o Order) error
+        }
+        type Notifier interface {
+            RefundIssued(ctx context.Context, o Order, cents int64) error
+        }
+
+        type IssueRefund struct {
+            Orders Orders
+            Notify Notifier
+            Now    func() time.Time
+        }
+
+        func (u IssueRefund) Run(ctx context.Context, orderID string, cents int64) error {
+            o, err := u.Orders.Get(ctx, orderID)
+            if err != nil {
+                return err
+            }
+            if err := o.Refund(cents, u.Now()); err != nil {
+                return err
+            }
+            if err := u.Orders.Save(ctx, o); err != nil {
+                return err
+            }
+            return u.Notify.RefundIssued(ctx, o, cents)
+        }
+
+        // httpapi/refunds.go: a humble adapter; gin stops here
+        func (h *Handler) CreateRefund(c *gin.Context) {
+            var req refundRequest
+            if err := c.ShouldBindJSON(&req); err != nil {
+                c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+                return
+            }
+            if err := h.issue.Run(c.Request.Context(), req.OrderID, req.Cents); err != nil {
+                c.JSON(statusFor(err), gin.H{"error": err.Error()})
+                return
+            }
+            c.JSON(http.StatusCreated, gin.H{"refunded_cents": req.Cents})
+        }
+
+        // postgres/orders.go: implements refund.Orders; pgx stops here
+        func (r *Orders) Get(ctx context.Context, id string) (refund.Order, error) {
+            o := refund.Order{ID: id}
+            err := r.pool.QueryRow(ctx, selectOrder, id).
+                Scan(&o.Email, &o.Paid, &o.Refunded, &o.PlacedAt)
+            return o, err
+        }
+
+        // cmd/api/main.go: the only package that knows every piece
+        issue := refund.IssueRefund{Orders: postgres.NewOrders(pool), Notify: mail.New(smtpAddr), Now: time.Now}
+        router.POST("/refunds", httpapi.New(issue).CreateRefund)
+      roles: { entity: [1, 16], strategy: [18, 25], context: [27, 45], client: [47, 59], pg: [61, 67], wire: [69, 71], call: [54, 54], rule: [10, 16], port: [61, 67], notify: [44, 44] }
+    again:
+      file: cmd/refund-cli/main.go · refund/issue_test.go
+      source: |
+        // cmd/refund-cli/main.go: a second driving adapter; package refund does not change
+        func main() {
+            orderID, cents := os.Args[1], mustParseCents(os.Args[2])
+            issue := refund.IssueRefund{Orders: postgres.NewOrders(connect()), Notify: mail.New(smtpAddr()), Now: time.Now}
+            if err := issue.Run(context.Background(), orderID, cents); err != nil {
+                log.Fatal(err)
+            }
+        }
+
+        // refund/issue_test.go: no database, no web server
+        func TestRefundAfter30DaysIsRefused(t *testing.T) {
+            orders := &memOrders{m: map[string]refund.Order{"o1": {ID: "o1", Paid: 4000, PlacedAt: day(1)}}}
+            u := refund.IssueRefund{Orders: orders, Notify: nopNotifier{}, Now: func() time.Time { return day(40) }}
+            if err := u.Run(t.Context(), "o1", 1000); !errors.Is(err, refund.ErrNotAllowed) {
+                t.Fatalf("got %v, want ErrNotAllowed", err)
+            }
+        }
+    cost:
+      before: { text: CLI copies 18 lines · tests need Postgres and HTTP, value: 0.8 }
+      after: { text: 1 new adapter file · tests run in memory, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Natural
+      note: 'Packages are the rings. Go refuses import cycles, so once `postgres` imports `refund`, `refund` cannot import `postgres` back; the compiler enforces half the rule. Interfaces declared where they are used, as here, are the ports. `internal/` limits who may import a package, and go-arch-lint or golangci-lint''s depguard turn the ring rules into a CI check.'
+      seenIn: '`internal/` directories, enforced by the go tool. go-arch-lint''s `.go-arch-lint.yml` with `mayDependOn` per component. `depguard` in golangci-lint for banned imports. `cmd/<name>/main.go` as the composition root.'
+
+  python:
+    before:
+      file: web/refunds.py
+      source: |
+        # web/refunds.py: one view holds the HTTP, the rule, the SQL and the email
+        @app.post("/refunds")
+        def create_refund():
+            body = request.get_json()
+            order_id, cents = body["order_id"], int(body["cents"])
+            with engine.begin() as conn:
+                row = conn.execute(text(
+                    "SELECT email, paid_cents, refunded_cents, placed_at FROM orders WHERE id = :id"),
+                    {"id": order_id}).one_or_none()
+                if row is None:
+                    return {"error": "no such order"}, 404
+                too_late = datetime.now(UTC) - row.placed_at > timedelta(days=30)
+                if too_late or row.refunded_cents + cents > row.paid_cents:
+                    return {"error": "refund not allowed"}, 422
+                conn.execute(text(
+                    "UPDATE orders SET refunded_cents = refunded_cents + :c WHERE id = :id"),
+                    {"c": cents, "id": order_id})
+            with smtplib.SMTP(SMTP_HOST) as smtp:
+                smtp.send_message(refund_mail(row.email, cents))
+            return {"refunded_cents": cents}, 201
+      roles: { client: [2, 5], context: [1, 20], pg: [6, 11], entity: [12, 14], mail: [18, 19] }
+      change:
+        - { after: 20, add: ['', '# cli.py: support wants the same refund without HTTP', 'def refund_from_cli(order_id: str, cents: int) -> None:', '    ...  # lines 6-19 again: the same SELECT, the same 30-day rule, the same UPDATE, the same email'] }
+    after:
+      file: domain/ · refunds/ · web/ · adapters/ · main.py
+      source: |
+        # domain/order.py: the entity; standard library only
+        class RefundNotAllowed(Exception): ...
+
+        @dataclass
+        class Order:
+            id: str
+            email: str
+            paid_cents: int
+            refunded_cents: int
+            placed_at: datetime
+
+            def refund(self, cents: int, now: datetime) -> None:
+                if now - self.placed_at > timedelta(days=30) or self.refunded_cents + cents > self.paid_cents:
+                    raise RefundNotAllowed(self.id)
+                self.refunded_cents += cents
+
+        # refunds/issue.py: the use case, and the ports it owns
+        class Orders(Protocol):
+            def get(self, order_id: str) -> Order: ...
+            def save(self, order: Order) -> None: ...
+
+        class Notifier(Protocol):
+            def refund_issued(self, order: Order, cents: int) -> None: ...
+
+        @dataclass
+        class IssueRefund:
+            orders: Orders
+            notify: Notifier
+            now: Callable[[], datetime] = lambda: datetime.now(UTC)
+
+            def __call__(self, order_id: str, cents: int) -> None:
+                order = self.orders.get(order_id)
+                order.refund(cents, self.now())
+                self.orders.save(order)
+                self.notify.refund_issued(order, cents)
+
+        # web/refunds.py: a humble adapter; Flask stops here
+        @bp.post("/refunds")
+        def create_refund():
+            body = request.get_json()
+            try:
+                current_app.extensions["issue_refund"](body["order_id"], int(body["cents"]))
+            except RefundNotAllowed:
+                return {"error": "refund not allowed"}, 422
+            return {"refunded_cents": int(body["cents"])}, 201
+
+        # adapters/postgres.py: implements Orders; SQLAlchemy stops here
+        class PgOrders:
+            def __init__(self, engine: Engine) -> None:
+                self.engine = engine
+
+            def get(self, order_id: str) -> Order:
+                with self.engine.connect() as conn:
+                    row = conn.execute(SELECT_ORDER, {"id": order_id}).one()
+                return Order(**row._mapping)
+
+        # main.py: the only module that knows every piece
+        issue = IssueRefund(orders=PgOrders(engine), notify=SmtpNotifier(SMTP_HOST))
+        app.extensions["issue_refund"] = issue
+      roles: { entity: [1, 15], strategy: [17, 23], context: [25, 35], client: [37, 45], pg: [47, 55], wire: [57, 59], call: [42, 42], rule: [12, 15], port: [52, 55], notify: [35, 35] }
+    again:
+      file: cli.py · test_issue_refund.py
+      source: |
+        # cli.py: a second driving adapter; the use case does not change
+        def main() -> None:
+            order_id, cents = sys.argv[1], int(sys.argv[2])
+            issue = IssueRefund(orders=PgOrders(create_engine(DB_URL)), notify=SmtpNotifier(SMTP_HOST))
+            issue(order_id, cents)
+
+        # test_issue_refund.py: no database, no web server
+        def test_refund_after_30_days_is_refused():
+            orders = InMemoryOrders({"o1": Order("o1", "a@shop.example", 4000, 0, day(1))})
+            issue = IssueRefund(orders=orders, notify=NullNotifier(), now=lambda: day(40))
+            with pytest.raises(RefundNotAllowed):
+                issue("o1", 1000)
+    cost:
+      before: { text: CLI copies 14 lines · tests need Postgres and Flask, value: 0.8 }
+      after: { text: 1 new adapter file · tests run in memory, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Useful
+      note: 'Nothing in Python stops `domain` from importing `flask`; any module can import any other at runtime. import-linter makes the rule a CI failure with a `layers` contract (outer layers listed first) or a `forbidden` contract such as "shop.domain must not import sqlalchemy". Protocols are the ports, and structural typing means adapters need not import them.'
+      seenIn: 'import-linter''s `layers`, `forbidden` and `independence` contracts. `typing.Protocol` (PEP 544). FastAPI''s `app.dependency_overrides`, which swaps an adapter for a fake in tests.'
+
+  typescript:
+    before:
+      file: web/refunds.ts
+      source: |
+        // web/refunds.ts: one route holds the HTTP, the rule, the SQL and the email
+        app.post("/refunds", async (req, res) => {
+          const { orderId, cents } = req.body as { orderId: string; cents: number };
+          const { rows } = await pool.query(
+            "SELECT email, paid_cents, refunded_cents, placed_at FROM orders WHERE id = $1",
+            [orderId],
+          );
+          const o = rows[0];
+          if (!o) return res.status(404).json({ error: "no such order" });
+          const tooLate = Date.now() - o.placed_at.getTime() > 30 * DAY_MS;
+          if (tooLate || Number(o.refunded_cents) + cents > Number(o.paid_cents)) {
+            return res.status(422).json({ error: "refund not allowed" });
+          }
+          await pool.query(
+            "UPDATE orders SET refunded_cents = refunded_cents + $1 WHERE id = $2",
+            [cents, orderId],
+          );
+          await mailer.sendMail(refundMail(o.email, cents));
+          res.status(201).json({ refundedCents: cents });
+        });
+      roles: { client: [2, 3], context: [1, 20], pg: [4, 9], entity: [10, 13], mail: [18, 18] }
+      change:
+        - { after: 20, add: ['', '// cli.ts: support wants the same refund without HTTP', 'async function refundFromCli(orderId: string, cents: number): Promise<void> {', '  // lines 4-18 again: the same SELECT, the same 30-day rule, the same UPDATE, the same email', '}'] }
+    after:
+      file: domain/ · refunds/ · web/ · adapters/ · main.ts
+      source: |
+        // domain/order.ts: the entity; no imports at all
+        export class RefundNotAllowed extends Error {}
+
+        export interface Order {
+          id: string;
+          email: string;
+          paidCents: number;
+          refundedCents: number;
+          placedAt: Date;
+        }
+
+        export function refund(o: Order, cents: number, now: Date): Order {
+          const tooLate = now.getTime() - o.placedAt.getTime() > 30 * DAY_MS;
+          if (tooLate || o.refundedCents + cents > o.paidCents) throw new RefundNotAllowed(o.id);
+          return { ...o, refundedCents: o.refundedCents + cents };
+        }
+
+        // refunds/issue.ts: the use case, and the ports it owns
+        export interface Orders {
+          get(id: string): Promise<Order>;
+          save(o: Order): Promise<void>;
+        }
+        export interface Notifier {
+          refundIssued(o: Order, cents: number): Promise<void>;
+        }
+
+        export function issueRefund(orders: Orders, notify: Notifier, now = () => new Date()) {
+          return async (orderId: string, cents: number): Promise<void> => {
+            const order = refund(await orders.get(orderId), cents, now());
+            await orders.save(order);
+            await notify.refundIssued(order, cents);
+          };
+        }
+
+        // web/refunds.ts: a humble adapter; Express stops here
+        export function refundRoutes(issue: ReturnType<typeof issueRefund>): Router {
+          return Router().post("/refunds", async (req, res) => {
+            try {
+              await issue(req.body.orderId, Number(req.body.cents));
+              res.status(201).json({ refundedCents: Number(req.body.cents) });
+            } catch (e) {
+              if (!(e instanceof RefundNotAllowed)) throw e;
+              res.status(422).json({ error: "refund not allowed" });
+            }
+          });
+        }
+
+        // adapters/postgres.ts: implements Orders; pg stops here
+        export class PgOrders implements Orders {
+          constructor(private pool: Pool) {}
+          async get(id: string): Promise<Order> {
+            const { rows } = await this.pool.query(SELECT_ORDER, [id]);
+            return toOrder(rows[0]);
+          }
+          async save(o: Order): Promise<void> {
+            await this.pool.query(UPDATE_REFUNDED, [o.refundedCents, o.id]);
+          }
+        }
+
+        // main.ts: the only module that knows every piece
+        const issue = issueRefund(new PgOrders(pool), new SmtpNotifier(transport));
+        app.use(refundRoutes(issue));
+      roles: { entity: [1, 16], strategy: [18, 25], context: [27, 33], client: [35, 46], pg: [48, 58], wire: [60, 62], call: [39, 39], rule: [12, 16], port: [51, 54], notify: [31, 31] }
+    again:
+      file: cli.ts · issue.test.ts
+      source: |
+        // cli.ts: a second driving adapter; the use case does not change
+        const [orderId, cents] = process.argv.slice(2);
+        const issue = issueRefund(new PgOrders(new Pool()), new SmtpNotifier(transport));
+        await issue(orderId, Number(cents));
+
+        // issue.test.ts: no database, no web server
+        test("a refund after 30 days is refused", async () => {
+          const orders = new InMemoryOrders([{ id: "o1", email: "a@shop.example", paidCents: 4000, refundedCents: 0, placedAt: day(1) }]);
+          const issue = issueRefund(orders, { refundIssued: async () => {} }, () => day(40));
+          await assert.rejects(issue("o1", 1000), RefundNotAllowed);
+        });
+    cost:
+      before: { text: CLI copies 15 lines · tests need Postgres and Express, value: 0.8 }
+      after: { text: 1 new adapter file · tests run in memory, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Useful
+      note: 'Any file can import any other, so the rule needs a tool: dependency-cruiser''s `forbidden` rules or eslint-plugin-boundaries fail the build when `src/domain` reaches `express` or `pg`. Interfaces vanish at runtime, and `import type` keeps a port import out of the emitted JavaScript entirely.'
+      seenIn: 'dependency-cruiser `forbidden` rules with `from`/`to` path patterns. eslint-plugin-boundaries element types. NestJS custom providers (`{ provide: ORDERS, useClass: PgOrders }`) as the composition root. `import type` since TypeScript 3.8.'
+
+  rust:
+    before:
+      file: web/src/refunds.rs
+      source: |
+        // web/src/refunds.rs: one handler holds the HTTP, the rule, the SQL and the email
+        #[post("/refunds")]
+        async fn create_refund(st: web::Data<AppState>, req: web::Json<RefundReq>) -> HttpResponse {
+            let row = sqlx::query!(
+                "SELECT email, paid_cents, refunded_cents, placed_at FROM orders WHERE id = $1",
+                req.order_id
+            )
+            .fetch_optional(&st.pool).await;
+            let Ok(Some(o)) = row else { return HttpResponse::NotFound().finish() };
+            let too_late = Utc::now() - o.placed_at > TimeDelta::days(30);
+            if too_late || o.refunded_cents + req.cents > o.paid_cents {
+                return HttpResponse::UnprocessableEntity().body("refund not allowed");
+            }
+            let updated = sqlx::query!(
+                "UPDATE orders SET refunded_cents = refunded_cents + $1 WHERE id = $2",
+                req.cents, req.order_id
+            )
+            .execute(&st.pool).await;
+            if updated.is_err() { return HttpResponse::InternalServerError().finish(); }
+            let _ = st.mailer.send(refund_mail(&o.email, req.cents)).await;
+            HttpResponse::Created().json(json!({ "refunded_cents": req.cents }))
+        }
+      roles: { client: [2, 3], context: [1, 22], pg: [4, 9], entity: [10, 13], mail: [20, 20] }
+      change:
+        - { after: 22, add: ['', '// cli/src/main.rs: support wants the same refund without HTTP', 'async fn refund_from_cli(pool: &PgPool, order_id: &str, cents: i64) -> anyhow::Result<()> {', '    // lines 4-20 again: the same SELECT, the same 30-day rule, the same UPDATE, the same email', '}'] }
+    after:
+      file: domain/ · refunds/ · web/ · pg_adapter/ · api/
+      source: |
+        // domain/src/order.rs: the entity; no framework crates in its Cargo.toml
+        pub struct Order {
+            pub id: String,
+            pub email: String,
+            pub paid: i64,
+            pub refunded: i64,
+            pub placed_at: DateTime<Utc>,
+        }
+
+        #[derive(Debug, thiserror::Error)]
+        pub enum RefundError {
+            #[error("refund not allowed")] NotAllowed,
+            #[error("order not found")] NotFound,
+            #[error("store unavailable: {0}")] Store(String),
+        }
+
+        impl Order {
+            pub fn refund(&mut self, cents: i64, now: DateTime<Utc>) -> Result<(), RefundError> {
+                if now - self.placed_at > TimeDelta::days(30) || self.refunded + cents > self.paid {
+                    return Err(RefundError::NotAllowed);
+                }
+                self.refunded += cents;
+                Ok(())
+            }
+        }
+
+        // refunds/src/issue.rs: the use case, and the ports it owns
+        #[async_trait]
+        pub trait Orders: Send + Sync {
+            async fn get(&self, id: &str) -> Result<Order, RefundError>;
+            async fn save(&self, o: &Order) -> Result<(), RefundError>;
+        }
+        #[async_trait]
+        pub trait Notifier: Send + Sync {
+            async fn refund_issued(&self, o: &Order, cents: i64);
+        }
+
+        pub struct IssueRefund { pub orders: Arc<dyn Orders>, pub notify: Arc<dyn Notifier> }
+
+        impl IssueRefund {
+            pub async fn run(&self, id: &str, cents: i64, now: DateTime<Utc>) -> Result<(), RefundError> {
+                let mut order = self.orders.get(id).await?;
+                order.refund(cents, now)?;
+                self.orders.save(&order).await?;
+                self.notify.refund_issued(&order, cents).await;
+                Ok(())
+            }
+        }
+
+        // web/src/refunds.rs: a humble adapter; actix-web stops here
+        #[post("/refunds")]
+        async fn create_refund(issue: web::Data<IssueRefund>, req: web::Json<RefundReq>) -> HttpResponse {
+            match issue.run(&req.order_id, req.cents, Utc::now()).await {
+                Ok(()) => HttpResponse::Created().json(json!({ "refunded_cents": req.cents })),
+                Err(RefundError::NotAllowed) => HttpResponse::UnprocessableEntity().finish(),
+                Err(RefundError::NotFound) => HttpResponse::NotFound().finish(),
+                Err(RefundError::Store(_)) => HttpResponse::ServiceUnavailable().finish(),
+            }
+        }
+
+        // pg_adapter/src/orders.rs: implements refunds::Orders; sqlx stops here
+        #[async_trait]
+        impl Orders for PgOrders {
+            async fn get(&self, id: &str) -> Result<Order, RefundError> {
+                let row = sqlx::query_as::<_, OrderRow>(SELECT_ORDER).bind(id)
+                    .fetch_optional(&self.pool).await
+                    .map_err(|e| RefundError::Store(e.to_string()))?;
+                row.map(Order::from).ok_or(RefundError::NotFound)
+            }
+            // save() has the same shape, with an UPDATE
+        }
+
+        // api/src/main.rs: the only crate that depends on every other
+        let issue = IssueRefund { orders: Arc::new(PgOrders::new(pool)), notify: Arc::new(SmtpNotifier::new(mailer)) };
+        App::new().app_data(web::Data::new(issue)).service(create_refund)
+      roles: { entity: [1, 25], strategy: [27, 36], context: [38, 48], client: [50, 59], pg: [61, 71], wire: [73, 75], call: [53, 53], rule: [17, 25], port: [64, 69], notify: [45, 45] }
+    again:
+      file: cli/src/main.rs · refunds/tests/issue.rs
+      source: |
+        // cli/src/main.rs: a second driving adapter; the refunds crate does not change
+        #[tokio::main]
+        async fn main() -> anyhow::Result<()> {
+            let args: Vec<String> = std::env::args().collect();
+            let issue = IssueRefund { orders: Arc::new(PgOrders::connect(&db_url()).await?), notify: Arc::new(SmtpNotifier::from_env()?) };
+            issue.run(&args[1], args[2].parse()?, Utc::now()).await?;
+            Ok(())
+        }
+
+        // refunds/tests/issue.rs: no database, no web server
+        #[tokio::test]
+        async fn refund_after_30_days_is_refused() {
+            let issue = IssueRefund { orders: Arc::new(MemOrders::with(order("o1", 4000, day(1)))), notify: Arc::new(NoMail) };
+            let err = issue.run("o1", 1000, day(40)).await.unwrap_err();
+            assert!(matches!(err, RefundError::NotAllowed));
+        }
+    cost:
+      before: { text: CLI copies 17 lines · tests need Postgres and actix, value: 0.8 }
+      after: { text: 1 new adapter file · tests run in memory, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Natural
+      note: 'Put each ring in its own crate in a Cargo workspace and the rule becomes a compile error: `domain` cannot name `sqlx` unless its Cargo.toml lists it, and Cargo rejects cyclic dependencies between crates. Traits are the ports. `async fn` in traits works for generics since Rust 1.75; for `Arc<dyn Orders>` you still need `#[async_trait]` or boxed futures.'
+      seenIn: 'Cargo workspaces with one crate per ring. `async_trait` for object-safe async ports. `sqlx::FromRow` kept in the adapter crate, with a `From<OrderRow> for Order` conversion at the boundary.'
+
+walk:
+  - text: Main is the only place that names every piece. It builds the Postgres and email adapters and hands them to the use case as its two ports.
+    nodes: [context, pg, mail]
+    edges: []
+    role: wire
+  - text: The HTTP adapter turns JSON into plain arguments and calls the use case. The web framework's types stop here; the use case never sees a request object.
+    nodes: [client, context]
+    edges: [client>context]
+    role: call
+  - text: The use case loads the order through its own Orders port and asks the entity whether the refund is allowed. The 30-day rule lives in the entity, with no imports from outside.
+    nodes: [context, entity]
+    edges: [context>entity]
+    role: rule
+  - text: At runtime the Orders call lands in the Postgres adapter. In the source code, the adapter imports the use case's package, never the other way round. Control flows out; the dependency points in.
+    nodes: [context, strategy, pg]
+    edges: [context>strategy, pg>strategy]
+    role: port
+  - text: The use case tells its Notifier port, and the email adapter sends the mail. A new database or mail provider replaces a box on the right and one line in main.
+    nodes: [context, strategy, mail]
+    edges: [context>strategy, mail>strategy]
+    role: notify
+
+checks:
+  overview:
+    question: May the refund use case import the web framework?
+    options:
+      - text: No. Nothing in the inner rings may name anything in an outer ring.
+        correct: true
+        why: Right. Once the use case names the framework, replacing the framework, adding a CLI or testing the rule all go through it.
+      - text: Yes, as long as it only uses the framework's request type.
+        why: The request type is the framework. Every caller, including tests and a CLI, would have to build one.
+      - text: Yes. Use cases are where HTTP requests are handled.
+        why: Controllers in the adapter ring handle HTTP. The use case takes plain arguments or a request model it defines.
+  engineer:
+    question: The refund SQL has to live somewhere. Where, under the Dependency Rule?
+    options:
+      - text: In an adapter that implements an Orders interface the use case owns.
+        correct: true
+        why: Right. The use case calls its own port; the adapter imports the use case's package and holds the SQL and the driver.
+      - text: In the use case, behind a private helper function.
+        why: Then the use case imports the driver, and its tests need a database.
+      - text: In an Orders interface declared in the postgres package, which the use case imports.
+        why: That is injection without inversion. The use case still imports the database package, so the arrow points outward.
+  deep:
+    question: The Orders port returns the ORM's mapped objects to the use case, to save writing a mapper. What does that cost?
+    options:
+      - text: The inner ring now depends on the ORM's types, sessions and lazy loading, and its tests need the ORM.
+        correct: true
+        why: Right. Data that crosses a boundary should be in the inner ring's own form. A lazy attribute that queries the database from inside a business rule is the ORM leaking inward.
+      - text: Nothing, because the ORM is only a library and not a framework.
+        why: The rule is about any outer-ring detail. An ORM decides how objects load, save and track changes, and that is exactly what the use case should not know.
+      - text: Mostly performance, because the objects are copied at the boundary.
+        why: Returning ORM objects avoids the copy. The cost is coupling, not speed.
+
+reference:
+  roles:
+    - role: Entity
+      example: Order, with its 30-day refund rule
+      job: Holds enterprise-wide rules. Imports nothing outside the standard library.
+    - role: Use case
+      example: IssueRefund
+      job: Runs one application operation, calls entities, and talks to the outside only through ports it owns.
+    - role: Port
+      example: Orders, Notifier
+      job: An interface in the inner ring that says what the use case needs from the outside.
+    - role: Adapter
+      example: the HTTP handler, the Postgres repository, the email notifier
+      job: Connects a port to one technology. Driving adapters call in; driven adapters implement ports.
+    - role: Main
+      example: cmd/api/main.go
+      job: The composition root. Builds every adapter and wires it to the use cases. The only module that knows them all.
+  useWhen:
+    - The business rules are worth protecting and will outlive the framework, the database or the delivery channel.
+    - The same operation is reached from several places, such as HTTP, a CLI, a queue consumer and a scheduled job.
+    - You want fast tests of the rules with no database or web server.
+  avoidWhen:
+    - The service is mostly CRUD with no real rules. Ports and mappers would only copy fields from one struct to another.
+    - A short-lived script or prototype. Let a later lesson's partial boundaries buy the option cheaply.
+  tradeoffs:
+    - More types and more files. Each boundary needs an interface, and often a mapping between the inner and outer data shapes.
+    - Navigation is harder. Jump-to-definition on a port lands on the interface, not on the code that runs.
+    - The rule says nothing about adapters depending on each other. Keep those edges few by convention or with an import linter.
+  lookalikes:
+    - name: Hexagonal architecture
+      how: Cockburn's ports and adapters. The same inward dependencies, drawn as a hexagon with driving adapters on one side and driven adapters on the other.
+    - name: Onion architecture
+      how: Jeffrey Palermo's version. Domain model at the center, then domain services and application services, with infrastructure outside.
+    - name: Classic layered architecture
+      how: Presentation over domain over data access. The domain imports the data layer, so the arrow at the bottom points the other way.
+---
+
+## [concept] The Dependency Rule
+
+**Source code dependencies point only inward, toward the business rules. The database, the web framework and the mail server are details that plug in from outside.**
+
+Draw the code as rings. <Term id="use-case">Use cases</Term> and entities sit in the middle; adapters, frameworks and drivers sit outside. The <Term id="dependency-rule">Dependency Rule</Term> says nothing in an inner ring may name anything in an outer ring: no import, no type, no data format.
+
+<Depth level={2}>
+Control still flows outward: the use case calls the database. The trick that reconciles the two is <Term id="dependency-inversion">dependency inversion</Term>. The use case declares the interface it needs, and the outer code implements it. That is <Term id="ports-and-adapters">ports and adapters</Term>: ports are the inner ring's own interfaces, and an adapter connects one port to one technology. Driving adapters (an HTTP handler, a CLI) call the use case. Driven adapters (a repository, a mailer) implement its ports.
+</Depth>
+
+<Depth level={3}>
+Robert C. Martin named the rule in a 2012 blog post and his 2017 book *Clean Architecture*. He presented it as the shared idea behind several earlier architectures: Alistair Cockburn's hexagonal architecture, Jeffrey Palermo's onion architecture, and Ivar Jacobson's boundary-control-entity. The four named rings are an example, not a law. What matters is the direction of the arrows.
+</Depth>
+
+## [problem] One handler that does everything
+
+The refund endpoint parses JSON, loads the order with SQL, checks the 30-day rule, updates the row and sends an email, all in one handler function. It is short, it works, and its integration test passes against a real database.
+
+<Depth level={2}>
+The business rule, "within 30 days and never more than was paid", sits between a framework call and a driver call. To run it, you need both.
+</Depth>
+
+<Depth level={3}>
+The handler also decides the data format of the rule. It reads columns into local variables, so the rule is written in terms of the table's shape, not an Order type of its own.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** support needs a command-line tool that issues refunds, and CI must run the refund tests without Postgres.
+
+The CLI cannot call the handler without faking an HTTP request, so someone copies the SELECT, the rule, the UPDATE and the email into a second function. Now the 30-day rule lives in two places. And no test of the rule can run without a database, because the rule only exists inside code that queries one.
+
+<Depth level={2}>
+Neither request touched the refund rule, yet both have to go through the code that holds it. The next policy change, say 60 days for gold customers, must be made twice and tested against Postgres twice.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The handler takes a `*gin.Context`. A CLI would have to build a gin context or copy the code; there is no third option.</Lang>
+<Lang only="python">The view reads `flask.request`, a context-local. Calling it from a CLI needs `app.test_request_context()`, which is a test tool, not an architecture.</Lang>
+<Lang only="typescript">The route closes over Express's `req` and `res`. The CLI would have to fake both objects, including `res.status().json()` chaining.</Lang>
+<Lang only="rust">The handler's arguments are `web::Data` and `web::Json` extractors. Outside actix-web there is nothing to pass it.</Lang>
+</Depth>
+
+## [morph] Rings, ports and adapters
+
+Drag the slider. The rule moves into an Order entity. The operation becomes an IssueRefund use case that owns two ports, Orders and Notifier. The HTTP handler, the Postgres repository and the email sender become adapters outside it, and main wires them together.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The HTTP handler is now a <Term id="humble-object">humble object</Term>: it parses, calls, and maps an error to a status code. It is hard to unit-test, so it is kept too simple to need much testing. Everything worth testing moved inward, where a plain function call and an in-memory fake are enough.
+</Depth>
+
+<Depth level={3}>
+Data crossing a boundary takes the inner ring's form. The adapter scans a row into the entity's own Order type and maps a duplicate or missing row to the use case's own error. Passing the driver's row type, or an ORM object, inward would make the entity depend on it again.
+</Depth>
+
+## [walk] Follow one refund
+
+One refund request through the rings, from main's wiring to the email. Step through it with the numbered buttons.
+
+<Depth level={3}>
+At runtime, the call path is the same length as before, plus one interface call per port. The difference is in the import graph: compilers, build caches, linters and test runners all follow imports, not calls.
+</Depth>
+
+## [again] The same request, the second time
+
+The CLI is one new file: a second driving adapter that builds the same use case and calls it. The test of the 30-day rule passes an in-memory Orders and a notifier that does nothing. Neither the entity nor the use case changed.
+
+<Depth level={2}>
+Main is the <Term id="composition-root">composition root</Term>, and there can be more than one. The API's main and the CLI's main wire the same use case to the same adapters, or to different ones.
+</Depth>
+
+<Depth level={3}>
+Martin treats tests as the outermost ring: they depend inward on the use case, and nothing depends on them. A test written against the use case's API survives a change of framework. A test that drives the HTTP handler and checks the database does not.
+</Depth>
+
+## [play] Swap the database
+
+The playground draws a refund service as rings. Add the shortcut imports a busy engineer really writes, watch which arrows turn red, then swap the database or the web framework and count what has to change.
+
+The table under the graph always compares your imports with the design that follows the rule, for both swaps.
+
+## [lens] How each language enforces it
+
+The rule is the same everywhere. What differs is whether the toolchain enforces it. Go packages and Rust crates turn part of it into a compile error; Python and TypeScript need an import linter in CI.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whatever the language, write the rule down as a check that fails the build. A rule enforced only in code review lasts until the first deadline.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="dependency-rule" />
+
+### When the full rule costs too much
+
+The rule has a price: a port per dependency, a mapper per boundary, and more files to read. A service that stores and returns records with almost no rules gains little from it. Start where the rules are. A single Orders port, used by the two use cases that have real policy, buys most of the testability for a fraction of the ceremony, and the rest of the service can stay a thin handler over the database until it grows rules of its own.
