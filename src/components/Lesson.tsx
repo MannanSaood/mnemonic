@@ -7,7 +7,8 @@ import { Diagram, edgeId, type ChangeMode } from "./Diagram";
 import { CodePanel } from "./CodePanel";
 import { Inline } from "./Inline";
 import { usePrefs, readProgress, writeProgress } from "./Prefs";
-import { LANG_LABEL, STEP_KEYS, STEP_LABEL, pick, type Lang, type PreparedCode, type PreparedLang, type Range, type StepKey, type TopicMeta } from "@/lib/types";
+import { Playground } from "@/playgrounds/Playground";
+import { DEPTH_LABEL, LANG_LABEL, STEP_KEYS, STEP_LABEL, depthName, depthNumber, pick, type Lang, type PreparedCode, type PreparedLang, type Range, type StepKey, type TopicMeta } from "@/lib/types";
 
 export interface LessonStep { key: StepKey; title: string; content: ReactNode }
 
@@ -18,6 +19,8 @@ interface Visual {
   caption: string;
   meter: "before" | "after" | null;
   lens?: boolean;
+  /** The "Try it" step: the playground replaces the diagram and code. */
+  play?: boolean;
 }
 
 const VISUALS: Record<StepKey, Visual> = {
@@ -27,6 +30,7 @@ const VISUALS: Record<StepKey, Visual> = {
   morph: { t: null, change: "none", code: "morph", caption: "Drag the slider to morph before into after", meter: null },
   walk: { t: 1, change: "none", code: "after", caption: "One call, start to finish", meter: null },
   again: { t: 1, change: "fresh", code: "again", caption: "After: the same request is one new piece", meter: "after" },
+  play: { t: 1, change: "none", code: "after", caption: "", meter: null, play: true },
   lens: { t: 1, change: "none", code: "after", caption: "The same roles, in your language", meter: null, lens: true },
   check: { t: 1, change: "none", code: "after", caption: "The design you just built", meter: null },
 };
@@ -106,9 +110,19 @@ export function Lesson({ id, meta, code, steps }: { id: string; meta: TopicMeta;
     return () => window.removeEventListener("keydown", onKey);
   }, [go, step]);
 
+  // the check matches the reader's depth; fall back to the deepest the lesson covers
+  const dn = depthName(depth);
+  const checkDepth = meta.checks[dn] ? dn : meta.depths[meta.depths.length - 1];
+  const check = meta.checks[checkDepth]!;
+  useEffect(() => setQuiz(null), [checkDepth]);
+
   function answer(k: number) {
     setQuiz(k);
-    if (meta.check.options[k].correct) writeProgress(id, { seen, done: true });
+    if (check.options[k].correct) {
+      const p = readProgress(id);
+      const passed = p.passed.includes(checkDepth) ? p.passed : [...p.passed, checkDepth];
+      writeProgress(id, { seen, passed });
+    }
   }
 
   /* ---------- what the code panel shows ---------- */
@@ -142,7 +156,7 @@ export function Lesson({ id, meta, code, steps }: { id: string; meta: TopicMeta;
             </li>
           ))}
         </ol>
-        <span className="label">Step {step + 1} of 8 · {STEP_LABEL[key]}</span>
+        <span className="label">Step {step + 1} of {STEP_KEYS.length} · {STEP_LABEL[key]}{key === "check" ? ` · ${DEPTH_LABEL[depthNumber(checkDepth)]}` : ""}</span>
         <h1 className="step-title">{s.title}</h1>
         <div className="step-body" aria-live="polite">
           {s.content}
@@ -168,27 +182,38 @@ export function Lesson({ id, meta, code, steps }: { id: string; meta: TopicMeta;
             </ol>
           )}
 
+          {key === "play" && (
+            <ol className="scenarios" aria-label="Scenarios to try">
+              {meta.playground.scenarios.map((sc, i) => (
+                <li key={i}><span><Inline text={sc.try} /></span><span className="notice">Notice: <Inline text={sc.notice} /></span></li>
+              ))}
+            </ol>
+          )}
+
           {key === "check" && (
             <div className="quiz">
-              <p><strong>{meta.check.question}</strong></p>
-              {meta.check.options.map((o, i) => (
+              <p><strong>{check.question}</strong></p>
+              {check.options.map((o, i) => (
                 <button key={i} onClick={() => answer(i)} className={quiz === i ? (o.correct ? "right" : "wrong") : ""}>{o.text}</button>
               ))}
-              <p className="fb" aria-live="polite">{quiz === null ? "" : meta.check.options[quiz].why}</p>
+              <p className="fb" aria-live="polite">{quiz === null ? "" : check.options[quiz].why}</p>
             </div>
           )}
 
-          {depth < 3 && key !== "check" && (
+          {depth < 3 && key !== "check" && key !== "play" && (
             <button className="go-deeper" onClick={() => setDepth((depth + 1) as 2 | 3)}>Go one level deeper</button>
           )}
         </div>
         <div className="nav">
           <button onClick={() => go(step - 1)} disabled={step === 0}>← Previous</button>
-          <span className="pos">{step + 1} / 8</span>
+          <span className="pos">{step + 1} / {STEP_KEYS.length}</span>
           <button className="primary" onClick={() => go(step + 1)} disabled={step === STEP_KEYS.length - 1}>Next →</button>
         </div>
       </div>
 
+      {vis.play ? (
+        <div className="visual wide"><Playground model={meta.playground.model} /></div>
+      ) : (
       <div className="visual">
         <figure className="figure" style={{ margin: 0 }}>
           <Diagram spec={meta.diagram} t={t} lang={lang} change={vis.change} litNodes={litNodes} litEdges={litEdges}
@@ -213,6 +238,7 @@ export function Lesson({ id, meta, code, steps }: { id: string; meta: TopicMeta;
         )}
         <CodePanel code={shown} lit={lit} note={LANG_LABEL[lang]} />
       </div>
+      )}
     </div>
   );
 }

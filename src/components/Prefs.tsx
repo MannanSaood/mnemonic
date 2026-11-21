@@ -1,7 +1,7 @@
 "use client";
 // Reader preferences: language lens and depth lens. Stored in localStorage only.
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
-import { LANGS, type Depth, type Lang } from "@/lib/types";
+import { LANGS, type Depth, type DepthName, type Lang } from "@/lib/types";
 
 interface Prefs { lang: Lang; depth: Depth; setLang: (l: Lang) => void; setDepth: (d: Depth) => void }
 const Ctx = createContext<Prefs>({ lang: "go", depth: 2, setLang: () => {}, setDepth: () => {} });
@@ -29,13 +29,17 @@ export function PrefsProvider({ children }: { children: ReactNode }) {
 export const usePrefs = () => useContext(Ctx);
 
 /* ---------- progress ---------- */
-export interface Progress { seen: number[]; done: boolean }
+/** seen: step indexes visited. passed: depths whose check was answered correctly. */
+export interface Progress { seen: number[]; passed: DepthName[] }
 export function readProgress(id: string): Progress {
   try {
     const v = localStorage.getItem("mn:progress:" + id);
-    if (v) return JSON.parse(v) as Progress;
+    if (v) {
+      const p = JSON.parse(v) as Partial<Progress>;
+      return { seen: p.seen ?? [], passed: p.passed ?? [] };
+    }
   } catch {}
-  return { seen: [], done: false };
+  return { seen: [], passed: [] };
 }
 export function writeProgress(id: string, p: Progress) {
   write("mn:progress:" + id, JSON.stringify(p));

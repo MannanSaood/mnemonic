@@ -2,7 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 import YAML from "yaml";
+import { PLAYGROUND_NAMES } from "../playgrounds/names";
 import {
+  DEPTH_NAMES,
   LANGS,
   STEP_KEYS,
   type CodeLine,
@@ -11,6 +13,8 @@ import {
   type LangCode,
   type PreparedCode,
   type PreparedLang,
+  type RoadmapProfile,
+  type SkillEntry,
   type StepKey,
   type TopicMeta,
   type Track,
@@ -36,6 +40,26 @@ export function getGlossary(): Record<string, GlossaryEntry> {
   return glossaryCache;
 }
 
+export function getSkills(): Record<string, SkillEntry> {
+  const list = YAML.parse(fs.readFileSync(path.join(CONTENT, "skills.yaml"), "utf8")) as SkillEntry[];
+  return Object.fromEntries(list.map((x) => [x.id, x]));
+}
+
+export function listRoadmaps(): RoadmapProfile[] {
+  const dir = path.join(CONTENT, "roadmaps");
+  if (!fs.existsSync(dir)) return [];
+  const skills = getSkills();
+  return fs.readdirSync(dir).filter((f) => f.endsWith(".yaml")).map((f) => {
+    const r = YAML.parse(fs.readFileSync(path.join(dir, f), "utf8")) as RoadmapProfile;
+    r.id = r.id || path.basename(f, ".yaml");
+    for (const g of r.goals) {
+      if (!skills[g.skill]) fail(`content/roadmaps/${f}`, `unknown skill "${g.skill}" (add it to content/skills.yaml)`);
+      if (!(DEPTH_NAMES as readonly string[]).includes(g.depth)) fail(`content/roadmaps/${f}`, `depth for "${g.skill}" must be overview, engineer or deep`);
+    }
+    return r;
+  });
+}
+
 /* ---------------- topics ---------------- */
 
 const STEP_RE = /^## \[([a-z]+)\]\s*(.+)$/gm;
@@ -50,6 +74,9 @@ function parseTopic(file: string): Topic {
   const { data, content } = matter(raw, { engines: { yaml: (s: string) => YAML.parse(s) as object } });
   const meta = data as TopicMeta;
   meta.slug = meta.slug || path.basename(file, ".mdx");
+  meta.id = `${meta.track}/${meta.slug}`;
+  meta.prerequisites ??= [];
+  meta.skills ??= [];
 
   // Optional trailing "## [reference]" section: extra prose for the Reference page only.
   let body = content;
@@ -68,11 +95,11 @@ function parseTopic(file: string): Topic {
     steps.push({ key: m[1] as StepKey, title: m[2].trim(), mdx: body.slice(start, end).trim() });
   });
 
-  validate(file, meta, steps);
+  validate(file, meta, steps, body + reference);
   return { meta, steps, reference };
 }
 
-function validate(file: string, meta: TopicMeta, steps: StepSource[]) {
+function validate(file: string, meta: TopicMeta, steps: StepSource[], prose: string) {
   const rel = path.relative(process.cwd(), file);
   for (const k of ["title", "track", "group", "summary", "intent", "changeRequest"] as const)
     if (!meta[k]) fail(rel, `frontmatter is missing "${k}"`);
@@ -95,9 +122,27 @@ function validate(file: string, meta: TopicMeta, steps: StepSource[]) {
     for (const w of meta.walk) if (!c.after.roles[w.role]) fail(rel, `walk role "${w.role}" has no line range in code.${lang}.after.roles`);
   }
   for (const w of meta.walk) for (const id of w.nodes) if (!nodeIds.has(id)) fail(rel, `walk names unknown node "${id}"`);
-  if (!meta.check?.options?.some((o) => o.correct)) fail(rel, "check needs one option with correct: true");
+  // roadmap metadata
+  const skills = getSkills();
+  if (!meta.skills.length) fail(rel, "skills must list at least one skill");
+  for (const sk of meta.skills) if (!skills[sk]) fail(rel, `unknown skill "${sk}" (add it to content/skills.yaml)`);
+  if (!meta.depths?.length) fail(rel, "depths must list overview, engineer and/or deep");
+  for (const d of meta.depths) {
+    if (!(DEPTH_NAMES as readonly string[]).includes(d)) fail(rel, `unknown depth "${d}"`);
+    const c = meta.checks?.[d];
+    if (!c) fail(rel, `checks.${d} is missing: every depth the lesson covers needs a check`);
+    if (c.options.filter((o) => o.correct).length !== 1) fail(rel, `checks.${d} needs exactly one option with correct: true`);
+  }
+  // playgrounds: the lesson's own, and any <Playground model="..."> in the prose
+  const names = PLAYGROUND_NAMES as readonly string[];
+  if (!meta.playground?.model) fail(rel, "playground.model is missing: every lesson has a playground");
+  if (!names.includes(meta.playground.model)) fail(rel, `unknown playground "${meta.playground.model}" (known: ${names.join(", ")})`);
+  if (!meta.playground.scenarios?.length) fail(rel, "playground.scenarios needs at least one scenario");
+  for (const m of prose.matchAll(/<Playground\s+model="([^"]+)"/g))
+    if (!names.includes(m[1])) fail(rel, `unknown playground "${m[1]}" in the prose`);
 }
 
+let prereqWarned = false;
 export function listTopics(): TopicMeta[] {
   const out: TopicMeta[] = [];
   for (const track of fs.readdirSync(CONTENT, { withFileTypes: true })) {
@@ -105,6 +150,13 @@ export function listTopics(): TopicMeta[] {
     for (const f of fs.readdirSync(path.join(CONTENT, track.name))) {
       if (f.endsWith(".mdx")) out.push(parseTopic(path.join(CONTENT, track.name, f)).meta);
     }
+  }
+  // Prerequisites may name lessons that are not written yet: warn once, do not fail.
+  const ids = new Set(out.map((t) => t.id));
+  if (!prereqWarned) {
+    prereqWarned = true;
+    for (const t of out) for (const p of t.prerequisites)
+      if (!ids.has(p)) console.warn(`[content] ${t.id}: prerequisite "${p}" is not written yet`);
   }
   return out.sort((a, b) => a.order - b.order);
 }

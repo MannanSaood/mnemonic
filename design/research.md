@@ -32,3 +32,24 @@ The rendered comparison is `design/directions.html`.
 - Margin: Fraunces, Newsreader, IBM Plex Mono
 - Schematic: Bricolage Grotesque, Instrument Sans, Martian Mono
 - Signal: Archivo (expanded width), Atkinson Hyperlegible Next, Atkinson Hyperlegible Mono
+
+## Playgrounds: what makes hands-on explainers work
+
+Studied for the "hands-on" direction (2026-11-21). Main reference: Jake Lazaroff,
+*An Interactive Intro to CRDTs* (jakelazaroff.com/words/an-interactive-intro-to-crdts/).
+
+| Source | What works | What Mnemonic takes from it |
+|---|---|---|
+| Jake Lazaroff, CRDTs | Opens with the finished, working demo ("this is what we'll end up with"). Each concept then gets its own small embedded playground (two peers side by side, a network on/off toggle, a latency slider). After each playground, a short list of **scenarios to try**, each saying what you should notice. The code shown under the playground is the same model that runs it. | Every playground ships with 2–4 guided scenarios written in the content file. Controls include failure injection (drop, delay, forget a step). The model's code is the code the lesson teaches. |
+| Bartosz Ciechanowski | Direct manipulation of one variable at a time; every figure responds instantly. | One control changes one thing; the view updates on every input, with no "run" button. |
+| Josh W. Comeau | Playgrounds where you edit and immediately see the effect; mistakes are safe and reversible. | Every playground has Reset, and breaking it is part of the lesson. |
+| Red Blob Games | You drag the actual objects, and the explanation sits next to the thing you are dragging. | Playgrounds sit inline in the lesson flow, next to the prose that tells you what to try. |
+
+Rules that follow:
+1. A playground runs a small **model**: plain TypeScript state plus pure step functions. The view
+   only renders state and sends actions, so models can be tested without a browser.
+2. Each playground has guided scenarios ("Try this: … Notice that …") in the topic file.
+3. The reader can break things on purpose (forget a branch, drop a packet, kill a leader), and
+   the model shows the consequence instead of preventing it.
+4. Every control works with the keyboard; the event log is announced to screen readers; reduced
+   motion swaps animation for instant updates.

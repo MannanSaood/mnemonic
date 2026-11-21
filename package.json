@@ -7,7 +7,8 @@
     "dev": "next dev",
     "build": "next build && pagefind --site out --output-subdir pagefind",
     "start": "npx serve out",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --no-warnings --test tests/*.test.ts"
   },
   "dependencies": {
     "gray-matter": "4.0.3",

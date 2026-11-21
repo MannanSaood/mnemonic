@@ -26,9 +26,16 @@ A topic is one file: `content/<track>/<topic>.mdx`. No code changes are needed.
   replaced lines, after, and the "same request again" addition), line ranges for each role,
   the cost meter, the language-lens notes, the walk-through steps, the check question and the
   Reference page data.
-- **Body (MDX)** holds the prose for the eight steps, each under a heading
+- **Roadmap metadata** in the frontmatter: `prerequisites` (lesson ids), `skills` (from
+  `content/skills.yaml`), `depths` (overview, engineer, deep) and `checks`, one question per
+  depth.
+- **A playground** (`playground.model` plus 2-4 `scenarios`): every lesson has one. Models live
+  in `src/playgrounds/<name>/` (a pure `model.ts` and a `View.tsx` built from
+  `src/playgrounds/kit.tsx`) and are registered in `names.ts` and `Playground.tsx`.
+  `<Playground model="..." />` also works anywhere in the prose.
+- **Body (MDX)** holds the prose for the nine steps, each under a heading
   `## [key] Title`, in this order: `concept`, `problem`, `pain`, `morph`, `walk`, `again`,
-  `lens`, `check`. An optional `## [reference]` section adds prose to the Reference page.
+  `play`, `lens`, `check`. An optional `## [reference]` section adds prose to the Reference page.
 - Inside the prose: `<Depth level={2}>` (Engineer) and `<Depth level={3}>` (Deep) for
   optional depth, `<Lang only="go">` for language-specific text, and
   `<Term id="interface">` for glossary hover definitions (`content/glossary.yaml`).
@@ -37,6 +44,10 @@ A topic is one file: `content/<track>/<topic>.mdx`. No code changes are needed.
 topic and stops with a clear message if a step, role or line range is missing or wrong.
 
 Tracks are listed in `content/tracks.yaml`; a track goes live when it has a topic.
+Roadmap goal profiles are in `content/roadmaps/`; `src/lib/roadmap.ts` turns a profile into an
+ordered path (the roadmap pages come later).
+
+`npm test` runs the playground model and roadmap tests (no browser needed).
 
 ## Layout
 
@@ -46,7 +57,7 @@ src/app/              pages: home, track, Learn, Reference, glossary
 src/components/       Lesson (the 8-step workflow), Diagram (morph), CodePanel, LensBar, ...
 src/lib/              content loading and validation, Shiki highlighting, MDX
 design/               the visual-direction comparison and research notes
-reference/            source material (the copyrighted textbook is git-ignored)
+reference/            source material; reference/books/ and all PDFs are git-ignored
 ```
 
 ## Design

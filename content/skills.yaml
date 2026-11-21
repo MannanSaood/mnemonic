@@ -1,0 +1,31 @@
+# The skill vocabulary. Topics tag themselves with these ids, and roadmap profiles ask for them.
+- id: design
+  title: Software design
+  summary: Shaping code so that likely changes are cheap; interfaces, coupling, cohesion, patterns.
+- id: extensibility
+  title: Extensibility
+  summary: Adding new variants and behaviour without editing code that already works.
+- id: testing
+  title: Testing
+  summary: Unit, integration and property tests; fakes and seams.
+- id: concurrency
+  title: Concurrency
+  summary: Goroutines and threads, channels, locks, races, and the scheduler.
+- id: go-runtime
+  title: Go runtime
+  summary: The scheduler, garbage collector, interfaces and maps as the runtime sees them.
+- id: os
+  title: Operating systems
+  summary: Processes, syscalls, virtual memory, files and the kernel's view of a program.
+- id: networking
+  title: Networking
+  summary: TCP, DNS, TLS and HTTP, from packets to protocols.
+- id: distributed-systems
+  title: Distributed systems
+  summary: Consensus, replication, clocks and failure.
+- id: kubernetes
+  title: Kubernetes
+  summary: Controllers, the API server, scheduling and operators.
+- id: debugging
+  title: Debugging
+  summary: Reading traces, profiles and logs to find the cause, not the symptom.

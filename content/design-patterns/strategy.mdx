@@ -5,9 +5,25 @@ group: Behavioral
 order: 1
 summary: Put each way of doing one step behind a shared interface, and let the caller choose which one to plug in.
 intent: The code that uses a step should not need to know how many ways there are to do it.
-changeRequest: The web-assets bucket needs Brotli compression.
+changeRequest: The EU store needs Klarna, so customers can pay later.
 languages: [go, python, typescript, rust]
-glossary: [interface, context-role, dependency-injection, open-closed, dynamic-dispatch]
+glossary: [interface, context-role, dependency-injection, open-closed, dynamic-dispatch, structural-typing]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: strategy-checkout
+  scenarios:
+    - try: In the switch design, pay with Stripe, then refund it.
+      notice: The call goes through a `case "stripe"` branch in Pay and another one in Refund.
+    - try: Still in the switch design, add Klarna to the config list and to the Pay switch only. Pay with Klarna, then refund.
+      notice: The payment works and the refund fails. The customer has paid and cannot get the money back, and nothing warned you.
+    - try: Switch to the strategy design and add the Klarna type. Pay and refund with Klarna.
+      notice: One addition, and both calls work. The meter shows no edits to existing code.
 
 # ---------------------------------------------------------------- diagram
 # Boxes are in SVG units. "before" is the design in the Problem step, "after" the refactored one.
@@ -17,41 +33,41 @@ diagram:
   nodes:
     - id: client
       kind: client
-      before: { x: 12, y: 30, w: 100, h: 48, title: config, sub: valid codecs }
+      before: { x: 12, y: 30, w: 100, h: 48, title: config, sub: provider list }
       after:  { x: 12, y: 30, w: 100, h: 48, title: main, sub: picks one }
     - id: context
       kind: context
-      before: { x: 168, y: 18, w: 262, h: 246, title: Uploader, sub: { go: "switch u.codec { … }", python: "if / elif self.codec", typescript: "switch (this.codec)", rust: "match self.codec" } }
-      after:  { x: 168, y: 30, w: 142, h: 56, title: Uploader, sub: { go: c Compressor, python: self.compress, typescript: private c, rust: "c: C" } }
+      before: { x: 168, y: 18, w: 262, h: 246, title: Checkout, sub: { go: "switch c.provider (×2)", python: "if / elif (×2)", typescript: "switch (this.provider) ×2", rust: "match self.provider (×2)" } }
+      after:  { x: 168, y: 30, w: 150, h: 56, title: Checkout, sub: { go: p PaymentProvider, python: self.provider, typescript: private provider, rust: "Box<dyn …>" } }
     - id: strategy
       kind: strategy
       appears: after
-      before: { x: 380, y: 30, w: 168, h: 56, title: "" }
-      after:  { x: 380, y: 30, w: 168, h: 56, title: { go: Compressor, python: Compress, typescript: Compressor, rust: Compressor }, sub: { go: interface, python: "Callable[[bytes], bytes]", typescript: interface, rust: trait } }
-    - id: gzip
+      before: { x: 370, y: 30, w: 180, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 180, h: 56, title: PaymentProvider, sub: { go: Charge · Refund, python: charge · refund, typescript: charge · refund, rust: charge · refund } }
+    - id: stripe
       kind: concrete
-      before: { x: 188, y: 88, w: 222, h: 32, title: { go: case "gzip", python: '== "gzip"', typescript: case "gzip", rust: '"gzip" =>' } }
-      after:  { x: 280, y: 204, w: 62, h: 40, title: { go: Gzip, python: gzip, typescript: Gzip, rust: Gzip } }
-    - id: zstd
+      before: { x: 188, y: 88, w: 222, h: 32, title: { go: case "stripe", python: '== "stripe"', typescript: case "stripe", rust: '"stripe" =>' } }
+      after:  { x: 280, y: 204, w: 62, h: 40, title: Stripe }
+    - id: paypal
       kind: concrete
-      before: { x: 188, y: 128, w: 222, h: 32, title: { go: case "zstd", python: '== "zstd"', typescript: case "zstd", rust: '"zstd" =>' } }
-      after:  { x: 350, y: 204, w: 62, h: 40, title: { go: Zstd, python: zstd, typescript: Zstd, rust: Zstd } }
-    - id: none
+      before: { x: 188, y: 128, w: 222, h: 32, title: { go: case "paypal", python: '== "paypal"', typescript: case "paypal", rust: '"paypal" =>' } }
+      after:  { x: 350, y: 204, w: 62, h: 40, title: PayPal }
+    - id: adyen
       kind: concrete
-      before: { x: 188, y: 168, w: 222, h: 32, title: { go: case "none", python: '== "none"', typescript: case "none", rust: '"none" =>' } }
-      after:  { x: 420, y: 204, w: 62, h: 40, title: { go: None, python: identity, typescript: Identity, rust: Identity } }
-    - id: brotli
+      before: { x: 188, y: 168, w: 222, h: 32, title: { go: case "adyen", python: '== "adyen"', typescript: case "adyen", rust: '"adyen" =>' } }
+      after:  { x: 420, y: 204, w: 62, h: 40, title: Adyen }
+    - id: klarna
       kind: concrete
       appears: change
-      before: { x: 188, y: 214, w: 222, h: 32, title: { go: case "brotli", python: '== "brotli"', typescript: case "brotli", rust: '"brotli" =>' } }
-      after:  { x: 490, y: 204, w: 62, h: 40, title: { go: Brotli, python: brotli, typescript: Brotli, rust: Brotli } }
+      before: { x: 188, y: 214, w: 222, h: 32, title: { go: case "klarna", python: '== "klarna"', typescript: case "klarna", rust: '"klarna" =>' } }
+      after:  { x: 490, y: 204, w: 62, h: 40, title: Klarna }
   edges:
     - { from: client, to: context, label: injects }
     - { from: context, to: strategy, label: holds }
-    - { from: gzip, to: strategy, kind: implements }
-    - { from: zstd, to: strategy, kind: implements, label: implements }
-    - { from: none, to: strategy, kind: implements }
-    - { from: brotli, to: strategy, kind: implements }
+    - { from: stripe, to: strategy, kind: implements }
+    - { from: paypal, to: strategy, kind: implements, label: implements }
+    - { from: adyen, to: strategy, kind: implements }
+    - { from: klarna, to: strategy, kind: implements }
 
 # ---------------------------------------------------------------- code
 # roles map a diagram node (or a walk role) to the lines it highlights.
@@ -59,327 +75,373 @@ diagram:
 code:
   go:
     before:
-      file: upload.go · config.go · headers.go
+      file: checkout.go · config.go
       source: |
-        // upload.go
-        func (u *Uploader) Upload(data []byte) error {
-            var body []byte
-            switch u.codec {
-            case "gzip":
-                body = gzipBytes(data)
-            case "zstd":
-                body = zstdBytes(data)
-            case "none":
-                body = data
+        // checkout.go
+        func (c *Checkout) Pay(o Order) (Receipt, error) {
+            switch c.provider {
+            case "stripe":
+                return c.stripe.Charge(o.Total, o.CardToken)
+            case "paypal":
+                return c.paypal.CreatePayment(o.Total, o.Email)
+            case "adyen":
+                return c.adyen.Authorise(o.Total, o.CardToken)
             default:
-                return fmt.Errorf("unknown codec %q", u.codec)
+                return Receipt{}, fmt.Errorf("unknown provider %q", c.provider)
             }
-            return u.send(body, encodingFor(u.codec))
+        }
+
+        func (c *Checkout) Refund(r Receipt) error {
+            switch c.provider {
+            case "stripe":
+                return c.stripe.Refund(r.ID)
+            case "paypal":
+                return c.paypal.RefundSale(r.ID)
+            case "adyen":
+                return c.adyen.Cancel(r.ID)
+            }
+            return fmt.Errorf("unknown provider %q", c.provider)
         }
 
         // config.go
-        var validCodecs = []string{"gzip", "zstd", "none"}
-
-        // headers.go
-        func encodingFor(codec string) string {
-            if codec == "none" { return "identity" }
-            return codec
-        }
-      roles: { context: [2, 15], gzip: [5, 6], zstd: [7, 8], none: [9, 10], client: [18, 18] }
+        var providers = []string{"stripe", "paypal", "adyen"}
+      roles: { context: [2, 25], stripe: [4, 5], paypal: [6, 7], adyen: [8, 9], client: [28, 28] }
       change:
-        - { after: 10, add: ['    case "brotli":', '        body = brotliBytes(data)'] }
-        - { line: 18, replace: 'var validCodecs = []string{"gzip", "zstd", "none", "brotli"}' }
-        - { after: 22, add: ['    if codec == "brotli" { return "br" }'] }
+        - { after: 9, add: ['    case "klarna":', '        return c.klarna.CreateOrder(o.Total, o.Email)'] }
+        - { after: 22, add: ['    case "klarna":', '        return c.klarna.Refund(r.ID)'] }
+        - { line: 28, replace: 'var providers = []string{"stripe", "paypal", "adyen", "klarna"}' }
     after:
-      file: upload.go · main.go
+      file: checkout.go · main.go
       source: |
-        type Compressor interface {
-            Compress(data []byte) ([]byte, error)
-            Encoding() string
+        type PaymentProvider interface {
+            Charge(o Order) (Receipt, error)
+            Refund(r Receipt) error
         }
 
-        type Uploader struct{ c Compressor }
+        type Checkout struct{ p PaymentProvider }
 
-        func (u *Uploader) Upload(data []byte) error {
-            body, err := u.c.Compress(data)
-            if err != nil {
-                return err
-            }
-            return u.send(body, u.c.Encoding())
+        func (c *Checkout) Pay(o Order) (Receipt, error) {
+            return c.p.Charge(o)
+        }
+
+        func (c *Checkout) Refund(r Receipt) error {
+            return c.p.Refund(r)
         }
 
         // main.go: the caller picks
-        up := &Uploader{c: Zstd{Level: 3}}
-      roles: { strategy: [1, 4], context: [6, 14], client: [17, 17], call: [8, 8], dispatch: [9, 9], send: [13, 13] }
+        co := &Checkout{p: stripe.New(apiKey)}
+      roles: { strategy: [1, 4], context: [6, 14], client: [17, 17], call: [8, 8], dispatch: [9, 9], refund: [12, 13] }
     again:
-      file: brotli.go
+      file: klarna.go
       source: |
-        // brotli.go: a new file; nothing above changes
-        type Brotli struct{ Quality int }
+        // klarna.go: a new file; nothing above changes
+        type Klarna struct{ client *klarna.Client }
 
-        func (b Brotli) Compress(p []byte) ([]byte, error) { /* … */ }
-        func (Brotli) Encoding() string                  { return "br" }
+        func (k Klarna) Charge(o Order) (Receipt, error) { /* … */ }
+        func (k Klarna) Refund(r Receipt) error          { /* … */ }
     cost:
-      before: { text: 4 lines · 3 files, value: 0.8 }
+      before: { text: 5 lines · 3 places, value: 0.85 }
       after: { text: 1 new type · 0 edits, value: 0.12 }
     lens:
       need: 3
       needLabel: Common
-      note: 'Use an interface when the variant carries state or has more than one method. When it is a single call, a plain function value is the Go way: `type CompressFunc func([]byte) ([]byte, error)`.'
+      note: 'Use an interface when the variant has more than one method (here, `Charge` and `Refund`) or carries state. For a single call, a plain function value is the Go way: `type ChargeFunc func(Order) (Receipt, error)`.'
       seenIn: '`sort.Slice(x, less)` and `slices.SortFunc` take the comparison as a function. `http.Server` takes any `http.Handler`. `hash.Hash` implementations swap behind one interface.'
 
   python:
     before:
-      file: upload.py · config.py · headers.py
+      file: checkout.py · config.py
       source: |
-        # upload.py
-        class Uploader:
-            def upload(self, data: bytes) -> None:
-                if self.codec == "gzip":
-                    body = gzip.compress(data)
-                elif self.codec == "zstd":
-                    body = zstd.compress(data)
-                elif self.codec == "none":
-                    body = data
-                else:
-                    raise ValueError(f"unknown codec {self.codec!r}")
-                self.send(body, encoding_for(self.codec))
+        # checkout.py
+        class Checkout:
+            def pay(self, order: Order) -> Receipt:
+                if self.provider == "stripe":
+                    return self.stripe.charge(order.total, order.card_token)
+                elif self.provider == "paypal":
+                    return self.paypal.create_payment(order.total, order.email)
+                elif self.provider == "adyen":
+                    return self.adyen.authorise(order.total, order.card_token)
+                raise ValueError(f"unknown provider {self.provider!r}")
+
+            def refund(self, receipt: Receipt) -> None:
+                if self.provider == "stripe":
+                    self.stripe.refund(receipt.id)
+                elif self.provider == "paypal":
+                    self.paypal.refund_sale(receipt.id)
+                elif self.provider == "adyen":
+                    self.adyen.cancel(receipt.id)
 
         # config.py
-        VALID_CODECS = {"gzip", "zstd", "none"}
-
-        # headers.py
-        def encoding_for(codec: str) -> str:
-            return "identity" if codec == "none" else codec
-      roles: { context: [2, 12], gzip: [4, 5], zstd: [6, 7], none: [8, 9], client: [15, 15] }
+        PROVIDERS = {"stripe", "paypal", "adyen"}
+      roles: { context: [2, 18], stripe: [4, 5], paypal: [6, 7], adyen: [8, 9], client: [21, 21] }
       change:
-        - { after: 9, add: ['        elif self.codec == "brotli":', '            body = brotli.compress(data)'] }
-        - { line: 15, replace: 'VALID_CODECS = {"gzip", "zstd", "none", "brotli"}' }
-        - { line: 19, replace: '    return {"none": "identity", "brotli": "br"}.get(codec, codec)' }
+        - { after: 9, add: ['        elif self.provider == "klarna":', '            return self.klarna.create_order(order.total, order.email)'] }
+        - { after: 18, add: ['        elif self.provider == "klarna":', '            self.klarna.refund(receipt.id)'] }
+        - { line: 21, replace: 'PROVIDERS = {"stripe", "paypal", "adyen", "klarna"}' }
     after:
-      file: upload.py · main.py
+      file: checkout.py · main.py
       source: |
-        from typing import Callable
+        from typing import Protocol
 
-        Compress = Callable[[bytes], bytes]
+        class PaymentProvider(Protocol):
+            def charge(self, order: Order) -> Receipt: ...
+            def refund(self, receipt: Receipt) -> None: ...
 
-        class Uploader:
-            def __init__(self, compress: Compress, encoding: str):
-                self.compress = compress
-                self.encoding = encoding
+        class Checkout:
+            def __init__(self, provider: PaymentProvider):
+                self.provider = provider
 
-            def upload(self, data: bytes) -> None:
-                body = self.compress(data)
-                self.send(body, self.encoding)
+            def pay(self, order: Order) -> Receipt:
+                return self.provider.charge(order)
+
+            def refund(self, receipt: Receipt) -> None:
+                self.provider.refund(receipt)
 
         # main.py: the caller picks
-        up = Uploader(zstd.compress, "zstd")
-      roles: { strategy: [1, 3], context: [5, 12], client: [15, 15], call: [10, 10], dispatch: [11, 11], send: [12, 12] }
+        checkout = Checkout(StripeProvider(api_key))
+      roles: { strategy: [3, 5], context: [7, 15], client: [18, 18], call: [11, 11], dispatch: [12, 12], refund: [14, 15] }
     again:
-      file: main.py
+      file: klarna.py
       source: |
-        # brotli: nothing new to write; pass the library's function
-        up = Uploader(brotli.compress, "br")
+        # klarna.py: a new class; nothing above changes
+        class KlarnaProvider:
+            def charge(self, order: Order) -> Receipt: ...
+            def refund(self, receipt: Receipt) -> None: ...
     cost:
-      before: { text: 4 lines · 3 files, value: 0.8 }
-      after: { text: 0 new types · 0 edits, value: 0.06 }
+      before: { text: 5 lines · 3 places, value: 0.85 }
+      after: { text: 1 new class · 0 edits, value: 0.12 }
     lens:
-      need: 1
-      needLabel: Rarely as a class
-      note: 'Functions are first-class, so a strategy is usually just a callable passed in. Reach for a `Protocol` class only when the strategy keeps state or has several methods.'
+      need: 2
+      needLabel: Sometimes
+      note: 'With one method, just pass a function. Here there are two (`charge` and `refund`), so a `Protocol` names the contract. Any class with those methods fits; it never has to inherit from `PaymentProvider`.'
       seenIn: '`sorted(items, key=…)`. `json.dumps(obj, default=…)`. `logging.Handler` subclasses plugged into a logger.'
 
   typescript:
     before:
-      file: upload.ts · config.ts · headers.ts
+      file: checkout.ts · config.ts
       source: |
-        // upload.ts
-        async upload(data: Uint8Array): Promise<void> {
-          let body: Uint8Array;
-          switch (this.codec) {
-            case "gzip":
-              body = gzipSync(data);
-              break;
-            case "zstd":
-              body = zstdCompressSync(data);
-              break;
-            case "none":
-              body = data;
-              break;
+        // checkout.ts
+        async pay(order: Order): Promise<Receipt> {
+          switch (this.provider) {
+            case "stripe":
+              return this.stripe.charge(order.total, order.cardToken);
+            case "paypal":
+              return this.paypal.createPayment(order.total, order.email);
+            case "adyen":
+              return this.adyen.authorise(order.total, order.cardToken);
             default:
-              throw new Error(`unknown codec ${this.codec}`);
+              throw new Error(`unknown provider ${this.provider}`);
           }
-          await this.send(body, encodingFor(this.codec));
+        }
+
+        async refund(receipt: Receipt): Promise<void> {
+          switch (this.provider) {
+            case "stripe":
+              return this.stripe.refund(receipt.id);
+            case "paypal":
+              return this.paypal.refundSale(receipt.id);
+            case "adyen":
+              return this.adyen.cancel(receipt.id);
+          }
         }
 
         // config.ts
-        export const VALID_CODECS = ["gzip", "zstd", "none"] as const;
-
-        // headers.ts
-        export const encodingFor = (codec: string) =>
-          codec === "none" ? "identity" : codec;
-      roles: { context: [2, 18], gzip: [5, 7], zstd: [8, 10], none: [11, 13], client: [21, 21] }
+        export const PROVIDERS = ["stripe", "paypal", "adyen"] as const;
+      roles: { context: [2, 24], stripe: [4, 5], paypal: [6, 7], adyen: [8, 9], client: [27, 27] }
       change:
-        - { after: 13, add: ['    case "brotli":', '      body = brotliCompressSync(data);', '      break;'] }
-        - { line: 21, replace: 'export const VALID_CODECS = ["gzip", "zstd", "none", "brotli"] as const;' }
-        - { line: 25, replace: '  codec === "none" ? "identity" : codec === "brotli" ? "br" : codec;' }
+        - { after: 9, add: ['    case "klarna":', '      return this.klarna.createOrder(order.total, order.email);'] }
+        - { after: 22, add: ['    case "klarna":', '      return this.klarna.refund(receipt.id);'] }
+        - { line: 27, replace: 'export const PROVIDERS = ["stripe", "paypal", "adyen", "klarna"] as const;' }
     after:
-      file: upload.ts · main.ts
+      file: checkout.ts · main.ts
       source: |
-        interface Compressor {
-          readonly encoding: string;
-          compress(data: Uint8Array): Uint8Array;
+        interface PaymentProvider {
+          charge(order: Order): Promise<Receipt>;
+          refund(receipt: Receipt): Promise<void>;
         }
 
-        class Uploader {
-          constructor(private readonly c: Compressor) {}
+        class Checkout {
+          constructor(private readonly provider: PaymentProvider) {}
 
-          async upload(data: Uint8Array): Promise<void> {
-            const body = this.c.compress(data);
-            await this.send(body, this.c.encoding);
+          pay(order: Order): Promise<Receipt> {
+            return this.provider.charge(order);
+          }
+
+          refund(receipt: Receipt): Promise<void> {
+            return this.provider.refund(receipt);
           }
         }
 
         // main.ts: the caller picks
-        const up = new Uploader(new Zstd({ level: 3 }));
-      roles: { strategy: [1, 4], context: [6, 13], client: [16, 16], call: [9, 9], dispatch: [10, 10], send: [11, 11] }
+        const checkout = new Checkout(new StripeProvider(apiKey));
+      roles: { strategy: [1, 4], context: [6, 16], client: [19, 19], call: [9, 9], dispatch: [10, 10], refund: [13, 14] }
     again:
-      file: brotli.ts
+      file: klarna.ts
       source: |
-        // brotli.ts: a new file; nothing above changes
-        export class Brotli implements Compressor {
-          readonly encoding = "br";
-          compress(data: Uint8Array) { return brotliCompressSync(data); }
+        // klarna.ts: a new file; nothing above changes
+        export class KlarnaProvider implements PaymentProvider {
+          async charge(order: Order): Promise<Receipt> { /* … */ }
+          async refund(receipt: Receipt): Promise<void> { /* … */ }
         }
     cost:
-      before: { text: 5 lines · 3 files, value: 0.85 }
+      before: { text: 5 lines · 3 places, value: 0.85 }
       after: { text: 1 new class · 0 edits, value: 0.12 }
     lens:
       need: 3
       needLabel: Common
-      note: 'Types are structural: any object with an `encoding` and a `compress` method fits, with no `implements` needed. For a single method, a function type such as `(data: Uint8Array) => Uint8Array` is lighter.'
+      note: 'Types are structural: any object with `charge` and `refund` methods of the right shape fits, with or without `implements`. For a single method, a function type such as `(order: Order) => Promise<Receipt>` is lighter.'
       seenIn: '`Array.prototype.sort(compareFn)`. Passport.js, whose login methods are literally called strategies. Pluggable loaders and plugins in bundlers.'
 
   rust:
     before:
-      file: upload.rs · config.rs · headers.rs
+      file: checkout.rs · config.rs
       source: |
-        // upload.rs
-        fn upload(&self, data: &[u8]) -> io::Result<()> {
-            let body = match self.codec.as_str() {
-                "gzip" => gzip_bytes(data)?,
-                "zstd" => zstd::encode_all(data, 3)?,
-                "none" => data.to_vec(),
-                other => return Err(unknown_codec(other)),
-            };
-            self.send(&body, encoding_for(&self.codec))
-        }
-
-        // config.rs
-        const VALID_CODECS: &[&str] = &["gzip", "zstd", "none"];
-
-        // headers.rs
-        fn encoding_for(codec: &str) -> &str {
-            if codec == "none" { "identity" } else { codec }
-        }
-      roles: { context: [2, 10], gzip: [4, 4], zstd: [5, 5], none: [6, 6], client: [13, 13] }
-      change:
-        - { after: 6, add: ['        "brotli" => brotli_bytes(data)?,'] }
-        - { line: 13, replace: 'const VALID_CODECS: &[&str] = &["gzip", "zstd", "none", "brotli"];' }
-        - { line: 17, replace: '    match codec { "none" => "identity", "brotli" => "br", c => c }' }
-    after:
-      file: upload.rs · main.rs
-      source: |
-        trait Compressor {
-            fn compress(&self, data: &[u8]) -> io::Result<Vec<u8>>;
-            fn encoding(&self) -> &'static str;
-        }
-
-        struct Uploader<C: Compressor> { c: C }
-
-        impl<C: Compressor> Uploader<C> {
-            fn upload(&self, data: &[u8]) -> io::Result<()> {
-                let body = self.c.compress(data)?;
-                self.send(&body, self.c.encoding())
+        // checkout.rs
+        fn pay(&self, order: &Order) -> Result<Receipt, PayError> {
+            match self.provider.as_str() {
+                "stripe" => self.stripe.charge(order.total, &order.card_token),
+                "paypal" => self.paypal.create_payment(order.total, &order.email),
+                "adyen" => self.adyen.authorise(order.total, &order.card_token),
+                other => Err(PayError::UnknownProvider(other.into())),
             }
         }
 
-        // main.rs: the caller picks
-        let up = Uploader { c: Zstd { level: 3 } };
-      roles: { strategy: [1, 4], context: [6, 13], client: [16, 16], call: [9, 9], dispatch: [10, 10], send: [11, 11] }
-    again:
-      file: brotli.rs
-      source: |
-        // brotli.rs: a new file; nothing above changes
-        struct Brotli { quality: u32 }
+        fn refund(&self, receipt: &Receipt) -> Result<(), PayError> {
+            match self.provider.as_str() {
+                "stripe" => self.stripe.refund(&receipt.id),
+                "paypal" => self.paypal.refund_sale(&receipt.id),
+                "adyen" => self.adyen.cancel(&receipt.id),
+                other => Err(PayError::UnknownProvider(other.into())),
+            }
+        }
 
-        impl Compressor for Brotli { /* compress, encoding */ }
+        // config.rs
+        const PROVIDERS: &[&str] = &["stripe", "paypal", "adyen"];
+      roles: { context: [2, 18], stripe: [4, 4], paypal: [5, 5], adyen: [6, 6], client: [21, 21] }
+      change:
+        - { after: 6, add: ['        "klarna" => self.klarna.create_order(order.total, &order.email),'] }
+        - { after: 15, add: ['        "klarna" => self.klarna.refund(&receipt.id),'] }
+        - { line: 21, replace: 'const PROVIDERS: &[&str] = &["stripe", "paypal", "adyen", "klarna"];' }
+    after:
+      file: checkout.rs · main.rs
+      source: |
+        trait PaymentProvider {
+            fn charge(&self, order: &Order) -> Result<Receipt, PayError>;
+            fn refund(&self, receipt: &Receipt) -> Result<(), PayError>;
+        }
+
+        struct Checkout {
+            provider: Box<dyn PaymentProvider>,
+        }
+
+        impl Checkout {
+            fn pay(&self, order: &Order) -> Result<Receipt, PayError> {
+                self.provider.charge(order)
+            }
+
+            fn refund(&self, receipt: &Receipt) -> Result<(), PayError> {
+                self.provider.refund(receipt)
+            }
+        }
+
+        // main.rs: the caller picks, from config, at runtime
+        let checkout = Checkout { provider: Box::new(Stripe::new(api_key)) };
+      roles: { strategy: [1, 4], context: [6, 18], client: [21, 21], call: [11, 11], dispatch: [12, 12], refund: [15, 16] }
+    again:
+      file: klarna.rs
+      source: |
+        // klarna.rs: a new file; nothing above changes
+        struct Klarna { client: klarna::Client }
+
+        impl PaymentProvider for Klarna { /* charge, refund */ }
     cost:
-      before: { text: 3 lines · 3 files, value: 0.7 }
+      before: { text: 3 lines · 3 places, value: 0.7 }
       after: { text: 1 new type · 0 edits, value: 0.12 }
     lens:
       need: 4
       needLabel: Core idiom
-      note: 'Use a generic `C: Compressor` when the choice is fixed at build time, and `Box<dyn Compressor>` when it comes from config at runtime. A closure such as `impl Fn(&[u8]) -> Vec<u8>` covers the one-method case.'
+      note: 'Use `Box<dyn PaymentProvider>` when the choice comes from config at runtime, as here. When it is fixed at build time, a generic `Checkout<P: PaymentProvider>` lets the compiler inline the calls. Closures cover the one-method case.'
       seenIn: '`slice::sort_by(|a, b| …)`. `HashMap<K, V, S>` takes its hashing strategy as the type parameter `S: BuildHasher`. Layers in `tower::Service`.'
 
 # ---------------------------------------------------------------- how it works
 walk:
-  - text: { go: '`main` builds an Uploader and hands it a `Zstd`. The choice is made once, outside.', python: '`main` builds an Uploader and hands it `zstd.compress`. The choice is made once, outside.', typescript: '`main` builds an Uploader and hands it a `Zstd`. The choice is made once, outside.', rust: '`main` builds an Uploader with a `Zstd`. The choice is made once, outside.' }
+  - text: { go: '`main` builds a Checkout and hands it a Stripe provider. The choice is made once, outside.', python: '`main` builds a Checkout and hands it a `StripeProvider`. The choice is made once, outside.', typescript: '`main` builds a Checkout and hands it a `StripeProvider`. The choice is made once, outside.', rust: '`main` boxes a `Stripe` and hands it to a Checkout. The choice is made once, outside.' }
     nodes: [client]
     edges: [client>context]
     role: client
-  - text: { go: 'Something calls `Upload(data)`. Uploader has no idea which codec it holds.', python: 'Something calls `upload(data)`. Uploader has no idea which codec it holds.', typescript: 'Something calls `upload(data)`. Uploader has no idea which codec it holds.', rust: 'Something calls `upload(data)`. Uploader only knows that `C` is a Compressor.' }
+  - text: { go: 'The shop calls `Pay(order)`. Checkout has no idea which provider it holds.', python: 'The shop calls `pay(order)`. Checkout has no idea which provider it holds.', typescript: 'The shop calls `pay(order)`. Checkout has no idea which provider it holds.', rust: 'The shop calls `pay(&order)`. Checkout only knows it holds some `PaymentProvider`.' }
     nodes: [context]
     edges: []
     role: call
-  - text: { go: '`u.c.Compress(data)` goes through the Compressor interface and runs Zstd''s method.', python: '`self.compress(data)` calls whatever function was passed in: here, `zstd.compress`.', typescript: '`this.c.compress(data)` calls the method on whatever object was passed in: here, a `Zstd`.', rust: '`self.c.compress(data)` calls Zstd''s implementation of the Compressor trait.' }
-    nodes: [strategy, zstd]
-    edges: [context>strategy, zstd>strategy]
+  - text: { go: '`c.p.Charge(o)` goes through the PaymentProvider interface and runs Stripe''s method.', python: '`self.provider.charge(order)` calls the method on whatever object was passed in: here, a `StripeProvider`.', typescript: '`this.provider.charge(order)` calls the method on whatever object was passed in: here, a `StripeProvider`.', rust: '`self.provider.charge(order)` looks up Stripe''s `charge` in the trait object''s vtable and calls it.' }
+    nodes: [strategy, stripe]
+    edges: [context>strategy, stripe>strategy]
     role: dispatch
-  - text: "Uploader sends the result with the codec's own encoding name. There is no lookup table left to update."
-    nodes: [context]
-    edges: []
-    role: send
+  - text: Later, Refund goes to the same provider object. Pay and Refund can no longer disagree about which provider took the money.
+    nodes: [context, strategy, stripe]
+    edges: [context>strategy, stripe>strategy]
+    role: refund
 
-# ---------------------------------------------------------------- check
-check:
-  question: Which of these situations calls for a Strategy?
-  options:
-    - text: A billing service applies one tax rule per country, chosen from config when the request starts.
-      correct: true
-      why: Right. The rule varies, the caller picks it, and the rule never switches itself during the request.
-    - text: A TCP connection behaves differently in LISTEN, ESTABLISHED and CLOSE_WAIT, and moves between those states by itself.
-      why: That is State. It has the same shape, but the object changes its own behaviour as it moves between states. In Strategy, the caller chooses.
-    - text: Three exporters all open a file, write a header, write rows and close, and differ only in how they write one row.
-      why: That is Template Method. The order of steps is fixed in one place and only one step varies. Strategy swaps the whole step, chosen from outside.
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these situations calls for a Strategy?
+    options:
+      - text: A billing service applies one tax rule per country, chosen from config when the request starts.
+        correct: true
+        why: Right. The rule varies, the caller picks it, and the rule never switches itself during the request.
+      - text: A TCP connection behaves differently in LISTEN, ESTABLISHED and CLOSE_WAIT, and moves between those states by itself.
+        why: That is State. It has the same shape, but the object changes its own behaviour as it moves between states. In Strategy, the caller chooses.
+      - text: Three exporters all open a file, write a header, write rows and close, and differ only in how they write one row.
+        why: That is Template Method. The order of steps is fixed in one place and only one step varies. Strategy swaps the whole step, chosen from outside.
+  engineer:
+    question: A new provider needs the customer's billing address. The existing providers ignore it. What is the cleanest change?
+    options:
+      - text: Add the billing address to Order, which every provider already receives.
+        correct: true
+        why: Right. The interface stays the same, and the providers that do not need the address ignore it. Every strategy getting the same inputs is the known cost of Strategy, and here it is cheap.
+      - text: In Checkout, check whether the provider is the new one, and if so look up the address and pass it separately.
+        why: That brings back a branch on the provider inside Checkout, the exact thing the pattern removed. The next special case adds another.
+      - text: Add a SetBillingAddress method to the PaymentProvider interface.
+        why: Every provider would have to implement a method that only one of them uses, and Checkout must remember to call it before Charge.
+  deep:
+    question: Checkout's provider is chosen from config at startup. Why can a call through the interface cost a little more than a direct call?
+    options:
+      - text: The target is found at runtime, through a table of method pointers or an attribute lookup, so the call is indirect and usually cannot be inlined.
+        correct: true
+        why: Right. In Go it is the itab, in Rust the vtable of a trait object, in Python and JavaScript a lookup on the object. For a payment call that waits on the network, the cost is invisible.
+      - text: The provider is copied each time a method is called through the interface.
+        why: No. The interface value holds a pointer (or a small value), and the call passes the receiver along. Nothing else is copied per call.
+      - text: The runtime checks the provider's type with reflection on every call.
+        why: No. The method table is set up when the provider is stored in the interface or trait object. No reflection happens on the call path.
 
 # ---------------------------------------------------------------- reference page
 reference:
   roles:
     - role: Context
-      example: Uploader
+      example: Checkout
       job: Holds a strategy and calls it. Never chooses one.
     - role: Strategy
-      example: { go: "Compressor (interface)", python: "Compress (a callable type)", typescript: "Compressor (interface)", rust: "Compressor (trait)" }
-      job: The one step that varies, given a name.
+      example: { go: "PaymentProvider (interface)", python: "PaymentProvider (Protocol)", typescript: "PaymentProvider (interface)", rust: "PaymentProvider (trait)" }
+      job: The step that varies, given a name.
     - role: Concrete strategy
-      example: { go: "Gzip, Zstd, None", python: "gzip.compress, zstd.compress", typescript: "Gzip, Zstd, Identity", rust: "Gzip, Zstd, Identity" }
+      example: "Stripe, PayPal, Adyen"
       job: One way of doing the step each.
     - role: Client
       example: main, or the config loader
       job: Picks a strategy and hands it to the context.
   useWhen:
     - Several interchangeable ways to do one step, chosen by config or by the caller.
-    - You want to test each variant alone, with a fixed input.
-    - The list of variants keeps growing, or is extended by other teams or plugins.
+    - Several operations must always agree on the same choice, like Pay and Refund here.
+    - You want to test each variant alone, and test the context with a fake.
   avoidWhen:
-    - There are only two variants and no third in sight. An if is clearer; add the interface when the second real variant arrives.
+    - There are only two variants and no third in sight. An if is clearer; add the interface when the next real variant arrives.
     - The variants need very different inputs. Forcing them behind one signature makes every strategy receive data it ignores.
   tradeoffs:
     - The caller must know which strategies exist in order to pick one.
     - More small types or functions to name and find.
-    - In Go and Rust (with trait objects), a call through the interface is indirect and usually cannot be inlined.
+    - Every strategy gets the same inputs, even the ones it does not use.
+    - In Go, and in Rust with trait objects, a call through the interface is indirect and usually cannot be inlined.
   lookalikes:
     - name: State
       how: Same shape, but the object switches its own behaviour as its state changes. In Strategy, the caller chooses and the choice does not change itself.
@@ -398,80 +460,84 @@ reference:
 The code that *uses* the step should not need to know how many ways there are to do it, or which one it was given.
 
 <Depth level={2}>
-Three roles do the work. The <Term id="context-role">context</Term> (`Uploader`) holds a strategy and calls it. The **strategy** is the step, named as a type. Each **concrete strategy** is one way of doing the step. A fourth party, the **client**, picks one and hands it in; usually that is `main` or the config loader. Handing it in is <Term id="dependency-injection">dependency injection</Term>.
+Three roles do the work. The <Term id="context-role">context</Term> (`Checkout`) holds a strategy and calls it. The **strategy** (`PaymentProvider`) is the step, named as a type. Each **concrete strategy** (Stripe, PayPal, Adyen) is one way of doing the step. A fourth party, the **client**, picks one and hands it in; usually that is `main` or the config loader. Handing it in is <Term id="dependency-injection">dependency injection</Term>.
 </Depth>
 
 <Depth level={3}>
 The 1994 *Design Patterns* catalogue files Strategy under behavioral patterns, and frames it as an alternative to subclassing: instead of a subclass per algorithm, the algorithm becomes an object of its own. It also names the costs. The client has to know the strategies exist in order to choose one, and every strategy receives the same inputs, even the ones it ignores. In languages where functions are values, a one-method strategy usually shrinks to a function.
 </Depth>
 
-## [problem] A branch that keeps growing
+## [problem] A checkout that knows every provider
 
-A service uploads build artifacts to object storage and compresses each file first. The codec comes from config. The code works, and it is tested.
+A shop's checkout takes payments through one of three providers, chosen per region in config. It works, and it is tested.
 
-Read it once. The list of codecs lives in three places: the branch in the upload method, the config check, and the header mapping.
+Read it once. The list of providers lives in three places: the branch in Pay, the branch in Refund, and the config list.
 
 <Depth level={2}>
-Each branch is a separate algorithm sharing one function. To test zstd on its own, you still build a whole Uploader and go through the branch.
+Each branch calls a different client library with different arguments. To test the Adyen path on its own, you still build a whole Checkout and go through the branch.
 </Depth>
 
 <Depth level={3}>
-Nothing here is wrong yet. Two codecs behind an `if` would be perfectly fine. The problem is the rate of change: each new codec edits the same three places, and each edit can break the codecs that already work.
+Nothing here is wrong yet. Two providers behind an `if` would be perfectly fine. The problem is the rate of change: each new provider edits the same three places, and each edit can break the providers that already work.
 </Depth>
 
 ## [pain] Then a change request arrives
 
-**Change request:** the web-assets bucket needs Brotli. Browsers accept `Content-Encoding: br`, and Brotli compresses text better than gzip.
+**Change request:** the EU store needs Klarna, so customers can pay later.
 
-The marked lines must change. None of them is about how Brotli works. They are bookkeeping, spread across three files.
+The marked lines must change. None of them is about how Klarna works. They are bookkeeping, spread across three places.
 
 <Depth level={2}>
-Miss one and the code still compiles. The config check rejects `"brotli"`, or the header says `brotli` instead of `br`, and you find out from a browser in production.
+The two branches can drift apart. Add Klarna to Pay but forget Refund and everything compiles, the tests for the old providers pass, and the first Klarna customer who asks for a refund gets an error.
 </Depth>
 
 <Depth level={3}>
-The branches also share one test surface. A change to the Brotli branch re-runs the tests of every other codec, and a mistake in it can break them.
+The branches also share one test surface. A change to the Klarna branch re-runs the tests of every other provider, and a mistake in it can break them.
 </Depth>
 
 ## [morph] Turn each branch into its own strategy
 
-Drag the slider. The branch becomes one interface, and each case moves out into its own small unit: a type, or in Python often just a function.
+Drag the slider. Both branches collapse into one interface, and each provider moves out into its own type.
 
 Hover a box in the diagram to see its code.
 
 <Depth level={2}>
-Uploader now depends on one small set of methods instead of on the list of codecs. Each codec can be tested on its own, with a fixed input. New codecs extend the system without editing it: the <Term id="open-closed">open/closed principle</Term>.
+Checkout now depends on two methods instead of on the list of providers. Each provider can be tested on its own, and Checkout can be tested with a fake provider. New providers extend the system without editing it: the <Term id="open-closed">open/closed principle</Term>.
 </Depth>
 
 <Depth level={3}>
-<Lang only="go">Go interfaces are satisfied implicitly. `Zstd` never says it implements `Compressor`; having the two methods is enough, and the compiler checks it where a `Zstd` is assigned to a `Compressor`.</Lang>
-<Lang only="python">Nothing is declared at all. Any callable that takes bytes and returns bytes fits, and the type hint is checked only by tools such as mypy.</Lang>
-<Lang only="typescript">TypeScript uses <Term id="structural-typing">structural typing</Term>: a `Zstd` fits `Compressor` because it has the right shape, with or without `implements`.</Lang>
-<Lang only="rust">Each codec opts in explicitly with `impl Compressor for Zstd`, and the compiler checks the method signatures there.</Lang>
+<Lang only="go">Go interfaces are satisfied implicitly. `Stripe` never says it implements `PaymentProvider`; having the two methods is enough, and the compiler checks it where a `Stripe` is stored in a `PaymentProvider`.</Lang>
+<Lang only="python">A `Protocol` is checked by tools such as mypy, not at runtime. Any object with `charge` and `refund` methods works, whatever it inherits from.</Lang>
+<Lang only="typescript">TypeScript uses <Term id="structural-typing">structural typing</Term>: a `StripeProvider` fits `PaymentProvider` because it has the right shape, with or without `implements`.</Lang>
+<Lang only="rust">Each provider opts in explicitly with `impl PaymentProvider for Stripe`, and the compiler checks the method signatures there.</Lang>
 </Depth>
 
-## [walk] Follow one upload
+## [walk] Follow one payment
 
-One call through the design, start to finish. Step through it with the numbered buttons.
+One payment through the design, start to finish. Step through it with the numbered buttons.
 
 <Depth level={3}>
-<Lang only="go">A call through an interface loads the method's address from the <Term id="itab">itab</Term> and makes an indirect call. That costs a few nanoseconds and usually prevents inlining. For a compressor that touches every byte, the cost is noise; in a tight inner loop it can matter.</Lang>
-<Lang only="python">`self.compress(data)` is an attribute lookup on the instance followed by a call. There is no interface table: whatever object is stored there is called, and a wrong one fails only when it runs.</Lang>
-<Lang only="typescript">The interface exists only at compile time. At runtime `this.c.compress` is a property lookup on the object; V8's inline caches keep it fast while a call site only ever sees one or two kinds of object.</Lang>
-<Lang only="rust">With `Uploader<C>`, the compiler makes one copy of `upload` per codec (<Term id="monomorphisation">monomorphisation</Term>) and can inline `compress`. `Box<dyn Compressor>` trades that for a single copy and a vtable call: <Term id="dynamic-dispatch">dynamic dispatch</Term>.</Lang>
+<Lang only="go">A call through an interface loads the method's address from the <Term id="itab">itab</Term> and makes an indirect call. It costs a few nanoseconds and usually prevents inlining. Next to a network call to a payment provider, that is noise.</Lang>
+<Lang only="python">`self.provider.charge(order)` is an attribute lookup on the object followed by a call. There is no interface table: whatever object is stored there is called, and a wrong one fails only when it runs.</Lang>
+<Lang only="typescript">The interface exists only at compile time. At runtime `this.provider.charge` is a property lookup on the object; V8's inline caches keep it fast while a call site only ever sees one or two kinds of object.</Lang>
+<Lang only="rust">`Box<dyn PaymentProvider>` stores a pointer to the data and a pointer to a vtable, and each call goes through the vtable: <Term id="dynamic-dispatch">dynamic dispatch</Term>. A generic `Checkout<P>` would instead get one compiled copy per provider (<Term id="monomorphisation">monomorphisation</Term>), with calls the compiler can inline.</Lang>
 </Depth>
 
-## [again] Brotli, the second time
+## [again] Klarna, the second time
 
-The same Brotli request, after the refactor. You add one new strategy. Nothing that already exists changes, so nothing that already works can break.
+The same Klarna request, after the refactor. You add one new provider type. Nothing that already exists changes, so nothing that already works can break, and Pay and Refund cannot drift apart.
 
 <Depth level={2}>
-One line of wiring remains: whatever turns the config string `"brotli"` into the new strategy. Keep that in one place, such as a map from names to constructors, and it stays one line.
+One line of wiring remains: whatever turns the config string `"klarna"` into the new provider. Keep that in one place, such as a map from names to constructors, and it stays one line.
 </Depth>
 
 <Depth level={3}>
-Tests follow the same split. The new codec gets its own test with a fixed input. Uploader's tests use a fake strategy that records what it was given, and they never change when a codec is added.
+Tests follow the same split. The Klarna provider gets its own tests against Klarna's sandbox. Checkout's tests use a fake provider that records what it was asked to charge and refund, and they never change when a provider is added.
 </Depth>
+
+## [play] Run the checkout yourself
+
+This checkout runs both designs. Take payments, add Klarna, and try to break it.
 
 ## [lens] How each language writes it
 
@@ -483,12 +549,16 @@ Switch the language at the top of the page; the code, the diagram labels and the
 Your language choice is remembered on every lesson.
 </Depth>
 
-## [check] Which situation needs it?
+## [check] Check yourself
 
-Pick one. The explanation appears under your answer.
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
 
 ## [reference]
 
+### Try it
+
+<Playground model="strategy-checkout" />
+
 ### When the strategy is just a function
 
-If a strategy has one method and no state, most languages let you pass a function instead of defining a type: `sort.Slice` in Go, `key=` in Python, a comparator in TypeScript, a closure in Rust. Start there. Move to an interface or trait when the strategy needs a second method (here, `Encoding`) or carries configuration such as a compression level.
+If a strategy has one method and no state, most languages let you pass a function instead of defining a type: `sort.Slice` in Go, `key=` in Python, a comparator in TypeScript, a closure in Rust. Start there. Move to an interface or trait when the strategy needs a second method (here, `Refund`) or carries configuration such as API keys.

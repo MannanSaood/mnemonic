@@ -9,9 +9,13 @@ export const LANG_SHORT: Record<Lang, string> = { go: "Go", python: "Python", ty
 export const DEPTHS = [1, 2, 3] as const;
 export type Depth = (typeof DEPTHS)[number];
 export const DEPTH_LABEL: Record<Depth, string> = { 1: "Overview", 2: "Engineer", 3: "Deep" };
+export const DEPTH_NAMES = ["overview", "engineer", "deep"] as const;
+export type DepthName = (typeof DEPTH_NAMES)[number];
+export const depthName = (d: Depth): DepthName => DEPTH_NAMES[d - 1];
+export const depthNumber = (n: DepthName): Depth => (DEPTH_NAMES.indexOf(n) + 1) as Depth;
 
 /** The fixed lesson anatomy. Every topic has these eight steps, in this order. */
-export const STEP_KEYS = ["concept", "problem", "pain", "morph", "walk", "again", "lens", "check"] as const;
+export const STEP_KEYS = ["concept", "problem", "pain", "morph", "walk", "again", "play", "lens", "check"] as const;
 export type StepKey = (typeof STEP_KEYS)[number];
 export const STEP_LABEL: Record<StepKey, string> = {
   concept: "Concept",
@@ -20,6 +24,7 @@ export const STEP_LABEL: Record<StepKey, string> = {
   morph: "Morph",
   walk: "How it works",
   again: "Same request again",
+  play: "Try it",
   lens: "Language lens",
   check: "Check",
 };
@@ -73,7 +78,13 @@ export interface ReferenceInfo {
   lookalikes: { name: string; how: string }[];
 }
 
+export interface Scenario { try: string; notice: string }
+export interface PlaygroundRef { model: string; scenarios: Scenario[] }
+export interface Check { question: string; options: CheckOption[] }
+
 export interface TopicMeta {
+  /** "<track>/<slug>", derived from the file path. */
+  id: string;
   title: string;
   slug: string;
   track: string;
@@ -86,12 +97,28 @@ export interface TopicMeta {
   diagram: DiagramSpec;
   code: Record<Lang, LangCode>;
   walk: WalkStep[];
-  check: { question: string; options: CheckOption[] };
+  /** Roadmap metadata. */
+  prerequisites: string[];
+  skills: string[];
+  depths: DepthName[];
+  /** One check per depth the lesson covers. Passing it marks the lesson done at that depth. */
+  checks: Partial<Record<DepthName, Check>>;
+  playground: PlaygroundRef;
   reference: ReferenceInfo;
   glossary?: string[];
 }
 
 export interface Track { id: string; title: string; summary: string; status: "live" | "planned"; groups?: string[] }
+
+export interface SkillEntry { id: string; title: string; summary: string }
+
+/** A goal profile: the skills a role needs, each at a depth, with the reason. */
+export interface RoadmapProfile {
+  id: string;
+  title: string;
+  summary: string;
+  goals: { skill: string; depth: DepthName; why: string }[];
+}
 
 export interface GlossaryEntry { id: string; term: string; short: string; long?: string }
 

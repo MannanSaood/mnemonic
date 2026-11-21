@@ -1,0 +1,18 @@
+title: Go backend engineer
+summary: HTTP and gRPC services in Go, running on Linux and Kubernetes.
+goals:
+  - skill: design
+    depth: engineer
+    why: Services grow by adding providers, handlers and storage backends, and good seams keep that cheap.
+  - skill: concurrency
+    depth: engineer
+    why: Every request runs in its own goroutine, so shared state needs care.
+  - skill: networking
+    depth: engineer
+    why: Timeouts, retries and connection reuse decide how a service behaves under load.
+  - skill: testing
+    depth: engineer
+    why: Fast, reliable tests are what let a team change a service safely.
+  - skill: os
+    depth: overview
+    why: File descriptors, memory and signals explain most production surprises.
