@@ -1,0 +1,10 @@
+# Terms introduced by code-craft/error-handling-strategies
+- id: wrapped-error
+  term: Wrapped error
+  short: An error that carries another error inside it, plus context such as which operation failed for which id. Code can still ask what the inner error was.
+- id: transient-failure
+  term: Transient failure
+  short: A failure that may succeed if you try again shortly, such as a timeout or a 503. A declined card or a missing record is not transient.
+- id: swallowed-error
+  term: Swallowed error
+  short: An error that is caught and dropped, so the caller is told the work succeeded when it did not.

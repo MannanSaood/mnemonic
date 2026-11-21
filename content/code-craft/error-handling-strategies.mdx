@@ -1,0 +1,695 @@
+---
+title: Error-handling strategies
+track: code-craft
+group: Everyday code
+order: 11
+summary: Handle each error once, in the layer that can act on it. Retry next to the call, add context on the way up, translate at the edge, never swallow.
+intent: When something fails, the customer is told the truth, the logs keep the cause, and no money moves twice.
+changeRequest: Declined cards must say so, and a one-second blip at the payment provider must not fail the checkout.
+languages: [go, python, typescript, rust]
+glossary: [wrapped-error, transient-failure, swallowed-error, idempotency-key, graceful-degradation, exponential-backoff]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [code-craft/defensive-programming-and-barricades]
+skills: [error-handling]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: error-handling-strategies
+  scenarios:
+    - try: "Predict, then inject Provider down with the starting policies."
+      notice: "The customer sees Order placed, the order ships, and the card was never charged. The log line is right and nobody acts on it."
+    - try: "Set the payment client to Wrap, return, and inject Provider down again."
+      notice: "The error reaches the handler, which answers 503 with a clear message and logs the whole chain once."
+    - try: "Set the service to Retry and the repository to Wrap, then inject DB timeout."
+      notice: "The service repeats the whole order, including the charge. The customer pays twice. Move the retry to the repository and it pays once."
+    - try: "Find one set of policies that passes Run all four faults."
+      notice: "Clients retry transient failures, the service wraps, the handler translates. Each layer handles an error once, for one reason."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: handler
+      kind: client
+      before: { x: 12, y: 110, w: 130, h: 50, title: Handler, sub: 500 + raw text }
+      after:  { x: 12, y: 110, w: 130, h: 50, title: Handler, sub: kind → status }
+    - id: service
+      kind: context
+      before: { x: 170, y: 18, w: 375, h: 240, title: Order service, sub: errors pass as strings }
+      after:  { x: 170, y: 110, w: 140, h: 50, title: Order service, sub: adds context }
+    - id: payment
+      kind: concrete
+      before: { x: 190, y: 70, w: 160, h: 46, title: Payment client, sub: "logs, returns ok" }
+      after:  { x: 345, y: 30, w: 150, h: 46, title: Payment client, sub: names the failure }
+    - id: repo
+      kind: concrete
+      before: { x: 190, y: 180, w: 160, h: 46, title: Repository, sub: driver error }
+      after:  { x: 345, y: 194, w: 150, h: 46, title: Repository, sub: wraps driver error }
+    - id: errs
+      kind: strategy
+      appears: after
+      before: { x: 375, y: 125, w: 150, h: 46, title: "" }
+      after:  { x: 170, y: 200, w: 140, h: 50, title: Error kinds, sub: declined · unavailable }
+    - id: retry
+      kind: concrete
+      appears: change
+      before: { x: 375, y: 70, w: 150, h: 46, title: Retry, sub: around place() }
+      after:  { x: 345, y: 112, w: 150, h: 46, title: Retry, sub: transient only }
+  edges:
+    - { from: handler, to: service, label: calls }
+    - { from: service, to: payment }
+    - { from: service, to: repo }
+    - { from: payment, to: errs, kind: implements, label: returns }
+    - { from: handler, to: errs, label: checks }
+    - { from: retry, to: payment, label: repeats }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: payment.go · orders.go · handler.go
+      source: |
+        // payment.go
+        func (c *PaymentClient) Charge(ctx context.Context, o Order) error {
+            resp, err := c.post(ctx, "/v1/charges", o.ChargeBody())
+            if err != nil {
+                log.Printf("charge failed: %v", err)
+                return nil // checkout must not break
+            }
+            defer resp.Body.Close()
+            if resp.StatusCode != http.StatusOK {
+                return errors.New("payment failed")
+            }
+            return nil
+        }
+
+        // orders.go
+        func (s *OrderService) Place(ctx context.Context, o Order) error {
+            if err := s.payments.Charge(ctx, o); err != nil {
+                return err
+            }
+            return s.repo.Save(ctx, o)
+        }
+
+        // handler.go
+        func (h *Handler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
+            o := decode(r)
+            err := h.orders.Place(r.Context(), o)
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            w.WriteHeader(http.StatusCreated)
+        }
+      roles: { payment: [1, 13], swallow: [4, 7], service: [15, 21], repo: [20, 20], handler: [23, 32] }
+      change:
+        - { after: 26, add: ['    for i := 0; i < 2 && err != nil; i++ {', '        err = h.orders.Place(r.Context(), o) // charges again if Save failed', '    }'] }
+        - { after: 27, add: ['        if err.Error() == "payment failed" { // declined, or provider down?', '            http.Error(w, "Your card was declined.", http.StatusPaymentRequired)', '            return', '        }'] }
+    after:
+      file: payment.go · orders.go · handler.go
+      source: |
+        // payment.go
+        var (
+            ErrDeclined    = errors.New("card declined")
+            ErrUnavailable = errors.New("payment provider unavailable")
+        )
+
+        func (c *PaymentClient) Charge(ctx context.Context, o Order) error {
+            resp, err := c.post(ctx, "/v1/charges", o.ChargeBody())
+            if err != nil {
+                return fmt.Errorf("charge order %s: %w: %w", o.ID, ErrUnavailable, err)
+            }
+            defer resp.Body.Close()
+            switch {
+            case resp.StatusCode == http.StatusPaymentRequired:
+                return fmt.Errorf("charge order %s: %w", o.ID, ErrDeclined)
+            case resp.StatusCode >= 500:
+                return fmt.Errorf("charge order %s: %w: status %d", o.ID, ErrUnavailable, resp.StatusCode)
+            }
+            return nil
+        }
+
+        // orders.go
+        func (s *OrderService) Place(ctx context.Context, o Order) error {
+            if err := s.payments.Charge(ctx, o); err != nil {
+                return fmt.Errorf("place order: %w", err)
+            }
+            if err := s.repo.Save(ctx, o); err != nil {
+                return fmt.Errorf("place order %s: %w", o.ID, err)
+            }
+            return nil
+        }
+
+        // handler.go: the edge, where errors become responses
+        func (h *Handler) PlaceOrder(w http.ResponseWriter, r *http.Request) {
+            err := h.orders.Place(r.Context(), decode(r))
+            switch {
+            case err == nil:
+                w.WriteHeader(http.StatusCreated)
+            case errors.Is(err, ErrDeclined):
+                http.Error(w, "Your card was declined.", http.StatusPaymentRequired)
+            case errors.Is(err, ErrUnavailable):
+                http.Error(w, "Payments are unavailable. Try again shortly.", http.StatusServiceUnavailable)
+            default:
+                slog.Error("place order", "err", err) // logged once, with the whole chain
+                http.Error(w, "Something went wrong.", http.StatusInternalServerError)
+            }
+        }
+      roles: { payment: [1, 20], errs: [2, 5], classify: [7, 20], service: [22, 31], wrap: [23, 31], repo: [27, 29], handler: [33, 47], translate: [36, 42], logonce: [43, 46] }
+    again:
+      file: payment.go
+      source: |
+        // payment.go: the retry sits next to the call it repeats
+        func (c *PaymentClient) ChargeWithRetry(ctx context.Context, o Order) error {
+            var err error
+            for attempt := range 3 {
+                if err = c.Charge(ctx, o); !errors.Is(err, ErrUnavailable) {
+                    return err // success, or a decline: trying again will not help
+                }
+                if err := sleep(ctx, backoff(attempt)); err != nil {
+                    return err // the request was cancelled while we waited
+                }
+            }
+            return err
+        }
+        // Charge sends o.ID as an idempotency key, so a retried charge is never taken twice.
+    cost:
+      before: { text: unpaid orders ship · cause lost · double charges, value: 0.85 }
+      after: { text: 1 function in 1 file, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Errors are ordinary return values, so every layer decides in plain sight. `fmt.Errorf` with `%w` wraps an error and keeps it inspectable; `errors.Is` and `errors.As` walk the chain. Since Go 1.20 one `Errorf` may wrap several errors, and `errors.Join` combines them. The trap is the bare `return err`: it keeps the cause but drops what this layer was doing.'
+      seenIn: '`errors.Is(err, fs.ErrNotExist)` works on any error from `os.Open`, however it was wrapped. `http.Server.ListenAndServe` returns `http.ErrServerClosed` after a clean shutdown, a sentinel that callers check for and do not log as a failure.'
+
+  python:
+    before:
+      file: payments.py · orders.py · handlers.py
+      source: |
+        # payments.py
+        class PaymentClient:
+            def charge(self, order: Order) -> None:
+                try:
+                    resp = self.http.post("/v1/charges", json=order.charge_body())
+                except httpx.TransportError:
+                    log.warning("charge failed")
+                    return  # checkout must not break
+                if resp.status_code != 200:
+                    raise Exception("payment failed")
+
+        # orders.py
+        class OrderService:
+            def place(self, order: Order) -> None:
+                self.payments.charge(order)
+                self.repo.save(order)
+
+        # handlers.py
+        def place_order(request: Request) -> Response:
+            order = decode(request)
+            try:
+                orders.place(order)
+            except Exception as e:
+                return Response(str(e), status=500)
+            return Response(status=201)
+      roles: { payment: [1, 10], swallow: [6, 8], service: [12, 16], repo: [16, 16], handler: [18, 25] }
+      change:
+        - { line: 22, replace: '        retry(lambda: orders.place(order), times=3)  # charges again if save failed' }
+        - { after: 23, add: ['        if str(e) == "payment failed":  # declined, or provider down?', '            return Response("Your card was declined.", status=402)'] }
+    after:
+      file: payments.py · orders.py · handlers.py
+      source: |
+        # payments.py
+        class PaymentError(Exception): ...
+        class CardDeclined(PaymentError): ...
+        class PaymentUnavailable(PaymentError): ...
+
+        class PaymentClient:
+            def charge(self, order: Order) -> None:
+                try:
+                    resp = self.http.post("/v1/charges", json=order.charge_body())
+                except httpx.TransportError as e:
+                    raise PaymentUnavailable(f"charge order {order.id}") from e
+                if resp.status_code == 402:
+                    raise CardDeclined(f"charge order {order.id}")
+                if resp.status_code >= 500:
+                    raise PaymentUnavailable(f"charge order {order.id}: status {resp.status_code}")
+
+        # orders.py
+        class OrderService:
+            def place(self, order: Order) -> None:
+                self.payments.charge(order)  # nothing to add here: let it rise
+                self.repo.save(order)
+
+        # handlers.py: the edge, where errors become responses
+        def place_order(request: Request) -> Response:
+            try:
+                orders.place(decode(request))
+            except CardDeclined:
+                return Response("Your card was declined.", status=402)
+            except PaymentUnavailable:
+                return Response("Payments are unavailable. Try again shortly.", status=503)
+            except Exception:
+                log.exception("place order failed")  # once, with the whole chain
+                return Response("Something went wrong.", status=500)
+            return Response(status=201)
+      roles: { payment: [1, 15], errs: [2, 4], classify: [7, 15], service: [17, 21], wrap: [19, 21], repo: [21, 21], handler: [23, 34], translate: [27, 30], logonce: [31, 33] }
+    again:
+      file: payments.py
+      source: |
+        # payments.py: the retry sits next to the call it repeats
+        def charge_with_retry(self, order: Order, attempts: int = 3) -> None:
+            for attempt in range(attempts):
+                try:
+                    return self.charge(order)
+                except PaymentUnavailable:
+                    if attempt == attempts - 1:
+                        raise
+                    time.sleep(backoff(attempt))
+        # charge() sends order.id as an idempotency key, so a retried charge is never taken twice.
+    cost:
+      before: { text: unpaid orders ship · cause lost · double charges, value: 0.85 }
+      after: { text: 1 function in 1 file, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Exceptions travel up on their own, so a middle layer that has nothing to add can do nothing. `raise New(...) from e` records the original as `__cause__`, and tracebacks print both. The common failure is the broad `except Exception:` in the middle of the stack, which catches bugs such as `KeyError` along with the failure you meant. Python 3.11 adds `e.add_note(...)` to attach context without changing the exception type.'
+      seenIn: '`requests` raises `ConnectionError`, `Timeout` and `HTTPError`, all subclasses of `RequestException`, so callers can catch as broadly or narrowly as they need. `json.JSONDecodeError` subclasses `ValueError`.'
+
+  typescript:
+    before:
+      file: payments.ts · orders.ts · handler.ts
+      source: |
+        // payments.ts
+        async charge(order: Order): Promise<void> {
+          let res: Response;
+          try {
+            res = await this.post("/v1/charges", order.chargeBody());
+          } catch (e) {
+            console.warn("charge failed", e);
+            return; // checkout must not break
+          }
+          if (res.status !== 200) throw new Error("payment failed");
+        }
+
+        // orders.ts
+        async place(order: Order): Promise<void> {
+          await this.payments.charge(order);
+          await this.repo.save(order);
+        }
+
+        // handler.ts
+        app.post("/orders", async (req, res) => {
+          const order = decode(req.body);
+          try {
+            await orders.place(order);
+            res.status(201).end();
+          } catch (e) {
+            res.status(500).send(String(e));
+          }
+        });
+      roles: { payment: [1, 11], swallow: [6, 9], service: [13, 17], repo: [16, 16], handler: [19, 28] }
+      change:
+        - { line: 23, replace: '    await retry(() => orders.place(order), 3); // charges again if save failed' }
+        - { after: 25, add: ['    if (String(e).includes("payment failed")) // declined, or provider down?', '      return res.status(402).send("Your card was declined.");'] }
+    after:
+      file: payments.ts · orders.ts · handler.ts
+      source: |
+        // payments.ts
+        export class CardDeclined extends Error {}
+        export class PaymentUnavailable extends Error {}
+
+        async charge(order: Order): Promise<void> {
+          let res: Response;
+          try {
+            res = await this.post("/v1/charges", order.chargeBody());
+          } catch (cause) {
+            throw new PaymentUnavailable(`charge order ${order.id}`, { cause });
+          }
+          if (res.status === 402) throw new CardDeclined(`charge order ${order.id}`);
+          if (res.status >= 500) throw new PaymentUnavailable(`charge order ${order.id}: status ${res.status}`);
+        }
+
+        // orders.ts
+        async place(order: Order): Promise<void> {
+          await this.payments.charge(order); // nothing to add here: let it propagate
+          await this.repo.save(order);
+        }
+
+        // handler.ts: the edge, where errors become responses
+        app.post("/orders", async (req, res) => {
+          try {
+            await orders.place(decode(req.body));
+            res.status(201).end();
+          } catch (e: unknown) {
+            if (e instanceof CardDeclined) return res.status(402).send("Your card was declined.");
+            if (e instanceof PaymentUnavailable) return res.status(503).send("Payments are unavailable. Try again shortly.");
+            logger.error({ err: e }, "place order failed"); // once, with the cause chain
+            res.status(500).send("Something went wrong.");
+          }
+        });
+      roles: { payment: [1, 14], errs: [2, 3], classify: [5, 14], service: [16, 20], wrap: [17, 20], repo: [19, 19], handler: [22, 33], translate: [27, 29], logonce: [30, 31] }
+    again:
+      file: payments.ts
+      source: |
+        // payments.ts: the retry sits next to the call it repeats
+        async chargeWithRetry(order: Order, attempts = 3): Promise<void> {
+          for (let attempt = 1; ; attempt++) {
+            try {
+              return await this.charge(order);
+            } catch (e) {
+              if (!(e instanceof PaymentUnavailable) || attempt === attempts) throw e;
+              await sleep(backoff(attempt));
+            }
+          }
+        }
+        // charge() sends order.id as an idempotency key, so a retried charge is never taken twice.
+    cost:
+      before: { text: unpaid orders ship · cause lost · double charges, value: 0.85 }
+      after: { text: 1 function in 1 file, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Anything can be thrown, so under `strict` the caught value is `unknown` (the `useUnknownInCatchVariables` flag, TypeScript 4.4) and you must narrow it with `instanceof` before use. ES2022 added `new Error(message, { cause })`, which keeps the original error attached. Thrown errors are not in any function signature; some teams return a `Result`-style union instead so the compiler makes callers handle failure.'
+      seenIn: '`fetch` rejects with a `TypeError` on a network failure and resolves normally on a 404 or 503, so the status check is yours. `AbortSignal.timeout(ms)` aborts with a `DOMException` named `TimeoutError`.'
+
+  rust:
+    before:
+      file: payments.rs · orders.rs · handler.rs
+      source: |
+        // payments.rs
+        async fn charge(&self, order: &Order) -> Result<(), String> {
+            let resp = match self.post("/v1/charges", &order.charge_body()).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    log::warn!("charge failed: {e}");
+                    return Ok(()); // checkout must not break
+                }
+            };
+            if resp.status() != StatusCode::OK {
+                return Err("payment failed".to_string());
+            }
+            Ok(())
+        }
+
+        // orders.rs
+        async fn place(&self, order: &Order) -> Result<(), String> {
+            self.payments.charge(order).await?;
+            self.repo.save(order).await.map_err(|e| e.to_string())
+        }
+
+        // handler.rs
+        async fn place_order(State(app): State<App>, Json(order): Json<Order>) -> Response {
+            let result = app.orders.place(&order).await;
+            match result {
+                Ok(()) => StatusCode::CREATED.into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            }
+        }
+      roles: { payment: [1, 14], swallow: [5, 8], service: [16, 20], repo: [19, 19], handler: [22, 29] }
+      change:
+        - { after: 24, add: ['    // retry: calls place() again, which charges again if save failed', '    let result = retry(3, || app.orders.place(&order)).await;'] }
+        - { after: 26, add: ['        Err(e) if e == "payment failed" => (StatusCode::PAYMENT_REQUIRED, "Your card was declined.").into_response(), // or was it down?'] }
+    after:
+      file: payments.rs · orders.rs · handler.rs
+      source: |
+        // payments.rs
+        #[derive(Debug, thiserror::Error)]
+        pub enum PaymentError {
+            #[error("card declined")]
+            Declined,
+            #[error("provider returned {0}")]
+            Unavailable(StatusCode),
+            #[error("provider unreachable")]
+            Unreachable(#[from] reqwest::Error),
+        }
+
+        async fn charge(&self, order: &Order) -> Result<(), PaymentError> {
+            let resp = self.post("/v1/charges", &order.charge_body()).await?; // From: Unreachable
+            match resp.status() {
+                StatusCode::PAYMENT_REQUIRED => Err(PaymentError::Declined),
+                s if s.is_server_error() => Err(PaymentError::Unavailable(s)),
+                _ => Ok(()),
+            }
+        }
+
+        // orders.rs
+        #[derive(Debug, thiserror::Error)]
+        pub enum PlaceError {
+            #[error("charge order {0}")]
+            Payment(OrderId, #[source] PaymentError),
+            #[error("save order {0}")]
+            Store(OrderId, #[source] sqlx::Error),
+        }
+
+        async fn place(&self, o: &Order) -> Result<(), PlaceError> {
+            self.payments.charge(o).await.map_err(|e| PlaceError::Payment(o.id, e))?;
+            self.repo.save(o).await.map_err(|e| PlaceError::Store(o.id, e))?;
+            Ok(())
+        }
+
+        // handler.rs: the edge, where errors become responses
+        async fn place_order(State(app): State<App>, Json(o): Json<Order>) -> Response {
+            use PaymentError::*;
+            match app.orders.place(&o).await {
+                Ok(()) => StatusCode::CREATED.into_response(),
+                Err(PlaceError::Payment(_, Declined)) => (StatusCode::PAYMENT_REQUIRED, "Your card was declined.").into_response(),
+                Err(PlaceError::Payment(_, Unavailable(_) | Unreachable(_))) => (StatusCode::SERVICE_UNAVAILABLE, "Payments are unavailable. Try again shortly.").into_response(),
+                Err(e) => {
+                    tracing::error!(error = &e as &dyn std::error::Error, "place order failed"); // once, whole chain
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong.").into_response()
+                }
+            }
+        }
+      roles: { payment: [1, 19], errs: [2, 10], classify: [12, 19], service: [21, 34], wrap: [30, 34], repo: [32, 32], handler: [36, 48], translate: [39, 42], logonce: [43, 46] }
+    again:
+      file: payments.rs
+      source: |
+        // payments.rs: the retry sits next to the call it repeats
+        impl PaymentError {
+            fn is_transient(&self) -> bool { !matches!(self, PaymentError::Declined) }
+        }
+
+        async fn charge_with_retry(&self, order: &Order) -> Result<(), PaymentError> {
+            let mut attempt = 0;
+            loop {
+                match self.charge(order).await {
+                    Err(e) if e.is_transient() && attempt < 2 => {
+                        attempt += 1;
+                        tokio::time::sleep(backoff(attempt)).await;
+                    }
+                    result => return result,
+                }
+            }
+        }
+        // charge() sends order.id as an idempotency key, so a retried charge is never taken twice.
+    cost:
+      before: { text: unpaid orders ship · cause lost · double charges, value: 0.85 }
+      after: { text: 1 function in 1 file, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'A function that can fail says so in its type: `Result<T, E>`. The `?` operator returns early and converts the error with `From`, so `#[from]` in `thiserror` makes a driver error become your variant automatically. Libraries usually define error enums with `thiserror` so callers can match on them; applications often use `anyhow` and add context with `.context("charge order")`. The compiler warns about an unused `Result`, so swallowing takes a visible `let _ =` or `.ok()`.'
+      seenIn: '`std::io::Error::kind()` returns an `ErrorKind` such as `NotFound` or `TimedOut` to match on. `std::error::Error::source()` is how every error exposes the one it wraps, and what `anyhow` walks to print a chain.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'The provider answers 503. The payment client is the only code that knows what a 503 from this provider means, so it names it: `ErrUnavailable`, wrapped with `%w` and the order id.', python: 'The provider answers 503. The payment client is the only code that knows what a 503 from this provider means, so it names it: it raises `PaymentUnavailable` with the order id.', typescript: 'The provider answers 503. The payment client is the only code that knows what a 503 from this provider means, so it names it: it throws `PaymentUnavailable` with the order id.', rust: 'The provider answers 503. The payment client is the only code that knows what a 503 from this provider means, so it names it: `PaymentError::Unavailable(503)`.' }
+    nodes: [payment, errs]
+    edges: [payment>errs]
+    role: classify
+  - text: { go: 'The order service cannot fix a payment outage, so it does not try. It adds what it was doing and returns the error unchanged inside.', python: 'The order service cannot fix a payment outage, so it does not try. It has nothing to add, so the exception rises through it untouched.', typescript: 'The order service cannot fix a payment outage, so it does not try. It has nothing to add, so the rejection propagates through it untouched.', rust: 'The order service cannot fix a payment outage, so it does not try. It wraps the error in `PlaceError::Payment` with the order id, and `?` returns it.' }
+    nodes: [service, payment]
+    edges: [service>payment]
+    role: wrap
+  - text: The handler is the edge. It asks what kind of failure this is and answers 503 with a message the customer can act on. No internal text leaves the service.
+    nodes: [handler, errs]
+    edges: [handler>errs]
+    role: translate
+  - text: Anything the handler does not recognise is a bug or an unplanned failure. It is logged once, here, with the whole chain from the handler down to the driver.
+    nodes: [handler, service]
+    edges: [handler>service]
+    role: logonce
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: The recommendations service behind a product page times out. What should the product page do?
+    options:
+      - text: Log the timeout and render the page without recommendations.
+        correct: true
+        why: Right. Recommendations are optional, so degrading is a deliberate, visible choice, and the log keeps the cause. That is different from swallowing, where the caller believes the work was done.
+      - text: Keep retrying until the recommendations service answers.
+        why: The customer waits on something optional, and every page view adds load to a service that is already struggling.
+      - text: Return a 500 for the whole page.
+        why: That turns a failure in an optional part into a failure of the whole page. The customer could have bought the product.
+  engineer:
+    question: Creating a user fails with the database driver's unique-violation error on the email column. Where should it become "that email is already registered"?
+    options:
+      - text: The repository turns it into a domain error such as EmailTaken, and the handler turns that into a 409 with the message.
+        correct: true
+        why: Right. The repository is the one layer that knows the driver, so it translates the driver's error. The handler is the one layer that knows HTTP and the customer, so it writes the message.
+      - text: The handler catches the driver exception and checks its SQLSTATE code.
+        why: That couples the HTTP layer to one database driver. Change the database or the driver and the handler breaks.
+      - text: The repository returns the text for the customer, ready to display.
+        why: The error kind is gone, so no caller can react to it, and data-layer code now owns wording for a screen it never sees.
+  deep:
+    question: A charge request was sent, and the payment client timed out waiting for the reply. What does the client know?
+    options:
+      - text: Not whether the charge happened. Retry with the same idempotency key so the provider returns the first result instead of charging again.
+        correct: true
+        why: Right. A timeout after sending is ambiguous. The idempotency key makes the retry safe whichever way it went, which is what lets the client treat the timeout as transient.
+      - text: The charge failed, so it is safe to retry without a key.
+        why: The provider may have charged the card and lost only the reply. A retry without a key can charge twice.
+      - text: The charge succeeded, because the request was sent.
+        why: Sending is not the same as being processed. The provider may have rejected it, or never received the whole request.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Client at the call
+      example: Payment client, repository
+      job: Knows what the outside world's failures mean. Names them as error kinds, retries the transient ones, keeps the original as the cause.
+    - role: Middle layer
+      example: Order service
+      job: Adds what it was doing and passes the error up. Handles an error only if it can do something useful about it.
+    - role: Edge
+      example: HTTP handler, queue consumer, CLI main
+      job: Turns an error into a status and a message, and logs anything unexpected once, with the whole chain.
+  useWhen:
+    - A request crosses several layers and at least one of them talks to a network, a disk or a database.
+    - Customers or callers need different answers for different failures (declined, try later, our fault).
+    - On-call engineers need to find the cause of a failure from the logs alone.
+  avoidWhen:
+    - A short script that you run by hand. Letting the error crash the program with its full trace is the right policy there.
+    - Inner helpers with one caller. A layer of wrapping per function adds noise; wrap where the context changes, usually at module or service boundaries.
+  tradeoffs:
+    - Error kinds are an API. Once callers match on `CardDeclined`, renaming or splitting it is a breaking change.
+    - Retries add latency to failures and load to a struggling dependency. Cap them, back off, and retry in one layer only.
+    - Messages written at the edge can be vague. The edge must log the full chain, or the detail is lost.
+  lookalikes:
+    - name: Graceful degradation
+      how: One deliberate response to a failure, serving less instead of failing. It is a policy chosen at a boundary, not a catch-all that hides errors.
+    - name: Circuit breaker
+      how: Stops calling a dependency that keeps failing. It decides whether to call at all, where a retry decides whether to call again.
+    - name: Railway-oriented programming
+      how: A functional style where each step returns success or failure and failures skip the rest. It is errors-as-values with combinators, as in Rust's `Result` and `?`.
+---
+
+## [concept] Error-handling strategies
+
+**Handle each error once, in the layer that can act on it. Retry next to the call, add context on the way up, translate at the edge, and never swallow.**
+
+When a call fails, the code that sees the failure has a few choices: try again, give up and pass the error up, substitute something and carry on, or turn it into a message for a person. Each layer of a request makes this choice, and the choices add up. One layer that hides a failure makes every layer above it wrong.
+
+<Depth level={2}>
+The useful question for each layer is what it knows. The client that called the payment provider knows what a 503 means and whether the call is safe to repeat. The service knows which order it was placing. The handler knows the customer and the protocol. So the client names and retries, the service adds context, and the handler translates. A layer that does someone else's job (a repository writing customer text, a handler parsing driver codes) is where error handling goes wrong.
+
+Robustness and correctness pull in different directions. A video player that skips a corrupt frame is right to carry on. A checkout that carries on after a failed charge ships goods for free. Decide per system which one matters more, write the policy down, and apply it the same way in every layer.
+</Depth>
+
+<Depth level={3}>
+Steve McConnell's *Code Complete* lists the classic options (return a neutral value, substitute the next valid data, return the previous answer, log a warning, return an error code, call a central handler, shut down) and frames the choice as correctness against robustness. Two newer ideas matter in services. A <Term id="wrapped-error">wrapped error</Term> keeps the original failure inside a new one, so context and cause both survive. And retries are only safe when the operation is idempotent, which for payments means sending an <Term id="idempotency-key">idempotency key</Term>.
+</Depth>
+
+## [problem] A checkout written to never break
+
+POST /orders charges the card through a payment provider, then saves the order. The payment client was written so that a network hiccup would not break checkout: it logs the error and returns success. Anything else from the provider becomes the text "payment failed". The handler sends whatever error reaches it back to the customer with a 500.
+
+<Depth level={2}>
+Each choice looks reasonable on its own. Not breaking checkout sounds kind. A short error string is easy to write. Returning the error text helps when you test locally. Together they mean that the most important failure, a charge that did not happen, is invisible to the code that saves the order.
+</Depth>
+
+<Depth level={3}>
+The network error is a <Term id="swallowed-error">swallowed error</Term>. The log line is accurate, which makes it worse: the code looks like it handles the failure, and reviewers move on. Logging is a record, not a decision.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** declined cards must say so, and a one-second blip at the payment provider must not fail the checkout.
+
+The obvious patch is in the handler, the only place that sees errors. It compares the error text with "payment failed", but a declined card and a provider outage both produce that text, so it cannot tell them apart. The retry goes around the whole order, because that is what the handler can call. When the database times out after a successful charge, the retry charges the card again.
+
+<Depth level={2}>
+The information the change needs was thrown away two layers down. The status code was replaced by a string, and the network error was replaced by success. No patch at the top can get it back. The fix has to start at the bottom, where the failure is first seen.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Comparing `err.Error()` with a string breaks the moment someone adds context with `fmt.Errorf`. That is why Go code checks errors with `errors.Is` and `errors.As`, which look through wrapping.</Lang>
+<Lang only="python">`str(e) == "payment failed"` matches the message, which anyone may reword. An exception class is a name the type checker and the `except` clause can both see.</Lang>
+<Lang only="typescript">`String(e).includes(...)` works on whatever was thrown, including strings and plain objects, and breaks silently when a message changes. A class checked with `instanceof` is a contract.</Lang>
+<Lang only="rust">Matching on `String` contents gives up the main thing `Result` offers, an error type the compiler checks. With an enum, the match on error kinds is exhaustive.</Lang>
+</Depth>
+
+## [morph] Name the failure where it happens
+
+Drag the slider. The payment client stops hiding failures and names them as error kinds. The service adds context and passes them up. The handler, at the edge, maps kinds to responses and logs anything unexpected once.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The kinds are few and chosen by what callers do next, not by what went wrong inside: declined (ask for another card), unavailable (try later, or retry), anything else (our bug). A timeout, a refused connection and a 503 are all "unavailable" to the caller.
+</Depth>
+
+<Depth level={3}>
+Exceptions and error values are two ways to carry the same information. With exceptions the middle layer can do nothing and the error still arrives; with values it must pass the error on explicitly, which makes the propagation visible in review. Either way the chain should end at one place that logs it.
+</Depth>
+
+## [walk] Follow one outage
+
+The provider is down. Step through how the failure travels up, and what each layer does with it.
+
+<Depth level={3}>
+<Lang only="go">`%w` stores the wrapped error, and `errors.Is` follows `Unwrap` methods down the chain, including the `Unwrap() []error` form that a multi-`%w` `Errorf` creates. The check is a loop over pointers, cheap enough to run on every request.</Lang>
+<Lang only="python">When `raise ... from e` runs, Python sets `__cause__` on the new exception and the traceback module prints both, separated by "The above exception was the direct cause of the following exception". An exception raised inside an `except` block without `from` still records the first one as `__context__`.</Lang>
+<Lang only="typescript">`cause` is an own property set by the `Error` constructor. Node's `util.inspect`, and so `console.error`, prints the cause chain; many loggers' error serialisers include it too, but check yours.</Lang>
+<Lang only="rust">`?` expands to a match that returns `Err(From::from(e))`. `thiserror` generates the `From` impl for `#[from]` fields and the `source()` method for `#[source]` fields, so the chain is plain data that any logger can walk.</Lang>
+</Depth>
+
+## [again] Retry the blip, the second time
+
+The same request, after the refactor. The retry goes into the payment client, next to the one call it repeats. It retries only "unavailable", with a short <Term id="exponential-backoff">backoff</Term>, and sends the order id as an idempotency key. The service and the handler do not change.
+
+<Depth level={2}>
+A <Term id="transient-failure">transient failure</Term> is worth retrying. A declined card is not, so the retry checks the kind. Retry in one layer only: if the client, the service and the handler each retry three times, one failing call becomes 27.
+</Depth>
+
+<Depth level={3}>
+Retries interact with outages. When a dependency is down, every client retrying at once can keep it down. Cap attempts, add jitter, and consider a retry budget or a circuit breaker for calls with heavy traffic. A slow failure is often worse than a fast one, so the retry also respects the request's deadline.
+</Depth>
+
+## [play] Pick a policy per layer, then break things
+
+A checkout request with four layers. Choose what each layer does when an error reaches it, then inject a failure at the provider or the database. Watch three things: what the customer is told, what the logs say, and what really happened to the money.
+
+## [lens] How each language writes it
+
+Go and Rust return errors as values; Python and TypeScript throw exceptions. The policy is the same in all four. The language decides how easy it is to forget a step.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="error-handling-strategies" />
+
+### One question per layer
+
+For each layer, ask what it knows that the others do not. If it knows how to recover, recover there. If it knows context, add it and pass the error on. If it knows the person waiting, write the message and log once. If it knows none of these, it should not touch the error at all.
+
+| Layer | Knows | Does |
+|---|---|---|
+| Client (HTTP, database) | What the failure means, whether a retry is safe | Names the kind, retries transient failures |
+| Service | What it was doing, for which ids | Adds context, passes it up |
+| Edge (handler, consumer) | The caller and the protocol | Maps kind to status and message, logs once |
