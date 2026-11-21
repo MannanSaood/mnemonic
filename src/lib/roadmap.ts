@@ -24,7 +24,7 @@ export interface RoadmapNode {
   skippable: boolean;
 }
 
-export interface RoadmapResult { nodes: RoadmapNode[]; missing: string[] }
+export interface RoadmapResult { nodes: RoadmapNode[]; missing: string[]; cyclic: string[] }
 
 /** passed: lesson id -> depths whose check the reader has passed. */
 export function computeRoadmap(profile: RoadmapProfile, lessons: TopicMeta[], passed: Record<string, DepthName[]> = {}): RoadmapResult {
@@ -75,7 +75,10 @@ export function computeRoadmap(profile: RoadmapProfile, lessons: TopicMeta[], pa
         if (indeg.get(other) === 0) ready.push(other);
       }
   }
-  if (out.length !== ids.length) throw new Error("[roadmap] prerequisites form a cycle: " + ids.filter((i) => !out.includes(i)).join(", "));
+  // A cycle (possible in planned outlines) must not break the path: keep those lessons in
+  // their own order at the point where the cycle blocks, and report them.
+  const cyclic = ids.filter((i) => !out.includes(i)).sort((a, b) => order.get(a)! - order.get(b)!);
+  out.push(...cyclic);
 
   return {
     nodes: out.map((id) => {
@@ -87,5 +90,6 @@ export function computeRoadmap(profile: RoadmapProfile, lessons: TopicMeta[], pa
       };
     }),
     missing: [...missing],
+    cyclic,
   };
 }
