@@ -1,0 +1,676 @@
+---
+title: Mediator
+track: design-patterns
+group: Behavioral
+order: 44
+summary: Let a set of objects talk through one coordinator instead of to each other, so each one knows only the coordinator.
+intent: Adding a part to a group of cooperating parts should not mean editing the parts already there.
+changeRequest: Checkout needs a gift card field that lowers the total and can make a payment method unnecessary.
+languages: [go, python, typescript, rust]
+glossary: [update-glitch, god-object, dependency-injection]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/coupling-and-cohesion]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: mediator
+  scenarios:
+    - try: Change the country.
+      notice: Wired, the change fans out through Summary and Promo, and Place order re-renders three times, twice with stale numbers. Through the mediator, every part updates once.
+    - try: Add the gift card.
+      notice: Wired, four existing parts must change. With a mediator, only the mediator does.
+    - try: Add loyalty points, then change the promo code.
+      notice: Promo clears points, points clear promo, and the wired page loops. The mediator has one rule that decides which one wins.
+    - try: Add all three change requests and read the mediator's rule count.
+      notice: The mediator now holds more rules than any part. The tangle moved into one place, which is the trade, and a sign to split it by flow.
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: customer, sub: edits fields }
+      after:  { x: 12, y: 108, w: 112, h: 48, title: customer, sub: edits fields }
+    - id: context
+      kind: context
+      before: { x: 150, y: 18, w: 400, h: 246, title: checkout page, sub: parts call each other }
+      after:  { x: 196, y: 104, w: 150, h: 56, title: Checkout, sub: mediator }
+    - id: shipping
+      kind: concrete
+      before: { x: 170, y: 56, w: 130, h: 34, title: Shipping, sub: calls 3 parts }
+      after:  { x: 400, y: 18, w: 150, h: 30, title: Shipping }
+    - id: promo
+      kind: concrete
+      before: { x: 400, y: 56, w: 130, h: 34, title: Promo, sub: calls Summary }
+      after:  { x: 400, y: 58, w: 150, h: 30, title: Promo }
+    - id: payment
+      kind: concrete
+      before: { x: 170, y: 140, w: 130, h: 34, title: Payment, sub: calls button }
+      after:  { x: 400, y: 98, w: 150, h: 30, title: Payment }
+    - id: summary
+      kind: concrete
+      before: { x: 400, y: 140, w: 130, h: 34, title: Summary, sub: calls button }
+      after:  { x: 400, y: 138, w: 150, h: 30, title: Summary }
+    - id: button
+      kind: concrete
+      before: { x: 285, y: 214, w: 130, h: 34, title: Place order }
+      after:  { x: 400, y: 178, w: 150, h: 30, title: Place order }
+    - id: giftcard
+      kind: concrete
+      appears: change
+      before: { x: 285, y: 98, w: 130, h: 34, title: Gift card, sub: calls 3 parts }
+      after:  { x: 400, y: 218, w: 150, h: 30, title: Gift card }
+  edges:
+    - { from: client, to: context, label: changes }
+    - { from: context, to: shipping }
+    - { from: context, to: promo }
+    - { from: context, to: payment, label: updates }
+    - { from: context, to: summary }
+    - { from: context, to: button }
+    - { from: context, to: giftcard }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: checkout.go
+      source: |
+        // checkout.go: each part holds the parts it must update
+        type Shipping struct {
+            summary *Summary
+            payment *Payment
+            promo   *Promo
+        }
+
+        func (s *Shipping) SetCountry(c string) {
+            s.summary.SetShipping(rateFor(c))
+            s.payment.SetMethods(methodsFor(c))
+            s.promo.Revalidate(c)
+        }
+
+        type Promo struct {
+            code    string
+            summary *Summary
+        }
+
+        func (p *Promo) Revalidate(country string) {
+            if !validIn(p.code, country) {
+                p.code = ""
+            }
+            p.summary.SetDiscount(discountFor(p.code))
+        }
+
+        type Summary struct {
+            shipping, discount Money
+            button             *PlaceOrder
+        }
+
+        func (s *Summary) SetShipping(m Money) {
+            s.shipping = m
+            s.button.Refresh(s.Total())
+        }
+
+        func (s *Summary) SetDiscount(m Money) {
+            s.discount = m
+            s.button.Refresh(s.Total())
+        }
+      roles: { context: [1, 39], shipping: [2, 12], payment: [10, 10], promo: [14, 24], summary: [26, 39], button: [28, 28] }
+      change:
+        - { line: 27, replace: '    shipping, discount, gift Money' }
+        - { after: 39, add: ['', 'func (s *Summary) SetGift(m Money) {', '    s.gift = m', '    s.button.Refresh(s.Total())', '}', '', '// giftcard.go: holds three more parts; Payment gains SetRequired, Cart must call Apply', 'type GiftCard struct {', '    summary *Summary', '    payment *Payment', '    button  *PlaceOrder', '}'] }
+    after:
+      file: checkout.go · shipping.go
+      source: |
+        // checkout.go: the one place that knows how the parts affect each other
+        type Checkout struct {
+            shipping *Shipping
+            promo    *Promo
+            payment  *Payment
+            summary  *Summary
+            button   *PlaceOrder
+        }
+
+        // Changed is called by any part when the customer changes it.
+        func (c *Checkout) Changed(part any) {
+            country := c.shipping.Country()
+            if part == c.shipping {
+                c.payment.SetMethods(methodsFor(country))
+                c.promo.DropIfInvalid(country)
+            }
+            total := c.summary.Show(rateFor(country), discountFor(c.promo.Code()))
+            c.button.Show(total, c.payment.Ready())
+        }
+
+        // shipping.go: a part knows only the mediator.
+        type Shipping struct {
+            country string
+            m       *Checkout
+        }
+
+        func (s *Shipping) SetCountry(country string) {
+            s.country = country
+            s.m.Changed(s)
+        }
+      roles: { context: [1, 19], shipping: [21, 29], payment: [14, 14], promo: [15, 15], summary: [17, 17], button: [18, 18], client: [27, 29], call: [27, 28], notify: [29, 29], rules: [13, 16], render: [17, 18] }
+    again:
+      file: giftcard.go
+      source: |
+        // giftcard.go: a new part that knows only the mediator
+        type GiftCard struct {
+            balance Money
+            m       *Checkout
+        }
+
+        func (g *GiftCard) Apply(b Money) {
+            g.balance = b
+            g.m.Changed(g)
+        }
+
+        // In Checkout.Changed, the render lines take the balance into account:
+        //     due := c.summary.Show(rateFor(country), discountFor(c.promo.Code()), c.gift.balance)
+        //     c.payment.SetRequired(due > 0)
+    cost:
+      before: { text: 4 parts edited · +4 links, value: 0.85 }
+      after: { text: 1 new part · 2 lines in the mediator, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Go often gets a mediator without naming it: one struct owns the parts and has one method per event, and the HTTP handler calls that method directly, so parts need no pointer back. Another Go form is a single goroutine that owns the state and receives every change on a channel.'
+      seenIn: 'Kubernetes controllers never call each other. Each one watches and writes objects through the API server, which coordinates them. The scheduler, the deployment controller and the kubelet cooperate without knowing each other.'
+
+  python:
+    before:
+      file: checkout.py
+      source: |
+        # checkout.py: each part holds the parts it must update
+        from __future__ import annotations
+
+        class Shipping:
+            def __init__(self, summary: Summary, payment: Payment, promo: Promo) -> None:
+                self.summary, self.payment, self.promo = summary, payment, promo
+
+            def set_country(self, country: str) -> None:
+                self.summary.set_shipping(rate_for(country))
+                self.payment.set_methods(methods_for(country))
+                self.promo.revalidate(country)
+
+        class Promo:
+            def __init__(self, summary: Summary) -> None:
+                self.code, self.summary = "", summary
+
+            def revalidate(self, country: str) -> None:
+                if not valid_in(self.code, country):
+                    self.code = ""
+                self.summary.set_discount(discount_for(self.code))
+
+        class Summary:
+            def __init__(self, button: PlaceOrder) -> None:
+                self.shipping = self.discount = Money(0)
+                self.button = button
+
+            def set_shipping(self, m: Money) -> None:
+                self.shipping = m
+                self.button.refresh(self.total())
+
+            def set_discount(self, m: Money) -> None:
+                self.discount = m
+                self.button.refresh(self.total())
+      roles: { context: [1, 33], shipping: [4, 11], payment: [10, 10], promo: [13, 20], summary: [22, 33], button: [25, 25] }
+      change:
+        - { line: 24, replace: '        self.shipping = self.discount = self.gift = Money(0)' }
+        - { after: 33, add: ['', '    def set_gift(self, m: Money) -> None:', '        self.gift = m', '        self.button.refresh(self.total())', '', '# gift_card.py: holds three more parts; Payment gains set_required, Cart must call apply', 'class GiftCard:', '    def __init__(self, summary: Summary, payment: Payment, button: PlaceOrder) -> None:', '        self.summary, self.payment, self.button = summary, payment, button'] }
+    after:
+      file: checkout.py
+      source: |
+        # checkout.py: the one place that knows how the parts affect each other
+        from __future__ import annotations
+
+        class Checkout:
+            def __init__(self) -> None:
+                self.shipping = Shipping(self)
+                self.promo = Promo(self)
+                self.payment = Payment(self)
+                self.summary = Summary()
+                self.button = PlaceOrder()
+
+            def changed(self, part: object) -> None:
+                country = self.shipping.country
+                if part is self.shipping:
+                    self.payment.set_methods(methods_for(country))
+                    self.promo.drop_if_invalid(country)
+                total = self.summary.show(rate_for(country), discount_for(self.promo.code))
+                self.button.show(total, self.payment.ready())
+
+        # A part knows only the mediator.
+        class Shipping:
+            def __init__(self, mediator: Checkout) -> None:
+                self.country, self.mediator = "", mediator
+
+            def set_country(self, country: str) -> None:
+                self.country = country
+                self.mediator.changed(self)
+      roles: { context: [4, 18], shipping: [21, 27], payment: [15, 15], promo: [16, 16], summary: [17, 17], button: [18, 18], client: [25, 27], call: [25, 26], notify: [27, 27], rules: [14, 16], render: [17, 18] }
+    again:
+      file: gift_card.py
+      source: |
+        # gift_card.py: a new part that knows only the mediator
+        class GiftCard:
+            def __init__(self, mediator: Checkout) -> None:
+                self.balance, self.mediator = Money(0), mediator
+
+            def apply(self, balance: Money) -> None:
+                self.balance = balance
+                self.mediator.changed(self)
+
+        # In Checkout.changed, the render lines take the balance into account:
+        #     due = self.summary.show(rate_for(country), discount_for(self.promo.code), self.gift_card.balance)
+        #     self.payment.set_required(due > 0)
+    cost:
+      before: { text: 4 parts edited · +4 links, value: 0.85 }
+      after: { text: 1 new class · 2 lines in the mediator, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Passing the mediator into each part, as here, is the plain form. Many Python codebases get the same decoupling from signals: parts send a signal and the coordinator connects to it, so parts never import each other.'
+      seenIn: 'Django signals (`post_save`, `request_finished`) let apps react to each other''s events without importing each other. In Tkinter, a parent frame often owns the widgets and wires their callbacks to its own methods, making it the dialog''s mediator.'
+
+  typescript:
+    before:
+      file: checkout.ts
+      source: |
+        // checkout.ts: each part holds the parts it must update
+        class Shipping {
+          constructor(private summary: Summary, private payment: Payment, private promo: Promo) {}
+
+          setCountry(country: string): void {
+            this.summary.setShipping(rateFor(country));
+            this.payment.setMethods(methodsFor(country));
+            this.promo.revalidate(country);
+          }
+        }
+
+        class Promo {
+          code = "";
+          constructor(private summary: Summary) {}
+
+          revalidate(country: string): void {
+            if (!validIn(this.code, country)) this.code = "";
+            this.summary.setDiscount(discountFor(this.code));
+          }
+        }
+
+        class Summary {
+          private shipping = 0;
+          private discount = 0;
+          constructor(private button: PlaceOrder) {}
+
+          setShipping(m: number): void {
+            this.shipping = m;
+            this.button.refresh(this.total());
+          }
+
+          setDiscount(m: number): void {
+            this.discount = m;
+            this.button.refresh(this.total());
+          }
+        }
+      roles: { context: [1, 36], shipping: [2, 10], payment: [7, 7], promo: [12, 20], summary: [22, 36], button: [25, 25] }
+      change:
+        - { after: 24, add: ['  private gift = 0;'] }
+        - { after: 35, add: ['', '  setGift(m: number): void {', '    this.gift = m;', '    this.button.refresh(this.total());', '  }'] }
+        - { after: 36, add: ['', '// gift-card.ts: holds three more parts; Payment gains setRequired, Cart must call apply', 'class GiftCard {', '  constructor(private summary: Summary, private payment: Payment, private button: PlaceOrder) {}', '}'] }
+    after:
+      file: checkout.ts
+      source: |
+        // checkout.ts: the one place that knows how the parts affect each other
+        class Checkout {
+          readonly shipping = new Shipping(this);
+          readonly promo = new Promo(this);
+          readonly payment = new Payment(this);
+          readonly summary = new Summary();
+          readonly button = new PlaceOrder();
+
+          changed(part: object): void {
+            const country = this.shipping.country;
+            if (part === this.shipping) {
+              this.payment.setMethods(methodsFor(country));
+              this.promo.dropIfInvalid(country);
+            }
+            const total = this.summary.show(rateFor(country), discountFor(this.promo.code));
+            this.button.show(total, this.payment.ready());
+          }
+        }
+
+        // A part knows only the mediator.
+        class Shipping {
+          country = "";
+          constructor(private mediator: Checkout) {}
+
+          setCountry(country: string): void {
+            this.country = country;
+            this.mediator.changed(this);
+          }
+        }
+      roles: { context: [2, 18], shipping: [21, 29], payment: [12, 12], promo: [13, 13], summary: [15, 15], button: [16, 16], client: [25, 28], call: [25, 26], notify: [27, 27], rules: [11, 14], render: [15, 16] }
+    again:
+      file: gift-card.ts
+      source: |
+        // gift-card.ts: a new part that knows only the mediator
+        class GiftCard {
+          balance = 0;
+          constructor(private mediator: Checkout) {}
+
+          apply(balance: number): void {
+            this.balance = balance;
+            this.mediator.changed(this);
+          }
+        }
+
+        // In Checkout.changed, the render lines take the balance into account:
+        //   const due = this.summary.show(rateFor(country), discountFor(this.promo.code), this.giftCard.balance);
+        //   this.payment.setRequired(due > 0);
+    cost:
+      before: { text: 4 parts edited · +4 links, value: 0.85 }
+      after: { text: 1 new class · 2 lines in the mediator, value: 0.3 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'In UI frameworks the common parent is the mediator. Children report events up through callbacks, the parent decides, and passes the results down as props. React calls this lifting state up. A store with reducers plays the same role for a whole app.'
+      seenIn: 'React''s lifting state up to the closest common parent. Redux, where components dispatch actions to one store instead of calling each other. Express and Koa middleware chains, where handlers share a request context instead of referencing each other.'
+
+  rust:
+    before:
+      file: checkout.rs
+      source: |
+        // checkout.rs: each part holds the parts it must update
+        pub struct Shipping {
+            summary: Rc<RefCell<Summary>>,
+            payment: Rc<RefCell<Payment>>,
+            promo: Rc<RefCell<Promo>>,
+        }
+
+        impl Shipping {
+            pub fn set_country(&self, country: &str) {
+                self.summary.borrow_mut().set_shipping(rate_for(country));
+                self.payment.borrow_mut().set_methods(methods_for(country));
+                self.promo.borrow_mut().revalidate(country);
+            }
+        }
+
+        pub struct Promo {
+            code: String,
+            summary: Rc<RefCell<Summary>>,
+        }
+
+        impl Promo {
+            pub fn revalidate(&mut self, country: &str) {
+                if !valid_in(&self.code, country) {
+                    self.code.clear();
+                }
+                self.summary.borrow_mut().set_discount(discount_for(&self.code));
+            }
+        }
+
+        pub struct Summary {
+            shipping: Money,
+            discount: Money,
+            button: Rc<RefCell<PlaceOrder>>,
+        }
+
+        impl Summary {
+            pub fn set_shipping(&mut self, m: Money) {
+                self.shipping = m;
+                self.button.borrow_mut().refresh(self.total());
+            }
+
+            pub fn set_discount(&mut self, m: Money) {
+                self.discount = m;
+                self.button.borrow_mut().refresh(self.total());
+            }
+        }
+      roles: { context: [1, 46], shipping: [2, 14], payment: [11, 11], promo: [16, 28], summary: [30, 46], button: [33, 33] }
+      change:
+        - { after: 32, add: ['    gift: Money,'] }
+        - { after: 45, add: ['', '    pub fn set_gift(&mut self, m: Money) {', '        self.gift = m;', '        self.button.borrow_mut().refresh(self.total());', '    }'] }
+        - { after: 46, add: ['', '// gift_card.rs: holds three more parts; Payment gains set_required, Cart must call apply', 'pub struct GiftCard {', '    summary: Rc<RefCell<Summary>>,', '    payment: Rc<RefCell<Payment>>,', '    button: Rc<RefCell<PlaceOrder>>,', '}'] }
+    after:
+      file: checkout.rs
+      source: |
+        // checkout.rs: the mediator owns the parts; changes arrive as messages
+        pub enum Change { Country(String), PromoCode(String) }
+
+        pub struct Checkout {
+            shipping: Shipping,
+            promo: Promo,
+            payment: Payment,
+            summary: Summary,
+            button: PlaceOrder,
+        }
+
+        impl Checkout {
+            pub fn changed(&mut self, change: Change) {
+                match change {
+                    Change::Country(c) => {
+                        self.shipping.country = c;
+                        self.payment.set_methods(methods_for(&self.shipping.country));
+                        self.promo.drop_if_invalid(&self.shipping.country);
+                    }
+                    Change::PromoCode(code) => self.promo.code = code,
+                }
+                let total = self.summary.show(rate_for(&self.shipping.country), discount_for(&self.promo.code));
+                self.button.show(total, self.payment.ready());
+            }
+        }
+      roles: { context: [4, 25], shipping: [16, 16], payment: [17, 17], promo: [18, 18], summary: [22, 22], button: [23, 23], client: [2, 2], call: [2, 2], notify: [13, 14], rules: [15, 19], render: [22, 23] }
+    again:
+      file: checkout.rs
+      source: |
+        // Change gains GiftCard(Money) and Checkout gains a gift: GiftCard field. One new arm:
+                    Change::GiftCard(balance) => self.gift.balance = balance,
+        // and the render lines take the balance into account:
+        //     let due = self.summary.show(rate, discount, self.gift.balance);
+        //     self.payment.set_required(due > Money::ZERO);
+    cost:
+      before: { text: 4 parts edited · +4 links, value: 0.85 }
+      after: { text: 1 new arm · 2 lines in the mediator, value: 0.25 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Parts that hold `Rc<RefCell<…>>` to each other fight the borrow checker, and a call that comes back to a part already borrowed panics at runtime. Rust pushes you toward one owner. The mediator owns the parts outright, changes arrive as an enum, and nothing points back.'
+      seenIn: 'In Bevy, systems never reference each other; they read and write shared components through the `World`, and the schedule decides the order. In tokio apps, an actor task owns the state and receives messages on an `mpsc` channel.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'The customer picks a country. The page calls `shipping.SetCountry("DE")`, which stores it.', python: 'The customer picks a country. The page calls `shipping.set_country("DE")`, which stores it.', typescript: 'The customer picks a country. The page calls `shipping.setCountry("DE")`, which stores it.', rust: 'The customer picks a country. The page sends `Change::Country("DE")` to the checkout; no part is called directly.' }
+    nodes: [client, context, shipping]
+    edges: [client>context]
+    role: call
+  - text: { go: 'Shipping tells the mediator it changed, passing itself. It does not know who cares.', python: 'Shipping tells the mediator it changed, passing itself. It does not know who cares.', typescript: 'Shipping tells the mediator it changed, passing itself. It does not know who cares.', rust: '`changed` matches on the message. Only the mediator knows which parts care about a country.' }
+    nodes: [shipping, context]
+    edges: [context>shipping]
+    role: notify
+  - text: The mediator applies the rules for a new country. Payment gets the methods for that country, and Promo drops a code that is not valid there.
+    nodes: [context, payment, promo]
+    edges: [context>payment, context>promo]
+    role: rules
+  - text: Only then does it render, once. Summary and Place order see the final shipping and discount together, never a half-updated total.
+    nodes: [context, summary, button]
+    edges: [context>summary, context>button]
+    role: render
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these calls for a Mediator?
+    options:
+      - text: Six deploy steps (build, tests, migration, canary, traffic shift, rollback) each call the others to decide what happens next.
+        correct: true
+        why: Right. Many parts that must cooperate, each knowing the others. An orchestrator that the steps report to, and that decides what runs next, is a mediator.
+      - text: A payment provider's SDK has forty calls, and the shop needs only three of them behind a simple interface.
+        why: That is Facade. It simplifies how you call a subsystem. The parts behind it do not report back to it, and they may still talk to each other.
+      - text: Several services need to hear when an order is placed, and the order service should not know who they are.
+        why: That is Observer. Events flow one way, from one source to many listeners. A mediator coordinates two-way cooperation between parts.
+  engineer:
+    question: After two years the checkout mediator is 1,400 lines and every checkout change touches it. What is the best next step?
+    options:
+      - text: Split it by flow, for example pricing, payment and delivery, each a smaller mediator for the parts it coordinates.
+        correct: true
+        why: Right. The pattern moves complexity into the mediator on purpose. When it grows into a god object, divide the cooperation into groups that change for different reasons.
+      - text: Go back to letting the parts call each other directly.
+        why: That brings back the tangle, the edits in many parts per change and the update cascades. The mediator was the right move; it has just grown too big.
+      - text: Let each part register callbacks on the mediator, so the rules live in the parts again.
+        why: Then each part again encodes what other parts must do. The coupling returns, now hidden behind the mediator.
+  deep:
+    question: In the wired checkout, Shipping updates Summary, which refreshes the button before Promo has dropped an invalid code. The button briefly shows a wrong total. What is this, and how does the mediator avoid it?
+    options:
+      - text: A glitch. A dependent recomputed between two of its inputs updating. The mediator applies every rule first and renders once, so nothing sees a half-updated state.
+        correct: true
+        why: Right. Reactive libraries avoid glitches the same way, by updating in dependency order before anyone reads. It is a single-threaded problem, about the order of synchronous calls.
+      - text: A data race between two threads. It needs a mutex around Summary.
+        why: There is only one thread. The calls run synchronously, depth first, and the wrong total comes from their order. A lock would not change the order.
+      - text: A memory leak, because Summary keeps a reference to the button.
+        why: Holding a reference is not a leak, and it does not explain a wrong value. The order of updates does.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Mediator
+      example: Checkout
+      job: Knows which parts affect which, applies those rules, and updates each part once.
+    - role: Colleague
+      example: Shipping, Promo, Payment, Summary, Place order
+      job: Does its own job and reports changes to the mediator. Knows no other part.
+    - role: Client
+      example: The customer, through the page
+      job: Changes a part, or sends the change to the mediator.
+  useWhen:
+    - Several parts must react to each other, and each new part would otherwise be wired to many existing ones.
+    - Updates must happen in a fixed order, or the page shows half-updated values.
+    - You want to reuse a part in another screen without dragging its neighbours along.
+  avoidWhen:
+    - Two or three parts with one simple dependency. A direct call is clearer.
+    - Events flow one way from one source to many listeners. Observer fits better.
+  tradeoffs:
+    - The mediator collects all the cooperation, so it can grow into a god object. Split it by flow when it does.
+    - To learn what a part does to the rest of the page, you read the mediator, not the part.
+    - Each part depends on the mediator, which makes the mediator hard to change without touching every part that calls it.
+  lookalikes:
+    - name: Facade
+      how: Gives callers a simpler interface to a subsystem. The subsystem does not know the facade, and its parts may still talk to each other.
+    - name: Observer
+      how: One-way notifications from a subject to listeners. A mediator often listens to its parts this way, then coordinates them.
+    - name: Event bus
+      how: A shared channel where anyone publishes and anyone subscribes. It removes references but not the rules; those end up spread across the subscribers.
+---
+
+## [concept] Mediator
+
+**Let a set of objects talk through one coordinator instead of to each other, so each one knows only the coordinator.**
+
+How the parts affect each other becomes the coordinator's job. Each part does its own work and reports what changed.
+
+<Depth level={2}>
+Two roles. The **mediator** (`Checkout`) knows every part and the rules between them: a new country changes the payment methods, an invalid promo is dropped, the total is shown once everything is settled. Each **colleague** (Shipping, Promo, Payment, Summary, Place order) knows only the mediator. With n parts that may all affect each other, direct wiring can need up to n×(n−1)/2 links; through a mediator it needs n.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Mediator under object behavioural patterns, with a font dialog as its example: a list box, an entry field and buttons that enable and fill each other. It names the benefits: colleagues are decoupled and reusable, and many-to-many protocols become one-to-many. It also names the cost plainly. The mediator centralises control and can become a monolith more complex than any colleague. It suggests the mediator can learn of changes through Observer.
+</Depth>
+
+## [problem] A checkout page wired to itself
+
+A checkout page has a shipping country, a promo code, a payment picker, a summary and a Place order button. Each part holds pointers to the parts it must update and calls them when it changes.
+
+Read it once. Shipping knows three other parts. Summary knows the button. Every rule about how the page behaves lives inside the part that happens to change first.
+
+<Depth level={2}>
+Follow one country change. Shipping updates Summary, which refreshes the button. Then it updates Payment, then Promo, which updates Summary again, which refreshes the button again. The button renders three times for one click, and the first render uses the old discount.
+</Depth>
+
+<Depth level={3}>
+To test Promo you need a Summary, which needs a PlaceOrder. To reuse Shipping on the address-book page you bring along a checkout's worth of parts. The links are the problem, not any single part.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** checkout needs a gift card field that lowers the total and can make a payment method unnecessary.
+
+The gift card must reach Summary, Payment and the button, so it holds all three. Summary gains a field and a setter, Payment gains `SetRequired`, and Cart must call the gift card when the basket changes. That is four existing parts edited for one new one.
+
+<Depth level={2}>
+Each edit is small, and that is the trap. Nobody owns the question of how the page behaves as a whole. The next request, loyalty points that cannot be combined with a promo code, makes Promo and Loyalty clear each other, and in this design they call each other forever.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">In Rust the tangle shows up early. Every link is an `Rc<RefCell<…>>`, and when Promo and Loyalty call each other, the second `borrow_mut` on an already borrowed cell panics with `BorrowMutError`.</Lang>
+<Lang only="go">Go will compile the loop happily. Promo calls Loyalty, which calls Promo, until the goroutine's stack hits its limit and the program dies with a fatal stack overflow.</Lang>
+<Lang only="python">Python will run the loop until it raises `RecursionError` after about a thousand nested calls, in the middle of a customer's click.</Lang>
+<Lang only="typescript">In the browser the loop ends with `RangeError: Maximum call stack size exceeded`, and the checkout stops responding to that click.</Lang>
+</Depth>
+
+## [morph] Route every change through one coordinator
+
+Drag the slider. The links between parts disappear. Each part reports to `Checkout`, and `Checkout` updates the others.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The rules did not vanish; they moved. They now sit in one method you can read top to bottom, in the order they run. Each part can be tested alone, and the mediator can be tested with simple fakes.
+</Depth>
+
+<Depth level={3}>
+The parts are built by the mediator and given a pointer back to it: a small case of <Term id="dependency-injection">dependency injection</Term>. In Rust the back pointer is dropped entirely. The page sends a `Change` message to the mediator, which owns the parts, so there is nothing for the borrow checker to object to.
+</Depth>
+
+## [walk] Follow one country change
+
+One click, start to finish. Step through it with the numbered buttons.
+
+<Depth level={3}>
+Because the mediator applies every rule before it renders, the summary and button never see a half-updated state. In the wired version they did, which is called a <Term id="update-glitch">glitch</Term>. Reactive libraries avoid glitches the same way: they settle all inputs first, then recompute each dependent once.
+</Depth>
+
+## [again] The gift card, the second time
+
+The same request, after the refactor. You add one part that knows only the mediator, and two lines in the mediator's render step. Shipping, Promo, Payment, Summary and the button do not change.
+
+<Depth level={2}>
+The loyalty request becomes one rule in the mediator, such as "whichever of promo and points the customer touched last wins". A loop between the two parts cannot happen, because neither part calls the other.
+</Depth>
+
+<Depth level={3}>
+Watch the mediator's size. Each request adds a rule or two, and after a few years it can be the biggest class in the checkout, a <Term id="god-object">god object</Term>. When that happens, split it by flow, with one mediator for pricing and one for payment and delivery, each coordinating fewer parts.
+</Depth>
+
+## [play] Click through a live checkout
+
+Two copies of the checkout take the same clicks and the same change requests: one wired part to part, one through a mediator. Watch the calls, count the re-renders, and add the change requests one by one.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. In UI code it is often just the parent component, and in Rust it is where ownership pushes you anyway.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="mediator" />
+
+### Orchestration and choreography
+
+In service architectures the same choice has other names. An orchestrator, such as a deploy pipeline or a saga coordinator, is a mediator: services report to it and it decides what runs next. Choreography is the event-bus version, where each service reacts to events and nobody holds the whole flow. Orchestration is easier to read and change in one place. Choreography avoids a central component, but spreads the rules across every subscriber.

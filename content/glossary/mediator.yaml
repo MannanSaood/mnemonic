@@ -1,0 +1,7 @@
+# Terms introduced by design-patterns/mediator.
+- id: update-glitch
+  term: Glitch
+  short: A moment when a dependent value shows a mix of old and new inputs because it recomputed before all its inputs had updated.
+- id: god-object
+  term: God object
+  short: One class that knows about and controls too much of the system, so almost every change has to go through it.
