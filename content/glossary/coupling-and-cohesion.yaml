@@ -1,0 +1,13 @@
+# Terms introduced by design-patterns/coupling-and-cohesion
+- id: coupling
+  term: Coupling
+  short: Two pieces of code are coupled when a change to one forces a change to the other.
+- id: cohesion
+  term: Cohesion
+  short: How well the code inside one module belongs together. High cohesion means the things that change together live together.
+- id: encapsulation
+  term: Encapsulation
+  short: Keeping a module's data private and letting others reach it only through the module's own methods.
+- id: connascence
+  term: Connascence
+  short: A finer-grained name for coupling. It sorts couplings by kind (name, type, meaning, position and more), from weaker to stronger.

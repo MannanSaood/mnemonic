@@ -1,0 +1,625 @@
+---
+title: Coupling and cohesion
+track: design-patterns
+group: Principles
+order: 11
+summary: Keep the code that changes together in one place, and let other modules ask it questions instead of reaching into its data.
+intent: A change to how one module stores something should stop at that module.
+changeRequest: A second warehouse opens, so stock must be kept per warehouse.
+languages: [go, python, typescript, rust]
+glossary: [coupling, cohesion, encapsulation, connascence, interface]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: coupling-and-cohesion
+  scenarios:
+    - try: "Predict, then change the stock map in the tangled design."
+      notice: "Inventory, Orders and Shipping all change, owned by three teams. Flip to Cohesive: only Inventory changes."
+    - try: "Change the price representation in the tangled design."
+      notice: "The ripple takes two hops: Orders' total changes shape, so Email and Shipping, which read the total, change too."
+    - try: "Change the carrier API, then the email layout."
+      notice: "Both stay inside one module in both designs. Coupling is always about a particular change."
+    - try: "In the cohesive design, turn on the shortcuts one by one and repeat your changes."
+      notice: "Each shortcut saves one method call and adds one module to the ripple. The table keeps score."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: orders
+      kind: client
+      before: { x: 12, y: 40, w: 110, h: 48, title: Orders, sub: writes Stock }
+      after:  { x: 12, y: 40, w: 110, h: 48, title: Orders, sub: { go: Reserve(lines), python: reserve(lines), typescript: reserve(lines), rust: reserve(&lines) } }
+    - id: shipping
+      kind: client
+      before: { x: 12, y: 170, w: 110, h: 48, title: Shipping, sub: reads Stock }
+      after:  { x: 12, y: 170, w: 110, h: 48, title: Shipping, sub: { go: Available(sku), python: available(sku), typescript: available(sku), rust: available(sku) } }
+    - id: api
+      kind: strategy
+      appears: after
+      before: { x: 175, y: 105, w: 150, h: 60, title: "" }
+      after:  { x: 170, y: 100, w: 160, h: 60, title: Inventory API, sub: { go: Reserve · Available, python: reserve · available, typescript: reserve · available, rust: reserve · available } }
+    - id: inventory
+      kind: context
+      before: { x: 200, y: 18, w: 340, h: 240, title: Inventory, sub: { go: Stock is exported, python: stock is public, typescript: stock is public, rust: pub stock } }
+      after:  { x: 380, y: 30, w: 170, h: 56, title: Inventory, sub: owns its stock }
+    - id: stock
+      kind: concrete
+      before: { x: 220, y: 90, w: 300, h: 40, title: { go: "Stock[sku]", python: "stock[sku]", typescript: "stock.get(sku)", rust: "stock[&sku]" } }
+      after:  { x: 380, y: 180, w: 80, h: 40, title: stock }
+    - id: warehouses
+      kind: concrete
+      appears: change
+      before: { x: 220, y: 180, w: 300, h: 40, title: { go: "Stock[wh][sku]", python: "stock[wh][sku]", typescript: "stock.get(wh).get(sku)", rust: "stock[&wh][&sku]" } }
+      after:  { x: 470, y: 180, w: 80, h: 40, title: per wh }
+  edges:
+    - { from: orders, to: api, label: asks }
+    - { from: shipping, to: api }
+    - { from: api, to: inventory, label: owned by }
+    - { from: stock, to: inventory, kind: implements, label: private }
+    - { from: warehouses, to: inventory, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: inventory.go · orders.go · shipping.go
+      source: |
+        // inventory.go
+        type Inventory struct {
+            Stock map[string]int // sku -> units on hand
+        }
+
+        // orders.go
+        func (o *Orders) Place(c Cart) (Order, error) {
+            for _, l := range c.Lines {
+                if o.inv.Stock[l.SKU] < l.Qty {
+                    return Order{}, ErrOutOfStock
+                }
+            }
+            for _, l := range c.Lines {
+                o.inv.Stock[l.SKU] -= l.Qty
+            }
+            return o.save(c)
+        }
+
+        // shipping.go
+        func (s *Shipping) Promise(l Line) string {
+            if s.inv.Stock[l.SKU] >= l.Qty {
+                return "ships today"
+            }
+            return "ships in 5 days"
+        }
+      roles: { inventory: [1, 4], stock: [3, 3], orders: [6, 17], shipping: [19, 25] }
+      change:
+        - { line: 3, replace: '    Stock map[string]map[string]int // warehouse -> sku -> units' }
+        - { line: 9, replace: '        if totalStock(o.inv.Stock, l.SKU) < l.Qty {' }
+        - { line: 14, replace: '        takeFromWarehouses(o.inv.Stock, l.SKU, l.Qty)' }
+        - { after: 17, add: ['', '// totalStock, takeFromWarehouses: new helpers in orders.go; shipping.go needs one too'] }
+        - { line: 21, replace: '    if totalStock(s.inv.Stock, l.SKU) >= l.Qty {' }
+    after:
+      file: inventory.go · orders.go · shipping.go
+      source: |
+        // inventory.go: the only code that touches stock
+        type Inventory struct {
+            stock map[string]int // unexported: sku -> units on hand
+        }
+
+        func (i *Inventory) Available(sku string) int { return i.stock[sku] }
+
+        func (i *Inventory) Reserve(lines []Line) error {
+            for _, l := range lines {
+                if i.stock[l.SKU] < l.Qty {
+                    return ErrOutOfStock
+                }
+            }
+            for _, l := range lines {
+                i.stock[l.SKU] -= l.Qty
+            }
+            return nil
+        }
+
+        // orders.go
+        func (o *Orders) Place(c Cart) (Order, error) {
+            if err := o.inv.Reserve(c.Lines); err != nil {
+                return Order{}, err
+            }
+            return o.save(c)
+        }
+
+        // shipping.go
+        func (s *Shipping) Promise(l Line) string {
+            if s.inv.Available(l.SKU) >= l.Qty {
+                return "ships today"
+            }
+            return "ships in 5 days"
+        }
+      roles: { inventory: [1, 18], stock: [3, 3], api: [6, 18], orders: [20, 26], shipping: [28, 34], call: [22, 22], reserve: [8, 18], ask: [30, 30], private: [2, 4] }
+    again:
+      file: inventory.go
+      source: |
+        // inventory.go: the only file that changes
+        type Inventory struct {
+            stock map[string]map[string]int // warehouse -> sku -> units
+        }
+
+        func (i *Inventory) Available(sku string) int {
+            n := 0
+            for _, wh := range i.stock {
+                n += wh[sku]
+            }
+            return n
+        }
+
+        // Reserve now picks a warehouse per line. Its signature is the same,
+        // so orders.go and shipping.go do not change.
+    cost:
+      before: { text: 5 edits · 3 files · 3 teams, value: 0.8 }
+      after: { text: 1 file · 1 team, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A lowercase field is invisible outside its package, so `stock` cannot be reached from `orders`. The boundary is the package, not the type: code in the same package can still touch it. Put a module that other teams use in its own package, or under `internal/` to keep it inside your module.'
+      seenIn: '`strings.Builder` and `bytes.Buffer` keep their byte slice unexported behind `WriteString` and `String`. `sync.WaitGroup` exposes `Add`, `Done` and `Wait`, never its counter.'
+
+  python:
+    before:
+      file: inventory.py · orders.py · shipping.py
+      source: |
+        # inventory.py
+        class Inventory:
+            def __init__(self):
+                self.stock: dict[str, int] = {}  # sku -> units on hand
+
+        # orders.py
+        class Orders:
+            def place(self, cart: Cart) -> Order:
+                for line in cart.lines:
+                    if self.inventory.stock.get(line.sku, 0) < line.qty:
+                        raise OutOfStock(line.sku)
+                for line in cart.lines:
+                    self.inventory.stock[line.sku] -= line.qty
+                return self.save(cart)
+
+        # shipping.py
+        class Shipping:
+            def promise(self, line: Line) -> str:
+                if self.inventory.stock.get(line.sku, 0) >= line.qty:
+                    return "ships today"
+                return "ships in 5 days"
+      roles: { inventory: [1, 4], stock: [4, 4], orders: [6, 14], shipping: [16, 21] }
+      change:
+        - { line: 4, replace: '        self.stock: dict[str, dict[str, int]] = {}  # warehouse -> sku -> units' }
+        - { line: 10, replace: '            if total_stock(self.inventory.stock, line.sku) < line.qty:' }
+        - { line: 13, replace: '            take_from_warehouses(self.inventory.stock, line.sku, line.qty)' }
+        - { after: 14, add: ['', '# total_stock, take_from_warehouses: new helpers; shipping.py imports one'] }
+        - { line: 19, replace: '        if total_stock(self.inventory.stock, line.sku) >= line.qty:' }
+    after:
+      file: inventory.py · orders.py · shipping.py
+      source: |
+        # inventory.py: the only code that touches stock
+        class Inventory:
+            def __init__(self):
+                self._stock: dict[str, int] = {}  # private by convention
+
+            def available(self, sku: str) -> int:
+                return self._stock.get(sku, 0)
+
+            def reserve(self, lines: list[Line]) -> None:
+                for line in lines:
+                    if self.available(line.sku) < line.qty:
+                        raise OutOfStock(line.sku)
+                for line in lines:
+                    self._stock[line.sku] -= line.qty
+
+        # orders.py
+        class Orders:
+            def place(self, cart: Cart) -> Order:
+                self.inventory.reserve(cart.lines)
+                return self.save(cart)
+
+        # shipping.py
+        class Shipping:
+            def promise(self, line: Line) -> str:
+                if self.inventory.available(line.sku) >= line.qty:
+                    return "ships today"
+                return "ships in 5 days"
+      roles: { inventory: [1, 14], stock: [4, 4], api: [6, 14], orders: [16, 20], shipping: [22, 27], call: [19, 19], reserve: [9, 14], ask: [25, 25], private: [2, 4] }
+    again:
+      file: inventory.py
+      source: |
+        # inventory.py: the only file that changes
+        class Inventory:
+            def __init__(self):
+                self._stock: dict[str, dict[str, int]] = {}  # warehouse -> sku -> units
+
+            def available(self, sku: str) -> int:
+                return sum(wh.get(sku, 0) for wh in self._stock.values())
+
+            # reserve() now picks a warehouse per line. Its signature is the same,
+            # so orders.py and shipping.py do not change.
+    cost:
+      before: { text: 5 edits · 3 files · 3 teams, value: 0.8 }
+      after: { text: 1 file · 1 team, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Nothing stops `orders.py` from reading `inventory._stock`; the leading underscore is a convention that linters and reviewers enforce. That makes the habit matter more in Python, not less. A `@property` lets you keep attribute syntax while the module decides what is exposed.'
+      seenIn: '`queue.Queue` keeps its deque and locks private behind `put` and `get`. `datetime` objects expose methods such as `astimezone` and `isoformat` rather than internal fields to edit.'
+
+  typescript:
+    before:
+      file: inventory.ts · orders.ts · shipping.ts
+      source: |
+        // inventory.ts
+        export class Inventory {
+          stock = new Map<string, number>(); // sku -> units on hand
+        }
+
+        // orders.ts
+        place(cart: Cart): Promise<Order> {
+          for (const l of cart.lines) {
+            if ((this.inventory.stock.get(l.sku) ?? 0) < l.qty) throw new OutOfStock(l.sku);
+          }
+          for (const l of cart.lines) {
+            this.inventory.stock.set(l.sku, this.inventory.stock.get(l.sku)! - l.qty);
+          }
+          return this.save(cart);
+        }
+
+        // shipping.ts
+        promise(l: Line): string {
+          return (this.inventory.stock.get(l.sku) ?? 0) >= l.qty ? "ships today" : "ships in 5 days";
+        }
+      roles: { inventory: [1, 4], stock: [3, 3], orders: [6, 15], shipping: [17, 20] }
+      change:
+        - { line: 3, replace: '  stock = new Map<string, Map<string, number>>(); // warehouse -> sku -> units' }
+        - { line: 9, replace: '    if (totalStock(this.inventory.stock, l.sku) < l.qty) throw new OutOfStock(l.sku);' }
+        - { line: 12, replace: '    takeFromWarehouses(this.inventory.stock, l.sku, l.qty);' }
+        - { after: 15, add: ['', '// totalStock, takeFromWarehouses: new helpers; shipping.ts imports one'] }
+        - { line: 19, replace: '  return totalStock(this.inventory.stock, l.sku) >= l.qty ? "ships today" : "ships in 5 days";' }
+    after:
+      file: inventory.ts · orders.ts · shipping.ts
+      source: |
+        // inventory.ts: the only code that touches stock
+        export class Inventory {
+          readonly #stock = new Map<string, number>(); // private: sku -> units
+
+          available(sku: string): number {
+            return this.#stock.get(sku) ?? 0;
+          }
+
+          reserve(lines: Line[]): void {
+            for (const l of lines) if (this.available(l.sku) < l.qty) throw new OutOfStock(l.sku);
+            for (const l of lines) this.#stock.set(l.sku, this.available(l.sku) - l.qty);
+          }
+        }
+
+        // orders.ts
+        place(cart: Cart): Promise<Order> {
+          this.inventory.reserve(cart.lines);
+          return this.save(cart);
+        }
+
+        // shipping.ts
+        promise(l: Line): string {
+          return this.inventory.available(l.sku) >= l.qty ? "ships today" : "ships in 5 days";
+        }
+      roles: { inventory: [1, 13], stock: [3, 3], api: [5, 12], orders: [15, 19], shipping: [21, 24], call: [17, 17], reserve: [9, 12], ask: [23, 23], private: [2, 3] }
+    again:
+      file: inventory.ts
+      source: |
+        // inventory.ts: the only file that changes
+        export class Inventory {
+          readonly #stock = new Map<string, Map<string, number>>(); // warehouse -> sku -> units
+
+          available(sku: string): number {
+            let n = 0;
+            for (const wh of this.#stock.values()) n += wh.get(sku) ?? 0;
+            return n;
+          }
+          // reserve() now picks a warehouse per line. Same signature,
+          // so orders.ts and shipping.ts do not change.
+        }
+    cost:
+      before: { text: 5 edits · 3 files · 3 teams, value: 0.8 }
+      after: { text: 1 file · 1 team, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`private` is checked only by the compiler and disappears in the emitted JavaScript. A `#field` is private at runtime too, so not even `(inv as any).stock` reaches it. Either way, the useful boundary is what the module exports.'
+      seenIn: '`Map` and `Set` hide their hash tables behind `get`, `set` and `has`. `URL` exposes `searchParams.get` and `set`, and keeps the parsed parts consistent for you.'
+
+  rust:
+    before:
+      file: inventory.rs · orders.rs · shipping.rs
+      source: |
+        // inventory.rs
+        pub struct Inventory {
+            pub stock: HashMap<String, u32>, // sku -> units on hand
+        }
+
+        // orders.rs
+        fn place(&mut self, cart: &Cart) -> Result<Order, OrderError> {
+            for l in &cart.lines {
+                if self.inventory.stock.get(&l.sku).copied().unwrap_or(0) < l.qty {
+                    return Err(OrderError::OutOfStock(l.sku.clone()));
+                }
+            }
+            for l in &cart.lines {
+                *self.inventory.stock.get_mut(&l.sku).unwrap() -= l.qty;
+            }
+            self.save(cart)
+        }
+
+        // shipping.rs
+        fn promise(&self, l: &Line) -> &'static str {
+            if self.inventory.stock.get(&l.sku).copied().unwrap_or(0) >= l.qty { "ships today" } else { "ships in 5 days" }
+        }
+      roles: { inventory: [1, 4], stock: [3, 3], orders: [6, 17], shipping: [19, 22] }
+      change:
+        - { line: 3, replace: '    pub stock: HashMap<String, HashMap<String, u32>>, // warehouse -> sku -> units' }
+        - { line: 9, replace: '        if total_stock(&self.inventory.stock, &l.sku) < l.qty {' }
+        - { line: 14, replace: '        take_from_warehouses(&mut self.inventory.stock, &l.sku, l.qty);' }
+        - { after: 17, add: ['', '// total_stock, take_from_warehouses: new pub helpers so shipping.rs can use one'] }
+        - { line: 21, replace: '    if total_stock(&self.inventory.stock, &l.sku) >= l.qty { "ships today" } else { "ships in 5 days" }' }
+    after:
+      file: inventory.rs · orders.rs · shipping.rs
+      source: |
+        // inventory.rs: the only code that touches stock
+        pub struct Inventory {
+            stock: HashMap<String, u32>, // private to this module
+        }
+
+        impl Inventory {
+            pub fn available(&self, sku: &str) -> u32 {
+                self.stock.get(sku).copied().unwrap_or(0)
+            }
+
+            pub fn reserve(&mut self, lines: &[Line]) -> Result<(), OutOfStock> {
+                if let Some(l) = lines.iter().find(|l| self.available(&l.sku) < l.qty) {
+                    return Err(OutOfStock(l.sku.clone()));
+                }
+                for l in lines {
+                    *self.stock.get_mut(&l.sku).unwrap() -= l.qty;
+                }
+                Ok(())
+            }
+        }
+
+        // orders.rs
+        fn place(&mut self, cart: &Cart) -> Result<Order, OrderError> {
+            self.inventory.reserve(&cart.lines)?;
+            self.save(cart)
+        }
+
+        // shipping.rs
+        fn promise(&self, l: &Line) -> &'static str {
+            if self.inventory.available(&l.sku) >= l.qty { "ships today" } else { "ships in 5 days" }
+        }
+      roles: { inventory: [1, 20], stock: [3, 3], api: [6, 20], orders: [22, 26], shipping: [28, 31], call: [24, 24], reserve: [11, 19], ask: [30, 30], private: [2, 4] }
+    again:
+      file: inventory.rs
+      source: |
+        // inventory.rs: the only file that changes
+        pub struct Inventory {
+            stock: HashMap<String, HashMap<String, u32>>, // warehouse -> sku -> units
+        }
+
+        impl Inventory {
+            pub fn available(&self, sku: &str) -> u32 {
+                self.stock.values().map(|wh| wh.get(sku).copied().unwrap_or(0)).sum()
+            }
+            // reserve() now picks a warehouse per line. Same signature,
+            // so orders.rs and shipping.rs do not change.
+        }
+    cost:
+      before: { text: 5 edits · 3 files · 3 teams, value: 0.8 }
+      after: { text: 1 file · 1 team, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Fields are private to their module by default, so the tangled version needed an explicit `pub stock`. The compiler pushes you toward the cohesive design; you have to opt in to reaching into another module. `pub(crate)` widens access to your own crate only.'
+      seenIn: '`Vec<T>` keeps its pointer, length and capacity private behind `push`, `len` and `reserve`. `String` guarantees valid UTF-8 because nobody outside can write its bytes directly.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'Orders calls `Reserve(c.Lines)`. It says what it needs, not how stock is stored.', python: 'Orders calls `reserve(cart.lines)`. It says what it needs, not how stock is stored.', typescript: 'Orders calls `reserve(cart.lines)`. It says what it needs, not how stock is stored.', rust: 'Orders calls `reserve(&cart.lines)`. It says what it needs, not how stock is stored.' }
+    nodes: [orders, api]
+    edges: [orders>api]
+    role: call
+  - text: Inventory checks every line, then takes the units. The check and the decrement sit together, next to the data they are about.
+    nodes: [api, inventory, stock]
+    edges: [api>inventory, stock>inventory]
+    role: reserve
+  - text: Shipping asks how many units are available. It gets a number, never the map.
+    nodes: [shipping, api]
+    edges: [shipping>api]
+    role: ask
+  - text: The map itself is private. Only Inventory's own code can read or write it, so only Inventory's code can depend on its shape.
+    nodes: [inventory, stock]
+    edges: [stock>inventory]
+    role: private
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Orders stores status as a string column. Which use of it will ripple when Orders changes how it stores status?
+    options:
+      - text: Billing queries the orders table directly with `WHERE status = 'paid'`.
+        correct: true
+        why: Right. Billing depends on Orders' storage and on its exact values. Rename a value or move the column and Billing breaks, in another team's code.
+      - text: Billing calls `orders.IsPaid(id)`.
+        why: That couples Billing to a question Orders answers. Orders can change how it stores status and keep `IsPaid` working.
+      - text: Billing and Orders both import the same `Money` type.
+        why: Sharing a stable vocabulary type is a weak, cheap kind of coupling. A change to how Orders stores status does not touch it.
+  engineer:
+    question: A shared `common` package holds date formatting, retry logic and the country tax table. Seven services import it. What is the main problem?
+    options:
+      - text: It has low cohesion. Its parts change for unrelated reasons, so a tax change rebuilds and redeploys services that only wanted dates.
+        correct: true
+        why: Right. Things that change together should live together, and things that do not should not. Split it by reason to change, and each service imports only what it uses.
+      - text: Seven importers is too many. A package should have at most two or three.
+        why: A small, stable package such as a date formatter can have many importers safely. The trouble is unrelated reasons to change, not the count.
+      - text: It should be copied into each service so no service depends on it.
+        why: Copying removes the import and keeps the coupling. When the tax table changes, all seven copies must change, and nothing tells you so.
+  deep:
+    question: Two services exchange CSV rows, and both agree the price is the fourth column. Which change makes this coupling weaker?
+    options:
+      - text: Send named fields, such as JSON with a `price` key, so both sides agree on a name instead of a position.
+        correct: true
+        why: Right. In connascence terms this turns connascence of position into connascence of name, which is weaker. Inserting a column no longer breaks the reader.
+      - text: Document in a README that column four is the price.
+        why: Documentation helps people find the coupling, but the coupling is as strong as before. Adding a column still silently shifts the price.
+      - text: Have the reader check that column four parses as a number.
+        why: That catches some mistakes at runtime, but a shifted column with another number in it (say, the quantity) still passes. The dependency on position remains.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Owner module
+      example: Inventory
+      job: Keeps its data private and answers questions about it.
+    - role: Small API
+      example: { go: "Available, Reserve", python: "available, reserve", typescript: "available, reserve", rust: "available, reserve" }
+      job: The questions other modules may ask. Shaped by what callers need, not by how data is stored.
+    - role: Callers
+      example: Orders, Shipping
+      job: Depend on the API only. They never name the data's shape.
+  useWhen:
+    - Several modules read or write the same data structure, or the same database table.
+    - A change in one team's module regularly breaks another team's build or tests.
+    - Logic about a piece of data (checks, conversions, formatting) is repeated in the modules that use it.
+  avoidWhen:
+    - The data really is a plain record passed between steps, such as a DTO or an event. Wrapping every field in getters adds ceremony without hiding a decision.
+    - The two pieces always change together and are owned by one person. Merging them is the cohesive move; an API between them is overhead.
+  tradeoffs:
+    - Callers can only do what the API offers. A new need means a new method on someone else's module.
+    - An API that copies the data's shape one getter per field hides nothing; the coupling remains.
+    - Moving logic next to its data can make the owner module bigger. That is fine while the logic shares one reason to change.
+  lookalikes:
+    - name: Single responsibility
+      how: Cohesion seen from one class. A class should have one reason to change, which is the same as keeping things that change together in one place.
+    - name: Facade
+      how: Gives a subsystem one simpler entry point. It lowers coupling to the subsystem as a whole, where this lesson is about each module guarding its own data.
+    - name: Law of Demeter
+      how: A rule of thumb against long chains like `order.customer.address.zip`. Each dot reaches one level further into someone else's structure.
+---
+
+## [concept] Coupling and cohesion
+
+**Keep the code that changes together in one place, and let other modules ask it questions instead of reaching into its data.**
+
+Two pieces of code are <Term id="coupling">coupled</Term> when changing one forces you to change the other. A module is <Term id="cohesion">cohesive</Term> when the code inside it belongs together, so one change stays inside it.
+
+<Depth level={2}>
+The two are linked. If a module's data can be read from anywhere, every reader is coupled to its shape, and the logic about that data spreads to the readers. Keeping the data private (<Term id="encapsulation">encapsulation</Term>) and moving the logic next to it does both at once: fewer couplings, more cohesion. Coupling is always about a change. Two modules can be tightly coupled for one change and independent for another.
+</Depth>
+
+<Depth level={3}>
+The terms come from Larry Constantine's structured design work, published with Ed Yourdon in *Structured Design* (1979). Kent Beck's *Tidy First?* restates them in terms of change: elements are coupled with respect to a particular change, and a cohesive element keeps the coupled sub-elements together. Meilir Page-Jones later named the kinds of coupling <Term id="connascence">connascence</Term>, ranked from weak (agreeing on a name) to strong (agreeing on positions, timing or values).
+</Depth>
+
+## [problem] An order service that shares its stock
+
+An online shop has an Inventory module that tracks units on hand per SKU. Orders checks stock and takes units when a customer buys. Shipping reads stock to promise "ships today". Each is owned by a different team.
+
+Read it once. Inventory is three lines. The logic about stock, checking it and taking units out of it, lives in Orders and Shipping.
+
+<Depth level={2}>
+Nothing here is a bug. It is short and fast, and each team wrote the obvious code with the map they could see. The cost is hidden: both teams now depend on the map's exact shape.
+</Depth>
+
+<Depth level={3}>
+In connascence terms, Orders and Shipping are connascent with Inventory on type (a map from SKU to int) and on meaning (the value is units on hand, everywhere, in one warehouse). Those agreements are written nowhere, so the compiler can only enforce the first.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** a second warehouse opens, so stock must be kept per warehouse.
+
+Inventory's change is one line. The marked lines in Orders and Shipping must change too, and they belong to two other teams. Both now need a "total across warehouses" helper, so it gets written in Orders and imported by Shipping, and a new coupling appears while you fix the old one.
+
+<Depth level={2}>
+The three edits must ship together. If Inventory deploys first, Orders and Shipping index the new nested map with a SKU and get nothing back. Three teams, one release, and a migration for the data in between.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go catches the type change at compile time in the same module: `o.inv.Stock[l.SKU] < l.Qty` no longer compiles. Across a service boundary, through JSON or a shared table, nothing would catch it.</Lang>
+<Lang only="python">Python catches nothing until the code runs. `stock.get(sku, 0)` on the new nested dict returns 0 for every SKU, so every product looks out of stock.</Lang>
+<Lang only="typescript">The compiler flags `stock.get(sku)` returning a `Map` where a number was expected, in each file that reads it. That makes the ripple easy to find, not small.</Lang>
+<Lang only="rust">The compiler flags every use in every module. The ripple is easy to find, and still three teams' code.</Lang>
+</Depth>
+
+## [morph] Move the questions next to the data
+
+Drag the slider. The stock map goes private. The checks and the decrement move into Inventory as two methods, and Orders and Shipping call those.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The new methods are shaped by what callers need ("are there enough?", "take these"), not by how stock is stored. That is what makes them survive the change. A getter that returns the map would hide nothing.
+</Depth>
+
+<Depth level={3}>
+The connascence got weaker. Callers now agree with Inventory only on method names and argument types (connascence of name and type), and those are checked by the compiler. The meaning of the stored numbers is known in one module only.
+</Depth>
+
+## [walk] Follow one order
+
+One order placed, one shipping promise made. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The boundary is the package: `stock` is unexported, so code in package `orders` cannot name it. A method call on `*Inventory` is a direct call, and small methods like `Available` are usually inlined, so the API costs nothing at runtime.</Lang>
+<Lang only="python">`_stock` is still reachable; only convention protects it. The call to `available` is an attribute lookup plus a call, a few tens of nanoseconds, next to a database round trip that dominates.</Lang>
+<Lang only="typescript">`#stock` is a true private field: the engine stores it outside the object's normal properties, so `Object.keys` and `JSON.stringify` do not see it either.</Lang>
+<Lang only="rust">Privacy is per module and checked at compile time. `available` is a plain method call that the optimiser usually inlines, so the boundary has no runtime cost.</Lang>
+</Depth>
+
+## [again] Per-warehouse stock, the second time
+
+The same request, after the refactor. Inventory changes its map and the body of `available` and `reserve`. Orders and Shipping do not change, so one team ships it, in one deploy.
+
+<Depth level={2}>
+Not every change stays local, and that is fine. Picking which warehouse ships an order is new behaviour that Shipping may need to know about. Then Inventory's API grows a method. That is a conversation about a real feature, not bookkeeping over someone else's map.
+</Depth>
+
+<Depth level={3}>
+The same reasoning applies across services: a shared database table is the tangled design at a larger scale. Each service owning its data and exposing an API is the cohesive one, with a network call where a method call was.
+</Depth>
+
+## [play] Change one detail, watch the ripple
+
+An order service with five modules owned by five teams. Click an internal detail of any module to change it. The change ripples out to every module that knows that detail, and on to modules that know something computed from it.
+
+Run each change in the tangled design and the cohesive one, then take a few shortcuts in the cohesive design and see what they cost.
+
+## [lens] How each language writes it
+
+Every language can hide a module's data. They differ on who enforces it: the compiler, the runtime, or only a naming convention.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="coupling-and-cohesion" />
+
+### A quick test for coupling
+
+Pick a change your team is likely to get next quarter. List every file it would touch, and who owns each one. If the list crosses team lines for a change that is about one thing, find the data or the decision that is shared, and move it behind one owner.
