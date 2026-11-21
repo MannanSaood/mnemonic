@@ -382,3 +382,4 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .step-body th, .step-body td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
 .step-body th { font-family: var(--f-code); font-size: .66rem; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); font-weight: 500; }
 .pg-loading { min-height: 320px; padding: 16px; align-content: center; justify-items: center; }
+.elabel { paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
