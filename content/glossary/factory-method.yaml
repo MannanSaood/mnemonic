@@ -1,0 +1,7 @@
+# Terms introduced by the Factory Method lesson.
+- id: creator-role
+  term: Creator
+  short: In Factory Method, the class that needs an object, calls a method to create it, and works with it only through its interface.
+- id: product-role
+  term: Product
+  short: In the creational patterns, the interface of the objects being created. The code that uses them never names their concrete classes.

@@ -1,0 +1,610 @@
+---
+title: Factory Method
+track: design-patterns
+group: Creational
+order: 20
+summary: Let the code that runs a job ask a method for the object it needs, and let each variant of the job decide which class that method creates.
+intent: The code that uses an object should not have to name the object's concrete class.
+changeRequest: Finance needs the nightly export as XLSX.
+languages: [go, python, typescript, rust]
+glossary: [creator-role, product-role, interface, open-closed, first-class-function, dynamic-dispatch]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: factory-method
+  scenarios:
+    - try: "Keep the switch design. Ship XLSX by asking platform for a case, then again by copying run() into your repo."
+      notice: "The PR leaves Finance without an export while it waits. The copy ships at once, misses platform's night-8 fix, and sends a broken file on night 10."
+    - try: "Switch the platform job to the createWriter() hook and override it."
+      notice: "XLSX ships on night 1, and the night-8 fix reaches you because the run() that executes is still platform's."
+    - try: "Drag the review time down to 1 day and run the PR again."
+      notice: "With a fast review the PR is fine for one team. The hook matters when many teams extend one job, or when the owner cannot take every request."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: config, sub: format list }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: main, sub: picks the job }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: ExportJob, sub: { go: "switch j.Format (×2)", python: "if / elif (×2)", typescript: "switch (this.format) ×2", rust: "match self.format (×2)" } }
+      after:  { x: 150, y: 24, w: 170, h: 60, title: ExportJob, sub: run · preview }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 24, w: 180, h: 60, title: "" }
+      after:  { x: 370, y: 24, w: 180, h: 60, title: { go: NewWriter func, python: create_writer(), typescript: createWriter(), rust: create_writer() }, sub: the factory method }
+    - id: product
+      kind: strategy
+      appears: after
+      before: { x: 150, y: 130, w: 170, h: 48, title: "" }
+      after:  { x: 150, y: 130, w: 170, h: 48, title: RowWriter, sub: write row · close }
+    - id: csv
+      kind: concrete
+      before: { x: 188, y: 88, w: 222, h: 32, title: { go: case "csv", python: '== "csv"', typescript: case "csv", rust: '"csv" =>' } }
+      after:  { x: 280, y: 204, w: 62, h: 40, title: CSV }
+    - id: json
+      kind: concrete
+      before: { x: 188, y: 128, w: 222, h: 32, title: { go: case "json", python: '== "json"', typescript: case "json", rust: '"json" =>' } }
+      after:  { x: 350, y: 204, w: 62, h: 40, title: JSON }
+    - id: parquet
+      kind: concrete
+      before: { x: 188, y: 168, w: 222, h: 32, title: { go: case "parquet", python: '== "parquet"', typescript: case "parquet", rust: '"parquet" =>' } }
+      after:  { x: 420, y: 204, w: 62, h: 40, title: Parquet }
+    - id: xlsx
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 214, w: 222, h: 32, title: { go: case "xlsx", python: '== "xlsx"', typescript: case "xlsx", rust: '"xlsx" =>' } }
+      after:  { x: 490, y: 204, w: 62, h: 40, title: XLSX }
+  edges:
+    - { from: client, to: context, label: builds }
+    - { from: context, to: strategy, label: calls }
+    - { from: strategy, to: product, label: returns }
+    - { from: csv, to: strategy, kind: implements }
+    - { from: json, to: strategy, kind: implements }
+    - { from: parquet, to: strategy, kind: implements, label: implements }
+    - { from: xlsx, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: export.go · preview.go · config.go
+      source: |
+        // export.go
+        func (j *ExportJob) Run(rows RowSource, out io.Writer) error {
+            var w RowWriter
+            switch j.Format {
+            case "csv":
+                w = NewCSVWriter(out)
+            case "json":
+                w = NewJSONWriter(out)
+            case "parquet":
+                w = NewParquetWriter(out, j.Schema)
+            default:
+                return fmt.Errorf("unknown format %q", j.Format)
+            }
+            return copyRows(rows, w)
+        }
+
+        // preview.go: the first 100 rows, for the UI
+        func (j *ExportJob) Preview(rows RowSource, out io.Writer) error {
+            var w RowWriter
+            switch j.Format {
+            case "csv":
+                w = NewCSVWriter(out)
+            case "json":
+                w = NewJSONWriter(out)
+            case "parquet":
+                w = NewParquetWriter(out, j.Schema)
+            default:
+                return fmt.Errorf("unknown format %q", j.Format)
+            }
+            return copyRows(Limit(rows, 100), w)
+        }
+
+        // config.go
+        var Formats = []string{"csv", "json", "parquet"}
+      roles: { context: [2, 31], csv: [5, 6], json: [7, 8], parquet: [9, 10], client: [34, 34] }
+      change:
+        - { after: 10, add: ['    case "xlsx":', '        w = NewXLSXWriter(out)'] }
+        - { after: 26, add: ['    case "xlsx":', '        w = NewXLSXWriter(out)'] }
+        - { line: 34, replace: 'var Formats = []string{"csv", "json", "parquet", "xlsx"}' }
+    after:
+      file: export.go · main.go
+      source: |
+        type RowWriter interface {
+            WriteRow(r Row) error
+            Close() error
+        }
+
+        // The factory method, as a function value.
+        type WriterFactory func(out io.Writer, s Schema) RowWriter
+
+        type ExportJob struct {
+            Schema    Schema
+            NewWriter WriterFactory
+        }
+
+        func (j *ExportJob) Run(rows RowSource, out io.Writer) error {
+            return copyRows(rows, j.NewWriter(out, j.Schema))
+        }
+
+        func (j *ExportJob) Preview(rows RowSource, out io.Writer) error {
+            return copyRows(Limit(rows, 100), j.NewWriter(out, j.Schema))
+        }
+
+        // main.go: one map from format to constructor
+        var factories = map[string]WriterFactory{
+            "csv": NewCSVWriter, "json": NewJSONWriter, "parquet": NewParquetWriter,
+        }
+        job := &ExportJob{Schema: s, NewWriter: factories[cfg.Format]}
+      roles: { product: [1, 4], strategy: [6, 7], context: [9, 20], client: [22, 26], csv: [24, 24], json: [24, 24], parquet: [24, 24], wire: [26, 26], run: [14, 16], create: [15, 15], preview: [18, 20] }
+    again:
+      file: xlsx.go
+      source: |
+        // xlsx.go: a new file, plus one entry in factories
+        func NewXLSXWriter(out io.Writer, _ Schema) RowWriter {
+            return &xlsxWriter{book: excelize.NewFile(), out: out}
+        }
+    cost:
+      before: { text: 5 lines · 3 places, value: 0.85 }
+      after: { text: 1 new func · 1 map entry, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Go has no subclasses, so there is nothing to override. The Go form is a factory function passed in, as a struct field or an argument. Embedding does not help: a method on the embedded `ExportJob` that calls `j.createWriter()` always runs `ExportJob`''s own version.'
+      seenIn: '`hmac.New(sha256.New, key)` takes a hash constructor and calls it whenever it needs a fresh hash. `sync.Pool{New: func() any { … }}` calls `New` when the pool is empty.'
+
+  python:
+    before:
+      file: export_job.py · config.py
+      source: |
+        # export_job.py
+        class ExportJob:
+            def run(self, rows: Iterable[Row], out: BinaryIO) -> None:
+                if self.format == "csv":
+                    writer = CsvWriter(out)
+                elif self.format == "json":
+                    writer = JsonWriter(out)
+                elif self.format == "parquet":
+                    writer = ParquetWriter(out, self.schema)
+                else:
+                    raise ValueError(f"unknown format {self.format!r}")
+                copy_rows(rows, writer)
+
+            def preview(self, rows: Iterable[Row], out: BinaryIO) -> None:
+                if self.format == "csv":
+                    writer = CsvWriter(out)
+                elif self.format == "json":
+                    writer = JsonWriter(out)
+                elif self.format == "parquet":
+                    writer = ParquetWriter(out, self.schema)
+                else:
+                    raise ValueError(f"unknown format {self.format!r}")
+                copy_rows(islice(rows, 100), writer)
+
+        # config.py
+        FORMATS = {"csv", "json", "parquet"}
+      roles: { context: [2, 23], csv: [4, 5], json: [6, 7], parquet: [8, 9], client: [26, 26] }
+      change:
+        - { after: 9, add: ['        elif self.format == "xlsx":', '            writer = XlsxWriter(out)'] }
+        - { after: 20, add: ['        elif self.format == "xlsx":', '            writer = XlsxWriter(out)'] }
+        - { line: 26, replace: 'FORMATS = {"csv", "json", "parquet", "xlsx"}' }
+    after:
+      file: export_job.py · main.py
+      source: |
+        from abc import ABC, abstractmethod
+
+        class ExportJob(ABC):
+            def __init__(self, schema: Schema):
+                self.schema = schema
+
+            @abstractmethod
+            def create_writer(self, out: BinaryIO) -> RowWriter: ...
+
+            def run(self, rows: Iterable[Row], out: BinaryIO) -> None:
+                copy_rows(rows, self.create_writer(out))
+
+            def preview(self, rows: Iterable[Row], out: BinaryIO) -> None:
+                copy_rows(islice(rows, 100), self.create_writer(out))
+
+        class CsvExport(ExportJob):
+            def create_writer(self, out): return CsvWriter(out)
+
+        class JsonExport(ExportJob):
+            def create_writer(self, out): return JsonWriter(out)
+
+        class ParquetExport(ExportJob):
+            def create_writer(self, out): return ParquetWriter(out, self.schema)
+
+        # main.py: one map from format to job class
+        JOBS = {"csv": CsvExport, "json": JsonExport, "parquet": ParquetExport}
+        job = JOBS[cfg.format](schema)
+      roles: { strategy: [7, 8], product: [8, 8], context: [3, 14], csv: [16, 17], json: [19, 20], parquet: [22, 23], client: [25, 27], wire: [27, 27], run: [10, 11], create: [22, 23], preview: [13, 14] }
+    again:
+      file: xlsx_export.py
+      source: |
+        # xlsx_export.py: a new class, plus one entry in JOBS
+        class XlsxExport(ExportJob):
+            def create_writer(self, out): return XlsxWriter(out)
+    cost:
+      before: { text: 5 lines · 3 places, value: 0.85 }
+      after: { text: 1 new class · 1 map entry, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Frameworks use an overridable method, as here. For plain code, remember that a class is already a callable that creates objects: `ExportJob(schema, writer_cls=XlsxWriter)` is often all the factory you need.'
+      seenIn: 'Django''s `FormMixin.get_form_class()` and Django REST framework''s `get_serializer_class()`. `logging.setLogRecordFactory()` swaps the function that creates every log record.'
+
+  typescript:
+    before:
+      file: export-job.ts · config.ts
+      source: |
+        // export-job.ts
+        run(rows: Iterable<Row>, out: Writable): Promise<void> {
+          let writer: RowWriter;
+          switch (this.format) {
+            case "csv": writer = new CsvWriter(out); break;
+            case "json": writer = new JsonWriter(out); break;
+            case "parquet": writer = new ParquetWriter(out, this.schema); break;
+            default: throw new Error(`unknown format ${this.format}`);
+          }
+          return copyRows(rows, writer);
+        }
+
+        preview(rows: Iterable<Row>, out: Writable): Promise<void> {
+          let writer: RowWriter;
+          switch (this.format) {
+            case "csv": writer = new CsvWriter(out); break;
+            case "json": writer = new JsonWriter(out); break;
+            case "parquet": writer = new ParquetWriter(out, this.schema); break;
+            default: throw new Error(`unknown format ${this.format}`);
+          }
+          return copyRows(take(rows, 100), writer);
+        }
+
+        // config.ts
+        export const FORMATS = ["csv", "json", "parquet"] as const;
+      roles: { context: [2, 22], csv: [5, 5], json: [6, 6], parquet: [7, 7], client: [25, 25] }
+      change:
+        - { after: 7, add: ['    case "xlsx": writer = new XlsxWriter(out); break;'] }
+        - { after: 18, add: ['    case "xlsx": writer = new XlsxWriter(out); break;'] }
+        - { line: 25, replace: 'export const FORMATS = ["csv", "json", "parquet", "xlsx"] as const;' }
+    after:
+      file: export-job.ts · main.ts
+      source: |
+        abstract class ExportJob {
+          constructor(protected readonly schema: Schema) {}
+
+          protected abstract createWriter(out: Writable): RowWriter;
+
+          run(rows: Iterable<Row>, out: Writable): Promise<void> {
+            return copyRows(rows, this.createWriter(out));
+          }
+
+          preview(rows: Iterable<Row>, out: Writable): Promise<void> {
+            return copyRows(take(rows, 100), this.createWriter(out));
+          }
+        }
+
+        class CsvExport extends ExportJob {
+          protected createWriter(out: Writable) { return new CsvWriter(out); }
+        }
+        class JsonExport extends ExportJob {
+          protected createWriter(out: Writable) { return new JsonWriter(out); }
+        }
+        class ParquetExport extends ExportJob {
+          protected createWriter(out: Writable) { return new ParquetWriter(out, this.schema); }
+        }
+
+        // main.ts: one map from format to job class
+        const JOBS = { csv: CsvExport, json: JsonExport, parquet: ParquetExport };
+        const job = new JOBS[cfg.format](schema);
+      roles: { strategy: [4, 4], product: [4, 4], context: [1, 13], csv: [15, 17], json: [18, 20], parquet: [21, 23], client: [25, 27], wire: [27, 27], run: [6, 8], create: [21, 23], preview: [10, 12] }
+    again:
+      file: xlsx-export.ts
+      source: |
+        // xlsx-export.ts: a new class, plus one entry in JOBS
+        export class XlsxExport extends ExportJob {
+          protected createWriter(out: Writable) { return new XlsxWriter(out); }
+        }
+    cost:
+      before: { text: 3 lines · 3 places, value: 0.7 }
+      after: { text: 1 new class · 1 map entry, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`protected abstract createWriter` makes the compiler insist that every subclass supplies one. Without a framework to extend, pass a constructor type instead: `new (out: Writable) => RowWriter`, or a plain function that returns a `RowWriter`.'
+      seenIn: '`document.createElement(tag)` creates the right element class for a tag name, and TypeScript types the result per tag. Node''s `http.createServer()` and `net.createConnection()` hide which class they build.'
+
+  rust:
+    before:
+      file: export_job.rs · config.rs
+      source: |
+        // export_job.rs
+        fn run(&self, rows: Rows, out: Box<dyn Write>) -> Result<(), ExportError> {
+            let writer: Box<dyn RowWriter> = match self.format.as_str() {
+                "csv" => Box::new(CsvWriter::new(out)),
+                "json" => Box::new(JsonWriter::new(out)),
+                "parquet" => Box::new(ParquetWriter::new(out, &self.schema)?),
+                other => return Err(ExportError::UnknownFormat(other.into())),
+            };
+            copy_rows(rows, writer)
+        }
+
+        fn preview(&self, rows: Rows, out: Box<dyn Write>) -> Result<(), ExportError> {
+            let writer: Box<dyn RowWriter> = match self.format.as_str() {
+                "csv" => Box::new(CsvWriter::new(out)),
+                "json" => Box::new(JsonWriter::new(out)),
+                "parquet" => Box::new(ParquetWriter::new(out, &self.schema)?),
+                other => return Err(ExportError::UnknownFormat(other.into())),
+            };
+            copy_rows(rows.take(100), writer)
+        }
+
+        // config.rs
+        const FORMATS: &[&str] = &["csv", "json", "parquet"];
+      roles: { context: [2, 20], csv: [4, 4], json: [5, 5], parquet: [6, 6], client: [23, 23] }
+      change:
+        - { after: 6, add: ['        "xlsx" => Box::new(XlsxWriter::new(out)),'] }
+        - { after: 16, add: ['        "xlsx" => Box::new(XlsxWriter::new(out)),'] }
+        - { line: 23, replace: 'const FORMATS: &[&str] = &["csv", "json", "parquet", "xlsx"];' }
+    after:
+      file: export_job.rs · main.rs
+      source: |
+        trait ExportJob {
+            fn schema(&self) -> &Schema;
+
+            // The factory method: each job type says which writer it makes.
+            fn create_writer(&self, out: Box<dyn Write>) -> Result<Box<dyn RowWriter>, ExportError>;
+
+            fn run(&self, rows: Rows, out: Box<dyn Write>) -> Result<(), ExportError> {
+                copy_rows(rows, self.create_writer(out)?)
+            }
+
+            fn preview(&self, rows: Rows, out: Box<dyn Write>) -> Result<(), ExportError> {
+                copy_rows(rows.take(100), self.create_writer(out)?)
+            }
+        }
+
+        struct ParquetExport { schema: Schema }
+
+        impl ExportJob for ParquetExport {
+            fn schema(&self) -> &Schema { &self.schema }
+            fn create_writer(&self, out: Box<dyn Write>) -> Result<Box<dyn RowWriter>, ExportError> {
+                Ok(Box::new(ParquetWriter::new(out, &self.schema)?))
+            }
+        }
+
+        // main.rs: pick the job type from config, once
+        let job: Box<dyn ExportJob> = jobs::from_format(&cfg.format, schema)?;
+      roles: { strategy: [4, 5], product: [5, 5], context: [1, 14], parquet: [16, 23], client: [25, 26], wire: [26, 26], run: [7, 9], create: [18, 23], preview: [11, 13] }
+    again:
+      file: xlsx_export.rs
+      source: |
+        // xlsx_export.rs: a new type, plus one arm in jobs::from_format
+        struct XlsxExport { schema: Schema }
+
+        impl ExportJob for XlsxExport {
+            fn schema(&self) -> &Schema { &self.schema }
+            fn create_writer(&self, out: Box<dyn Write>) -> Result<Box<dyn RowWriter>, ExportError> {
+                Ok(Box::new(XlsxWriter::new(out)))
+            }
+        }
+    cost:
+      before: { text: 3 lines · 3 places, value: 0.7 }
+      after: { text: 1 new type · 1 match arm, value: 0.18 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A trait gives you the shape directly: a required method (`create_writer`) and provided methods (`run`, `preview`) that call it. When the job does not need to be a trait object, a generic `ExportJob<F: Fn(Box<dyn Write>) -> W>` takes a closure and skips the boxing.'
+      seenIn: '`BuildHasher::build_hasher()`: `HashMap` calls it to create a fresh `Hasher` each time it hashes a key. `Default::default()` is a factory method every type can provide.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: '`main` looks up the constructor for the configured format and stores it in the job''s `NewWriter` field.', python: '`main` looks up the job class for the configured format and creates a `ParquetExport`.', typescript: '`main` looks up the job class for the configured format and creates a `ParquetExport`.', rust: '`main` asks `jobs::from_format` for the right job type, boxed as a `dyn ExportJob`.' }
+    nodes: [client]
+    edges: [client>context]
+    role: wire
+  - text: The nightly run starts. The job knows when it needs a writer, after the output is open and before the first row, but not which kind.
+    nodes: [context]
+    edges: []
+    role: run
+  - text: { go: 'It calls `j.NewWriter(out, j.Schema)`. The stored function builds a Parquet writer and returns it as a `RowWriter`.', python: 'It calls `self.create_writer(out)`. `ParquetExport`''s override builds a `ParquetWriter`.', typescript: 'It calls `this.createWriter(out)`. `ParquetExport`''s override builds a `ParquetWriter`.', rust: 'It calls `self.create_writer(out)?`. `ParquetExport`''s impl builds a `ParquetWriter` and boxes it.' }
+    nodes: [context, strategy, parquet, product]
+    edges: [context>strategy, parquet>strategy, strategy>product]
+    role: create
+  - text: The UI asks for a preview. Preview makes its writer through the same method, so it can never show a different format from the export.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: preview
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these situations calls for a Factory Method?
+    options:
+      - text: A report runner fetches data, renders a chart and emails it the same way for every team, but each team's report needs its own kind of chart object.
+        correct: true
+        why: Right. The runner knows when to create the chart and what to do with it. Only the class varies, and that one decision moves to each team's variant.
+      - text: An HTTP request has a dozen optional settings, and callers keep passing them in the wrong order.
+        why: That is Builder. The problem is assembling one complex object step by step, not choosing its class.
+      - text: A deploy tool must create a bucket, a queue and a secret store, and all three must come from the same cloud.
+        why: That is Abstract Factory. It creates a family of related objects that have to match. Factory Method creates one product.
+  engineer:
+    question: Another team needs XLSX. Instead of overriding createWriter(), they copy run() into their subclass and change the line that makes the writer. Tests pass. What goes wrong later?
+    options:
+      - text: When the platform team fixes or extends run(), the fix never reaches this team's export.
+        correct: true
+        why: Right. Their run() is a frozen copy. A factory method exists so that a variant replaces one decision and keeps sharing everything else.
+      - text: The code no longer compiles, because run() may not be overridden.
+        why: Most languages allow it, and the code works on day one. The cost shows up only when run() changes.
+      - text: Every export now runs twice, once in each run().
+        why: Only the subclass's run() executes for that object. Nothing runs twice. The problem is that the base run() is now dead code for this team.
+  deep:
+    question: In Go, XlsxJob embeds ExportJob and defines its own createWriter method. ExportJob's Run calls j.createWriter(). Which writer does Run create for an XlsxJob?
+    options:
+      - text: ExportJob's own, because the call inside Run is bound to ExportJob's method set. Embedding promotes methods outward; it never dispatches back to the outer type.
+        correct: true
+        why: Right. Go has no virtual methods on structs. To let a variant decide, pass a function value or an interface, as the Go code here does with the NewWriter field.
+      - text: XlsxJob's, because Go looks up the method on the outermost type at runtime.
+        why: That is how subclass overriding works in Python, TypeScript or Java. Inside Run, the receiver is the embedded ExportJob, whose type knows nothing of XlsxJob.
+      - text: It is a compile error, because two methods have the same name.
+        why: Go allows it. The outer type's method shadows the promoted one for calls made on XlsxJob, but calls made inside ExportJob still go to ExportJob's.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Creator
+      example: ExportJob
+      job: Runs the work that needs an object, and asks the factory method for it.
+    - role: Factory method
+      example: { go: "NewWriter (a func field)", python: "create_writer()", typescript: "createWriter() (protected abstract)", rust: "create_writer() (required trait method)" }
+      job: The one place that decides which class to create.
+    - role: Product
+      example: RowWriter
+      job: The interface the creator uses. It never sees the concrete class.
+    - role: Concrete creator
+      example: { go: "NewCSVWriter, NewParquetWriter", python: "CsvExport, ParquetExport", typescript: "CsvExport, ParquetExport", rust: "ParquetExport (impl ExportJob)" }
+      job: Supplies the factory method for one variant.
+    - role: Concrete product
+      example: "CsvWriter, ParquetWriter"
+      job: The object actually created.
+  useWhen:
+    - Shared code knows when it needs an object and what to do with it, but not which class to create.
+    - Other teams or users extend your code, and you want them to add variants without editing or copying it.
+    - Several methods create the same kind of object and must always agree, like Run and Preview here.
+    - Tests need to swap in a fake product, such as an in-memory writer instead of a file.
+  avoidWhen:
+    - You own all the code and the variants rarely change. A constructor call, or one small function that picks the class, is simpler.
+    - The only reason to subclass the creator would be to pick a product. Pass a function or class in instead.
+  tradeoffs:
+    - In class-based languages, each product can need its own creator subclass.
+    - Readers have to look in another place to see which class gets created.
+    - The product interface must cover what the creator needs from every variant.
+  lookalikes:
+    - name: Abstract Factory
+      how: An object whose several factory methods create a family of related products that must match. Factory Method is one method making one product.
+    - name: Template Method
+      how: A fixed algorithm with steps subclasses fill in. A factory method is often one of those steps; its only job is to create an object.
+    - name: Strategy
+      how: Swaps how a step is done. A factory method only decides which object to create; what the object then does is up to it.
+    - name: Simple factory
+      how: One function with a switch that returns the right class. Useful, and often enough, but every new variant edits that function.
+---
+
+## [concept] Factory Method
+
+**Let the code that runs a job ask a method for the object it needs, and let each variant of the job decide which class that method creates.**
+
+The code that *uses* the object should not have to name its concrete class. It knows *when* it needs one and what to do with it. Somebody else decides *which* one.
+
+<Depth level={2}>
+Four roles. The <Term id="creator-role">creator</Term> (`ExportJob`) does the real work and calls the **factory method** whenever it needs an object. The <Term id="product-role">product</Term> (`RowWriter`) is the <Term id="interface">interface</Term> the creator works with. Each **concrete creator** supplies the factory method for one variant, and returns a **concrete product** such as `ParquetWriter`.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Factory Method as a *class* creational pattern, because it varies the created class through inheritance, and gives it a second name, Virtual Constructor. Its motivating case is a framework that must create documents but only knows the abstract document class. The book names the cost too: you may end up subclassing the creator just to choose a product. Languages with <Term id="first-class-function">first-class functions</Term> usually avoid that cost by passing the factory in.
+</Depth>
+
+## [problem] An export job that names every writer
+
+A data platform runs nightly exports for customers in CSV, JSON or Parquet, chosen per customer in config. The same job also renders a 100-row preview in the UI.
+
+Read it once. The list of writer classes appears three times: in Run, in Preview and in the config list.
+
+<Depth level={2}>
+Run and Preview each build their own writer. Both switches have to stay identical, or the preview shows one format while the export delivers another.
+</Depth>
+
+<Depth level={3}>
+The job also depends on every writer library at once. A Parquet writer pulls in a columnar encoding library, and the export job imports it even for customers who only ever get CSV.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** Finance needs the nightly export as XLSX.
+
+The marked lines must change, in three places. None of them is about writing a spreadsheet. They are about choosing a class.
+
+<Depth level={2}>
+Now suppose the job belongs to a platform team and Finance's request comes from the Billing team. Billing cannot add a case without a PR into code it does not own, and the platform team becomes a queue for every new format in the company.
+</Depth>
+
+<Depth level={3}>
+The common workaround is worse. Billing copies `Run` into its own code and adds the case there. It ships today, and from then on every fix platform makes to `Run` misses Billing's copy.
+</Depth>
+
+## [morph] Move the choice into one method
+
+Drag the slider. Both switches collapse into one method that creates the writer, and each format moves out into its own creator.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The job now depends on the `RowWriter` interface and on one creation method. A new format extends the job without editing it, the <Term id="open-closed">open/closed principle</Term> applied to object creation. Run and Preview share the method, so they cannot disagree about the format.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go has no inheritance, so the factory method becomes a function value stored in the job. Function types must match exactly: `NewCSVWriter` has to return `RowWriter`, not `*csvWriter`, to fit `WriterFactory`.</Lang>
+<Lang only="python">`@abstractmethod` stops anyone from creating a bare `ExportJob`: Python raises `TypeError` when you call `ExportJob(schema)`. The check happens when the object is created, not when the method is called.</Lang>
+<Lang only="typescript">`protected abstract` makes the compiler reject any subclass that forgets `createWriter`, and keeps outside code from calling it directly.</Lang>
+<Lang only="rust">The trait holds both halves: `create_writer` has no body, so every job type must write one, and `run` and `preview` have default bodies that every job type gets for free.</Lang>
+</Depth>
+
+## [walk] Follow one nightly export
+
+One Parquet export through the design, start to finish. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`j.NewWriter(out, j.Schema)` is an indirect call through a function value. The compiler cannot inline it, which costs nanoseconds per export, not per row.</Lang>
+<Lang only="python">`self.create_writer(out)` looks the method up on the object's class first, so `ParquetExport`'s version wins over the abstract one. That lookup follows the class's method resolution order.</Lang>
+<Lang only="typescript">`this.createWriter` is looked up along the prototype chain at runtime. `ParquetExport.prototype` has its own `createWriter`, so the base version is never reached.</Lang>
+<Lang only="rust">Through `Box<dyn ExportJob>`, the call to `run` goes through a vtable, and inside the default `run`, `self.create_writer` does too: <Term id="dynamic-dispatch">dynamic dispatch</Term> on both calls.</Lang>
+</Depth>
+
+## [again] XLSX, the second time
+
+The same request after the refactor. You add one creator that makes an XLSX writer, and register it in the map. The job itself does not change, so Run and Preview pick up the new format together.
+
+<Depth level={2}>
+The map from a config string to a creator is a parameterized factory, and it is the one place left that names every format. Keep it next to `main`. The catalogue describes this variant too: a factory method that takes an identifier and returns the matching product.
+</Depth>
+
+<Depth level={3}>
+Tests get the same seam. A test creator can return an in-memory writer, so `Run` can be tested without a disk, a bucket or a Parquet library. Michael Feathers calls this move Extract and Override Factory Method.
+</Depth>
+
+## [play] Ship a format on a job you do not own
+
+You are on the Billing team. The export job belongs to platform, and Finance wants XLSX from tonight. Try each way of shipping it, run fourteen nights, and see which one still works after platform changes its own code.
+
+## [lens] How each language writes it
+
+Only two of the four languages have subclassing, so the pattern looks quite different across them. In Go it is a function value; in Rust it is a trait with one required method.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="factory-method" />
+
+### A factory method or a factory function?
+
+A factory function picks a class from a parameter, and every new variant edits it. A factory method lets each variant supply its own creation code, and nothing shared is edited. Start with the function when you own all the variants. Move to the method, or to passing a constructor in, when other people need to add variants to code they cannot change.
