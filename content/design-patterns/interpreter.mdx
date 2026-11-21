@@ -1,0 +1,592 @@
+---
+title: Interpreter
+track: design-patterns
+group: Behavioral
+order: 42
+summary: Give each rule of a small language its own node type with an evaluate method, and run a sentence by evaluating its tree.
+intent: Rules that change every week should be data you can edit, not code you have to deploy.
+changeRequest: Sales wants the new checkout in Japan too, for pro accounts or teams of 50 seats and up.
+languages: [go, python, typescript, rust]
+glossary: [abstract-syntax-tree, short-circuit-evaluation, interface]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/composite]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: interpreter
+  scenarios:
+    - try: Answer the prediction, then click Sam.
+      notice: Only 2 of 7 nodes run. The AND asks its first child, gets false and stops. Each node asks only its own children, and that recursion is the whole interpreter.
+    - try: Do the Japan task by changing one value in the tree.
+      notice: Five customers match, the hard-coded version would have needed a deploy, and this one needed none. The rule is data.
+    - try: Do the big-accounts task.
+      notice: Flipping OR to AND is a one-node edit. The printed rule and the generated code change with it, because they are two more interpretations of the same tree.
+    - try: Change the seats comparison to read country, then click Lena and Marc, then Save.
+      notice: Lena still gets an answer, because the OR never reaches the bad node for her. Marc gets an error. The checker walks the whole tree and refuses to save it.
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: flag service, sub: calls a function }
+      after:  { x: 12, y: 30, w: 112, h: 48, title: flag service, sub: "Eval(user)" }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: flags code, sub: one func per flag }
+      after:  { x: 168, y: 30, w: 150, h: 56, title: rule tree, sub: newCheckout }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 30, w: 180, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 180, h: 56, title: Expr, sub: { go: Eval(u) bool, python: eval(u) -> bool, typescript: union + evaluate, rust: enum + eval } }
+    - id: and
+      kind: concrete
+      before: { x: 188, y: 56, w: 222, h: 30, title: "a && b && c" }
+      after:  { x: 102, y: 204, w: 82, h: 40, title: And }
+    - id: or
+      kind: concrete
+      before: { x: 188, y: 92, w: 222, h: 30, title: "a || b" }
+      after:  { x: 192, y: 204, w: 82, h: 40, title: Or }
+    - id: not
+      kind: concrete
+      before: { x: 188, y: 128, w: 222, h: 30, title: "!optOut" }
+      after:  { x: 282, y: 204, w: 82, h: 40, title: Not }
+    - id: in
+      kind: concrete
+      before: { x: 188, y: 164, w: 222, h: 30, title: country == … }
+      after:  { x: 372, y: 204, w: 82, h: 40, title: In }
+    - id: atleast
+      kind: concrete
+      before: { x: 188, y: 200, w: 222, h: 30, title: seats >= 50 }
+      after:  { x: 462, y: 204, w: 82, h: 40, title: AtLeast }
+    - id: store
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 234, w: 222, h: 26, title: '|| "JP" + deploy' }
+      after:  { x: 12, y: 112, w: 112, h: 44, title: flag store, sub: rule as JSON }
+  edges:
+    - { from: client, to: context, label: evaluates }
+    - { from: store, to: context, label: loads }
+    - { from: context, to: strategy, label: root }
+    - { from: and, to: strategy, kind: implements }
+    - { from: or, to: strategy, kind: implements }
+    - { from: not, to: strategy, kind: implements, label: implements }
+    - { from: in, to: strategy, kind: implements }
+    - { from: atleast, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: flags.go
+      source: |
+        // flags.go: one function per flag, compiled into the service
+        func newCheckoutEnabled(u User) bool {
+            inMarket := u.Country == "DE" || u.Country == "FR"
+            bigOrPro := u.Plan == "pro" || u.Seats >= 50
+            return inMarket && bigOrPro && !u.OptOut
+        }
+
+        func bulkInvoicesEnabled(u User) bool {
+            return u.Plan == "pro" && u.Seats >= 200
+        }
+
+        var flags = map[string]func(User) bool{
+            "new-checkout":  newCheckoutEnabled,
+            "bulk-invoices": bulkInvoicesEnabled,
+        }
+      roles: { context: [2, 15], in: [3, 3], or: [4, 4], atleast: [4, 4], and: [5, 5], not: [5, 5], client: [12, 15] }
+      change:
+        - { line: 3, replace: '    inMarket := u.Country == "DE" || u.Country == "FR" || u.Country == "JP"' }
+    after:
+      file: rule.go
+      source: |
+        // rule.go: one type per grammar rule; a rule is a tree of them
+        type Expr interface{ Eval(u User) bool }
+
+        type And []Expr
+        type Or []Expr
+        type Not struct{ X Expr }
+        type In struct {
+            Attr   string
+            Values []string
+        }
+        type AtLeast struct {
+            Attr string
+            N    int
+        }
+
+        func (a And) Eval(u User) bool {
+            for _, x := range a {
+                if !x.Eval(u) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        func (o Or) Eval(u User) bool {
+            for _, x := range o {
+                if x.Eval(u) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        func (n Not) Eval(u User) bool     { return !n.X.Eval(u) }
+        func (in In) Eval(u User) bool     { return slices.Contains(in.Values, u.Text(in.Attr)) }
+        func (a AtLeast) Eval(u User) bool { return u.Number(a.Attr) >= a.N }
+
+        // The rule itself is data, decoded from the flag store's JSON:
+        var newCheckout Expr = And{
+            In{"country", []string{"DE", "FR"}},
+            Or{In{"plan", []string{"pro"}}, AtLeast{"seats", 50}},
+            Not{In{"opt_out", []string{"true"}}},
+        }
+        // in the request handler:
+        enabled := newCheckout.Eval(user)
+      roles: { strategy: [2, 2], and: [16, 23], or: [25, 32], not: [34, 34], in: [35, 35], atleast: [36, 36], context: [39, 43], client: [45, 45], call: [45, 45], recurse: [16, 23], leaf: [35, 36], data: [38, 43] }
+    again:
+      file: flag store
+      source: |
+        // No Go changes. In the flag store, the country list gains "JP":
+        //   {"op": "in", "attr": "country", "values": ["DE", "FR", "JP"]}
+        // Every instance picks up the new tree on its next refresh.
+    cost:
+      before: { text: 1 line · 1 deploy, value: 0.6 }
+      after: { text: 0 lines · data only, value: 0.05 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A one-method interface and slice types for And and Or keep each node tiny. For anything beyond a handful of operators, do not write the parser yourself: Google''s CEL (`cel-go`) parses, type-checks and evaluates expressions like `user.seats >= 50 && user.plan == "pro"`, and Kubernetes uses it for admission policies.'
+      seenIn: '`text/template` parses a template into a node tree (`text/template/parse`) and executes it by walking the nodes. `regexp/syntax` parses a pattern into a `Regexp` tree before it is compiled to a program.'
+
+  python:
+    before:
+      file: flags.py
+      source: |
+        # flags.py: one function per flag, deployed with the service
+        def new_checkout_enabled(u: User) -> bool:
+            in_market = u.country in {"DE", "FR"}
+            big_or_pro = u.plan == "pro" or u.seats >= 50
+            return in_market and big_or_pro and not u.opt_out
+
+        def bulk_invoices_enabled(u: User) -> bool:
+            return u.plan == "pro" and u.seats >= 200
+
+        FLAGS = {
+            "new-checkout": new_checkout_enabled,
+            "bulk-invoices": bulk_invoices_enabled,
+        }
+      roles: { context: [2, 13], in: [3, 3], or: [4, 4], atleast: [4, 4], and: [5, 5], not: [5, 5], client: [10, 13] }
+      change:
+        - { line: 3, replace: '    in_market = u.country in {"DE", "FR", "JP"}' }
+    after:
+      file: rules.py
+      source: |
+        # rules.py: one class per grammar rule; a rule is a tree of them
+        from dataclasses import dataclass
+        from typing import Protocol
+
+        class Expr(Protocol):
+            def eval(self, u: User) -> bool: ...
+
+        @dataclass
+        class And:
+            parts: list[Expr]
+            def eval(self, u: User) -> bool:
+                return all(p.eval(u) for p in self.parts)
+
+        @dataclass
+        class Or:
+            parts: list[Expr]
+            def eval(self, u: User) -> bool:
+                return any(p.eval(u) for p in self.parts)
+
+        @dataclass
+        class Not:
+            part: Expr
+            def eval(self, u: User) -> bool:
+                return not self.part.eval(u)
+
+        @dataclass
+        class In:
+            attr: str
+            values: set[object]
+            def eval(self, u: User) -> bool:
+                return getattr(u, self.attr) in self.values
+
+        @dataclass
+        class AtLeast:
+            attr: str
+            n: int
+            def eval(self, u: User) -> bool:
+                return getattr(u, self.attr) >= self.n
+
+        # The rule itself is data, parsed from the flag store's JSON:
+        new_checkout = And([
+            In("country", {"DE", "FR"}),
+            Or([In("plan", {"pro"}), AtLeast("seats", 50)]),
+            Not(In("opt_out", {True})),
+        ])
+
+        enabled = new_checkout.eval(user)
+      roles: { strategy: [5, 6], and: [8, 12], or: [14, 18], not: [20, 24], in: [26, 31], atleast: [33, 38], context: [40, 45], client: [47, 47], call: [47, 47], recurse: [11, 12], leaf: [30, 31], data: [40, 45] }
+    again:
+      file: flag store
+      source: |
+        # No Python changes. In the flag store, the country list gains "JP":
+        #   {"op": "in", "attr": "country", "values": ["DE", "FR", "JP"]}
+        # Every worker picks up the new tree on its next refresh.
+    cost:
+      before: { text: 1 line · 1 deploy, value: 0.6 }
+      after: { text: 0 lines · data only, value: 0.05 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'One dataclass per rule with an `eval` method is the textbook form. A common alternative keeps the nodes as plain data and puts the interpreter in one function with a `match` statement over the node classes. `all()` and `any()` over a generator short-circuit just like `and` and `or`.'
+      seenIn: 'Python''s own `ast` module parses source into node classes, and `ast.literal_eval` evaluates a safe subset of them. SQLAlchemy builds SQL from expression trees: `User.age >= 18` returns a node, not a bool.'
+
+  typescript:
+    before:
+      file: flags.ts
+      source: |
+        // flags.ts: one function per flag, bundled with the service
+        function newCheckoutEnabled(u: User): boolean {
+          const inMarket = u.country === "DE" || u.country === "FR";
+          const bigOrPro = u.plan === "pro" || u.seats >= 50;
+          return inMarket && bigOrPro && !u.optOut;
+        }
+
+        function bulkInvoicesEnabled(u: User): boolean {
+          return u.plan === "pro" && u.seats >= 200;
+        }
+
+        export const flags: Record<string, (u: User) => boolean> = {
+          "new-checkout": newCheckoutEnabled,
+          "bulk-invoices": bulkInvoicesEnabled,
+        };
+      roles: { context: [2, 15], in: [3, 3], or: [4, 4], atleast: [4, 4], and: [5, 5], not: [5, 5], client: [12, 15] }
+      change:
+        - { line: 3, replace: '  const inMarket = u.country === "DE" || u.country === "FR" || u.country === "JP";' }
+    after:
+      file: rules.ts
+      source: |
+        // rules.ts: the grammar as a union; a rule is plain JSON in this shape
+        type Expr =
+          | { op: "and"; args: Expr[] }
+          | { op: "or"; args: Expr[] }
+          | { op: "not"; arg: Expr }
+          | { op: "in"; attr: keyof User; values: unknown[] }
+          | { op: "atLeast"; attr: keyof User; n: number };
+
+        function evaluate(e: Expr, u: User): boolean {
+          switch (e.op) {
+            case "and": return e.args.every((a) => evaluate(a, u));
+            case "or": return e.args.some((a) => evaluate(a, u));
+            case "not": return !evaluate(e.arg, u);
+            case "in": return e.values.includes(u[e.attr]);
+            case "atLeast": return Number(u[e.attr]) >= e.n;
+          }
+        }
+
+        // The rule itself is data, as stored in the flag service:
+        const newCheckout: Expr = {
+          op: "and", args: [
+            { op: "in", attr: "country", values: ["DE", "FR"] },
+            { op: "or", args: [{ op: "in", attr: "plan", values: ["pro"] }, { op: "atLeast", attr: "seats", n: 50 }] },
+            { op: "not", arg: { op: "in", attr: "optOut", values: [true] } },
+          ],
+        };
+
+        const enabled = evaluate(newCheckout, user);
+      roles: { strategy: [2, 7], and: [11, 11], or: [12, 12], not: [13, 13], in: [14, 14], atleast: [15, 15], context: [20, 26], client: [28, 28], call: [28, 28], recurse: [11, 11], leaf: [14, 15], data: [19, 26] }
+    again:
+      file: flag store
+      source: |
+        // No TypeScript changes. In the flag store, the country list gains "JP":
+        //   { "op": "in", "attr": "country", "values": ["DE", "FR", "JP"] }
+        // The next request evaluates the new tree.
+    cost:
+      before: { text: 1 line · 1 deploy, value: 0.6 }
+      after: { text: 0 lines · data only, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A discriminated union is the grammar and its JSON form at once, and one `evaluate` function switches on `op`. With `strictNullChecks` the compiler flags a missing case, because the function could then fall off the end without returning. This is the shape JsonLogic uses.'
+      seenIn: 'JsonLogic (`json-logic-js`) rules such as `{"and": [{">=": [{"var": "seats"}, 50]}, …]}`. MongoDB query documents like `{ seats: { $gte: 50 } }` are trees the server evaluates. ESLint rules walk the ESTree syntax tree of your code.'
+
+  rust:
+    before:
+      file: flags.rs
+      source: |
+        // flags.rs: one function per flag, compiled into the service
+        fn new_checkout_enabled(u: &User) -> bool {
+            let in_market = u.country == "DE" || u.country == "FR";
+            let big_or_pro = u.plan == "pro" || u.seats >= 50;
+            in_market && big_or_pro && !u.opt_out
+        }
+
+        fn bulk_invoices_enabled(u: &User) -> bool {
+            u.plan == "pro" && u.seats >= 200
+        }
+
+        pub fn flag(name: &str) -> Option<fn(&User) -> bool> {
+            match name {
+                "new-checkout" => Some(new_checkout_enabled),
+                "bulk-invoices" => Some(bulk_invoices_enabled),
+                _ => None,
+            }
+        }
+      roles: { context: [2, 18], in: [3, 3], or: [4, 4], atleast: [4, 4], and: [5, 5], not: [5, 5], client: [12, 18] }
+      change:
+        - { line: 3, replace: '    let in_market = u.country == "DE" || u.country == "FR" || u.country == "JP";' }
+    after:
+      file: rule.rs
+      source: |
+        // rule.rs: the grammar as an enum; a rule is a tree of its variants
+        #[derive(Deserialize)]
+        #[serde(tag = "op", rename_all = "camelCase")]
+        pub enum Expr {
+            And { args: Vec<Expr> },
+            Or { args: Vec<Expr> },
+            Not { arg: Box<Expr> },
+            In { attr: Attr, values: Vec<Value> },
+            AtLeast { attr: Attr, n: i64 },
+        }
+
+        impl Expr {
+            pub fn eval(&self, u: &User) -> bool {
+                match self {
+                    Expr::And { args } => args.iter().all(|a| a.eval(u)),
+                    Expr::Or { args } => args.iter().any(|a| a.eval(u)),
+                    Expr::Not { arg } => !arg.eval(u),
+                    Expr::In { attr, values } => values.contains(&u.get(*attr)),
+                    Expr::AtLeast { attr, n } => u.get(*attr).as_int().is_some_and(|v| v >= *n),
+                }
+            }
+        }
+
+        // In the request handler: the rule is data, deserialized from the flag store's JSON
+        let new_checkout: Expr = serde_json::from_str(&stored_rule)?;
+        let enabled = new_checkout.eval(&user);
+      roles: { strategy: [2, 10], and: [15, 15], or: [16, 16], not: [17, 17], in: [18, 18], atleast: [19, 19], context: [24, 25], client: [26, 26], call: [26, 26], recurse: [15, 15], leaf: [18, 19], data: [24, 25] }
+    again:
+      file: flag store
+      source: |
+        // No Rust changes. In the flag store, the country list gains "JP":
+        //   {"op": "in", "attr": "country", "values": ["DE", "FR", "JP"]}
+        // serde builds the new tree on the next refresh.
+    cost:
+      before: { text: 1 line · 1 deploy, value: 0.6 }
+      after: { text: 0 lines · data only, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'An enum is the grammar, a `match` is the interpreter, and the compiler insists the match covers every variant, so adding an operator shows you every place to update. `serde` turns the stored JSON straight into the tree, and `Box` breaks the recursion only where a variant holds a single child.'
+      seenIn: 'The `regex` crate parses a pattern into an AST and then a high-level IR (`regex-syntax`) before compiling it. Apache DataFusion and Polars represent query expressions as an `Expr` enum and walk it to plan and evaluate.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'A request asks whether the new checkout is on for this user. The flag service calls `Eval` on the root of the stored tree.', python: 'A request asks whether the new checkout is on for this user. The flag service calls `eval` on the root of the stored tree.', typescript: 'A request asks whether the new checkout is on for this user. The flag service calls `evaluate` on the root of the stored tree.', rust: 'A request asks whether the new checkout is on for this user. The flag service calls `eval` on the root of the stored tree.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: call
+  - text: The root is an And. It asks each child in turn and stops at the first false one. It knows nothing about countries or seats, only about its children.
+    nodes: [context, strategy, and]
+    edges: [context>strategy, and>strategy]
+    role: recurse
+  - text: The leaves do the real reading. In checks one attribute against a list, AtLeast compares a number. They are the base case of the recursion.
+    nodes: [in, atleast, strategy]
+    edges: [in>strategy, atleast>strategy]
+    role: leaf
+  - text: The tree itself came from the flag store. Changing who sees the feature means storing a different tree, with no build and no deploy.
+    nodes: [store, context]
+    edges: [store>context]
+    role: data
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these calls for the Interpreter pattern?
+    options:
+      - text: On-call engineers want to write alert conditions such as errors > 50 and region = eu, and change them without a deploy.
+        correct: true
+        why: Right. There is a small language of conditions, its sentences change often, and they are evaluated against changing input.
+      - text: A checkout picks one of three payment providers from config.
+        why: That is Strategy. There is no language to evaluate, only one choice among a few implementations.
+      - text: A storage bucket is a tree of folders and files, each able to report its total size.
+        why: That is Composite. It has the same tree shape, but it represents a structure, not sentences of a language.
+  engineer:
+    question: A product manager saved a rule containing country >= 50. Most requests still return a result, but some fail. Why, and what prevents it?
+    options:
+      - text: For many users an OR or AND short-circuits before reaching the bad node. Type-check the whole tree when the rule is saved, which is a second interpretation of the same tree.
+        correct: true
+        why: Right. Evaluation only visits the nodes it needs, so a broken node hides until some input reaches it. A checker visits every node, once, at save time.
+      - text: The evaluator has a race condition between concurrent requests.
+        why: Evaluation reads an immutable tree and one user, so concurrent requests do not interfere. The failure depends on which user is evaluated.
+      - text: Comparisons should catch the error and return false.
+        why: That hides a broken rule. The flag silently turns off for those users and nobody learns the rule is wrong.
+  deep:
+    question: Flag evaluation has become a large share of CPU in the flag service. What is the usual fix that keeps rules as data?
+    options:
+      - text: Compile each tree once when it is saved, for example into nested closures or bytecode, and run that compiled form per request.
+        correct: true
+        why: Right. Walking the tree costs a dynamic call and a pointer chase per node on every request. Compiling once removes that. The catalogue makes the same point, and the compiler can itself be written as an interpreter over the tree.
+      - text: Turn the rules back into hard-coded functions.
+        why: That is fast, but it brings back the code change and deploy for every rule change, which is what the language was for.
+      - text: Cache each rule's result.
+        why: The result depends on the user, so a per-rule cache is wrong. A per-user cache only helps if the same users repeat, and it goes stale when the rule changes.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Abstract expression
+      example: { go: "Expr (interface)", python: "Expr (Protocol)", typescript: "Expr (union type)", rust: "Expr (enum)" }
+      job: The common type of every node, with one evaluate operation.
+    - role: Nonterminal expression
+      example: And, Or, Not
+      job: A grammar rule built from other expressions. Evaluates by asking its children.
+    - role: Terminal expression
+      example: In, AtLeast
+      job: A leaf. Reads the input and answers directly.
+    - role: Context
+      example: The user being evaluated
+      job: The input every node can read.
+    - role: Client
+      example: The flag service
+      job: Gets the tree (built by a parser or decoded from JSON) and calls evaluate on its root.
+  useWhen:
+    - Rules change more often than the code, and the people changing them should not need a deploy.
+    - The language is small, a handful of operators, and you can represent a sentence as a tree.
+    - You need to do several things with the same rules, such as evaluate, print, validate or explain.
+  avoidWhen:
+    - The grammar is large. Use an existing language such as CEL, or a parser generator, instead of one class per rule.
+    - Evaluation is on a hot path and the rules rarely change. Hard-code them or compile them.
+  tradeoffs:
+    - Parsing is a separate problem the pattern does not solve. JSON as the syntax avoids most of it.
+    - Each new operation over the tree (print, check, explain) touches every node type, which is when Visitor helps.
+    - Tree-walking is slower than compiled code. Compile once at save time if it matters.
+    - A broken rule fails at runtime, often only for some inputs, unless the tree is checked when it is saved.
+  lookalikes:
+    - name: Composite
+      how: The same tree of parts and wholes. Interpreter is a Composite whose nodes are rules of a language with an evaluate operation.
+    - name: Visitor
+      how: Moves operations such as evaluate, print and check out of the node types into separate objects, so adding an operation does not touch every node.
+    - name: Strategy
+      how: Swaps one fixed behaviour. Interpreter lets you build new behaviour by combining nodes.
+---
+
+## [concept] Interpreter
+
+**Give each rule of a small language its own node type with an evaluate method, and run a sentence by evaluating its tree.**
+
+A sentence such as `country in [DE, FR] and (plan = pro or seats >= 50)` becomes a tree of small objects. Each node evaluates itself by asking its children. A new sentence is a new tree, not new code.
+
+<Depth level={2}>
+The tree is an <Term id="abstract-syntax-tree">abstract syntax tree</Term>. Two kinds of node do the work. **Nonterminal** nodes (And, Or, Not) combine other expressions and evaluate them recursively. **Terminal** nodes (In, AtLeast) read the input, which the catalogue calls the context, and answer directly. All of them share one abstract **expression** type. Building the tree is a separate step. A parser can do it, or, as here, a JSON decoder.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Interpreter under class behavioural patterns, using regular expressions as its example. It says the pattern works best for simple grammars where efficiency is not critical. It notes that efficient interpreters usually translate the tree into another form first, such as a state machine for a regular expression. It also says the pattern does not address parsing. And it points to Visitor once you keep adding new operations over the same tree.
+</Depth>
+
+## [problem] A function per flag
+
+A SaaS product ships features behind flags. Each flag's targeting rule is a Go, Python, TypeScript or Rust function in the flag service: which countries, which plans, how many seats, minus anyone who opted out of betas.
+
+The code is fine. It is short, typed and tested. The rules just do not belong to the people who write it.
+
+<Depth level={2}>
+Sales, support and product ask for targeting changes every week: another country, a bigger seat threshold, one more customer. Each one is a code change, a review, a build and a deploy, done by an engineer who has to translate a sentence from a ticket into boolean logic.
+</Depth>
+
+<Depth level={3}>
+The web and mobile apps also need the same rules to hide or show UI before they ask the server. With functions, each client gets its own copy of the logic in its own language, and the copies drift.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** sales wants the new checkout in Japan too, for pro accounts or teams of 50 seats and up.
+
+One marked line. The edit is trivial, and it still costs a ticket, a pull request, a review, a build and a deploy to every instance, plus a matching release of each client that copies the rule.
+
+<Depth level={2}>
+Multiply by forty flags and a few requests a week each. The flag service becomes a queue of one-line pull requests, and the people who own the rules wait on the people who own the code.
+</Depth>
+
+<Depth level={3}>
+The ad hoc fix is to load the country list from config. Then the seat threshold, then the plan list, then a flag for whether it is "or" or "and". Each new knob is another special case in code. A small language with three or four operators covers all of them at once.
+</Depth>
+
+## [morph] Turn the operators into node types
+
+Drag the slider. Each operator in the hard-coded function becomes a type: `&&` becomes And, `||` becomes Or, `!` becomes Not, and the comparisons become In and AtLeast. The rule itself moves out of the code into a tree of those types.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The node types change rarely, only when the language gains an operator. The trees change all the time and are stored as data. Every client that can decode the JSON and has the same few node types gets the same rule.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Each node type implements the one-method `Expr` interface. `And` and `Or` are slice types, so a rule literal reads almost like the sentence. Decoding from JSON needs a small custom `UnmarshalJSON` that looks at the `op` field and picks the type.</Lang>
+<Lang only="python">Each node is a dataclass with an `eval` method, and `Expr` is a `Protocol`, so the nodes need no common base class. A parser for the JSON form is a dozen lines that look at `op` and build the right class.</Lang>
+<Lang only="typescript">Here the nodes are not classes. A discriminated union describes the tree, and that union is also the JSON format. One `evaluate` function holds every node's behaviour. This is the Interpreter's structure with the operation pulled out of the nodes.</Lang>
+<Lang only="rust">The enum is the grammar and `serde` builds the tree straight from JSON, using the `op` field as the tag. `Not` boxes its child; `And` and `Or` hold a `Vec<Expr>`, which already adds the indirection a recursive type needs.</Lang>
+</Depth>
+
+## [walk] Follow one evaluation
+
+One user, one flag check. Step through it with the numbered buttons.
+
+<Depth level={3}>
+And and Or use <Term id="short-circuit-evaluation">short-circuit evaluation</Term>: an And stops at its first false child. Put cheap and selective checks first. A country check that fails for most users saves evaluating everything behind it. Short-circuiting also hides errors: a broken node is only reached by some users. Validate the whole tree when it is saved.
+</Depth>
+
+## [again] Japan, the second time
+
+The same request, after the refactor. Someone with access to the flag store adds "JP" to the country list. No code changes, no build, no deploy, and every client that evaluates the tree sees the same rule.
+
+<Depth level={2}>
+Rules are now data, so treat them like data. Validate on save, keep a history so a bad rule can be rolled back, and let the people who own the rule preview who it matches before saving.
+</Depth>
+
+<Depth level={3}>
+The engineering work moves to the language. Adding an operator such as `startsWith` is still a code change, in every evaluator. Keep the language small and stable, and push complexity into the trees, not into new operators.
+</Depth>
+
+## [play] Edit a live rule
+
+The rule is a tree you can edit node by node. Pick a customer to trace the evaluation, work through the requests from sales, and try to save a rule that cannot work.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. Some languages put the behaviour in node classes; others keep the nodes as plain data and put the interpreter in one function.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="interpreter" />
+
+### Before you write your own
+
+Most teams should not invent a rule language. CEL (Common Expression Language) is used by Kubernetes and Google Cloud. JsonLogic is a small JSON format with libraries in many languages. Feature-flag products ship their own targeting rules. Write your own only when the language is tiny and you control every evaluator. Even then, borrow one of these formats so the rules outlive your code.

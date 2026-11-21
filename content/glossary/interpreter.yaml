@@ -1,0 +1,7 @@
+# Terms introduced by design-patterns/interpreter.
+- id: abstract-syntax-tree
+  term: Abstract syntax tree
+  short: A tree of nodes, one per operator or value, that represents a sentence in a language without its punctuation or layout.
+- id: short-circuit-evaluation
+  term: Short-circuit evaluation
+  short: Stopping an AND at the first false part, or an OR at the first true part, because the rest cannot change the answer.
