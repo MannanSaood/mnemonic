@@ -1,0 +1,7 @@
+# Terms introduced by the Bridge lesson.
+- id: bridge-implementor
+  term: Implementor
+  short: In Bridge, the interface for the implementation side, such as a Channel. It offers primitive operations that the abstraction builds on.
+- id: pair-class-explosion
+  term: Class per combination
+  short: One class for every pair of two independent choices, such as IncidentSlack and DigestEmail. N kinds and M channels make N × M classes.

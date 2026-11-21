@@ -1,0 +1,590 @@
+---
+title: Bridge
+track: design-patterns
+group: Structural
+order: 31
+summary: Split two dimensions that vary independently into two hierarchies, and let one hold a reference to the other.
+intent: What an alert says and where it is delivered should change separately, so adding a kind of alert or a channel is one new class, not one per combination.
+changeRequest: Every alert must also go out by SMS.
+languages: [go, python, typescript, rust]
+glossary: [interface, bridge-implementor, pair-class-explosion, dependency-injection, dynamic-dispatch, monomorphisation]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/composition-over-inheritance]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: bridge
+  scenarios:
+    - try: "Predict the class count, then add SMS and SLA breach to the grid."
+      notice: "With one class per pair there are 16 classes; with a bridge, 8. Each new channel costs the pair design one class per kind."
+    - try: "Ship the runbook change, then the Block Kit change."
+      notice: "The pair design edits a whole row, then a whole column. The bridge edits one Alert class, then one Channel class."
+    - try: "Look at the Digest on SMS, then ship MaxLength."
+      notice: "The digest was cut at 160 characters. Fixing it in the bridge means a new primitive on Channel, which every channel must implement. That is the joint's cost."
+    - try: "Keep adding until the grid is 5 × 5."
+      notice: "25 classes against 10. The gap grows with every row and every column."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: config, sub: kind × channel }
+      after:  { x: 8, y: 30, w: 76, h: 44, title: main, sub: any pair }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: alert classes, sub: "one per pair: 9" }
+      after:  { x: 102, y: 30, w: 150, h: 44, title: Alert, sub: says what }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 330, y: 30, w: 200, h: 44, title: "" }
+      after:  { x: 330, y: 30, w: 200, h: 44, title: Channel, sub: { go: Deliver(Message), python: deliver(message), typescript: deliver(message), rust: deliver(&message) } }
+    - id: incident
+      kind: concrete
+      before: { x: 188, y: 80, w: 222, h: 32, title: Incident × 3 channels }
+      after:  { x: 8, y: 130, w: 84, h: 40, title: Incident }
+    - id: digest
+      kind: concrete
+      before: { x: 188, y: 120, w: 222, h: 32, title: Digest × 3 channels }
+      after:  { x: 100, y: 130, w: 84, h: 40, title: Digest }
+    - id: reminder
+      kind: concrete
+      before: { x: 188, y: 160, w: 222, h: 32, title: Reminder × 3 channels }
+      after:  { x: 192, y: 130, w: 84, h: 40, title: Reminder }
+    - id: slack
+      kind: concrete
+      appears: after
+      before: { x: 290, y: 130, w: 70, h: 40, title: Slack }
+      after:  { x: 290, y: 130, w: 70, h: 40, title: Slack }
+    - id: email
+      kind: concrete
+      appears: after
+      before: { x: 366, y: 130, w: 70, h: 40, title: Email }
+      after:  { x: 366, y: 130, w: 70, h: 40, title: Email }
+    - id: pager
+      kind: concrete
+      appears: after
+      before: { x: 478, y: 130, w: 78, h: 40, title: PagerDuty }
+      after:  { x: 478, y: 130, w: 78, h: 40, title: PagerDuty }
+    - id: sms
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 206, w: 222, h: 32, title: SMS × 3 kinds }
+      after:  { x: 420, y: 206, w: 76, h: 40, title: SMS }
+  edges:
+    - { from: client, to: context, label: picks }
+    - { from: context, to: strategy, label: holds }
+    - { from: incident, to: context, kind: implements }
+    - { from: digest, to: context, kind: implements, label: kinds }
+    - { from: reminder, to: context, kind: implements }
+    - { from: slack, to: strategy, kind: implements }
+    - { from: email, to: strategy, kind: implements, label: channels }
+    - { from: pager, to: strategy, kind: implements }
+    - { from: sms, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: alerts.go
+      source: |
+        // alerts.go: one type per kind and channel
+        type IncidentSlack struct{ slack *SlackClient }
+
+        func (a IncidentSlack) Send(i Incident) error {
+            return a.slack.Post("#ops", fmt.Sprintf("*SEV%d %s*\n%s", i.Sev, i.Service, i.Summary))
+        }
+
+        type IncidentEmail struct{ mail *Mailer }
+
+        func (a IncidentEmail) Send(i Incident) error {
+            return a.mail.Send(oncall, fmt.Sprintf("[SEV%d] %s", i.Sev, i.Service), i.Summary)
+        }
+
+        type DigestSlack struct{ slack *SlackClient }
+
+        func (a DigestSlack) Send(d Digest) error {
+            return a.slack.Post("#ops", "*Daily digest*\n"+strings.Join(d.Lines, "\n"))
+        }
+
+        // ... IncidentPager, DigestEmail, DigestPager, ReminderSlack, ReminderEmail, ReminderPager
+      roles: { context: [1, 20], incident: [2, 12], digest: [14, 18], reminder: [20, 20] }
+      change:
+        - { after: 20, add: ['type IncidentSMS struct{ sms *SMSClient }', 'func (a IncidentSMS) Send(i Incident) error { /* format for SMS, again */ }', 'type DigestSMS struct{ sms *SMSClient }', 'func (a DigestSMS) Send(d Digest) error { /* … */ }', 'type ReminderSMS struct{ sms *SMSClient }', 'func (a ReminderSMS) Send(r Reminder) error { /* … */ }'] }
+    after:
+      file: alert.go · channel.go · main.go
+      source: |
+        // The implementor: what every channel can do.
+        type Channel interface {
+            Deliver(m Message) error
+        }
+
+        type Message struct {
+            Title, Body string
+            Severity    Severity
+        }
+
+        // The abstraction: what an incident says. It holds a Channel.
+        type IncidentAlert struct{ ch Channel }
+
+        func (a IncidentAlert) Send(i Incident) error {
+            return a.ch.Deliver(Message{
+                Title:    fmt.Sprintf("SEV%d %s", i.Sev, i.Service),
+                Body:     i.Summary,
+                Severity: Critical,
+            })
+        }
+
+        type Slack struct{ client *SlackClient }
+
+        func (s Slack) Deliver(m Message) error {
+            return s.client.Post("#ops", "*"+m.Title+"*\n"+m.Body)
+        }
+
+        // main.go: any alert on any channel
+        incidents := IncidentAlert{ch: Slack{client: slackClient}}
+      roles: { strategy: [1, 9], context: [11, 20], incident: [11, 20], slack: [22, 26], client: [29, 29], compose: [14, 19], bridge: [15, 15], deliver: [24, 26] }
+    again:
+      file: sms.go
+      source: |
+        // sms.go: one new Channel; every alert kind can use it
+        type SMS struct {
+            client *SMSClient
+            to     string
+        }
+
+        func (s SMS) Deliver(m Message) error {
+            return s.client.Text(s.to, m.Title+". "+m.Body)
+        }
+    cost:
+      before: { text: 3 new types · 1 per kind, value: 0.75 }
+      after: { text: 1 new type · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A Go bridge is a struct holding an interface value. Keep the implementor interface small and primitive (here one `Deliver`), and let the alert types build higher-level behaviour on it. When an alert kind is only data, a single `Alert` struct with a `Compose` function per kind is lighter than a type per kind.'
+      seenIn: '`database/sql`: `sql.DB` is the abstraction, and each driver implements `driver.Driver` and `driver.Conn` underneath. `log/slog`: `slog.Logger` holds a `slog.Handler`, so loggers and output formats vary independently.'
+
+  python:
+    before:
+      file: alerts.py
+      source: |
+        # alerts.py: one class per kind and channel
+        class IncidentSlack:
+            def send(self, i: Incident) -> None:
+                self.slack.post("#ops", f"*SEV{i.sev} {i.service}*\n{i.summary}")
+
+        class IncidentEmail:
+            def send(self, i: Incident) -> None:
+                self.mail.send(ONCALL, f"[SEV{i.sev}] {i.service}", i.summary)
+
+        class DigestSlack:
+            def send(self, d: Digest) -> None:
+                self.slack.post("#ops", "*Daily digest*\n" + "\n".join(d.lines))
+
+        # ... IncidentPager, DigestEmail, DigestPager, ReminderSlack, ReminderEmail, ReminderPager
+      roles: { context: [1, 14], incident: [2, 8], digest: [10, 12], reminder: [14, 14] }
+      change:
+        - { after: 14, add: ['class IncidentSMS:', '    def send(self, i: Incident) -> None: ...  # format for SMS, again', 'class DigestSMS:', '    def send(self, d: Digest) -> None: ...', 'class ReminderSMS:', '    def send(self, r: Reminder) -> None: ...'] }
+    after:
+      file: alert.py · channel.py · main.py
+      source: |
+        class Channel(Protocol):
+            def deliver(self, m: Message) -> None: ...
+
+        @dataclass(frozen=True)
+        class Message:
+            title: str
+            body: str
+            severity: Severity
+
+        class IncidentAlert:
+            """What an incident says. Where it goes is the channel's job."""
+            def __init__(self, channel: Channel):
+                self.channel = channel
+
+            def send(self, i: Incident) -> None:
+                self.channel.deliver(Message(f"SEV{i.sev} {i.service}", i.summary, Severity.CRITICAL))
+
+        class Slack:
+            def __init__(self, client: SlackClient):
+                self.client = client
+
+            def deliver(self, m: Message) -> None:
+                self.client.post("#ops", f"*{m.title}*\n{m.body}")
+
+        # main.py: any alert on any channel
+        incidents = IncidentAlert(Slack(slack_client))
+      roles: { strategy: [1, 8], context: [10, 16], incident: [10, 16], slack: [18, 23], client: [26, 26], compose: [15, 16], bridge: [16, 16], deliver: [22, 23] }
+    again:
+      file: sms.py
+      source: |
+        # sms.py: one new Channel; every alert kind can use it
+        class SMS:
+            def __init__(self, client: SMSClient, to: str):
+                self.client, self.to = client, to
+
+            def deliver(self, m: Message) -> None:
+                self.client.text(self.to, f"{m.title}. {m.body}")
+    cost:
+      before: { text: 3 new classes · 1 per kind, value: 0.75 }
+      after: { text: 1 new class · 0 edits, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'With duck typing, the channel can be any object with a `deliver` method, or even a plain function `Callable[[Message], None]`. If alert kinds differ only in their text, a dict of formatting functions keyed by kind does the job with no classes at all.'
+      seenIn: '`logging`: a `Logger` holds `Handler`s, and each handler holds a `Formatter`, so what is logged, where it goes and how it looks vary separately. DB-API drivers behind SQLAlchemy''s engine.'
+
+  typescript:
+    before:
+      file: alerts.ts
+      source: |
+        // alerts.ts: one class per kind and channel
+        class IncidentSlack {
+          constructor(private slack: SlackClient) {}
+          send(i: Incident) { return this.slack.post("#ops", `*SEV${i.sev} ${i.service}*\n${i.summary}`); }
+        }
+        class IncidentEmail {
+          constructor(private mail: Mailer) {}
+          send(i: Incident) { return this.mail.send(ONCALL, `[SEV${i.sev}] ${i.service}`, i.summary); }
+        }
+        class DigestSlack {
+          constructor(private slack: SlackClient) {}
+          send(d: Digest) { return this.slack.post("#ops", `*Daily digest*\n${d.lines.join("\n")}`); }
+        }
+        // ... IncidentPager, DigestEmail, DigestPager, ReminderSlack, ReminderEmail, ReminderPager
+      roles: { context: [1, 14], incident: [2, 9], digest: [10, 13], reminder: [14, 14] }
+      change:
+        - { after: 14, add: ['class IncidentSms {', '  constructor(private sms: SmsClient) {}', '  send(i: Incident) { /* format for SMS, again */ }', '}', '// ... DigestSms, ReminderSms'] }
+    after:
+      file: alert.ts · channel.ts · main.ts
+      source: |
+        // The implementor: what every channel can do.
+        interface Channel {
+          deliver(m: Message): Promise<void>;
+        }
+
+        interface Message { title: string; body: string; severity: "critical" | "warning" | "info" }
+
+        // The abstraction: what an incident says. It holds a Channel.
+        class IncidentAlert {
+          constructor(private readonly channel: Channel) {}
+          send(i: Incident) {
+            return this.channel.deliver({ title: `SEV${i.sev} ${i.service}`, body: i.summary, severity: "critical" });
+          }
+        }
+
+        class Slack implements Channel {
+          constructor(private readonly client: SlackClient) {}
+          async deliver(m: Message) {
+            await this.client.post("#ops", `*${m.title}*\n${m.body}`);
+          }
+        }
+
+        // main.ts: any alert on any channel
+        const incidents = new IncidentAlert(new Slack(slackClient));
+      roles: { strategy: [1, 6], context: [8, 14], incident: [8, 14], slack: [16, 21], client: [24, 24], compose: [11, 13], bridge: [12, 12], deliver: [18, 20] }
+    again:
+      file: sms.ts
+      source: |
+        // sms.ts: one new Channel; every alert kind can use it
+        class Sms implements Channel {
+          constructor(private readonly client: SmsClient, private readonly to: string) {}
+          async deliver(m: Message) {
+            await this.client.text(this.to, `${m.title}. ${m.body}`);
+          }
+        }
+    cost:
+      before: { text: 3 new classes · 1 per kind, value: 0.75 }
+      after: { text: 1 new class · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'With structural typing, a channel can be an object literal `{ deliver }`. A discriminated union of alert kinds with one `compose` function is a lighter abstraction side when kinds carry no behaviour of their own.'
+      seenIn: 'Prisma and Drizzle: one query API, a driver adapter per database underneath. Pino and Winston: a logger holds transports, so log calls and destinations vary independently.'
+
+  rust:
+    before:
+      file: alerts.rs
+      source: |
+        // alerts.rs: one type per kind and channel
+        struct IncidentSlack { slack: SlackClient }
+        impl IncidentSlack {
+            fn send(&self, i: &Incident) -> Result<(), SendError> {
+                self.slack.post("#ops", &format!("*SEV{} {}*\n{}", i.sev, i.service, i.summary))
+            }
+        }
+
+        struct DigestSlack { slack: SlackClient }
+        impl DigestSlack {
+            fn send(&self, d: &Digest) -> Result<(), SendError> {
+                self.slack.post("#ops", &format!("*Daily digest*\n{}", d.lines.join("\n")))
+            }
+        }
+
+        // ... IncidentEmail, IncidentPager, DigestEmail, DigestPager, Reminder × 3
+      roles: { context: [1, 15], incident: [2, 7], digest: [9, 14], reminder: [16, 16] }
+      change:
+        - { after: 16, add: ['struct IncidentSms { sms: SmsClient }', 'impl IncidentSms { fn send(&self, i: &Incident) -> Result<(), SendError> { /* format for SMS, again */ } }', 'struct DigestSms { sms: SmsClient }', 'impl DigestSms { fn send(&self, d: &Digest) -> Result<(), SendError> { /* … */ } }', 'struct ReminderSms { sms: SmsClient }', 'impl ReminderSms { fn send(&self, r: &Reminder) -> Result<(), SendError> { /* … */ } }'] }
+    after:
+      file: alert.rs · channel.rs · main.rs
+      source: |
+        // The implementor: what every channel can do.
+        trait Channel {
+            fn deliver(&self, m: &Message) -> Result<(), SendError>;
+        }
+
+        struct Message { title: String, body: String, severity: Severity }
+
+        // The abstraction: what an incident says. It holds some Channel.
+        struct IncidentAlert { channel: Box<dyn Channel> }
+
+        impl IncidentAlert {
+            fn send(&self, i: &Incident) -> Result<(), SendError> {
+                self.channel.deliver(&Message {
+                    title: format!("SEV{} {}", i.sev, i.service),
+                    body: i.summary.clone(),
+                    severity: Severity::Critical,
+                })
+            }
+        }
+
+        struct Slack { client: SlackClient }
+
+        impl Channel for Slack {
+            fn deliver(&self, m: &Message) -> Result<(), SendError> {
+                self.client.post("#ops", &format!("*{}*\n{}", m.title, m.body))
+            }
+        }
+
+        // main.rs: any alert on any channel, chosen from config
+        let incidents = IncidentAlert { channel: Box::new(Slack { client: slack_client }) };
+      roles: { strategy: [1, 6], context: [8, 19], incident: [8, 19], slack: [21, 27], client: [30, 30], compose: [12, 18], bridge: [13, 13], deliver: [23, 26] }
+    again:
+      file: sms.rs
+      source: |
+        // sms.rs: one new Channel; every alert kind can use it
+        struct Sms { client: SmsClient, to: String }
+
+        impl Channel for Sms {
+            fn deliver(&self, m: &Message) -> Result<(), SendError> {
+                self.client.text(&self.to, &format!("{}. {}", m.title, m.body))
+            }
+        }
+    cost:
+      before: { text: 3 new types · 1 per kind, value: 0.75 }
+      after: { text: 1 new type · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`Box<dyn Channel>` binds the channel at runtime, from config, which is the point of the pattern. A generic `IncidentAlert<C: Channel>` gives static dispatch but fixes the channel at compile time, and `IncidentAlert<Slack>` and `IncidentAlert<Sms>` become different types.'
+      seenIn: '`tracing`: the `tracing` macros are the abstraction, and a `Subscriber` decides where spans and events go. `std::io::Write` behind `BufWriter` and formatters: `write!` works against any writer.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: '`main` picks a pair: an incident alert that delivers through Slack. Any kind can be paired with any channel.'
+    nodes: [client, context]
+    edges: [client>context]
+    role: client
+  - text: "IncidentAlert decides what to say: a title, a body and a severity. It knows nothing about Slack."
+    nodes: [context, incident]
+    edges: [incident>context]
+    role: compose
+  - text: It hands the message across the bridge, the one reference it holds, by calling deliver on its Channel.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: bridge
+  - text: Slack turns the message into its own API call. Email, PagerDuty and SMS would each do it their own way, from the same message.
+    nodes: [slack, strategy]
+    edges: [slack>strategy]
+    role: deliver
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these situations calls for a Bridge?
+    options:
+      - text: Sales, usage and invoice reports must each export to PDF, CSV and XLSX, and both lists keep growing.
+        correct: true
+        why: Right. Two dimensions vary independently. With a bridge, each new report or format is one class, not one per combination.
+      - text: A legacy SDK must fit the payment interface the rest of the code uses.
+        why: That is Adapter. It makes an existing class fit after the fact. A bridge is designed up front to keep two dimensions apart.
+      - text: The checkout uses one payment provider, chosen per region.
+        why: That is Strategy. There is one dimension that varies. A bridge has two, each with its own hierarchy.
+  engineer:
+    question: You add SMS, and the daily digest no longer fits in 160 characters. What is the cleanest fix?
+    options:
+      - text: Add a primitive to Channel, such as a maximum length, and let the digest shorten itself when space is short.
+        correct: true
+        why: Right. The alert stays in charge of what to say, and the channel says what it can carry. It costs one new method on every channel, which is the price of the joint.
+      - text: In the digest, check whether the channel is SMS, and send a short version if so.
+        why: That makes the alert depend on a concrete channel, which is the coupling the bridge removed. The next small channel needs another check.
+      - text: Let SMS cut the message at 160 characters.
+        why: Then the on-call engineer gets a digest that stops mid-sentence. The playground shows what is lost.
+  deep:
+    question: The catalogue says Bridge avoids a permanent binding between an abstraction and its implementation. Which design keeps that property?
+    options:
+      - text: The alert holds its channel through an interface, and the channel is chosen when the alert is built, for example from config.
+        correct: true
+        why: Right. The binding happens at runtime and can differ per alert. In Go and TypeScript that is an interface value, in Rust a trait object, in Python any object with deliver.
+      - text: The alert is generic over its channel, as in IncidentAlert of Slack, resolved at compile time.
+        why: The code is still split in two, and dispatch is static and fast, but each alert's channel is fixed when the program is compiled. Choosing it from config then needs a trait object or an enum after all.
+      - text: IncidentAlert inherits from the Slack client.
+        why: That is the permanent binding the pattern avoids. The incident can never go anywhere but Slack, and a new channel means new subclasses.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Abstraction
+      example: Alert
+      job: Defines what the client uses, and holds a reference to an implementor.
+    - role: Refined abstraction
+      example: "IncidentAlert, DigestAlert, ReminderAlert"
+      job: One kind of alert. Builds its behaviour on the implementor's primitives.
+    - role: Implementor
+      example: { go: "Channel (interface)", python: "Channel (Protocol)", typescript: "Channel (interface)", rust: "Channel (trait)" }
+      job: The primitive operations every implementation offers. Often lower-level than the abstraction.
+    - role: Concrete implementor
+      example: "Slack, Email, PagerDuty, SMS"
+      job: One way to carry out the primitives.
+  useWhen:
+    - Two dimensions vary independently and both lists grow, such as message kinds and delivery channels, or reports and export formats.
+    - The implementation must be chosen at runtime, per object, from config.
+    - You see a class per combination, named like IncidentSlack, DigestEmail.
+  avoidWhen:
+    - Only one dimension varies. Use Strategy, or a plain interface.
+    - The combinations are few and fixed. A handful of small classes is easier to read than two hierarchies.
+    - The two sides cannot agree on a stable set of primitives. The joint would change with every new implementation.
+  tradeoffs:
+    - N + M classes instead of N × M, and each change lands on one side.
+    - The implementor interface is a contract both sides depend on. Adding a primitive touches every implementation.
+    - Implementations with special powers (Slack buttons, PagerDuty escalation) are only reachable through primitives the interface offers.
+    - One more indirection to follow when reading the code.
+  lookalikes:
+    - name: Adapter
+      how: Makes an existing class fit an interface after the fact. A bridge is designed up front so two sides can vary independently.
+    - name: Strategy
+      how: Same shape on one side. Strategy swaps one algorithm in a context; Bridge splits a whole hierarchy into two that both grow.
+    - name: Abstract Factory
+      how: Can create the right implementor for a platform or a config, and hand it to the abstraction.
+    - name: State
+      how: Also holds an object it delegates to, but the object replaces itself as the state changes.
+---
+
+## [concept] Bridge
+
+**Split two dimensions that vary independently into two hierarchies, and let one hold a reference to the other.**
+
+Alerts vary in what they say (incident, digest, reminder) and in where they go (Slack, email, PagerDuty). With one class per pair, every new kind or channel multiplies the class count. A bridge keeps the two apart: an Alert decides what to say, and holds a Channel that decides how to deliver it.
+
+<Depth level={2}>
+Four roles. The **abstraction** (`Alert`) is what clients use, and holds a reference to an **<Term id="bridge-implementor">implementor</Term>** (`Channel`). **Refined abstractions** (`IncidentAlert`, `DigestAlert`) are the kinds. **Concrete implementors** (`Slack`, `Email`, `PagerDuty`) are the channels. The reference between the two sides is the bridge. Passing a channel in when the alert is built is <Term id="dependency-injection">dependency injection</Term>.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Bridge as an object structural pattern. Its intent is to decouple an abstraction from its implementation so the two can vary independently. It warns against a <Term id="pair-class-explosion">class per combination</Term>, and notes that the implementor interface need not mirror the abstraction's. Typically the implementor offers primitive operations, and the abstraction builds higher-level operations on them. Listed consequences: the implementation can be chosen or changed at runtime, both sides can be extended independently, and clients are shielded from implementation details.
+</Depth>
+
+## [problem] An alert class for every pair
+
+An on-call system sends three kinds of alert over three channels. Each pair is its own class: `IncidentSlack`, `IncidentEmail`, `DigestSlack`, and six more. It works, and each class is small.
+
+Read it once. The incident's wording is repeated in every Incident class, and Slack's message format is repeated in every Slack class.
+
+<Depth level={2}>
+Each class mixes two decisions: what this alert says, and how this channel delivers it. A change to either one is spread across a row or a column of classes.
+</Depth>
+
+<Depth level={3}>
+The repetition drifts. One incident class gets the new severity label and another does not. One Slack class handles rate limits and another does not. Nothing forces the copies to agree.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** every alert must also go out by SMS.
+
+The marked lines must be added: one new class per kind of alert, three today. Each one re-formats its alert for SMS from scratch.
+
+<Depth level={2}>
+The next request for a new kind of alert costs one class per channel, now four. The class count is kinds × channels, and every request in either direction makes the next one more expensive.
+</Depth>
+
+<Depth level={3}>
+The pair classes also pin the choice at compile time. Sending a reminder by SMS to some users and by email to others means picking between two classes in the calling code, so the calling code has to know every pair.
+</Depth>
+
+## [morph] Split the pairs into two hierarchies
+
+Drag the slider. The nine pair classes split into three alert kinds and three channels, joined by one reference: an Alert holds a Channel.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Now each request lands on one side. A new channel is one class that implements `Channel`. A new kind of alert is one class that composes a `Message`. Rewording incidents touches `IncidentAlert` only; changing Slack's format touches `Slack` only.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`IncidentAlert` holds a `Channel` interface value. The channel is chosen when the struct is built, so two incident alerts in the same process can use different channels.</Lang>
+<Lang only="python">`IncidentAlert` accepts any object with a `deliver` method. A type checker confirms it against the `Channel` protocol; at runtime, any object with the method works.</Lang>
+<Lang only="typescript">`IncidentAlert` holds a `Channel`. Any object with a matching `deliver` fits, so a test can pass `{ deliver: async (m) => { sent.push(m); } }` with no class at all.</Lang>
+<Lang only="rust">`Box<dyn Channel>` lets the channel be chosen at runtime, which is the binding the pattern wants. Each call goes through the trait object's vtable: <Term id="dynamic-dispatch">dynamic dispatch</Term>.</Lang>
+</Depth>
+
+## [walk] Follow one alert across the bridge
+
+One incident, from the alert that composes it to the channel that delivers it. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`a.ch.Deliver(...)` is one interface call. The `Message` is passed by value: a small struct of two strings and a severity, copied cheaply.</Lang>
+<Lang only="python">`self.channel.deliver(...)` is an attribute lookup and a call. A frozen dataclass keeps the message immutable, so a channel cannot change it for the next one.</Lang>
+<Lang only="typescript">The message is a plain object literal. Nothing at runtime checks it against `Message`; the compiler did that once.</Lang>
+<Lang only="rust">The message is passed by reference, `&Message`, so nothing is cloned to deliver it. A generic `IncidentAlert<C: Channel>` would let the compiler inline `deliver` through <Term id="monomorphisation">monomorphisation</Term>, at the cost of fixing the channel at compile time.</Lang>
+</Depth>
+
+## [again] SMS, the second time
+
+The same request after the refactor. SMS is one new Channel. Every kind of alert can use it, and no alert class changes.
+
+<Depth level={2}>
+A channel with a hard limit exposes the joint. A daily digest that reads fine in Slack is cut at 160 characters in an SMS. The fix belongs in the implementor interface: a primitive such as a maximum length, which the digest uses to shorten itself. Every channel must now implement it. Choosing the primitives carefully is most of the work of a bridge.
+</Depth>
+
+<Depth level={3}>
+Test each side alone. Alert tests use a fake channel that records the messages it receives. Channel tests send a fixed message and check the API call. Then one or two end-to-end tests cover the pairs that matter most, such as incidents on PagerDuty.
+</Depth>
+
+## [play] Grow the alert grid, ship the changes
+
+Every cell is a real message: one kind of alert on one channel. With one class per pair, each cell is a class. With a bridge, only the row and column headers are.
+
+Grow both lists, ship the change requests, and compare what each design cost.
+
+## [lens] How each language writes it
+
+The pattern is the same everywhere: one side holds the other through an interface. What changes is how much ceremony the abstraction side needs. When alert kinds are only data, a function per kind is often enough.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="bridge" />
+
+### Bridge, Strategy and Adapter
+
+All three hold an object behind an interface. Strategy has one dimension: the context swaps one algorithm. Bridge has two: both the abstraction and the implementor have hierarchies that grow, and the reference joins them. Adapter is not designed up front at all: it makes an existing class fit an interface it was not written for. If you find yourself writing classes named after two things at once, such as `DigestEmail`, look for a bridge.
