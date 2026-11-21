@@ -1,0 +1,22 @@
+# Terms introduced by the Rate limiter algorithms lesson.
+- id: token-bucket
+  term: Token bucket
+  short: A limiter that holds up to b tokens, refilled at r per second. Each request spends one; with none left it is refused. Allows bursts of b and an average of r.
+- id: leaky-bucket
+  term: Leaky bucket
+  short: A limiter that puts requests in a queue of size b drained at a steady r per second. Bursts are delayed, not passed on; a full queue refuses new ones.
+- id: fixed-window-counter
+  term: Fixed window counter
+  short: A limiter that counts requests per clock interval and resets at each boundary. Cheap, but up to twice the limit can pass in a moment that straddles a boundary.
+- id: sliding-window-log
+  term: Sliding window log
+  short: A limiter that stores the time of every admitted request and allows a new one only if fewer than r fall in the trailing window. Exact, but memory grows with the limit.
+- id: sliding-window-counter
+  term: Sliding window counter
+  short: A limiter that estimates the trailing window as the previous window's count, weighted by how much it overlaps, plus the current count. Two counters, close to exact.
+- id: lazy-refill
+  term: Lazy refill
+  short: Computing a bucket's tokens only when a request arrives, from the stored count and the time since the last update, instead of running a timer per bucket.
+- id: gcra
+  term: GCRA (generic cell rate algorithm)
+  short: A leaky-bucket equivalent that stores one timestamp per key, the theoretical arrival time of the next allowed request, and admits a request if it is not too early.

@@ -1,0 +1,558 @@
+---
+title: Rate limiter algorithms
+track: system-design
+group: Building blocks
+order: 6
+summary: Token bucket, leaky bucket, fixed window and sliding windows all say r per second, and they disagree on bursts. Pick by what your backend can absorb, and update the shared counter atomically.
+intent: A limit of r per second should mean what you think it means at the backend, on every gateway, at every second boundary.
+changeRequest: Search falls over under spikes. Make 10 requests per second hold for any one-second span, and still let a client that has been quiet send a short burst.
+languages: [go, python, typescript, rust]
+glossary: [token-bucket, leaky-bucket, fixed-window-counter, sliding-window-log, sliding-window-counter, lazy-refill, gcra]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [system-design/scale-from-zero]
+skills: [scalability, resilience]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: rate-limiter-algorithms
+  scenarios:
+    - try: "Predict, then press Boundary burst."
+      notice: "The fixed window lets all 20 through in 200 ms, twice the limit. The sliding log lets 10 through; the token bucket 11."
+    - try: "Press One big burst, then set Burst b to 20."
+      notice: "The token bucket and the leaky bucket admit the same requests. The token bucket sends them on at once; the leaky bucket makes some wait almost two seconds."
+    - try: "Press Retry waves."
+      notice: "The sliding counter admits far fewer than the sliding log, because it assumes last second's requests were spread over the whole second."
+    - try: "Press Boundary burst, then Two gateways, no atomic update."
+      notice: "Every limiter, even the exact sliding log, lets 20 through. The lost update breaks them all."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 100, w: 106, h: 56, title: API client, sub: key k-42 }
+      after:  { x: 12, y: 100, w: 106, h: 56, title: API client, sub: key k-42 }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 250, h: 236, title: Gateway, sub: middleware }
+      after:  { x: 140, y: 30, w: 120, h: 56, title: Gateway, sub: middleware }
+    - id: window
+      kind: concrete
+      before: { x: 158, y: 100, w: 214, h: 44, title: INCR per clock second }
+      after:  { x: 140, y: 196, w: 120, h: 44, title: 429 + Retry-After }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 286, y: 96, w: 120, h: 76, title: "" }
+      after:  { x: 286, y: 96, w: 120, h: 76, title: Token bucket, sub: Lua in Redis }
+    - id: store
+      kind: concrete
+      appears: after
+      before: { x: 286, y: 196, w: 120, h: 44, title: "" }
+      after:  { x: 286, y: 196, w: 120, h: 44, title: tokens · ts }
+    - id: backend
+      kind: concrete
+      before: { x: 430, y: 40, w: 120, h: 56, title: Search API, sub: 10/s comfortably }
+      after:  { x: 430, y: 40, w: 120, h: 56, title: Search API, sub: 10/s comfortably }
+    - id: spike
+      kind: concrete
+      appears: change
+      before: { x: 430, y: 160, w: 120, h: 56, title: 2× at boundary, sub: "20 in 0.2 s" }
+      after:  { x: 430, y: 160, w: 120, h: 56, title: burst ≤ 20, sub: then 10/s }
+  edges:
+    - { from: client, to: context, label: request }
+    - { from: context, to: strategy, label: EVALSHA }
+    - { from: window, to: strategy, label: refused }
+    - { from: store, to: strategy, label: state }
+    - { from: strategy, to: backend, label: admitted }
+    - { from: strategy, to: spike, label: shape }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: ratelimit.go
+      source: |
+        // ratelimit.go: 10 requests per API key per clock second
+        func (m *RateLimit) Wrap(next http.Handler) http.Handler {
+            return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                key := fmt.Sprintf("rl:%s:%d", r.Header.Get("X-Api-Key"), time.Now().Unix())
+                n, err := m.rdb.Incr(r.Context(), key).Result()
+                if err == nil && n == 1 {
+                    m.rdb.Expire(r.Context(), key, 2*time.Second)
+                }
+                if err == nil && n > 10 {
+                    w.Header().Set("Retry-After", "1")
+                    http.Error(w, "rate limited", http.StatusTooManyRequests)
+                    return
+                }
+                next.ServeHTTP(w, r)
+            })
+        }
+      roles: { context: [2, 16], client: [3, 3], window: [4, 8], store: [5, 5], backend: [14, 14], spike: [9, 9] }
+      change:
+        - { line: 9, replace: '        if err == nil && n > 5 { // halve it: boundaries let twice the limit through' }
+    after:
+      file: ratelimit.go
+      source: |
+        // ratelimit.go: a token bucket per API key, refilled lazily inside Redis
+        var tokenBucket = redis.NewScript(`
+        local rate, burst = tonumber(ARGV[1]), tonumber(ARGV[2])
+        local t = redis.call('TIME')
+        local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+        local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+        local tokens = math.min(burst, (tonumber(b[1]) or burst) + (now - (tonumber(b[2]) or now)) * rate)
+        local ok = tokens >= 1
+        if ok then tokens = tokens - 1 end
+        redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
+        redis.call('EXPIRE', KEYS[1], math.ceil(burst / rate) + 1)
+        return ok and 1 or 0`)
+
+        func (m *RateLimit) Allow(ctx context.Context, apiKey string) (bool, error) {
+            ok, err := tokenBucket.Run(ctx, m.rdb, []string{"tb:" + apiKey}, 10, 20).Int()
+            return ok == 1, err
+        }
+
+        func (m *RateLimit) Wrap(next http.Handler) http.Handler {
+            return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                ok, err := m.Allow(r.Context(), r.Header.Get("X-Api-Key"))
+                if err == nil && !ok {
+                    w.Header().Set("Retry-After", "1")
+                    http.Error(w, "rate limited", http.StatusTooManyRequests)
+                    return
+                }
+                next.ServeHTTP(w, r) // on a Redis error, fail open
+            })
+        }
+      roles: { strategy: [2, 12], atomic: [2, 12], refill: [4, 7], spend: [8, 11], store: [6, 6], call: [14, 17], context: [19, 29], client: [21, 21], window: [22, 26], reject: [22, 26], backend: [27, 27], spike: [15, 15] }
+    again:
+      file: ratelimit_test.go
+      source: |
+        // ratelimit_test.go: 200 concurrent requests from one key get the burst, not more
+        func TestBurstIsTheCeiling(t *testing.T) {
+            m := &RateLimit{rdb: testRedis(t)}
+            var allowed atomic.Int64
+            var wg sync.WaitGroup
+            for range 200 {
+                wg.Go(func() {
+                    if ok, _ := m.Allow(t.Context(), "k-42"); ok {
+                        allowed.Add(1)
+                    }
+                })
+            }
+            wg.Wait()
+            if n := allowed.Load(); n < 20 || n > 22 { // the burst, plus a token or two of refill
+                t.Fatalf("allowed %d of 200", n)
+            }
+        }
+    cost:
+      before: { text: limit halved · quiet users refused · still 10 in 0.2 s, value: 0.75 }
+      after: { text: at most 20 at once · then 10/s · any gateway, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`golang.org/x/time/rate` is a token bucket in the standard extended library: `rate.NewLimiter(r, b)`, then `Allow`, `Wait(ctx)` or `Reserve`. It lives in one process, so with several gateways each one allows the full rate. For a shared limit, a script in Redis keeps read, decide and write in one step; go-redis''s `Script.Run` sends `EVALSHA` and falls back to `EVAL`.'
+      seenIn: '`golang.org/x/time/rate`. go-redis `redis.NewScript`. `http.StatusTooManyRequests`. `sync.WaitGroup.Go` in Go 1.25 tests.'
+
+  python:
+    before:
+      file: rate_limit.py
+      source: |
+        # rate_limit.py: 10 requests per API key per clock second
+        @app.middleware("http")
+        async def rate_limit(request: Request, call_next):
+            key = f"rl:{request.headers.get('x-api-key')}:{int(time.time())}"
+            n = await redis.incr(key)
+            if n == 1:
+                await redis.expire(key, 2)
+            if n > 10:
+                return JSONResponse({"error": "rate limited"}, status_code=429, headers={"Retry-After": "1"})
+            return await call_next(request)
+      roles: { context: [2, 10], client: [3, 3], window: [4, 7], store: [5, 5], spike: [8, 8], backend: [10, 10] }
+      change:
+        - { line: 8, replace: '    if n > 5:  # halve it: boundaries let twice the limit through' }
+    after:
+      file: rate_limit.py
+      source: |
+        # rate_limit.py: a token bucket per API key, refilled lazily inside Redis
+        TOKEN_BUCKET = redis.register_script("""
+        local rate, burst = tonumber(ARGV[1]), tonumber(ARGV[2])
+        local t = redis.call('TIME')
+        local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+        local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+        local tokens = math.min(burst, (tonumber(b[1]) or burst) + (now - (tonumber(b[2]) or now)) * rate)
+        local ok = tokens >= 1
+        if ok then tokens = tokens - 1 end
+        redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
+        redis.call('EXPIRE', KEYS[1], math.ceil(burst / rate) + 1)
+        return ok and 1 or 0
+        """)
+
+        @app.middleware("http")
+        async def rate_limit(request: Request, call_next):
+            api_key = request.headers.get("x-api-key")
+            allowed = await TOKEN_BUCKET(keys=[f"tb:{api_key}"], args=[10, 20]) == 1
+            if not allowed:
+                return JSONResponse({"error": "rate limited"}, status_code=429, headers={"Retry-After": "1"})
+            return await call_next(request)
+      roles: { strategy: [2, 13], atomic: [2, 13], refill: [4, 7], spend: [8, 11], store: [6, 6], call: [17, 18], context: [15, 21], client: [16, 16], window: [19, 20], reject: [19, 20], backend: [21, 21], spike: [18, 18] }
+    again:
+      file: test_rate_limit.py
+      source: |
+        # test_rate_limit.py: 200 concurrent requests from one key get the burst, not more
+        async def test_burst_is_the_ceiling(client):
+            responses = await asyncio.gather(*(client.get("/search", headers={"x-api-key": "k-42"}) for _ in range(200)))
+            ok = sum(r.status_code == 200 for r in responses)
+            assert 20 <= ok <= 22  # the burst, plus a token or two of refill
+            assert all(r.headers["retry-after"] == "1" for r in responses if r.status_code == 429)
+    cost:
+      before: { text: limit halved · quiet users refused · still 10 in 0.2 s, value: 0.75 }
+      after: { text: at most 20 at once · then 10/s · any gateway, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The `limits` package implements fixed window, moving window (a sliding log) and sliding window counter strategies over memory, Redis and other storages; it is what Flask-Limiter and SlowAPI build on. redis-py''s `register_script` returns a callable that uses `EVALSHA` and reloads the script on `NOSCRIPT`.'
+      seenIn: '`limits` (`FixedWindowRateLimiter`, `MovingWindowRateLimiter`, `SlidingWindowCounterRateLimiter`). Flask-Limiter. redis-py `register_script`.'
+
+  typescript:
+    before:
+      file: rate-limit.ts
+      source: |
+        // rate-limit.ts: 10 requests per API key per clock second
+        export async function rateLimit(req: Request, res: Response, next: NextFunction) {
+          const key = `rl:${req.get("x-api-key")}:${Math.floor(Date.now() / 1000)}`;
+          const n = await redis.incr(key);
+          if (n === 1) await redis.expire(key, 2);
+          if (n > 10) {
+            res.set("Retry-After", "1").status(429).json({ error: "rate limited" });
+            return;
+          }
+          next();
+        }
+      roles: { context: [2, 11], client: [2, 2], window: [3, 5], store: [4, 4], spike: [6, 6], backend: [10, 10] }
+      change:
+        - { line: 6, replace: '  if (n > 5) { // halve it: boundaries let twice the limit through' }
+    after:
+      file: rate-limit.ts
+      source: |
+        // rate-limit.ts: a token bucket per API key, refilled lazily inside Redis
+        const TOKEN_BUCKET = `
+        local rate, burst = tonumber(ARGV[1]), tonumber(ARGV[2])
+        local t = redis.call('TIME')
+        local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+        local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+        local tokens = math.min(burst, (tonumber(b[1]) or burst) + (now - (tonumber(b[2]) or now)) * rate)
+        local ok = tokens >= 1
+        if ok then tokens = tokens - 1 end
+        redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
+        redis.call('EXPIRE', KEYS[1], math.ceil(burst / rate) + 1)
+        return ok and 1 or 0`;
+
+        export async function rateLimit(req: Request, res: Response, next: NextFunction) {
+          const allowed = await redis.eval(TOKEN_BUCKET, 1, `tb:${req.get("x-api-key")}`, 10, 20);
+          if (allowed === 0) {
+            res.set("Retry-After", "1").status(429).json({ error: "rate limited" });
+            return;
+          }
+          next();
+        }
+      roles: { strategy: [2, 12], atomic: [2, 12], refill: [4, 7], spend: [8, 11], store: [6, 6], call: [15, 15], context: [14, 21], client: [14, 14], window: [16, 19], reject: [16, 19], backend: [20, 20], spike: [15, 15] }
+    again:
+      file: rate-limit.test.ts
+      source: |
+        // rate-limit.test.ts: 200 concurrent requests from one key get the burst, not more
+        test("the burst is the ceiling", async () => {
+          const responses = await Promise.all(Array.from({ length: 200 }, () =>
+            request(app).get("/search").set("x-api-key", "k-42")));
+          const ok = responses.filter((r) => r.status === 200).length;
+          assert.ok(ok >= 20 && ok <= 22); // the burst, plus a token or two of refill
+        });
+    cost:
+      before: { text: limit halved · quiet users refused · still 10 in 0.2 s, value: 0.75 }
+      after: { text: at most 20 at once · then 10/s · any gateway, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'In Node every request runs on one event loop, so an in-memory limiter needs no locks, but each process has its own. `rate-limiter-flexible` offers memory, Redis and other stores with `consume(key)`; `express-rate-limit` is a middleware with pluggable stores. With ioredis, `defineCommand` registers a script once and calls it by SHA.'
+      seenIn: '`rate-limiter-flexible` (`RateLimiterRedis`, `consume`). `express-rate-limit`. ioredis `eval` and `defineCommand`.'
+
+  rust:
+    before:
+      file: rate_limit.rs
+      source: |
+        // rate_limit.rs: 10 requests per API key per clock second
+        async fn rate_limit(State(app): State<App>, req: Request, next: Next) -> Response {
+            let api_key = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("anon");
+            let second = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let key = format!("rl:{api_key}:{second}");
+            let mut redis = app.redis.clone();
+            let n: u64 = redis.incr(&key, 1).await.unwrap_or(0);
+            if n == 1 {
+                let _: () = redis.expire(&key, 2).await.unwrap_or(());
+            }
+            if n > 10 {
+                return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")]).into_response();
+            }
+            next.run(req).await
+        }
+      roles: { context: [2, 15], client: [3, 3], window: [4, 10], store: [7, 7], spike: [11, 11], backend: [14, 14] }
+      change:
+        - { line: 11, replace: '    if n > 5 { // halve it: boundaries let twice the limit through' }
+    after:
+      file: rate_limit.rs
+      source: |
+        // rate_limit.rs: a token bucket per API key, refilled lazily inside Redis
+        static TOKEN_BUCKET: LazyLock<Script> = LazyLock::new(|| Script::new(r#"
+        local rate, burst = tonumber(ARGV[1]), tonumber(ARGV[2])
+        local t = redis.call('TIME')
+        local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+        local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+        local tokens = math.min(burst, (tonumber(b[1]) or burst) + (now - (tonumber(b[2]) or now)) * rate)
+        local ok = tokens >= 1
+        if ok then tokens = tokens - 1 end
+        redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
+        redis.call('EXPIRE', KEYS[1], math.ceil(burst / rate) + 1)
+        return ok and 1 or 0"#));
+
+        async fn rate_limit(State(app): State<App>, req: Request, next: Next) -> Response {
+            let api_key = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("anon");
+            let mut redis = app.redis.clone();
+            let allowed: i64 = TOKEN_BUCKET.key(format!("tb:{api_key}")).arg(10).arg(20)
+                .invoke_async(&mut redis).await.unwrap_or(1); // on a Redis error, fail open
+            if allowed == 0 {
+                return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")]).into_response();
+            }
+            next.run(req).await
+        }
+      roles: { strategy: [2, 12], atomic: [2, 12], refill: [4, 7], spend: [8, 11], store: [6, 6], call: [17, 18], context: [14, 23], client: [15, 15], window: [19, 21], reject: [19, 21], backend: [22, 22], spike: [17, 17] }
+    again:
+      file: tests/rate_limit.rs
+      source: |
+        // tests/rate_limit.rs: 200 concurrent requests from one key get the burst, not more
+        #[tokio::test]
+        async fn the_burst_is_the_ceiling() {
+            let app = test_app().await;
+            let calls = (0..200).map(|_| app.get("/search").header("x-api-key", "k-42").send());
+            let responses = futures::future::join_all(calls).await;
+            let ok = responses.iter().filter(|r| r.status() == StatusCode::OK).count();
+            assert!((20..=22).contains(&ok), "allowed {ok} of 200"); // the burst, plus a token or two
+        }
+    cost:
+      before: { text: limit halved · quiet users refused · still 10 in 0.2 s, value: 0.75 }
+      after: { text: at most 20 at once · then 10/s · any gateway, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`governor` implements GCRA, a leaky-bucket equivalent that stores one timestamp per key, with direct and keyed limiters; `tower_governor` wraps it as a tower layer for axum. Both are per process. The `redis` crate''s `Script` hashes the source once and calls `EVALSHA`, loading the script if Redis answers `NOSCRIPT`.'
+      seenIn: '`governor` (`Quota::per_second`, `RateLimiter::direct`, `check`). `tower_governor`. `redis::Script`. `tower::limit::RateLimitLayer`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A request from key k-42 reaches a gateway. The middleware calls the token-bucket script in Redis with the key, a rate of 10 and a burst of 20.
+    nodes: [client, context, strategy]
+    edges: [client>context, context>strategy]
+    role: call
+  - text: The script reads the bucket's tokens and the time it last changed, and adds 10 tokens for every second since then, up to 20. No timer runs between requests.
+    nodes: [strategy, store]
+    edges: [store>strategy]
+    role: refill
+  - text: There is at least one token, so it spends one, writes the bucket back with the current time, and the request goes on to search.
+    nodes: [strategy, backend]
+    edges: [strategy>backend]
+    role: spend
+  - text: A burst of 30 follows. The first 20 or so find tokens; the rest get 429 and a Retry-After header, and the backend never sees them.
+    nodes: [strategy, window, spike]
+    edges: [window>strategy, strategy>spike]
+    role: reject
+  - text: Two gateways call at the same moment. Redis runs one script to the end before it starts the next, so the second one sees the first one's write.
+    nodes: [context, strategy, store]
+    edges: [context>strategy, store>strategy]
+    role: atomic
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: Which algorithm is designed to let a client that has been quiet send a short burst?
+    options:
+      - text: Token bucket
+        correct: true
+        why: Right. Unused tokens pile up to the bucket size, so a quiet client can spend them all at once, then gets the steady rate.
+      - text: Leaky bucket
+        why: The leaky bucket queues a burst and lets it out at the steady rate. It smooths bursts instead of passing them on.
+      - text: Sliding window log
+        why: The log allows at most r in any trailing window, whatever happened before.
+  engineer:
+    question: A fixed window limiter allows 100 requests per minute. How many can a client get through in two seconds?
+    options:
+      - text: "200"
+        correct: true
+        why: Right. 100 in the last second of one minute and 100 in the first second of the next. Each window is within its limit.
+      - text: "100"
+        why: That would be true of a sliding window. The fixed window forgets everything at the boundary.
+      - text: About 3
+        why: That is the average rate. Fixed windows say nothing about how requests spread inside a window.
+  deep:
+    question: Two gateways share a Redis counter. Each reads tokens = 1, decides to allow, and writes tokens = 0. What fixes it?
+    options:
+      - text: Do the read, the decision and the write in one atomic step in Redis, such as a Lua script.
+        correct: true
+        why: Right. Redis runs a script to the end before any other command, so the second gateway sees the first one's write.
+      - text: Put a mutex around the limiter code in each gateway.
+        why: A mutex only orders threads inside one process. The two gateways are different processes.
+      - text: Use a sliding window log instead of a token bucket.
+        why: Any algorithm loses updates if it reads, decides and writes as separate commands from different processes.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Limiter state
+      example: tokens and last time, a count per window, or a log of times
+      job: What the algorithm remembers per key. Its size decides memory per client.
+    - role: Shared store
+      example: Redis, with a Lua script per decision
+      job: Lets every gateway enforce one limit. Updates must be atomic.
+    - role: Middleware
+      example: { go: "an http.Handler wrapper", python: "an ASGI middleware", typescript: "Express middleware", rust: "an axum middleware fn" }
+      job: Picks the key (API key, user, IP), asks the limiter, and answers 429 with Retry-After.
+    - role: Client back-off
+      example: honour Retry-After, back off with jitter
+      job: Turns refusals into fewer requests instead of a retry storm.
+  useWhen:
+    - Token bucket for public APIs, where clients are bursty and you want a steady average with some slack.
+    - Leaky bucket or GCRA when the thing behind the limiter needs a smooth rate, and callers can wait.
+    - Sliding window counter as a cheap, close-to-exact default for per-key limits in a shared store.
+    - Sliding window log when exactness matters and limits are small.
+  avoidWhen:
+    - A fixed window in front of a backend that cannot take twice the limit in a moment.
+    - A per-process limiter when the limit is meant per customer across a fleet.
+    - Rate limiting as a security control on its own; it slows abuse, it does not authenticate.
+  tradeoffs:
+    - Every shared-store limiter adds a network round trip per request. Local limiters are free but multiply the limit by the number of gateways.
+    - When the store is down you choose to fail open (risk overload) or closed (refuse everyone). Most APIs fail open.
+    - A burst allowance is kindness to clients and a spike for the backend. Size it to what the backend can absorb.
+    - The sliding counter assumes requests were spread evenly over the last window, so it under-admits right after a burst.
+  lookalikes:
+    - name: Load shedding
+      how: Refuses work because the server is overloaded right now, whoever sent it. A rate limit refuses because one client exceeded its share.
+    - name: Concurrency limit
+      how: Caps requests in flight, not requests per second. A slow backend lowers the throughput automatically.
+    - name: Backpressure
+      how: A full queue slows the producer down instead of refusing it.
+    - name: Quota
+      how: A budget per day or month, usually billed or enforced by a counter that never refills within the period.
+---
+
+## [concept] Rate limiter algorithms
+
+**A rate limiter keeps per-client state and refuses a request when that state says the client is over its limit. The algorithms differ in what state they keep, and so in what they do with bursts.**
+
+A <Term id="token-bucket">token bucket</Term> lets a quiet client burst. A <Term id="leaky-bucket">leaky bucket</Term> smooths bursts into a steady flow. A <Term id="fixed-window-counter">fixed window counter</Term> counts per clock interval and forgets at each boundary. The <Term id="sliding-window-log">sliding window log</Term> and the <Term id="sliding-window-counter">sliding window counter</Term> look back over the last interval from every request.
+
+<Depth level={2}>
+They all agree on steady traffic under the limit. Choose by bursts: can the service behind the limiter take a burst of b at once (token bucket), must it see a steady rate (leaky bucket), or must no interval ever exceed r (sliding log)? A refused request gets HTTP 429 Too Many Requests and a Retry-After header saying when to come back.
+</Depth>
+
+<Depth level={3}>
+None of these needs a timer per client. The token bucket stores tokens and a timestamp and computes the refill when the next request arrives, a <Term id="lazy-refill">lazy refill</Term>. <Term id="gcra">GCRA</Term> goes further and stores a single timestamp: the earliest time the next request is allowed.
+</Depth>
+
+## [problem] Ten requests per second, per clock second
+
+A search API sits behind gateways that share a Redis. Each request increments a counter named after the API key and the current second, the first increment sets a two-second expiry, and anything past 10 gets a 429. It is the counter pattern from the Redis `INCR` documentation, and it is easy to reason about.
+
+<Depth level={2}>
+It is cheap: one key per client per second, one round trip. The increment is atomic, so two gateways never lose a count. Its weakness is the boundary. The count for second 41 knows nothing about second 40.
+</Depth>
+
+<Depth level={3}>
+`INCR` and `EXPIRE` are two commands here. If a gateway dies between them, the key never expires. With one key per second that only leaks memory; with one key per client it would block that client forever. A script or `SET key 0 EX 2 NX` before the increment avoids it.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** search falls over under spikes. Make 10 requests per second hold for any one-second span, and still let a client that has been quiet send a short burst.
+
+The search cluster logs 20 requests from one key inside 200 ms, many times a day: 10 at the end of one clock second and 10 at the start of the next. The marked line is the usual first fix, halving the limit. Now clients who spread their requests evenly get refused at 6 per second, and a boundary still lets 10 through in a fifth of a second.
+
+<Depth level={2}>
+A fixed window promises at most r per clock window, not per second. Any client can get 2r through around a boundary, and retrying clients do it without trying: they get a 429, wait for Retry-After, and all come back at the start of the next window.
+</Depth>
+
+<Depth level={3}>
+Halving the limit cannot fix this, because the problem is not the number. The state, one count per clock second, cannot express "how many in the last second". The algorithm has to change.
+</Depth>
+
+## [morph] Keep a bucket instead of a count
+
+Drag the slider. The per-second counter becomes a token bucket: two numbers per key, refilled lazily and updated by a script that runs inside Redis.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Two knobs: the rate r is the long-run average, the burst b is how much a quiet client can spend at once. In any second a client gets at most b + r through, and at most r per second over the long run. Set b from what the backend can absorb, not from what clients want.
+</Depth>
+
+<Depth level={3}>
+Redis runs a script to the end before it runs any other command, so read, refill, spend and write are one step even with many gateways. The script reads the clock with `TIME`, which is allowed because Redis replicates a script's effects, not the script; using Redis's clock means gateways with skewed clocks still agree.
+</Depth>
+
+## [walk] Follow one request
+
+One request from one key through the token bucket, then a burst, then two gateways at once. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`redis.NewScript` keeps the source and its SHA1. `Run` sends `EVALSHA` and, if Redis has lost its script cache after a restart, `EVAL` with the full source.</Lang>
+<Lang only="python">The callable from `register_script` sends `EVALSHA` and reloads the script on a `NOSCRIPT` error. With `redis.asyncio`, the call returns an awaitable.</Lang>
+<Lang only="typescript">`redis.eval` sends the whole script each time. `defineCommand` in ioredis caches it and calls it by SHA, which saves bandwidth on a hot path.</Lang>
+<Lang only="rust">`Script::new` hashes the source once. `invoke_async` tries `EVALSHA` and loads the script if Redis answers `NOSCRIPT`.</Lang>
+</Depth>
+
+## [again] The same spikes again
+
+The same client sends 10 at the end of a second and 10 at the start of the next. With a full bucket of 20 it gets all 20, once; after that it gets 10 per second, however it times them. A client that sends evenly at 10 per second is never refused. The test fires 200 requests at once and expects the burst, not more.
+
+<Depth level={2}>
+If the backend cannot take 20 at once, lower b, or use a leaky bucket and make callers wait instead. Return Retry-After on every 429, and make your own clients back off with jitter, or the refusals come straight back.
+</Depth>
+
+<Depth level={3}>
+When Redis is unreachable the middleware above fails open: it lets requests through rather than refuse everyone. For an expensive or abusable endpoint, failing closed or falling back to a per-gateway limiter may be the better choice.
+</Depth>
+
+## [play] Five limiters, one stream
+
+The same requests go through all five algorithms at once, with the same limit. Shape the traffic by clicking the strip, change the limit and the burst, and break the shared store.
+
+## [lens] How each language does it
+
+Every language has an in-process token bucket or GCRA limiter, and every Redis client can run a script. In-process limiters are per gateway; a shared limit needs the store.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whatever the language, decide the key first: API key, user, IP, or a combination. A limit per IP refuses a whole office behind one address; a limit per API key does nothing against a client that creates keys.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="rate-limiter-algorithms" />
+
+### Five algorithms side by side
+
+- **Token bucket.** Stores tokens and a time. Lets a burst of b through at once; at most b + r in any one window.
+- **Leaky bucket.** Stores a queue, or the next free time. Delays a burst to the drain rate, so the output is exact.
+- **Fixed window.** Stores one count per window. Up to 2r can pass around a boundary.
+- **Sliding log.** Stores a time per admitted request. Never more than r in any window, at the cost of memory.
+- **Sliding counter.** Stores two counts. Close to r; it under-admits just after a burst because it assumes the last window was evenly spread.
+
+nginx's `limit_req` uses the leaky bucket method: `burst` is the queue, and `nodelay` passes queued requests on at once while still counting them. By default it answers 503, not 429, unless you set `limit_req_status`.
