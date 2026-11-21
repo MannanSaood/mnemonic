@@ -1,0 +1,25 @@
+# Terms introduced by the TLS handshake lesson.
+- id: sni
+  term: SNI (Server Name Indication)
+  short: The host name the client puts in its ClientHello, so a server with many sites can pick the right certificate. It is sent in plain text.
+- id: alpn
+  term: ALPN
+  short: Application-Layer Protocol Negotiation. Client and server agree inside the TLS handshake on the protocol that runs on top, such as h2 or http/1.1.
+- id: ecdhe
+  term: ECDHE
+  short: Ephemeral elliptic-curve Diffie-Hellman. Each side sends a fresh public key and both compute the same secret, which nobody watching the wire can compute.
+- id: forward-secrecy
+  term: Forward secrecy
+  short: Recorded traffic stays unreadable even if the server's long-term private key leaks later, because the session keys came from ephemeral keys that were thrown away.
+- id: certificate-chain
+  term: Certificate chain
+  short: The server's certificate, the intermediate CA certificates that signed it, and finally a root CA the client already trusts. The server sends all but the root.
+- id: certificate-verify
+  term: CertificateVerify
+  short: The TLS 1.3 message in which the server signs the handshake so far with the private key of its certificate. It proves the server holds the key, not just a copy of the certificate.
+- id: session-resumption
+  term: Session resumption
+  short: Reconnecting with a ticket or pre-shared key from an earlier handshake, which skips sending and checking the certificate.
+- id: zero-rtt
+  term: 0-RTT early data
+  short: In TLS 1.3 resumption, application data sent in the client's first flight. It saves a round trip but can be replayed, so it suits only idempotent requests.

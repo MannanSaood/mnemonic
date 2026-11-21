@@ -1,0 +1,519 @@
+---
+title: The TLS handshake
+track: networking
+group: DNS and TLS
+order: 25
+summary: TLS agrees on fresh keys with whoever answered, then proves with a certificate and a signature that whoever answered is the server you named.
+intent: Know what each round trip of the handshake does, why TLS 1.3 needs one where 1.2 needed two, and which check stops an impostor.
+changeRequest: All outbound traffic now goes through the new corporate egress proxy, which inspects TLS.
+languages: [go, python, typescript, rust]
+glossary: [sni, alpn, ecdhe, forward-secrecy, certificate-chain, certificate-verify, session-resumption, zero-rtt]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [networking/tcp-connection-lifecycle]
+skills: [networking, tls, security]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: tls-handshake
+  scenarios:
+    - try: "Connect with TLS 1.3, then switch to TLS 1.2 and connect again."
+      notice: "1.3 sends its key share in the first message, so the request leaves after two round trips including TCP. 1.2 needs three. In 1.2 the certificate also crosses the wire in plain text."
+    - try: "Break the chain one way at a time: expire the leaf, give it the wrong name, drop the intermediate, untrust the root."
+      notice: "Each break fails a different check, and the error changes with it. Switch the page language to see your library's own message."
+    - try: "Put an attacker with a copied certificate in the path, then one with its own certificate."
+      notice: "The copied certificate fails the signature check: the attacker has no private key. Its own certificate fails the chain check: no trusted CA signed it."
+    - try: "Keep the own-certificate attacker and turn verification off."
+      notice: "The handshake completes, everything is encrypted, and the attacker reads the bearer token. Turning verification off is what lets it in."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 12, y: 106, w: 104, h: 56, title: payouts, sub: HTTPS client }
+      after:  { x: 12, y: 106, w: 104, h: 56, title: payouts, sub: HTTPS client }
+    - id: tls
+      kind: context
+      before: { x: 144, y: 24, w: 264, h: 226, title: HTTPS, sub: "what you assumed: encrypted means safe" }
+      after:  { x: 144, y: 106, w: 122, h: 56, title: handshake, sub: ECDHE · 1 RTT }
+    - id: verify
+      kind: strategy
+      appears: after
+      before: { x: 144, y: 206, w: 122, h: 52, title: "" }
+      after:  { x: 144, y: 206, w: 122, h: 52, title: verify, sub: chain · dates · name · sig }
+    - id: proxy
+      kind: concrete
+      before: { x: 164, y: 112, w: 224, h: 48, title: egress proxy, sub: sees only ciphertext }
+      after:  { x: 292, y: 106, w: 116, h: 56, title: egress proxy, sub: own CA · rejected }
+    - id: partner
+      kind: concrete
+      before: { x: 436, y: 106, w: 112, h: 56, title: partner API, sub: api.example.com }
+      after:  { x: 436, y: 106, w: 112, h: 56, title: partner API, sub: api.example.com }
+  edges:
+    - { from: app, to: tls, label: ClientHello }
+    - { from: tls, to: proxy }
+    - { from: proxy, to: partner, label: tunnel }
+    - { from: verify, to: tls, kind: implements, label: aborts on fail }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: partner.go
+      source: |
+        // partner.go
+        // Staging uses a self-signed certificate, so verification is off.
+        var partner = &http.Client{
+            Timeout: 10 * time.Second,
+            Transport: &http.Transport{
+                TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+            },
+        }
+
+        func createPayout(ctx context.Context, p Payout) error {
+            body, _ := json.Marshal(p)
+            req, err := http.NewRequestWithContext(ctx, "POST", partnerURL+"/v1/payouts", bytes.NewReader(body))
+            if err != nil {
+                return err
+            }
+            req.Header.Set("Authorization", "Bearer "+apiKey)
+            resp, err := partner.Do(req)
+            if err != nil {
+                return err
+            }
+            defer resp.Body.Close()
+            return checkStatus(resp)
+        }
+      roles: { app: [10, 10], tls: [5, 7], verify: [6, 6], proxy: [17, 17], partner: [12, 12] }
+      change:
+        - { after: 5, add: ['        Proxy: http.ProxyFromEnvironment, // the new egress proxy; it inspects TLS'] }
+        - { line: 16, replace: '    req.Header.Set("Authorization", "Bearer "+apiKey) // now in the proxy''s logs' }
+    after:
+      file: partner.go
+      source: |
+        // partner.go
+        // Verify always. Staging's private CA is trusted explicitly, never by turning checks off.
+        func newPartnerClient(extraCA []byte) (*http.Client, error) {
+            roots, err := x509.SystemCertPool()
+            if err != nil {
+                return nil, err
+            }
+            if len(extraCA) > 0 && !roots.AppendCertsFromPEM(extraCA) {
+                return nil, errors.New("partner: bad CA bundle")
+            }
+            return &http.Client{
+                Timeout: 10 * time.Second,
+                Transport: &http.Transport{
+                    Proxy: http.ProxyFromEnvironment,
+                    TLSClientConfig: &tls.Config{
+                        RootCAs:    roots,            // the chain must end at one of these
+                        MinVersion: tls.VersionTLS12, // 1.3 is chosen when both sides support it
+                    },
+                    ForceAttemptHTTP2: true,
+                },
+            }, nil
+        }
+      roles: { app: [3, 3], tls: [13, 20], verify: [16, 16], proxy: [14, 14], partner: [11, 21], hello: [15, 18], keys: [17, 17], check: [16, 16], data: [11, 21] }
+    again:
+      file: main.go
+      source: |
+        // main.go: staging passes its private CA; production passes nothing
+        client, err := newPartnerClient(cfg.PartnerCAPEM)
+        if err != nil {
+            log.Fatal(err)
+        }
+    cost:
+      before: { text: API key exposed · every request readable, value: 0.95 }
+      after: { text: 0 bytes readable · a loud x509 error, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`crypto/tls` verifies by default against the system roots and uses TLS 1.3 whenever the server has it. `tls.Config` sets `RootCAs`, `MinVersion` and `ServerName`. `InsecureSkipVerify` switches off the chain, date and name checks. To add a rule, use `VerifyConnection` and leave the defaults running.'
+      seenIn: '`http.Transport.TLSClientConfig`. `x509.SystemCertPool()`. `tls.Config.NextProtos` for ALPN. `ClientSessionCache` with `tls.NewLRUClientSessionCache` turns on resumption.'
+
+  python:
+    before:
+      file: partner.py
+      source: |
+        # partner.py
+        import requests
+
+        # Staging uses a self-signed certificate, so verification is off.
+        session = requests.Session()
+        session.verify = False
+
+        def create_payout(payout: dict) -> None:
+            resp = session.post(
+                f"{PARTNER_URL}/v1/payouts",
+                json=payout,
+                headers={"Authorization": f"Bearer {API_KEY}"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+      roles: { app: [8, 8], tls: [5, 6], verify: [6, 6], proxy: [9, 9], partner: [10, 10] }
+      change:
+        - { after: 6, add: ['# HTTPS_PROXY now points at the egress proxy, which inspects TLS'] }
+        - { line: 12, replace: '        headers={"Authorization": f"Bearer {API_KEY}"},  # now in the proxy''s logs' }
+    after:
+      file: partner.py
+      source: |
+        # partner.py
+        import os
+        import requests
+
+        # Verify always. Staging sets PARTNER_CA_BUNDLE to its private CA; production
+        # leaves it unset and uses certifi's public roots. Never verify=False.
+        session = requests.Session()
+        session.verify = os.environ.get("PARTNER_CA_BUNDLE", True)
+
+        def create_payout(payout: dict) -> None:
+            resp = session.post(
+                f"{PARTNER_URL}/v1/payouts",
+                json=payout,
+                headers={"Authorization": f"Bearer {API_KEY}"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+      roles: { app: [10, 10], tls: [7, 8], verify: [8, 8], proxy: [11, 11], partner: [12, 12], hello: [11, 12], keys: [11, 11], check: [8, 8], data: [11, 16] }
+    again:
+      file: app.py
+      source: |
+        # app.py: the same call; a bad certificate now raises SSLCertVerificationError
+        create_payout({"amount": 125_000, "iban": iban})
+    cost:
+      before: { text: API key exposed · every request readable, value: 0.95 }
+      after: { text: 0 bytes readable · a loud SSL error, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`ssl.create_default_context()` turns on `CERT_REQUIRED` and `check_hostname` and loads the system roots; since Python 3.10 it also refuses anything older than TLS 1.2. requests verifies by default against certifi''s bundle, and `verify=` also takes a CA file path, which is how you trust a private CA. `verify=False` turns the chain and name checks off.'
+      seenIn: '`ssl.create_default_context()`. `SSLContext.load_verify_locations()`. `requests.Session.verify`. The `truststore` package, to use the operating system''s trust store instead of certifi.'
+
+  typescript:
+    before:
+      file: partner.ts
+      source: |
+        // partner.ts
+        import { Agent, request } from "undici";
+
+        // Staging uses a self-signed certificate, so verification is off.
+        const agent = new Agent({ connect: { rejectUnauthorized: false } });
+
+        export async function createPayout(payout: Payout): Promise<void> {
+          const res = await request(`${PARTNER_URL}/v1/payouts`, {
+            method: "POST",
+            dispatcher: agent,
+            headers: { authorization: `Bearer ${API_KEY}`, "content-type": "application/json" },
+            body: JSON.stringify(payout),
+          });
+          if (res.statusCode >= 300) throw new Error(`partner: ${res.statusCode}`);
+        }
+      roles: { app: [7, 7], tls: [5, 5], verify: [5, 5], proxy: [8, 8], partner: [8, 8] }
+      change:
+        - { line: 5, replace: 'const agent = new EnvHttpProxyAgent({ requestTls: { rejectUnauthorized: false } }); // egress proxy' }
+        - { line: 11, replace: '    headers: { authorization: `Bearer ${API_KEY}`, "content-type": "application/json" }, // in proxy logs' }
+    after:
+      file: partner.ts
+      source: |
+        // partner.ts
+        import { readFileSync } from "node:fs";
+        import { rootCertificates } from "node:tls";
+        import { EnvHttpProxyAgent, request } from "undici";
+
+        // Verify always. Staging's private CA is added to the public roots, never trusted by turning checks off.
+        const extraCA = process.env.PARTNER_CA_FILE ? [readFileSync(process.env.PARTNER_CA_FILE, "utf8")] : [];
+        const agent = new EnvHttpProxyAgent({
+          requestTls: {
+            ca: [...rootCertificates, ...extraCA], // the chain must end at one of these
+            minVersion: "TLSv1.2",                 // 1.3 is chosen when both sides support it
+          },
+        });
+
+        export async function createPayout(payout: Payout): Promise<void> {
+          const res = await request(`${PARTNER_URL}/v1/payouts`, {
+            method: "POST",
+            dispatcher: agent,
+            headers: { authorization: `Bearer ${API_KEY}`, "content-type": "application/json" },
+            body: JSON.stringify(payout),
+          });
+          if (res.statusCode >= 300) throw new Error(`partner: ${res.statusCode}`);
+        }
+      roles: { app: [15, 15], tls: [8, 13], verify: [10, 10], proxy: [8, 8], partner: [16, 16], hello: [9, 12], keys: [11, 11], check: [10, 10], data: [16, 21] }
+    again:
+      file: payouts.ts
+      source: |
+        // payouts.ts: the same call; a bad certificate now rejects with a TLS error
+        await createPayout({ amount: 125_000, iban });
+    cost:
+      before: { text: API key exposed · every request readable, value: 0.95 }
+      after: { text: 0 bytes readable · a loud TLS error, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Every Node TLS client verifies by default (`rejectUnauthorized: true`) against Node''s bundled Mozilla roots. Passing `ca` replaces those roots, so spread `tls.rootCertificates` in when you add a private CA, or set `NODE_EXTRA_CA_CERTS`. `NODE_TLS_REJECT_UNAUTHORIZED=0` switches verification off for the whole process.'
+      seenIn: '`tls.rootCertificates`. `NODE_EXTRA_CA_CERTS`. undici''s `Agent({ connect })` and `EnvHttpProxyAgent({ requestTls })`. `tls.connect({ servername, ALPNProtocols })`.'
+
+  rust:
+    before:
+      file: partner.rs
+      source: |
+        // partner.rs
+        // Staging uses a self-signed certificate, so verification is off.
+        pub fn partner_client() -> reqwest::Result<reqwest::Client> {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .danger_accept_invalid_certs(true)
+                .build()
+        }
+
+        pub async fn create_payout(c: &reqwest::Client, p: &Payout) -> reqwest::Result<()> {
+            c.post(format!("{PARTNER_URL}/v1/payouts"))
+                .bearer_auth(API_KEY)
+                .json(p)
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok(())
+        }
+      roles: { app: [10, 10], tls: [3, 8], verify: [6, 6], proxy: [14, 14], partner: [11, 11] }
+      change:
+        - { after: 6, add: ['        // reqwest reads HTTPS_PROXY: the new egress proxy, which inspects TLS'] }
+        - { line: 12, replace: '        .bearer_auth(API_KEY) // now in the proxy''s logs' }
+    after:
+      file: partner.rs
+      source: |
+        // partner.rs
+        // Verify always. Staging's private CA is added to the trusted roots,
+        // never trusted by turning checks off.
+        pub fn partner_client(extra_ca: Option<&[u8]>) -> reqwest::Result<reqwest::Client> {
+            let mut b = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .use_rustls_tls()
+                .min_tls_version(reqwest::tls::Version::TLS_1_2); // 1.3 chosen when both sides support it
+            if let Some(pem) = extra_ca {
+                b = b.add_root_certificate(reqwest::Certificate::from_pem(pem)?);
+            }
+            b.build()
+        }
+
+        pub async fn create_payout(c: &reqwest::Client, p: &Payout) -> reqwest::Result<()> {
+            c.post(format!("{PARTNER_URL}/v1/payouts"))
+                .bearer_auth(API_KEY)
+                .json(p)
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok(())
+        }
+      roles: { app: [15, 15], tls: [5, 12], verify: [9, 11], proxy: [19, 19], partner: [16, 16], hello: [7, 8], keys: [8, 8], check: [9, 11], data: [16, 20] }
+    again:
+      file: main.rs
+      source: |
+        // main.rs: staging passes its private CA; production passes None
+        let client = partner_client(cfg.partner_ca_pem.as_deref())?;
+    cost:
+      before: { text: API key exposed · every request readable, value: 0.95 }
+      after: { text: 0 bytes readable · a loud rustls error, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`rustls` speaks only TLS 1.2 and 1.3 and has no flag to skip verification: you have to write a `ServerCertVerifier` and install it through `dangerous()`, which stands out in review. Roots come from `webpki-roots` or from the OS through `rustls-native-certs` or `rustls-platform-verifier`. `native-tls` wraps SChannel, Security.framework or OpenSSL instead.'
+      seenIn: '`reqwest::ClientBuilder::add_root_certificate` and `danger_accept_invalid_certs`. `rustls::ClientConfig`. `tokio_rustls::TlsConnector`. `native_tls::TlsConnector`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The client opens TCP, then sends ClientHello. It lists the versions and ciphers it supports, a fresh X25519 public key as its key share, SNI api.example.com and ALPN h2. This message is plain text.
+    nodes: [app, tls]
+    edges: [app>tls]
+    role: hello
+  - text: The server answers with ServerHello and its own key share. Both sides now compute the same secret with ECDHE, and everything after this point is encrypted, including the certificate chain, CertificateVerify and Finished.
+    nodes: [tls, proxy, partner]
+    edges: [tls>proxy, proxy>partner]
+    role: keys
+  - text: The client checks the chain up to a root it trusts, the dates on every certificate, the name against api.example.com, and the signature over the handshake. The inspecting proxy's certificate chains to a CA the client does not trust, so the client sends an alert and hangs up before any request leaves.
+    nodes: [verify, tls, proxy]
+    edges: [verify>tls]
+    role: check
+  - text: With the proxy set to tunnel this host instead, the partner's real certificate passes every check. The client sends Finished and the POST in the same flight, one round trip after TCP.
+    nodes: [app, tls, partner]
+    edges: [app>tls, tls>proxy, proxy>partner]
+    role: data
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: What does TLS give a connection?
+    options:
+      - text: Encryption, and proof that the other end holds the private key of a certificate valid for the name you asked for.
+        correct: true
+        why: Right. The key exchange gives privacy; the certificate checks tell you who you are private with. You need both.
+      - text: Encryption. The certificate is there for the padlock in the browser.
+        why: Without the certificate checks, the encryption may be to an attacker in the middle. The certificate is what binds the keys to the server's name.
+      - text: Proof that the server is trustworthy and safe to send data to.
+        why: A certificate proves control of a name, nothing about honesty. A phishing site can have a perfectly valid certificate for its own name.
+  engineer:
+    question: On a new connection, how many round trips does a full TLS 1.3 handshake add before the client can send its request, on top of TCP's one?
+    options:
+      - text: One.
+        correct: true
+        why: Right. The client sends its key share in ClientHello, so after the server's single reply both sides have keys and the client can send Finished and the request together.
+      - text: Two.
+        why: That was TLS 1.2. The client had to learn the server's parameters before sending its own key exchange.
+      - text: Zero.
+        why: Only with resumption and 0-RTT early data, and that data can be replayed. A first connection always pays one round trip.
+  deep:
+    question: An attacker on the path replays a server's real certificate chain, byte for byte. Which check stops it?
+    options:
+      - text: The server's signature over the handshake transcript (CertificateVerify), which needs the certificate's private key.
+        correct: true
+        why: Right. The certificate is public. The signature over this handshake, including both key shares, can only be made with the private key, which the attacker does not have.
+      - text: The chain check, because a copied chain no longer verifies.
+        why: The copied chain is genuine and verifies perfectly. Copying does not break any signature inside the certificates.
+      - text: The name check, because the attacker's IP address differs from the server's.
+        why: The name check compares the certificate with the host name, not with any IP address. The copied certificate has the right name.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Client
+      example: { go: "crypto/tls via net/http", python: "ssl via requests", typescript: "node:tls via undici", rust: "rustls via reqwest" }
+      job: Offers versions and a key share, then checks everything the server sends.
+    - role: Server
+      example: api.example.com
+      job: Picks parameters, sends its key share, certificate chain and a signature over the handshake.
+    - role: Certificate chain
+      example: "leaf, then Example Issuing CA"
+      job: Binds the server's public key to its name, signed up to a root.
+    - role: Trust store
+      example: "system roots, certifi, Node's bundle, webpki-roots"
+      job: The roots the client accepts as the end of a chain.
+  useWhen:
+    - A client disables verification to get past a staging or self-signed certificate. Trust that CA explicitly instead.
+    - A call works in the browser and fails from your service with an unknown-authority error. The server probably omits its intermediate.
+    - New connections to a far region are slow. Count the handshake round trips, and reuse connections or resume sessions.
+  avoidWhen:
+    - Do not turn verification off anywhere, including staging. Flags like that reach production.
+    - Do not pin TLS 1.2 as a maximum unless you must. 1.3 saves a round trip and removes the old, weak options.
+  tradeoffs:
+    - A full handshake costs a round trip and an asymmetric signature check; resumption skips the certificate entirely.
+    - 0-RTT early data saves another round trip but can be replayed, so use it only for idempotent requests.
+    - SNI is sent in plain text, so the name you connect to is visible on the path unless Encrypted Client Hello is in use.
+    - A TLS-inspecting proxy works only if clients trust its CA, and then it can read everything.
+  lookalikes:
+    - name: Certificates and PKI
+      how: The next lesson goes deeper into what a certificate proves, how chains are built, and client certificates (mTLS).
+    - name: SSH
+      how: Also an ephemeral key exchange plus host authentication, but it trusts host keys on first use instead of a CA chain.
+    - name: QUIC
+      how: Runs the TLS 1.3 handshake inside its own transport, so the transport and crypto handshakes share one round trip.
+---
+
+## [concept] The TLS handshake
+
+**TLS first agrees on fresh keys with whoever answered, then proves that whoever answered holds the private key of a certificate for the name you asked for. Encryption without the second part protects you from nobody in the middle.**
+
+The handshake does both in one round trip in TLS 1.3, two in TLS 1.2. After it, every byte is encrypted and authenticated.
+
+<Depth level={2}>
+The client's first message, ClientHello, carries the versions and ciphers it supports, a key share for <Term id="ecdhe">ECDHE</Term>, the host name in <Term id="sni">SNI</Term> and the application protocols in <Term id="alpn">ALPN</Term>. The server replies with its key share; both sides derive the same secret. Then the server sends its <Term id="certificate-chain">certificate chain</Term> and a <Term id="certificate-verify">CertificateVerify</Term>, a signature over the handshake so far. The client checks the chain against its trust store, the dates, the name, and the signature. Any failure ends the handshake with an alert.
+</Depth>
+
+<Depth level={3}>
+TLS 1.3 (RFC 8446, 2018) removed RSA key transport, so every full handshake uses an ephemeral key exchange and has <Term id="forward-secrecy">forward secrecy</Term>. It encrypts everything after ServerHello, including the certificate, and every handshake message feeds a running transcript hash. Finished is a MAC over that transcript, so a tampered or downgraded handshake fails. TLS 1.2 (RFC 5246) sent the certificate in plain text and still allowed key exchanges without forward secrecy.
+</Depth>
+
+## [problem] A payouts client with verification switched off
+
+The payouts service sends money instructions to a partner API over HTTPS. Staging uses a self-signed certificate, so someone turned verification off to make staging work. The same client runs in production.
+
+It works. The traffic is HTTPS, a packet capture shows only ciphertext, and nothing has gone wrong in a year.
+
+<Depth level={2}>
+The mental model behind it: TLS is encryption, and the certificate is a formality that sometimes gets in the way. If the bytes on the wire are unreadable, the connection is safe.
+</Depth>
+
+<Depth level={3}>
+Every language makes this one flag away: `InsecureSkipVerify`, `verify=False`, `rejectUnauthorized: false`, `danger_accept_invalid_certs`. Each one skips the chain, date and name checks and leaves the key exchange running, so the connection still looks encrypted.
+</Depth>
+
+## [pain] Then the egress proxy arrives
+
+**Change request:** all outbound traffic now goes through the new corporate egress proxy, which inspects TLS.
+
+Payouts keep working. Two weeks later security finds the partner's API key in the proxy's request logs, which are shipped to a third-party log service. The marked lines are why. The proxy answers every handshake with a certificate from its own CA, decrypts, logs, and re-encrypts to the partner. A verifying client would have refused it. This one cannot tell the proxy from the partner.
+
+<Depth level={2}>
+Every service that verifies broke loudly on day one with an unknown-authority error, and the platform team added the partner host to the proxy's no-inspection list for those. The payouts service never broke, so nobody looked. The key must be rotated, and every payout made in those two weeks was readable on the path.
+</Depth>
+
+<Depth level={3}>
+The proxy did nothing exotic. It ran a normal TLS 1.3 handshake with the client using its own key, and a second one with the partner. Both connections were encrypted end to end. The only thing that could have exposed it was the certificate check that had been switched off.
+</Depth>
+
+## [morph] From an encrypted pipe to an authenticated one
+
+Drag the slider. The single HTTPS box splits into the handshake, the verifier that can abort it, and the proxy that now has to present a certificate the client trusts.
+
+The code turns verification back on and trusts staging's CA explicitly instead.
+
+<Depth level={2}>
+Trusting a private CA is a configuration value, not a code path: staging passes its CA bundle, production passes nothing. Verification stays on everywhere, so the staging setup also tests the production code path.
+</Depth>
+
+<Depth level={3}>
+Most libraries verify the CertificateVerify signature even with verification off. That does not help, because an attacker who brings its own certificate also brings the matching key. Only the chain and name checks tie the key to the partner.
+</Depth>
+
+## [walk] Follow one handshake
+
+One new connection through the proxy, traced through TLS 1.3, first while the proxy inspects TLS, then after it tunnels the partner's traffic.
+
+<Depth level={3}>
+After the handshake the server usually sends a NewSessionTicket. Next time the client can resume with that ticket: no certificate is sent or checked, because the ticket proves the earlier handshake. With 0-RTT the request can ride in the first flight, but early data can be replayed by an attacker, so servers should accept it only for idempotent requests.
+</Depth>
+
+## [again] The proxy, the second time
+
+The same proxy, the same partner, with the fixed client. On day one the handshake fails with an unknown-authority error, the platform team adds the partner to the no-inspection list, and from then on the proxy only tunnels bytes it cannot read. The API key never reaches a log.
+
+<Depth level={2}>
+The loud failure is the feature. An error on day one costs an hour; silent interception cost a key rotation and an incident review.
+</Depth>
+
+<Depth level={3}>
+A related failure looks the same from the outside: a server that sends its leaf but not its intermediate. Browsers often fill the gap from a cache or by fetching the issuer from the address in the certificate; OpenSSL, Go on Linux, Node and rustls do not. The fix is on the server: send the full chain. `openssl s_client -connect host:443 -servername host -showcerts` shows exactly what it sends.
+</Depth>
+
+## [play] Run a handshake and break it
+
+A client, a server and a certificate chain you can break. Pick a version, resumption and round-trip time, break something, and connect. Every message is drawn on the timeline, and the client lists every check it ran.
+
+Switch the page language to see the error text your own library would show.
+
+## [lens] How each language configures TLS
+
+Every mainstream client verifies by default. The differences are in where the roots come from, how you add a private CA, and how loud the off switch is.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Go and Rust with rustls use their own TLS implementations; Python and Node use OpenSSL; `native-tls` uses the platform's library. That is why the same broken chain produces different messages, and why a missing intermediate can work on a Mac and fail on Linux.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="tls-handshake" />
+
+### Inspect a real handshake
+
+`curl -v https://api.example.com` prints the TLS version, cipher, ALPN result and the certificate's subject, issuer and dates. `openssl s_client -connect api.example.com:443 -servername api.example.com -showcerts` prints the whole chain the server sends, which is the quickest way to spot a missing intermediate.
