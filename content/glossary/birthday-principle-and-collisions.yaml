@@ -1,0 +1,13 @@
+# Terms introduced by math-for-cs/birthday-principle-and-collisions.
+- id: birthday-bound
+  term: Birthday bound
+  short: For n random draws from d values, a repeat becomes likely near √d draws, not near d. The chance of one is about 1 - e^(-n²/2d).
+- id: uuidv4
+  term: UUIDv4
+  short: A 128-bit identifier with 122 random bits and 6 fixed version and variant bits (RFC 9562). Collisions are negligible for any realistic number of IDs.
+- id: csprng
+  term: CSPRNG
+  short: A cryptographically secure random number generator, such as the operating system's. Its output cannot be predicted from earlier output, unlike Math.random or Python's random.
+- id: linearity-of-expectation
+  term: Linearity of expectation
+  short: The expected value of a sum is the sum of the expected values, even when the parts depend on each other. It counts expected collisions pair by pair.

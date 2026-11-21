@@ -1,0 +1,595 @@
+---
+title: Birthday principle and collisions
+track: math-for-cs
+group: Probability
+order: 24
+summary: Draw n random IDs from d possible values and two of them match far sooner than intuition says, near √d instead of near d. That one rule sizes random IDs, short links, truncated hashes and hash tables, and it says how many bits an ID needs for your traffic.
+intent: Estimate the chance of an ID or hash collision for your numbers, size IDs so it is negligible, and make the rare collision harmless.
+changeRequest: Import 2 million attachments from the old system into the new upload store this weekend.
+languages: [go, python, typescript, rust]
+glossary: [birthday-bound, uuidv4, csprng, linearity-of-expectation, uuidv7]
+
+prerequisites: [math-for-cs/probability-spaces-and-the-four-step-method]
+skills: [probability, hashing]
+depths: [overview, engineer, deep]
+
+playground:
+  model: birthday-principle-and-collisions
+  scenarios:
+    - try: "Keep 8 hex chars, predict, then press Run 10 trials a few times."
+      notice: "The first repeat arrives somewhere between a few thousand and a few hundred thousand IDs, averaging near 82,000. The orange steps follow the blue formula curve, which crosses 50% near 77,000."
+    - try: "Press 2 million files, keep Plain put, and press Save the files."
+      notice: "Hundreds of names are hit twice, close to the formula's 466. Each one is a file silently replaced. Switch to Insert-if-absent and the same run loses nothing."
+    - try: "Press 1 billion and drag the bits slider until P(any collision) drops below 1 in 10^9."
+      notice: "It takes 89 bits. Halve the number of IDs and you save only 2 bits: the risk grows with n², so every doubling of n costs two bits."
+    - try: "Pick UUIDv4 with 2 million files."
+      notice: "The chance is about 4 × 10^-25. 122 random bits are enough for any system that will ever exist; the simulation cannot even run that large."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 104, h: 48, title: importer, sub: 2M files }
+      after:  { x: 12, y: 111, w: 104, h: 48, title: importer, sub: 2M files }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 260, h: 236, title: upload store, sub: "pictured as: 4.3B is plenty" }
+      after:  { x: 140, y: 20, w: 120, h: 48, title: upload store, sub: random key per file }
+    - id: keygen
+      kind: concrete
+      before: { x: 160, y: 72, w: 220, h: 32, title: 8 hex chars }
+      after:  { x: 140, y: 111, w: 120, h: 48, title: key, sub: 122+ random bits }
+    - id: space
+      kind: concrete
+      before: { x: 160, y: 120, w: 220, h: 32, title: "2^32 = 4.3B keys" }
+      after:  { x: 140, y: 202, w: 120, h: 48, title: pairs, sub: "n(n−1) / 2" }
+    - id: store
+      kind: concrete
+      before: { x: 160, y: 168, w: 220, h: 32, title: plain put }
+      after:  { x: 430, y: 30, w: 118, h: 48, title: put if absent, sub: taken → retry }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 290, y: 111, w: 120, h: 48, title: "" }
+      after:  { x: 290, y: 111, w: 120, h: 48, title: birthday bound, sub: "risk ≈ n²/2d" }
+    - id: change
+      kind: concrete
+      appears: change
+      before: { x: 424, y: 202, w: 124, h: 44, title: 2M import, sub: ~466 overwritten }
+      after:  { x: 430, y: 202, w: 118, h: 44, title: 2M import, sub: "risk < 10^-24" }
+  edges:
+    - { from: client, to: context, label: save }
+    - { from: context, to: keygen, label: key }
+    - { from: space, to: strategy, label: pairs }
+    - { from: keygen, to: strategy, label: "d = 2^bits" }
+    - { from: strategy, to: change, label: risk }
+    - { from: context, to: store, label: put }
+
+code:
+  go:
+    before:
+      file: uploads.go
+      source: |
+        // uploads.go: store each upload under a short random key
+        func newKey() string {
+            b := make([]byte, 4) // 8 hex characters: 4.3 billion keys, plenty
+            rand.Read(b)         // crypto/rand
+            return hex.EncodeToString(b)
+        }
+
+        func (s *Store) Save(ctx context.Context, body io.Reader) (string, error) {
+            key := newKey()
+            _, err := s.s3.PutObject(ctx, &s3.PutObjectInput{Bucket: &s.bucket, Key: &key, Body: body})
+            return key, err
+        }
+      roles: { context: [8, 12], keygen: [2, 6], space: [3, 3], store: [10, 10], client: [8, 8] }
+      change:
+        - after: 12
+          add:
+            - ""
+            - "// ImportLegacy copies 2 million attachments from the old system this weekend."
+            - "func (s *Store) ImportLegacy(ctx context.Context, old []Attachment) error {"
+            - "    for _, a := range old {"
+            - "        if _, err := s.Save(ctx, a.Open()); err != nil {"
+            - "            return err"
+            - "        }"
+            - "    }"
+            - "    return nil"
+            - "}"
+    after:
+      file: uploads.go
+      source: |
+        // uploads.go: 130 random bits per key, and the store refuses to overwrite
+        func newKey() string {
+            return rand.Text() // crypto/rand, Go 1.24+: 26 base32 characters, 130 random bits
+        }
+
+        func (s *Store) Save(ctx context.Context, body io.ReadSeeker) (string, error) {
+            for range 3 {
+                key := newKey()
+                _, err := s.s3.PutObject(ctx, &s3.PutObjectInput{
+                    Bucket: &s.bucket, Key: &key, Body: body,
+                    IfNoneMatch: aws.String("*"), // fail instead of replacing another file
+                })
+                var apiErr smithy.APIError
+                if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "PreconditionFailed" {
+                    return key, err // stored, or a real error
+                }
+                body.Seek(0, io.SeekStart) // the name was taken: rewind and draw a new one
+            }
+            return "", errors.New("three key collisions in a row: check the random source")
+        }
+
+        func (s *Store) ImportLegacy(ctx context.Context, old []Attachment) error {
+            for _, a := range old {
+                if _, err := s.Save(ctx, a.Open()); err != nil {
+                    return err
+                }
+            }
+            return nil
+        }
+      roles: { context: [6, 20], keygen: [2, 4], strategy: [2, 4], rule: [2, 4], bits: [3, 3], guard: [9, 19], store: [9, 12], pairs: [22, 29], import: [22, 29], client: [22, 29], change: [22, 29] }
+    again:
+      file: uploads_test.go
+      source: |
+        // uploads_test.go: the birthday bound for the import, checked before running it
+        func pCollide(n float64, bits int) float64 {
+            return -math.Expm1(-n * (n - 1) / 2 / math.Ldexp(1, bits))
+        }
+
+        func TestImportIsSafe(t *testing.T) {
+            if p := pCollide(2e6, 32); p < 0.999 {
+                t.Fatalf("old keys: %g", p)
+            }
+            if p := pCollide(2e6, 130); p > 1e-20 {
+                t.Fatalf("new keys: %g", p)
+            }
+        }
+    cost:
+      before: { text: "~466 files silently replaced by other files", value: 0.9 }
+      after: { text: "collision chance ~10^-27 · and a taken name is retried", value: 0.04 }
+    lens:
+      need: 1
+      needLabel: One function
+      note: '`crypto/rand.Text()` (Go 1.24) returns 26 base32 characters with 130 random bits, and since 1.24 `crypto/rand.Read` never returns an error. `math/rand/v2` is for simulations, not IDs: its output is not meant to be unpredictable. `github.com/google/uuid` gives `uuid.NewString()` (v4) and `uuid.NewV7()`. `math.Expm1` keeps a tiny probability like 10^-27 from rounding to 0.'
+      seenIn: '`crypto/rand.Text`, `crypto/rand.Read`, `uuid.NewString`, `math.Expm1`. Git abbreviates object ids to 7 or more hex characters and lengthens them as a repository grows, for exactly this reason.'
+
+  python:
+    before:
+      file: uploads.py
+      source: |
+        # uploads.py: store each upload under a short random key
+        import secrets
+
+
+        def new_key() -> str:
+            return secrets.token_hex(4)  # 8 hex characters: 4.3 billion keys, plenty
+
+
+        def save(s3, bucket: str, body: bytes) -> str:
+            key = new_key()
+            s3.put_object(Bucket=bucket, Key=key, Body=body)
+            return key
+      roles: { context: [9, 12], keygen: [5, 6], space: [6, 6], store: [11, 11], client: [9, 9] }
+      change:
+        - after: 12
+          add:
+            - ""
+            - ""
+            - "def import_legacy(s3, bucket: str, old: list[Attachment]) -> None:"
+            - "    \"\"\"Copies 2 million attachments from the old system this weekend.\"\"\""
+            - "    for a in old:"
+            - "        save(s3, bucket, a.read())"
+    after:
+      file: uploads.py
+      source: |
+        # uploads.py: 128 random bits per key, and the store refuses to overwrite
+        import secrets
+
+        from botocore.exceptions import ClientError
+
+
+        def new_key() -> str:
+            return secrets.token_hex(16)  # 32 hex characters: 128 random bits
+
+
+        def save(s3, bucket: str, body: bytes) -> str:
+            for _ in range(3):
+                key = new_key()
+                try:
+                    s3.put_object(Bucket=bucket, Key=key, Body=body, IfNoneMatch="*")
+                    return key
+                except ClientError as e:
+                    if e.response["Error"]["Code"] != "PreconditionFailed":
+                        raise  # a real error, not a collision
+            raise RuntimeError("three key collisions in a row: check the random source")
+
+
+        def import_legacy(s3, bucket: str, old: list[Attachment]) -> None:
+            for a in old:
+                save(s3, bucket, a.read())
+      roles: { context: [11, 20], keygen: [7, 8], strategy: [7, 8], rule: [7, 8], bits: [8, 8], guard: [12, 20], store: [15, 15], pairs: [23, 25], import: [23, 25], client: [23, 25], change: [23, 25] }
+    again:
+      file: test_uploads.py
+      source: |
+        # test_uploads.py: the birthday bound for the import, checked before running it
+        import math
+
+
+        def p_collide(n: int, bits: int) -> float:
+            return -math.expm1(-n * (n - 1) / 2 / 2**bits)
+
+
+        def test_import_is_safe():
+            assert p_collide(2_000_000, 32) > 0.999  # the old keys
+            assert p_collide(2_000_000, 128) < 1e-20
+    cost:
+      before: { text: "~466 files silently replaced by other files", value: 0.9 }
+      after: { text: "collision chance ~10^-26 · and a taken name is retried", value: 0.04 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: '`secrets.token_hex(n)` and `secrets.token_urlsafe(n)` read n bytes from the operating system''s CSPRNG; `uuid.uuid4()` does the same for a UUID. The `random` module is a Mersenne Twister: fine for simulations, predictable from its output, and never for IDs or tokens. `math.expm1` computes 1 − e^(−x) without losing tiny values, and Python ints make 2**128 exact.'
+      seenIn: '`secrets.token_hex`, `secrets.token_urlsafe`, `uuid.uuid4`, `math.expm1`. Django''s `get_random_string` for short codes, which also draws from `secrets`.'
+
+  typescript:
+    before:
+      file: uploads.ts
+      source: |
+        // uploads.ts: store each upload under a short random key
+        import { randomBytes } from "node:crypto";
+        import { PutObjectCommand, type S3Client } from "@aws-sdk/client-s3";
+
+        const newKey = () => randomBytes(4).toString("hex"); // 8 hex characters: 4.3 billion keys, plenty
+
+        export async function save(s3: S3Client, bucket: string, body: Buffer): Promise<string> {
+          const key = newKey();
+          await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
+          return key;
+        }
+      roles: { context: [7, 11], keygen: [5, 5], space: [5, 5], store: [9, 9], client: [7, 7] }
+      change:
+        - after: 11
+          add:
+            - ""
+            - "// importLegacy copies 2 million attachments from the old system this weekend."
+            - "export async function importLegacy(s3: S3Client, bucket: string, old: Attachment[]): Promise<void> {"
+            - "  for (const a of old) await save(s3, bucket, await a.read());"
+            - "}"
+    after:
+      file: uploads.ts
+      source: |
+        // uploads.ts: 122 random bits per key, and the store refuses to overwrite
+        import { randomUUID } from "node:crypto";
+        import { PutObjectCommand, S3ServiceException, type S3Client } from "@aws-sdk/client-s3";
+
+        const newKey = () => randomUUID(); // UUIDv4: 122 random bits from the OS generator
+
+        export async function save(s3: S3Client, bucket: string, body: Buffer): Promise<string> {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const key = newKey();
+            try {
+              await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, IfNoneMatch: "*" }));
+              return key;
+            } catch (e) {
+              if (!(e instanceof S3ServiceException && e.$metadata.httpStatusCode === 412)) throw e;
+            }
+          }
+          throw new Error("three key collisions in a row: check the random source");
+        }
+
+        export async function importLegacy(s3: S3Client, bucket: string, old: Attachment[]): Promise<void> {
+          for (const a of old) await save(s3, bucket, await a.read());
+        }
+      roles: { context: [7, 18], keygen: [5, 5], strategy: [5, 5], rule: [5, 5], bits: [5, 5], guard: [8, 17], store: [11, 11], pairs: [20, 22], import: [20, 22], client: [20, 22], change: [20, 22] }
+    again:
+      file: uploads.test.ts
+      source: |
+        // uploads.test.ts: the birthday bound for the import, checked before running it
+        const pCollide = (n: number, bits: number) => -Math.expm1((-n * (n - 1)) / 2 / 2 ** bits);
+
+        test("the import is safe with 122-bit keys", () => {
+          assert.ok(pCollide(2_000_000, 32) > 0.999); // the old keys
+          assert.ok(pCollide(2_000_000, 122) < 1e-18);
+        });
+    cost:
+      before: { text: "~466 files silently replaced by other files", value: 0.9 }
+      after: { text: "collision chance ~10^-25 · and a taken name is retried", value: 0.05 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: '`crypto.randomUUID()` exists in Node and in browsers and returns a version 4 UUID from the CSPRNG. `crypto.getRandomValues` fills a typed array. `Math.random()` is not cryptographic and should never make an ID or token. `nanoid` produces 21 URL-safe characters, 126 bits, by default. A `number` holds 2^128 only approximately, which is fine for a probability but not for an ID; keep IDs as strings or `BigInt`.'
+      seenIn: '`crypto.randomUUID`, `crypto.getRandomValues`, `Math.expm1`, the `nanoid` and `uuid` packages (`uuid` v7 for time-ordered keys).'
+
+  rust:
+    before:
+      file: uploads.rs
+      source: |
+        // uploads.rs: store each upload under a short random key
+        fn new_key() -> String {
+            format!("{:08x}", rand::random::<u32>()) // 8 hex characters: 4.3 billion keys, plenty
+        }
+
+        pub async fn save(s3: &aws_sdk_s3::Client, bucket: &str, body: Vec<u8>) -> Result<String, Error> {
+            let key = new_key();
+            s3.put_object().bucket(bucket).key(&key).body(body.into()).send().await?;
+            Ok(key)
+        }
+      roles: { context: [6, 10], keygen: [2, 4], space: [3, 3], store: [8, 8], client: [6, 6] }
+      change:
+        - after: 10
+          add:
+            - ""
+            - "/// Copies 2 million attachments from the old system this weekend."
+            - "pub async fn import_legacy(s3: &aws_sdk_s3::Client, bucket: &str, old: Vec<Attachment>) -> Result<(), Error> {"
+            - "    for a in old {"
+            - "        save(s3, bucket, a.read().await?).await?;"
+            - "    }"
+            - "    Ok(())"
+            - "}"
+    after:
+      file: uploads.rs
+      source: |
+        // uploads.rs: 122 random bits per key, and the store refuses to overwrite
+        fn new_key() -> String {
+            uuid::Uuid::new_v4().to_string() // 122 random bits from the OS generator
+        }
+
+        pub async fn save(s3: &aws_sdk_s3::Client, bucket: &str, body: Vec<u8>) -> Result<String, Error> {
+            for _ in 0..3 {
+                let key = new_key();
+                let put = s3.put_object().bucket(bucket).key(&key).body(body.clone().into())
+                    .if_none_match("*") // fail instead of replacing another file
+                    .send().await;
+                match put {
+                    Ok(_) => return Ok(key),
+                    Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 412) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(Error::KeyCollisions) // three in a row: check the random source
+        }
+
+        pub async fn import_legacy(s3: &aws_sdk_s3::Client, bucket: &str, old: Vec<Attachment>) -> Result<(), Error> {
+            for a in old {
+                save(s3, bucket, a.read().await?).await?;
+            }
+            Ok(())
+        }
+      roles: { context: [6, 19], keygen: [2, 4], strategy: [2, 4], rule: [2, 4], bits: [3, 3], guard: [7, 18], store: [9, 11], pairs: [21, 26], import: [21, 26], client: [21, 26], change: [21, 26] }
+    again:
+      file: tests/uploads.rs
+      source: |
+        // tests/uploads.rs: the birthday bound for the import, checked before running it
+        fn p_collide(n: f64, bits: i32) -> f64 {
+            -(-n * (n - 1.0) / 2.0 / 2f64.powi(bits)).exp_m1()
+        }
+
+        #[test]
+        fn import_is_safe() {
+            assert!(p_collide(2e6, 32) > 0.999); // the old keys
+            assert!(p_collide(2e6, 122) < 1e-18);
+        }
+    cost:
+      before: { text: "~466 files silently replaced by other files", value: 0.9 }
+      after: { text: "collision chance ~10^-25 · and a taken name is retried", value: 0.05 }
+    lens:
+      need: 2
+      needLabel: Library
+      note: 'The standard library has no random number generator. The `uuid` crate with the `v4` feature gives `Uuid::new_v4()`, `rand::random` and `rand::rng()` draw from a CSPRNG seeded by the OS, and `getrandom` reads OS randomness directly. `f64::exp_m1` keeps tiny probabilities exact. A `u128` holds a 128-bit ID exactly if you need it as a number.'
+      seenIn: '`uuid::Uuid::new_v4`, `Uuid::now_v7`, `rand::random`, `getrandom::fill`, `f64::exp_m1`.'
+
+walk:
+  - text: The importer saves 2 million files. Collisions are about pairs, and 2 million files make about 2 × 10^12 pairs, a million times more pairs than files.
+    nodes: [client, space, strategy]
+    edges: [client>context, space>strategy]
+    role: pairs
+  - text: Each pair shares a key with chance 1/d. By linearity of expectation the expected number of matching pairs is n(n−1)/2d, and the chance of at least one is about 1 − e^(−n²/2d). It passes 50% near 1.18 √d.
+    nodes: [keygen, strategy]
+    edges: [keygen>strategy]
+    role: rule
+  - text: With 8 hex characters d is 2^32, √d is 65,536, and 2 million files expect about 466 matching pairs. With 122 or more random bits the same import has a chance below 10^-24.
+    nodes: [context, keygen]
+    edges: [context>keygen]
+    role: bits
+  - text: The store is told to refuse an existing key. If the improbable happens, the put fails with 412, and the code draws a new key instead of replacing someone else's file.
+    nodes: [context, store]
+    edges: [context>store]
+    role: guard
+  - text: The import runs with a risk that can be written down before the weekend and checked in a test.
+    nodes: [strategy, change]
+    edges: [strategy>change]
+    role: import
+
+checks:
+  overview:
+    question: Files get names of 8 random hex characters, 4.3 billion possible names. Roughly when does a repeated name become more likely than not?
+    options:
+      - text: After about 77,000 files
+        correct: true
+        why: Right. That is about 1.18 times √(4.3 billion). 77,000 files make about 3 billion pairs, and each pair matches with chance 1 in 4.3 billion.
+      - text: After about 2 billion files, half the space
+        why: That would be true if only a new file against one old file mattered. Every pair counts, and pairs grow with the square of the count.
+      - text: Only after 4.3 billion files
+        why: At that point a repeat is certain by pigeonhole, but it is likely long before.
+  engineer:
+    question: About how many pairs of files share a name when 2 million files get random 32-bit names?
+    options:
+      - text: About 466
+        correct: true
+        why: Right. C(2,000,000, 2) / 2^32 ≈ 2 × 10^12 / 4.3 × 10^9 ≈ 466. Without a guard, each one is a file overwritten.
+      - text: About 0.0005
+        why: That is 2 million divided by 2^32, the chance for one new file against an empty store. The import compares every file with every other.
+      - text: About 1
+        why: The chance of at least one collision is essentially 100%, and the expected count is in the hundreds.
+  deep:
+    question: You need 1 billion random IDs with at most a one-in-a-billion chance of any collision. What is the fewest number of random bits?
+    options:
+      - text: 89
+        correct: true
+        why: Right. n²/2d ≤ 10^-9 gives d ≥ 10^18 / (2 × 10^-9) = 5 × 10^26, which is 2^88.7. With 88 bits the chance is about 1.6 × 10^-9.
+      - text: 60
+        why: 2^60 is about the square of a billion. At that size a collision has roughly a 35% chance.
+      - text: 128
+        why: 128 bits is a sensible choice with margin, but it is not the minimum.
+
+reference:
+  roles:
+    - role: Space size d
+      example: 2^32 for 8 hex chars, 62^6 for a 6-character code, 2^122 for UUIDv4
+      job: How many values an ID can take. Only random bits count.
+    - role: Pairs
+      example: n(n−1)/2
+      job: The number of chances to collide. Grows with the square of n.
+    - role: Birthday bound
+      example: P ≈ 1 − e^(−n²/2d), 50% near 1.18 √d
+      job: Turns n and d into a risk you can compare with a budget.
+    - role: Random source
+      example: the OS CSPRNG through crypto/rand, secrets, crypto.randomUUID, getrandom
+      job: Makes the IDs actually uniform and unpredictable, which the formula assumes.
+    - role: Uniqueness guard
+      example: a unique index, S3 If-None-Match, INSERT ... ON CONFLICT DO NOTHING
+      job: Turns the rare collision into a retry instead of silent data loss.
+  useWhen:
+    - Sizing random IDs, tokens, short links or idempotency keys for an expected count.
+    - Deciding how far a hash or checksum can be truncated for display or deduplication.
+    - Estimating collisions in a hash table, a Bloom filter or a sharded key space.
+  avoidWhen:
+    - The IDs are not random. Sequential or time-ordered IDs (UUIDv7) collide only through bugs, and the formula says nothing about them.
+    - An attacker can choose the inputs. Hash collisions under attack need a cryptographic hash or a keyed hash, not more bits of a weak one.
+  tradeoffs:
+    - Every doubling of the number of IDs costs two more bits for the same risk.
+    - Shorter IDs are easier to read and type, but need a uniqueness check and retries.
+    - A guard makes collisions safe at any size, but costs a conditional write or an index lookup on every insert.
+  lookalikes:
+    - name: Pigeonhole principle
+      how: With more items than values, a repeat is certain. The birthday bound says it is likely far earlier.
+    - name: Hash table load factor
+      how: The same pairs argument says collisions in a table start at about √m keys, so tables must handle them from the start.
+    - name: Birthday attack
+      how: An attacker finds two inputs with the same n-bit hash in about 2^(n/2) tries, which is why 128-bit hashes give 64-bit collision security.
+---
+
+## [concept] Birthday principle and collisions
+
+**When you draw n random IDs from d possible values, the chance that some two match is about 1 − e^(−n²/2d). Collisions become likely near √d IDs, far sooner than d, because every pair of IDs is a chance to collide.**
+
+The classic version: in a room of 23 people, two share a birthday more often than not. The same arithmetic decides whether your random IDs, short links or truncated hashes can collide. The <Term id="birthday-bound">birthday bound</Term> turns "4.3 billion values, we will never run out" into "collisions start in the tens of thousands".
+
+<Depth level={2}>
+Count pairs, not items. n IDs make n(n−1)/2 pairs, and each pair matches with chance 1/d. By <Term id="linearity-of-expectation">linearity of expectation</Term>, the expected number of matching pairs is n(n−1)/2d, even though the pairs are not independent. While that number is small, it is also roughly the chance of any collision. The chance passes 50% near n = 1.18 √d and 63% at n = √(2d).
+
+To size an ID, solve n²/2d ≤ p for the risk p you accept: d ≥ n²/2p. Only random bits count. A <Term id="uuidv4">UUIDv4</Term> has 122, and a <Term id="uuidv7">UUIDv7</Term> spends 48 bits on a timestamp and keeps 74 random bits for the IDs made in the same millisecond.
+</Depth>
+
+<Depth level={3}>
+The exact chance of no collision is the product of (1 − i/d) for i from 1 to n − 1: each new ID must avoid all earlier ones. Because 1 − x ≤ e^(−x), the product is at most e^(−n(n−1)/2d), and for n much smaller than d the two agree closely. That bound is how MIT's Mathematics for Computer Science derives the √d rule. The expected number of draws until the first repeat is about √(πd/2), about 1.25 √d.
+</Depth>
+
+## [problem] Short random names for uploads
+
+An upload service stores each file in object storage under a random key of 8 hex characters. That is 32 random bits, 4.3 billion possible keys, from the operating system's <Term id="csprng">secure random generator</Term>. Keys go into URLs, so short is nice.
+
+The service holds about 30,000 files. Nobody has seen a collision.
+
+<Depth level={2}>
+At 30,000 files the expected number of matching pairs is 30,000² / (2 × 2^32), about 0.1. There is roughly a 1 in 10 chance that a collision has already happened. Nobody would know: a plain put to an existing key replaces the object and returns success.
+</Depth>
+
+<Depth level={3}>
+The generator is not the problem. crypto/rand, secrets and randomBytes are uniform, which is exactly what the formula assumes. A biased or poorly seeded generator makes it worse: two processes that seed a PRNG with the same clock second produce the same IDs, a collision rate no formula predicts.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** import 2 million attachments from the old system into the new upload store this weekend.
+
+The marked lines save every old attachment through the same code. 2 million files make about 2 × 10^12 pairs, and each pair matches with chance 1 in 4.3 billion: about 466 matching pairs. The chance of at least one is indistinguishable from 100%. Each match silently replaces a file with another customer's attachment, and the first sign is a support ticket weeks later.
+
+<Depth level={2}>
+The intuition that failed is "2 million is tiny next to 4.3 billion". It compares the count to the space. The right comparison is the count squared to twice the space: (2 × 10^6)² / (2 × 4.3 × 10^9) ≈ 466.
+</Depth>
+
+<Depth level={3}>
+Retrying on collision does not help when the store cannot tell you there was one. The before code has no uniqueness check, so even a perfect retry loop would never run.
+</Depth>
+
+## [morph] Size the key for the pairs, then guard it
+
+Drag the slider. "4.3 billion is plenty" becomes a risk computed from the pairs, and the plain put becomes a put that refuses an existing key.
+
+The key grows to 122 or more random bits: a UUID, 16 random bytes, or Go's `rand.Text()`. At 2 million files the chance of any collision falls to about 10^-25. The store is also told to refuse an existing key, so if the improbable happens the save fails and draws a new key instead of destroying a file.
+
+<Depth level={2}>
+Both halves matter. Enough bits make collisions too rare to plan around. The guard makes them harmless when they happen anyway, through a bug, a bad generator or a key someone shortened later. The guard alone, with short keys, works too, but every save at scale pays for retries, and a key collision in a URL that was already shared cannot be retried.
+</Depth>
+
+<Depth level={3}>
+Amazon S3 supports conditional writes with `If-None-Match: *` on PutObject since August 2024 and answers 412 Precondition Failed when the key exists. In a database the same guard is a unique index with `INSERT ... ON CONFLICT DO NOTHING` (PostgreSQL) and a check of the affected row count.
+</Depth>
+
+## [walk] Count the pairs
+
+From the pairs to the formula, to the bits, to the guard. Use the numbered buttons.
+
+<Depth level={2}>
+The rule sizes more than IDs. A 6-character code from 62 symbols has 62^6 ≈ 5.7 × 10^10 values and reaches even odds of a collision at about 280,000 links. A hash table with m slots sees its first collision around √m keys, which is why every table needs a collision strategy from the start. A 64-bit hash used as a deduplication key becomes risky around 2^32, about 4 billion items.
+</Depth>
+
+<Depth level={3}>
+For cryptographic hashes the same bound becomes the birthday attack. Finding any two inputs with the same n-bit hash takes about 2^(n/2) tries, so a 128-bit hash offers about 64 bits of collision resistance. That is part of why MD5 was retired and SHA-256 has 256 bits.
+</Depth>
+
+## [again] The same import, with wide keys and a guard
+
+The import runs with 2 million 122-to-130-bit keys. The chance of any collision is far below 10^-24, and if one happens the store refuses it and the code retries. The test states the bound for the old and new key sizes, so a future change that shortens the key fails in CI.
+
+<Depth level={2}>
+Write the risk calculation down where the key is generated. "122 random bits, 10^-25 at 2 million files, retried on conflict" is a sentence a reviewer can check. "Random string" is not.
+</Depth>
+
+<Depth level={3}>
+Use `expm1` for the probability. 1 − e^(−x) for x = 10^-25 is 1 − 1 in floating point, which is 0; `expm1(-x)` keeps it as −10^-25. The same care applies to logarithms of probabilities near 1 (`log1p`).
+</Depth>
+
+## [play] Collide the IDs
+
+Pick an ID size and a number of IDs and read the risk. Then simulate: draw random IDs until two match, many times, and watch the results trace the formula. Finally import 2 million files with plain puts and with insert-if-absent.
+
+## [lens] Random IDs in each language
+
+Every language here has a one-line way to get 122 or more random bits from the operating system. The mistakes are using a non-cryptographic generator, or shortening the result.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+| ID format | Random bits | 50% collision near | Fine for |
+|---|---|---|---|
+| 8 hex characters | 32 | 77,000 | almost nothing unguarded |
+| 6 base62 characters | 35.7 | 280,000 | short links, with a uniqueness check |
+| random 64-bit integer | 64 | 5 billion | most single tables |
+| UUIDv4 | 122 | 2.7 × 10^18 | anything |
+| 16 random bytes | 128 | 2.2 × 10^19 | anything |
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="birthday-principle-and-collisions" />
+
+### The formulas
+
+| Quantity | Formula | For d = 2^32 |
+|---|---|---|
+| Expected matching pairs | n(n−1) / 2d | 466 at n = 2 million |
+| P(at least one collision) | ≈ 1 − e^(−n(n−1)/2d) | 50% at n ≈ 77,000 |
+| n for probability p | √(2d · ln(1/(1−p))) | 1% at n ≈ 9,300 |
+| Draws until the first repeat | ≈ √(πd/2) | ≈ 82,000 |
+| Bits for n IDs at risk p | log2(n² / 2p) | 89 bits for 10^9 IDs at 10^-9 |
