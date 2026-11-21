@@ -1,0 +1,683 @@
+---
+title: Layering and domain logic styles
+track: software-architecture
+group: Boundaries
+order: 4
+summary: Pick where business rules live (one script per action, a domain model, or the database) to match how many rules you have and how much they interact, and keep a thin service layer around them.
+intent: Each business rule should be written once, in a place every caller reaches, and the cost of adding the next rule should not grow with the number of rules already there.
+changeRequest: Gold members get 5% off, and discounts must never add up to more than 20% of the order.
+languages: [go, python, typescript, rust]
+glossary: [transaction-script, domain-model, table-module, service-layer, anemic-domain-model, layer]
+
+prerequisites: []
+skills: [architecture, design]
+depths: [overview, engineer, deep]
+
+playground:
+  model: layering-and-domain-logic
+  scenarios:
+    - try: "Answer the prediction. As transaction scripts, write 10% off orders over $100 into Checkout only, and ship it."
+      notice: "Checkout charges $166.50 and the cart preview still shows $185.00. Every screen that prices an order is its own script, and each needs its own copy."
+    - try: "Ship all five rules as transaction scripts, writing each into all four scripts, and watch the chart."
+      notice: "The gift-card exclusion and the cap rework every rule already in every script. Four copies per rule make scripts the expensive option from rule 4."
+    - try: "Switch to Domain model and ship the same five rules into the Order box."
+      notice: "One edit per rule and every screen agrees. The domain model started 30 lines behind and still finishes far ahead."
+    - try: "Switch to In the database and ship a rule into the SQL function only."
+      notice: "Checkout, reorder and the invoice agree, but the cart preview prices a cart that has no order row yet, so it needs its own copy, in another language."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 52, title: Controllers, sub: checkout · cart }
+      after:  { x: 12, y: 30, w: 112, h: 52, title: Controllers, sub: checkout · cart }
+    - id: context
+      kind: context
+      before: { x: 146, y: 14, w: 250, h: 180, title: Transaction scripts, sub: PlaceOrder · QuoteCart }
+      after:  { x: 146, y: 30, w: 160, h: 52, title: Service layer, sub: transaction · calls Order }
+    - id: rules
+      kind: concrete
+      before: { x: 162, y: 70, w: 218, h: 44, title: discount math × 2, sub: one copy per script }
+      after:  { x: 146, y: 150, w: 160, h: 56, title: Order, sub: total() · one cap }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 420, y: 110, w: 128, h: 52, title: "" }
+      after:  { x: 340, y: 150, w: 208, h: 56, title: Discount, sub: one type per rule }
+    - id: db
+      kind: concrete
+      before: { x: 162, y: 130, w: 218, h: 44, title: orders table, sub: SQL in each script }
+      after:  { x: 340, y: 30, w: 208, h: 52, title: Order mapper, sub: rows ↔ Order }
+    - id: gold
+      kind: concrete
+      appears: change
+      before: { x: 146, y: 212, w: 250, h: 44, title: Gold 5% · cap × 2, sub: edit both scripts }
+      after:  { x: 340, y: 218, w: 208, h: 44, title: GoldTier, sub: one new type }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: context, to: db, label: load · save }
+    - { from: context, to: rules, label: total() }
+    - { from: rules, to: strategy, label: applies each }
+    - { from: gold, to: strategy, kind: implements }
+
+code:
+  go:
+    before:
+      file: checkout/place_order.go · cart/quote.go
+      source: |
+        // checkout/place_order.go: one script per user action
+        func PlaceOrder(ctx context.Context, db *sql.DB, cartID, coupon string) (int64, error) {
+            tx, err := db.BeginTx(ctx, nil)
+            if err != nil {
+                return 0, err
+            }
+            defer tx.Rollback()
+            lines, err := loadCart(ctx, tx, cartID)
+            if err != nil {
+                return 0, err
+            }
+            subtotal := sum(lines)
+            discount := int64(0)
+            if subtotal >= 100_00 {
+                discount += subtotal / 10
+            }
+            if coupon != "" {
+                discount += couponValue(ctx, tx, coupon)
+            }
+            total := subtotal - discount
+            if err := insertOrder(ctx, tx, cartID, total); err != nil {
+                return 0, err
+            }
+            return total, tx.Commit()
+        }
+
+        // cart/quote.go: the cart preview prices the same cart again
+        func QuoteCart(ctx context.Context, db *sql.DB, cartID, coupon string) (int64, error) {
+            lines, err := loadCart(ctx, db, cartID)
+            if err != nil {
+                return 0, err
+            }
+            subtotal := sum(lines)
+            discount := int64(0)
+            if subtotal >= 100_00 {
+                discount += subtotal / 10
+            }
+            if coupon != "" {
+                discount += couponValue(ctx, db, coupon)
+            }
+            return subtotal - discount, nil
+        }
+      roles: { client: [2, 2], context: [1, 42], rules: [12, 20], db: [21, 23], gold: [34, 40] }
+      change:
+        - { after: 19, add: ['    if cust.Tier == Gold {', '        discount += subtotal * 5 / 100', '    }', '    discount = min(discount, subtotal/5) // the cap must come after every rule'] }
+        - { after: 40, add: ['    if cust.Tier == Gold { // the same four lines, again', '        discount += subtotal * 5 / 100', '    }', '    discount = min(discount, subtotal/5)'] }
+    after:
+      file: pricing/ · checkout/ · cart/
+      source: |
+        // pricing/order.go: the domain model; rules live with the data they use
+        type Order struct {
+            Lines    []Line
+            Customer Customer
+            Coupon   *Coupon
+        }
+
+        type Discount interface {
+            Amount(o *Order, eligible Money) Money
+        }
+
+        var Discounts = []Discount{Over100{}, CouponOff{}, GoldTier{}}
+
+        func (o *Order) Eligible() Money {
+            var m Money
+            for _, l := range o.Lines {
+                if !l.GiftCard {
+                    m += l.Price * Money(l.Qty)
+                }
+            }
+            return m
+        }
+
+        func (o *Order) Total() Money {
+            eligible, d := o.Eligible(), Money(0)
+            for _, rule := range Discounts {
+                d += rule.Amount(o, eligible)
+            }
+            return o.Subtotal() - min(d, eligible/5) // one cap, after every rule
+        }
+
+        // pricing/gold.go: one rule, one type
+        type GoldTier struct{}
+
+        func (GoldTier) Amount(o *Order, eligible Money) Money {
+            if o.Customer.Tier != Gold {
+                return 0
+            }
+            return eligible * 5 / 100
+        }
+
+        // checkout/service.go: the service layer owns the transaction, not the rules
+        func (s *Service) PlaceOrder(ctx context.Context, cartID string) (Money, error) {
+            return s.tx.Do(ctx, func(r Repos) (Money, error) {
+                order, err := r.Orders.FromCart(ctx, cartID)
+                if err != nil {
+                    return 0, err
+                }
+                total := order.Total()
+                return total, r.Orders.Save(ctx, order)
+            })
+        }
+
+        // cart/service.go: the preview asks the same object
+        func (s *Service) QuoteCart(ctx context.Context, cartID string) (Money, error) {
+            order, err := s.orders.FromCart(ctx, cartID)
+            if err != nil {
+                return 0, err
+            }
+            return order.Total(), nil
+        }
+      roles: { rules: [1, 30], strategy: [8, 12], gold: [32, 40], context: [42, 61], db: [45, 48], request: [43, 44], load: [45, 48], price: [24, 30], policy: [35, 40], save: [49, 50] }
+    again:
+      file: pricing/order_test.go
+      source: |
+        // pricing/order_test.go: the rules test without a database or a web server
+        func TestGoldAndCouponAreCappedAt20Percent(t *testing.T) {
+            o := &Order{
+                Lines:    []Line{{Price: 120_00, Qty: 1}, {Price: 50_00, Qty: 1, GiftCard: true}},
+                Customer: Customer{Tier: Gold},
+                Coupon:   &Coupon{Off: 40_00},
+            }
+            // eligible $120: 10% + 5% + $40 = $58 off, capped at $24
+            if got := o.Total(); got != 170_00-24_00 {
+                t.Fatalf("Total() = %v, want 146.00", got)
+            }
+        }
+    cost:
+      before: { text: 2 scripts edited · cap reworks every rule twice, value: 0.75 }
+      after: { text: 1 new type · cap already in one place, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Go code often starts as transaction scripts: a service function that runs SQL through `database/sql` or code generated by sqlc. That is fine while rules are few. A domain model in Go is plain structs with methods and small interfaces, mapped by hand in a repository, because there is no dominant ORM to do it for you.'
+      seenIn: 'sqlc, which generates a typed Go function per SQL query and suits transaction scripts. `database/sql` transactions opened in the service function. GORM models, which are Active Record style when rules live on them.'
+
+  python:
+    before:
+      file: checkout/place_order.py · cart/quote.py
+      source: |
+        # checkout/place_order.py: one script per user action
+        def place_order(conn: Connection, cart_id: str, coupon: str | None) -> int:
+            with conn.transaction():
+                lines = load_cart(conn, cart_id)
+                subtotal = sum(l.price * l.qty for l in lines)
+                discount = 0
+                if subtotal >= 100_00:
+                    discount += subtotal // 10
+                if coupon:
+                    discount += coupon_value(conn, coupon)
+                total = subtotal - discount
+                insert_order(conn, cart_id, total)
+            return total
+
+        # cart/quote.py: the cart preview prices the same cart again
+        def quote_cart(conn: Connection, cart_id: str, coupon: str | None) -> int:
+            lines = load_cart(conn, cart_id)
+            subtotal = sum(l.price * l.qty for l in lines)
+            discount = 0
+            if subtotal >= 100_00:
+                discount += subtotal // 10
+            if coupon:
+                discount += coupon_value(conn, coupon)
+            return subtotal - discount
+      roles: { client: [2, 2], context: [1, 24], rules: [5, 11], db: [12, 12], gold: [18, 23] }
+      change:
+        - { after: 10, add: ['        if cust.tier == "gold":', '            discount += subtotal * 5 // 100', '        discount = min(discount, subtotal // 5)  # the cap must come after every rule'] }
+        - { after: 23, add: ['    if cust.tier == "gold":  # the same three lines, again', '        discount += subtotal * 5 // 100', '    discount = min(discount, subtotal // 5)'] }
+    after:
+      file: pricing/ · checkout/ · cart/
+      source: |
+        # pricing/order.py: the domain model; rules live with the data they use
+        class Discount(Protocol):
+            def amount(self, order: "Order", eligible: int) -> int: ...
+
+        @dataclass
+        class Order:
+            lines: list[Line]
+            customer: Customer
+            coupon: Coupon | None = None
+
+            def eligible(self) -> int:
+                return sum(l.price * l.qty for l in self.lines if not l.gift_card)
+
+            def total(self) -> int:
+                eligible = self.eligible()
+                d = sum(rule.amount(self, eligible) for rule in DISCOUNTS)
+                return self.subtotal() - min(d, eligible // 5)  # one cap, after every rule
+
+        # pricing/gold.py: one rule, one class
+        class GoldTier:
+            def amount(self, order: Order, eligible: int) -> int:
+                return eligible * 5 // 100 if order.customer.tier == "gold" else 0
+
+        # checkout/services.py: the service layer owns the transaction, not the rules
+        def place_order(uow: UnitOfWork, cart_id: str) -> int:
+            with uow:
+                order = uow.orders.from_cart(cart_id)
+                total = order.total()
+                uow.orders.add(order)
+                uow.commit()
+            return total
+
+        # cart/services.py: the preview asks the same object
+        def quote_cart(uow: UnitOfWork, cart_id: str) -> int:
+            with uow:
+                return uow.orders.from_cart(cart_id).total()
+      roles: { rules: [1, 17], strategy: [2, 3], gold: [19, 22], context: [24, 36], db: [27, 27], request: [25, 26], load: [27, 27], price: [14, 17], policy: [20, 22], save: [29, 30] }
+    again:
+      file: test_order.py
+      source: |
+        # test_order.py: the rules test without a database or a web server
+        def test_gold_and_coupon_are_capped_at_20_percent():
+            order = Order(
+                lines=[Line(price=120_00, qty=1), Line(price=50_00, qty=1, gift_card=True)],
+                customer=Customer(tier="gold"),
+                coupon=Coupon(off=40_00),
+            )
+            # eligible $120: 10% + 5% + $40 = $58 off, capped at $24
+            assert order.total() == 170_00 - 24_00
+    cost:
+      before: { text: 2 scripts edited · cap reworks every rule twice, value: 0.75 }
+      after: { text: 1 new class · cap already in one place, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Django models are Active Record: data and persistence in one class, so rules tend to go on the model or into service functions around it. SQLAlchemy can map plain classes with `registry.map_imperatively`, which keeps a domain model free of the ORM. A service function with a Unit of Work, as here, is the shape used in the Cosmic Python book.'
+      seenIn: 'Django model methods and custom managers. SQLAlchemy imperative mapping (`registry.map_imperatively`). `dataclasses` and `typing.Protocol` for the domain objects and policies.'
+
+  typescript:
+    before:
+      file: checkout/placeOrder.ts · cart/quoteCart.ts
+      source: |
+        // checkout/placeOrder.ts: one script per user action
+        export async function placeOrder(db: Pool, cartId: string, coupon?: string): Promise<number> {
+          return withTransaction(db, async (tx) => {
+            const lines = await loadCart(tx, cartId);
+            const subtotal = lines.reduce((s, l) => s + l.price * l.qty, 0);
+            let discount = 0;
+            if (subtotal >= 100_00) discount += Math.round(subtotal / 10);
+            if (coupon) discount += await couponValue(tx, coupon);
+            const total = subtotal - discount;
+            await insertOrder(tx, cartId, total);
+            return total;
+          });
+        }
+
+        // cart/quoteCart.ts: the cart preview prices the same cart again
+        export async function quoteCart(db: Pool, cartId: string, coupon?: string): Promise<number> {
+          const lines = await loadCart(db, cartId);
+          const subtotal = lines.reduce((s, l) => s + l.price * l.qty, 0);
+          let discount = 0;
+          if (subtotal >= 100_00) discount += Math.round(subtotal / 10);
+          if (coupon) discount += await couponValue(db, coupon);
+          return subtotal - discount;
+        }
+      roles: { client: [2, 2], context: [1, 23], rules: [5, 9], db: [10, 10], gold: [18, 22] }
+      change:
+        - { after: 8, add: ['    if (cust.tier === "gold") discount += Math.round(subtotal * 0.05);', '    discount = Math.min(discount, Math.floor(subtotal / 5)); // the cap must come after every rule'] }
+        - { after: 21, add: ['  if (cust.tier === "gold") discount += Math.round(subtotal * 0.05); // again', '  discount = Math.min(discount, Math.floor(subtotal / 5));'] }
+    after:
+      file: pricing/ · checkout/ · cart/
+      source: |
+        // pricing/order.ts: the domain model; rules live with the data they use
+        export interface Discount {
+          amount(order: Order, eligible: number): number;
+        }
+
+        export class Order {
+          constructor(readonly lines: Line[], readonly customer: Customer, readonly coupon?: Coupon) {}
+
+          eligible(): number {
+            return this.lines.filter((l) => !l.giftCard).reduce((s, l) => s + l.price * l.qty, 0);
+          }
+
+          total(discounts: readonly Discount[] = DISCOUNTS): number {
+            const eligible = this.eligible();
+            const d = discounts.reduce((sum, rule) => sum + rule.amount(this, eligible), 0);
+            return this.subtotal() - Math.min(d, Math.floor(eligible / 5)); // one cap, after every rule
+          }
+        }
+
+        // pricing/gold.ts: one rule, one object
+        export const goldTier: Discount = {
+          amount: (o, eligible) => (o.customer.tier === "gold" ? Math.round(eligible * 0.05) : 0),
+        };
+
+        // checkout/service.ts: the service layer owns the transaction, not the rules
+        export async function placeOrder(uow: UnitOfWork, cartId: string): Promise<number> {
+          return uow.run(async (repos) => {
+            const order = await repos.orders.fromCart(cartId);
+            const total = order.total();
+            await repos.orders.save(order, total);
+            return total;
+          });
+        }
+
+        // cart/service.ts: the preview asks the same object
+        export async function quoteCart(orders: OrderRepository, cartId: string): Promise<number> {
+          return (await orders.fromCart(cartId)).total();
+        }
+      roles: { rules: [1, 18], strategy: [2, 4], gold: [20, 23], context: [25, 38], db: [28, 28], request: [26, 27], load: [28, 28], price: [13, 17], policy: [21, 23], save: [30, 30] }
+    again:
+      file: order.test.ts
+      source: |
+        // order.test.ts: the rules test without a database or a web server
+        test("gold and a coupon are capped at 20% of the eligible amount", () => {
+          const order = new Order(
+            [{ price: 120_00, qty: 1, giftCard: false }, { price: 50_00, qty: 1, giftCard: true }],
+            { tier: "gold" },
+            { off: 40_00 },
+          );
+          // eligible $120: 10% + 5% + $40 = $58 off, capped at $24
+          assert.equal(order.total(), 170_00 - 24_00);
+        });
+    cost:
+      before: { text: 2 scripts edited · cap reworks every rule twice, value: 0.75 }
+      after: { text: 1 new object · cap already in one place, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'NestJS services over TypeORM entities easily become transaction scripts with anemic entities: the entity is a bag of decorated columns and the service holds every rule. Nothing stops you putting methods on the entity class. A domain model with a separate mapper is a deliberate choice, often with an ORM that has a Unit of Work.'
+      seenIn: 'NestJS `@Injectable()` services as the service layer. TypeORM entities as Active Record (`BaseEntity`) or with repositories. MikroORM, whose `EntityManager` tracks changes and writes them on `flush()`.'
+
+  rust:
+    before:
+      file: checkout/place_order.rs · cart/quote.rs
+      source: |
+        // checkout/place_order.rs: one script per user action
+        pub async fn place_order(db: &PgPool, cart_id: &str, coupon: Option<&str>) -> sqlx::Result<i64> {
+            let mut tx = db.begin().await?;
+            let lines = load_cart(&mut *tx, cart_id).await?;
+            let subtotal: i64 = lines.iter().map(|l| l.price * l.qty).sum();
+            let mut discount = 0;
+            if subtotal >= 100_00 {
+                discount += subtotal / 10;
+            }
+            if let Some(code) = coupon {
+                discount += coupon_value(&mut *tx, code).await?;
+            }
+            let total = subtotal - discount;
+            insert_order(&mut *tx, cart_id, total).await?;
+            tx.commit().await?;
+            Ok(total)
+        }
+
+        // cart/quote.rs: the cart preview prices the same cart again
+        pub async fn quote_cart(db: &PgPool, cart_id: &str, coupon: Option<&str>) -> sqlx::Result<i64> {
+            let mut conn = db.acquire().await?;
+            let lines = load_cart(&mut *conn, cart_id).await?;
+            let subtotal: i64 = lines.iter().map(|l| l.price * l.qty).sum();
+            let mut discount = 0;
+            if subtotal >= 100_00 {
+                discount += subtotal / 10;
+            }
+            if let Some(code) = coupon {
+                discount += coupon_value(&mut *conn, code).await?;
+            }
+            Ok(subtotal - discount)
+        }
+      roles: { client: [2, 2], context: [1, 32], rules: [5, 13], db: [14, 15], gold: [23, 30] }
+      change:
+        - { after: 12, add: ['    if cust.tier == Tier::Gold {', '        discount += subtotal * 5 / 100;', '    }', '    discount = discount.min(subtotal / 5); // the cap must come after every rule'] }
+        - { after: 30, add: ['    if cust.tier == Tier::Gold { // the same four lines, again', '        discount += subtotal * 5 / 100;', '    }', '    discount = discount.min(subtotal / 5);'] }
+    after:
+      file: pricing/ · checkout/ · cart/
+      source: |
+        // pricing/order.rs: the domain model; rules live with the data they use
+        pub trait Discount {
+            fn amount(&self, order: &Order, eligible: i64) -> i64;
+        }
+
+        pub struct Order {
+            pub lines: Vec<Line>,
+            pub customer: Customer,
+            pub coupon: Option<Coupon>,
+        }
+
+        impl Order {
+            pub fn eligible(&self) -> i64 {
+                self.lines.iter().filter(|l| !l.gift_card).map(|l| l.price * l.qty).sum()
+            }
+
+            pub fn total(&self, discounts: &[&dyn Discount]) -> i64 {
+                let eligible = self.eligible();
+                let d: i64 = discounts.iter().map(|rule| rule.amount(self, eligible)).sum();
+                self.subtotal() - d.min(eligible / 5) // one cap, after every rule
+            }
+        }
+
+        // pricing/gold.rs: one rule, one type
+        pub struct GoldTier;
+
+        impl Discount for GoldTier {
+            fn amount(&self, o: &Order, eligible: i64) -> i64 {
+                if o.customer.tier == Tier::Gold { eligible * 5 / 100 } else { 0 }
+            }
+        }
+
+        // checkout/service.rs: the service layer owns the transaction, not the rules
+        pub async fn place_order(db: &PgPool, cart_id: &str) -> Result<i64, AppError> {
+            let mut tx = db.begin().await?;
+            let order = orders::from_cart(&mut *tx, cart_id).await?;
+            let total = order.total(DISCOUNTS);
+            orders::save(&mut *tx, &order, total).await?;
+            tx.commit().await?;
+            Ok(total)
+        }
+
+        // cart/service.rs: the preview asks the same object
+        pub async fn quote_cart(db: &PgPool, cart_id: &str) -> Result<i64, AppError> {
+            Ok(orders::from_cart(db, cart_id).await?.total(DISCOUNTS))
+        }
+      roles: { rules: [1, 22], strategy: [2, 4], gold: [24, 31], context: [33, 46], db: [36, 36], request: [34, 35], load: [36, 36], price: [17, 21], policy: [27, 31], save: [38, 39] }
+    again:
+      file: pricing/tests.rs
+      source: |
+        // pricing/tests.rs: the rules test without a database or a web server
+        #[test]
+        fn gold_and_coupon_are_capped_at_20_percent() {
+            let order = Order {
+                lines: vec![Line::new(120_00, 1), Line::gift_card(50_00)],
+                customer: Customer { tier: Tier::Gold },
+                coupon: Some(Coupon { off: 40_00 }),
+            };
+            // eligible $120: 10% + 5% + $40 = $58 off, capped at $24
+            assert_eq!(order.total(DISCOUNTS), 170_00 - 24_00);
+        }
+    cost:
+      before: { text: 2 scripts edited · cap reworks every rule twice, value: 0.75 }
+      after: { text: 1 new type · cap already in one place, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'With sqlx you write SQL by hand, which makes transaction scripts the path of least resistance. A domain model is structs with `impl` blocks. When the set of rules is closed and known, an `enum Discount` with one `match` is often clearer than a trait; use a trait, as here, when other crates must add rules.'
+      seenIn: 'sqlx `query_as!` into plain structs, mapped to domain types with `From`. Diesel and SeaORM models, which are row types first. Enums with exhaustive `match` for closed sets of pricing rules.'
+
+walk:
+  - text: The checkout controller calls the service layer's PlaceOrder. The service layer is the application's API; it opens the transaction and holds no pricing rule.
+    nodes: [client, context]
+    edges: [client>context]
+    role: request
+  - text: The service asks the mapper for the Order built from the cart. The mapper turns rows into objects, so the Order knows nothing about SQL.
+    nodes: [context, db]
+    edges: [context>db]
+    role: load
+  - text: Order.Total works out the eligible amount once, without gift cards, adds up every discount and applies the 20% cap once, after all of them.
+    nodes: [context, rules]
+    edges: [context>rules]
+    role: price
+  - text: Each discount is its own small type. The gold rule is one new type, and the cap did not have to learn about it.
+    nodes: [rules, strategy, gold]
+    edges: [rules>strategy, gold>strategy]
+    role: policy
+  - text: The service saves the order and commits. The cart preview calls the same Total on the same object, so the two can no longer disagree.
+    nodes: [context, db]
+    edges: [context>db]
+    role: save
+
+checks:
+  overview:
+    question: Which style organises business logic as one procedure per user action?
+    options:
+      - text: Transaction Script.
+        correct: true
+        why: Right. Each request gets a procedure that reads, decides and writes. Simple, and fast to write while the rules are few.
+      - text: Domain Model.
+        why: A domain model puts rules on objects that represent the business, and many actions share them.
+      - text: Service Layer.
+        why: A service layer is the set of operations the application offers. It can call scripts or a domain model, but it is not where the rules live.
+  engineer:
+    question: The pricing code has 30 rules that interact, with exclusions, tiers and caps, and gains a few every month. Which style fits?
+    options:
+      - text: A domain model, with each rule in one place that every caller reaches.
+        correct: true
+        why: Right. Interacting rules are what a domain model handles well. The mapping cost is paid once; the alternative is paying for every rule in every script.
+      - text: Transaction scripts that call shared helper functions.
+        why: Helpers stop copy-paste of each rule, but the order the rules run in, and how they combine, is still repeated in every script. Caps and exclusions break there.
+      - text: A stored procedure, so every application shares it.
+        why: It is one copy for code that can reach a row. Callers without one, such as a cart preview, need another copy, and every change becomes a migration.
+  deep:
+    question: What is the anemic domain model problem?
+    options:
+      - text: The objects carry only data and services hold every rule, so nothing guards the object's invariants and rules repeat across services.
+        correct: true
+        why: Right. You pay for a domain model's objects and mapping and get transaction scripts in disguise. Fowler's 2003 entry calls it a design that looks like a domain model but has no behaviour.
+      - text: The domain objects have too many methods, which slows the ORM down.
+        why: The problem is the opposite, too few methods. Behaviour belongs with the data.
+      - text: The domain model is too small for the database it maps to.
+        why: Size is not the point. Anemic means the objects have no behaviour of their own.
+
+reference:
+  roles:
+    - role: Presentation
+      example: the checkout and cart controllers
+      job: Turns requests into calls on the service layer and results into responses.
+    - role: Service layer
+      example: PlaceOrder, QuoteCart
+      job: Defines the application's operations. Opens the transaction, loads and saves, calls the domain. Holds no business rule.
+    - role: Domain
+      example: Order and its Discount policies
+      job: Holds the business rules, each in one place, with the data they use.
+    - role: Data source
+      example: the Order mapper or repository
+      job: Moves data between the database and the domain objects.
+  useWhen:
+    - Transaction scripts while rules are few and independent, such as an admin tool or a CRUD service.
+    - A domain model when rules interact, change often, or are shared by several entry points.
+    - A thin service layer in either case, so the transaction and the use case's steps have one home.
+  avoidWhen:
+    - A domain model for a service with no real rules. The mapper and the objects cost more than the logic.
+    - Business rules in the database when callers price things that have no row yet, or when the rules need unit tests.
+  tradeoffs:
+    - A domain model needs a mapping between objects and tables, and a team that knows how to keep rules on the objects.
+    - Transaction scripts are easy to read one at a time, and duplication creeps in between them.
+    - A Table Module fits tools built around record sets, with one object per table instead of one per row.
+    - Each layer boundary adds mapping and copying. Keep calls between layers inside one process.
+  lookalikes:
+    - name: Active Record
+      how: A row object with domain logic and its own save(). A domain model and its data source merged into one class; fine while the model and the table look alike.
+    - name: Table Module
+      how: One instance per table, working on all its rows. Sits between scripts and a domain model.
+    - name: Layered vs hexagonal
+      how: Classic layering puts the domain above the data source, so the domain imports it. The Dependency Rule inverts that edge, so the data source depends on the domain.
+---
+
+## [concept] Layering and domain logic styles
+
+**Split an application into layers, presentation, domain and data source, and then choose how the domain layer holds its rules: one script per action, or a model of objects that carry the rules with their data.**
+
+Martin Fowler's *Patterns of Enterprise Application Architecture* names three ways to organise the rules. A <Term id="transaction-script">transaction script</Term> is one procedure per request. A <Term id="domain-model">domain model</Term> is a web of objects that hold both data and behaviour. A <Term id="table-module">table module</Term> is one object per table that works on all its rows. Around any of them sits a <Term id="service-layer">service layer</Term>, the set of operations the application offers.
+
+<Depth level={2}>
+None of the styles is better in general. Scripts are quick to write and to read while the rules are few. A domain model costs more at the start, because objects need mapping to tables, and pays off when rules multiply and interact. The skill is to notice which side of that line the code is on, and to move when it crosses.
+</Depth>
+
+<Depth level={3}>
+A <Term id="layer">layer</Term> is logical, a tier is physical. Presentation, domain and data source can all run in one process, and usually should: every hop between tiers adds a network call where a layer boundary would add a function call.
+</Depth>
+
+## [problem] Two scripts price the same cart
+
+Checkout's PlaceOrder script loads the cart, applies 10% off orders over $100 and any coupon, inserts the order and commits. The cart preview's QuoteCart script loads the same cart and applies the same two rules, so the customer sees the price they will pay.
+
+<Depth level={2}>
+Each script reads well on its own. The duplication is small, and it was a fair call when there were two rules: one copy each, side by side.
+</Depth>
+
+<Depth level={3}>
+The rules are written in terms of local variables: subtotal and discount. There is no Order object to put a rule on, so the only place a new rule can go is into each script that prices something.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** gold members get 5% off, and discounts must never add up to more than 20% of the order.
+
+The gold rule goes into both scripts. The cap is worse. It has to run after every other rule, so in each script it goes at the end and has to know every discount above it. Miss one script and the preview shows one price while checkout charges another.
+
+<Depth level={2}>
+The cost of a rule now depends on how many rules exist and how many scripts price an order. Reorder and the invoice PDF price orders too, so the real count is four copies, not two.
+</Depth>
+
+<Depth level={3}>
+Shared helper functions remove the copy-paste of each rule but not the sequencing. "Eligible amount first, then percentages, then fixed amounts, then the cap" is itself a rule, and each script repeats it.
+</Depth>
+
+## [morph] Rules move onto the Order
+
+Drag the slider. The two scripts become a thin service layer. The pricing math moves onto an Order object, with each discount as its own small type and the cap applied once in Order.Total. A mapper loads and saves the Order.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The service layer keeps what is not a business rule: the transaction, loading and saving, and the order of steps in one use case. If a rule creeps into a service method, it will be copied into the next service method. That is how a domain model turns <Term id="anemic-domain-model">anemic</Term>.
+</Depth>
+
+<Depth level={3}>
+With a domain model, the transaction usually opens in the service layer and a Unit of Work tracks which objects changed. Rich objects also need to be persistence-ignorant, so they can be built and tested in memory, as the test below does.
+</Depth>
+
+## [walk] Follow one checkout
+
+One checkout through the layers, from the controller to the commit. Step through it with the numbered buttons.
+
+## [again] The same request, the second time
+
+The gold rule is one new type. The cap is already in one place and did not change. The preview and checkout call the same Total, so they cannot drift. And the test of the cap runs on a plain object, with no database and no web server.
+
+<Depth level={2}>
+The next rule costs the same as this one did. That flat line is what the domain model buys with its up-front cost.
+</Depth>
+
+## [play] Ship five rules three ways
+
+Five discount rules arrive one at a time. For each, click every place you will write it, then ship, and watch what each screen charges. Each style keeps its own codebase, so ship the same rules as scripts, as a domain model and in the database, and compare the curves.
+
+## [lens] How each language leans
+
+Each ecosystem has a default. Go and Rust lean toward scripts because SQL is written by hand; Python and TypeScript lean toward Active Record because their popular ORMs work that way. Either can hold a domain model.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="layering-and-domain-logic" />
+
+### Moving from scripts to a model
+
+You rarely start with a domain model, and you rarely need to rewrite to get one. When the same rule shows up in a second script, extract it into a function that takes a small value type, such as an Order with its lines. When a third rule needs to know about the first two, give that type a method that applies them in order. The scripts shrink into service methods one at a time, and the model grows only where the rules are.

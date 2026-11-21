@@ -1,0 +1,19 @@
+# Terms introduced by software-architecture/layering-and-domain-logic
+- id: transaction-script
+  term: Transaction Script
+  short: Business logic organised as one procedure per request from the presentation, which reads, computes and writes directly (Martin Fowler, Patterns of Enterprise Application Architecture).
+- id: domain-model
+  term: Domain Model
+  short: An object model of the domain that holds both data and behaviour, so each business rule lives with the data it uses (Fowler, PoEAA).
+- id: table-module
+  term: Table Module
+  short: One object per database table that holds the business logic for all of that table's rows, working on record sets rather than one object per row (Fowler, PoEAA).
+- id: service-layer
+  term: Service Layer
+  short: The application's boundary of operations, such as PlaceOrder. It coordinates each operation, opens the transaction and calls the domain, without holding business rules itself (Randy Stafford, in PoEAA).
+- id: anemic-domain-model
+  term: Anemic domain model
+  short: Domain objects that hold only data, with every rule in service code around them. It pays for a domain model's mapping and gets transaction scripts (Fowler, 2003).
+- id: layer
+  term: Layer
+  short: A logical grouping of code by responsibility, such as presentation, domain and data source, where each layer uses only the layers below it. A tier is a physical deployment unit; several layers can run in one tier.
