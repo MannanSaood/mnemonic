@@ -1,0 +1,610 @@
+---
+title: Replication lag and session guarantees
+track: distributed-systems
+group: Replication
+order: 10
+summary: A follower applies the leader's writes a little later, so a read from it can show you the past, even your own last write.
+intent: Decide which reads may see the past, and route the rest so a user never sees their own write vanish or the page go back in time.
+changeRequest: Make the profile page show a user's new display name right after they save it.
+languages: [go, python, typescript, rust]
+glossary: [replication-lag, read-your-writes, monotonic-reads, consistent-prefix, lsn, session-guarantee, eventual-consistency]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [distributed-systems/replication-leader-follower]
+skills: [replication]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: replication-lag-and-session-guarantees
+  scenarios:
+    - try: "On the laptop, press Save new name, then Refresh twice, with reads going to any replica."
+      notice: "The new name appears, then the old one comes back. The second refresh hit follower 2, which is 4 seconds behind."
+    - try: "Switch the rule to Sticky replica and do the same on the phone."
+      notice: "The page never goes backwards, because one follower applies the log in order. But the phone is pinned to the slow follower, so its own save is missing for 4 seconds."
+    - try: "Switch to Version token. Drag both lags to 5 s, save on the laptop and refresh on the phone."
+      notice: "The token lives in the laptop's cookie, so the phone reads the old name. Tick the box that keeps the token per user and try again."
+    - try: "Drag both lags to 7 s and use the Leader for 3 s rule."
+      notice: "A time window is a guess about lag. When lag grows past it, the guarantee silently stops holding."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 92, h: 48, title: Browser, sub: save · reload }
+      after:  { x: 12, y: 111, w: 92, h: 48, title: Browser, sub: cookie seen_lsn }
+    - id: context
+      kind: context
+      before: { x: 124, y: 18, w: 262, h: 236, title: Profile handler, sub: "write → leader · read → any replica" }
+      after:  { x: 124, y: 111, w: 118, h: 48, title: Handler, sub: save · profile }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 262, y: 104, w: 132, h: 62, title: "" }
+      after:  { x: 262, y: 104, w: 132, h: 62, title: Read router, sub: "replayed ≥ token?" }
+    - id: leader
+      kind: concrete
+      before: { x: 420, y: 20, w: 128, h: 48, title: Leader, sub: takes writes }
+      after:  { x: 420, y: 20, w: 128, h: 48, title: Leader, sub: writes · fallback }
+    - id: f1
+      kind: concrete
+      before: { x: 420, y: 111, w: 128, h: 48, title: Follower 1, sub: async · 1 s behind }
+      after:  { x: 420, y: 111, w: 128, h: 48, title: Follower 1, sub: async · 1 s behind }
+    - id: f2
+      kind: concrete
+      before: { x: 420, y: 202, w: 128, h: 48, title: Follower 2, sub: async · 4 s behind }
+      after:  { x: 420, y: 202, w: 128, h: 48, title: Follower 2, sub: async · 4 s behind }
+  edges:
+    - { from: client, to: context, label: requests }
+    - { from: context, to: strategy, label: token }
+    - { from: strategy, to: leader, label: write }
+    - { from: strategy, to: f1 }
+    - { from: strategy, to: f2, label: caught up? }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: profile.go
+      source: |
+        // profile.go
+        func (h *Handler) SaveName(w http.ResponseWriter, r *http.Request) {
+            _, err := h.primary.ExecContext(r.Context(),
+                `UPDATE users SET display_name = $1 WHERE id = $2`, r.FormValue("name"), userID(r))
+            if err != nil {
+                http.Error(w, "could not save", http.StatusInternalServerError)
+                return
+            }
+            http.Redirect(w, r, "/profile", http.StatusSeeOther)
+        }
+
+        func (h *Handler) Profile(w http.ResponseWriter, r *http.Request) {
+            db := h.replicas.Next() // round-robin over the read replicas
+            var name string
+            err := db.QueryRowContext(r.Context(),
+                `SELECT display_name FROM users WHERE id = $1`, userID(r)).Scan(&name)
+            if err != nil {
+                http.Error(w, "not found", http.StatusNotFound)
+                return
+            }
+            render(w, "profile", name)
+        }
+      roles: { context: [12, 22], leader: [3, 4], f1: [13, 13], f2: [13, 13], client: [9, 9] }
+      change:
+        - { after: 8, add: ['    time.Sleep(500 * time.Millisecond) // give the replicas a moment'] }
+    after:
+      file: profile.go
+      source: |
+        // profile.go: a write hands back a log position; a read goes where it has arrived
+        func (h *Handler) SaveName(w http.ResponseWriter, r *http.Request) {
+            ctx := r.Context()
+            _, err := h.primary.ExecContext(ctx,
+                `UPDATE users SET display_name = $1 WHERE id = $2`, r.FormValue("name"), userID(r))
+            var lsn string // read after the commit, so the position covers it
+            if err == nil {
+                err = h.primary.QueryRowContext(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&lsn)
+            }
+            if err != nil {
+                http.Error(w, "could not save", http.StatusInternalServerError)
+                return
+            }
+            http.SetCookie(w, &http.Cookie{Name: "seen_lsn", Value: lsn, Path: "/"})
+            http.Redirect(w, r, "/profile", http.StatusSeeOther)
+        }
+
+        // reader returns a replica that has replayed the token, else the primary.
+        func (h *Handler) reader(r *http.Request) *sql.DB {
+            c, err := r.Cookie("seen_lsn")
+            if err != nil {
+                return h.replicas.Next()
+            }
+            for _, db := range h.replicas.All() {
+                var ok bool
+                q := `SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn`
+                if db.QueryRowContext(r.Context(), q, c.Value).Scan(&ok) == nil && ok {
+                    return db
+                }
+            }
+            return h.primary
+        }
+
+        func (h *Handler) Profile(w http.ResponseWriter, r *http.Request) {
+            var name string
+            err := h.reader(r).QueryRowContext(r.Context(),
+                `SELECT display_name FROM users WHERE id = $1`, userID(r)).Scan(&name)
+            if err != nil {
+                http.Error(w, "not found", http.StatusNotFound)
+                return
+            }
+            render(w, "profile", name)
+        }
+      roles: { context: [34, 43], strategy: [18, 32], leader: [4, 8], f1: [24, 29], f2: [24, 29], client: [14, 15], write: [4, 8], token: [14, 14], route: [24, 29], fallback: [31, 31] }
+    again:
+      file: session.go
+      source: |
+        // session.go: the same request from the phone. Keep the token per user, not per cookie.
+        func (h *Handler) rememberLSN(ctx context.Context, uid int64, lsn string) error {
+            key := fmt.Sprintf("seen_lsn:%d", uid)
+            return h.redis.Set(ctx, key, lsn, time.Minute).Err()
+        }
+    cost:
+      before: { text: old name whenever lag > 500 ms · every save 500 ms slower, value: 0.8 }
+      after: { text: 0 stale reloads · 1 small query per replica tried, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: '`database/sql` and pgx give you one pool per address and nothing more, so the router above is yours to write. The MongoDB Go driver has it built in: `readpref.SecondaryPreferred()` picks secondaries, and a session started with `options.Session().SetCausalConsistency(true)` carries the cluster time between operations, which is the token.'
+      seenIn: '`pg_current_wal_lsn()` and `pg_last_wal_replay_lsn()` in PostgreSQL. MongoDB causally consistent sessions (`operationTime`, `clusterTime`). Rails, whose database selector reads from the primary for 2 seconds after a write by default.'
+
+  python:
+    before:
+      file: profile.py
+      source: |
+        # profile.py
+        @app.post("/profile/name")
+        def save_name():
+            with primary.connection() as conn:
+                conn.execute(
+                    "UPDATE users SET display_name = %s WHERE id = %s",
+                    (request.form["name"], current_user_id()),
+                )
+            return redirect("/profile", code=303)
+
+
+        @app.get("/profile")
+        def profile():
+            with replicas.next().connection() as conn:  # round-robin over read replicas
+                row = conn.execute(
+                    "SELECT display_name FROM users WHERE id = %s",
+                    (current_user_id(),),
+                ).fetchone()
+            return render_template("profile.html", name=row[0])
+      roles: { context: [12, 19], leader: [4, 8], f1: [14, 14], f2: [14, 14], client: [9, 9] }
+      change:
+        - { after: 8, add: ['    time.sleep(0.5)  # give the replicas a moment'] }
+    after:
+      file: profile.py
+      source: |
+        # profile.py: a write hands back a log position; a read goes where it has arrived
+        @app.post("/profile/name")
+        def save_name():
+            with primary.connection() as conn:
+                conn.execute(
+                    "UPDATE users SET display_name = %s WHERE id = %s",
+                    (request.form["name"], current_user_id()),
+                )
+            with primary.connection() as conn:  # after the commit, so it covers it
+                lsn = conn.execute("SELECT pg_current_wal_lsn()::text").fetchone()[0]
+            resp = redirect("/profile", code=303)
+            resp.set_cookie("seen_lsn", lsn)
+            return resp
+
+
+        def reader(token: str | None) -> ConnectionPool:
+            """A replica that has replayed the token, else the primary."""
+            if token is None:
+                return replicas.next()
+            for pool in replicas.all():
+                with pool.connection() as conn:
+                    (ok,) = conn.execute(
+                        "SELECT pg_last_wal_replay_lsn() >= %s::pg_lsn", (token,)
+                    ).fetchone()
+                if ok:
+                    return pool
+            return primary
+
+
+        @app.get("/profile")
+        def profile():
+            with reader(request.cookies.get("seen_lsn")).connection() as conn:
+                row = conn.execute(
+                    "SELECT display_name FROM users WHERE id = %s",
+                    (current_user_id(),),
+                ).fetchone()
+            return render_template("profile.html", name=row[0])
+      roles: { context: [30, 37], strategy: [16, 27], leader: [4, 10], f1: [20, 26], f2: [20, 26], client: [11, 13], write: [4, 10], token: [12, 12], route: [20, 26], fallback: [27, 27] }
+    again:
+      file: session.py
+      source: |
+        # session.py: the same request from the phone. Keep the token per user, not per cookie.
+        def remember_lsn(uid: int, lsn: str) -> None:
+            cache.set(f"seen_lsn:{uid}", lsn, ex=60)
+    cost:
+      before: { text: old name whenever lag > 500 ms · every save 500 ms slower, value: 0.8 }
+      after: { text: 0 stale reloads · 1 small query per replica tried, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Framework helps
+      note: 'Django routes reads with a database router: `db_for_read` and `db_for_write` pick a connection alias per query, and the token check fits there. PyMongo has the whole thing built in: `client.start_session(causal_consistency=True)` plus `read_preference=ReadPreference.SECONDARY_PREFERRED` gives read-your-writes and monotonic reads on secondaries when reads and writes use majority concern.'
+      seenIn: 'Django database routers (`db_for_read`). PyMongo `ClientSession` with `causal_consistency=True`. psycopg pools, one per replica address.'
+
+  typescript:
+    before:
+      file: profile.ts
+      source: |
+        // profile.ts
+        app.post("/profile/name", async (req, res) => {
+          await primary.query(
+            "UPDATE users SET display_name = $1 WHERE id = $2",
+            [req.body.name, req.user.id],
+          );
+          res.redirect(303, "/profile");
+        });
+
+        app.get("/profile", async (req, res) => {
+          const db = replicas.next(); // round-robin over read replicas
+          const { rows } = await db.query(
+            "SELECT display_name FROM users WHERE id = $1",
+            [req.user.id],
+          );
+          res.render("profile", { name: rows[0].display_name });
+        });
+      roles: { context: [10, 17], leader: [3, 6], f1: [11, 11], f2: [11, 11], client: [7, 7] }
+      change:
+        - { after: 6, add: ['  await new Promise((r) => setTimeout(r, 500)); // give the replicas a moment'] }
+    after:
+      file: profile.ts
+      source: |
+        // profile.ts: a write hands back a log position; a read goes where it has arrived
+        app.post("/profile/name", async (req, res) => {
+          await primary.query(
+            "UPDATE users SET display_name = $1 WHERE id = $2",
+            [req.body.name, req.user.id],
+          );
+          // read after the commit, so the position covers it
+          const { rows } = await primary.query("SELECT pg_current_wal_lsn()::text AS lsn");
+          res.cookie("seen_lsn", rows[0].lsn);
+          res.redirect(303, "/profile");
+        });
+
+        // A replica that has replayed the token, else the primary.
+        async function reader(token: string | undefined): Promise<Pool> {
+          if (!token) return replicas.next();
+          for (const db of replicas.all()) {
+            const { rows } = await db.query(
+              "SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn AS ok",
+              [token],
+            );
+            if (rows[0].ok) return db;
+          }
+          return primary;
+        }
+
+        app.get("/profile", async (req, res) => {
+          const db = await reader(req.cookies.seen_lsn);
+          const { rows } = await db.query(
+            "SELECT display_name FROM users WHERE id = $1",
+            [req.user.id],
+          );
+          res.render("profile", { name: rows[0].display_name });
+        });
+      roles: { context: [26, 33], strategy: [13, 24], leader: [3, 8], f1: [16, 22], f2: [16, 22], client: [9, 10], write: [3, 8], token: [9, 9], route: [16, 22], fallback: [23, 23] }
+    again:
+      file: session.ts
+      source: |
+        // session.ts: the same request from the phone. Keep the token per user, not per cookie.
+        export async function rememberLsn(uid: number, lsn: string): Promise<void> {
+          await redis.set(`seen_lsn:${uid}`, lsn, { EX: 60 });
+        }
+    cost:
+      before: { text: old name whenever lag > 500 ms · every save 500 ms slower, value: 0.8 }
+      after: { text: 0 stale reloads · 1 small query per replica tried, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Library helps
+      note: 'node-postgres gives one `Pool` per address; routing is yours. Prisma''s read-replicas extension sends reads to replicas and lets you force the primary with `$primary()`, but it does not track log positions for you. The MongoDB Node driver does: `client.startSession({ causalConsistency: true })` with `readPreference: "secondaryPreferred"`.'
+      seenIn: '`@prisma/extension-read-replicas` and its `$primary()`. MongoDB `startSession({ causalConsistency: true })`. One `pg.Pool` per replica.'
+
+  rust:
+    before:
+      file: profile.rs
+      source: |
+        // profile.rs
+        async fn save_name(State(db): State<Db>, user: User, Form(f): Form<NameForm>) -> Result<Redirect, AppError> {
+            sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
+                .bind(&f.name)
+                .bind(user.id)
+                .execute(&db.primary)
+                .await?;
+            Ok(Redirect::to("/profile"))
+        }
+
+        async fn profile(State(db): State<Db>, user: User) -> Result<Html<String>, AppError> {
+            let pool = db.replicas.next(); // round-robin over read replicas
+            let name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+                .bind(user.id)
+                .fetch_one(pool)
+                .await?;
+            Ok(render_profile(&name))
+        }
+      roles: { context: [11, 18], leader: [3, 7], f1: [12, 12], f2: [12, 12], client: [8, 8] }
+      change:
+        - { after: 7, add: ['    tokio::time::sleep(Duration::from_millis(500)).await; // give the replicas a moment'] }
+    after:
+      file: profile.rs
+      source: |
+        // profile.rs: a write hands back a log position; a read goes where it has arrived
+        async fn save_name(State(db): State<Db>, user: User, jar: CookieJar, Form(f): Form<NameForm>)
+            -> Result<(CookieJar, Redirect), AppError> {
+            sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
+                .bind(&f.name)
+                .bind(user.id)
+                .execute(&db.primary)
+                .await?;
+            // read after the commit, so the position covers it
+            let lsn: String = sqlx::query_scalar("SELECT pg_current_wal_lsn()::text")
+                .fetch_one(&db.primary)
+                .await?;
+            Ok((jar.add(Cookie::new("seen_lsn", lsn)), Redirect::to("/profile")))
+        }
+
+        /// A replica that has replayed the token, else the primary.
+        async fn reader<'a>(db: &'a Db, token: Option<&str>) -> &'a PgPool {
+            let Some(token) = token else { return db.replicas.next() };
+            for pool in db.replicas.all() {
+                let ok: Option<bool> = sqlx::query_scalar("SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn")
+                    .bind(token)
+                    .fetch_one(pool)
+                    .await
+                    .ok();
+                if ok == Some(true) {
+                    return pool;
+                }
+            }
+            &db.primary
+        }
+
+        async fn profile(State(db): State<Db>, user: User, jar: CookieJar) -> Result<Html<String>, AppError> {
+            let pool = reader(&db, jar.get("seen_lsn").map(|c| c.value())).await;
+            let name: String = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+                .bind(user.id)
+                .fetch_one(pool)
+                .await?;
+            Ok(render_profile(&name))
+        }
+      roles: { context: [32, 39], strategy: [16, 30], leader: [4, 12], f1: [19, 28], f2: [19, 28], client: [13, 13], write: [4, 12], token: [13, 13], route: [19, 28], fallback: [29, 29] }
+    again:
+      file: session.rs
+      source: |
+        // session.rs: the same request from the phone. Keep the token per user, not per cookie.
+        async fn remember_lsn(cache: &mut MultiplexedConnection, uid: i64, lsn: &str) -> RedisResult<()> {
+            cache.set_ex(format!("seen_lsn:{uid}"), lsn, 60).await
+        }
+    cost:
+      before: { text: old name whenever lag > 500 ms · every save 500 ms slower, value: 0.8 }
+      after: { text: 0 stale reloads · 1 small query per replica tried, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'sqlx and tokio-postgres give you one pool per address, so the router is yours, and the borrow checker makes you say how long the chosen pool is borrowed (`&''a PgPool`). The official `mongodb` crate has causally consistent sessions (`client.start_session()`, on by default) and read preferences through `SelectionCriteria`.'
+      seenIn: '`sqlx::PgPool`, one per replica. The `mongodb` crate''s `ClientSession`. `axum_extra` cookies to carry the token.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The save goes to the leader and commits. Then the handler asks the leader for its current log position, which is past that commit.
+    nodes: [context, strategy, leader]
+    edges: [context>strategy, strategy>leader]
+    role: write
+  - text: The position goes back to the browser in a cookie. It is the session's token, its promise of how much it has seen.
+    nodes: [client, context]
+    edges: [client>context]
+    role: token
+  - text: On reload, the router asks each follower whether it has replayed up to the token. Follower 1 has; follower 2, 4 seconds behind, has not.
+    nodes: [strategy, f1, f2]
+    edges: [strategy>f1, strategy>f2]
+    role: route
+  - text: If no follower has caught up, the read goes to the leader. The user sees their new name either way, and most reads still land on followers.
+    nodes: [strategy, leader]
+    edges: [strategy>leader]
+    role: fallback
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A user saves a new display name. The reload shows the old one. The database is a leader with asynchronous followers. What most likely happened?
+    options:
+      - text: The reload was served by a follower that had not applied the save yet.
+        correct: true
+        why: Right. The leader committed the save. A follower applies it a little later, and the reload landed in that gap.
+      - text: The save was lost when the leader crashed.
+        why: Nothing crashed. The save is on the leader, and the follower will show it once it catches up. Waiting and reloading again would show the new name.
+      - text: The browser cached the old page.
+        why: A cache could do this too, but the page was fetched again. The read hit a replica that was behind, which is the usual cause in a replicated setup.
+  engineer:
+    question: You pin each user's session to one follower, chosen by hashing the session id. What do you get?
+    options:
+      - text: Monotonic reads. A user can still miss their own write while their follower lags.
+        correct: true
+        why: Right. One follower applies the log in order, so it never shows something older than it showed before. But it can be behind, so a write the user just made can be missing.
+      - text: Read-your-writes, because the user always talks to the same server.
+        why: The writes go to the leader, not to the pinned follower. The follower gets them after its lag.
+      - text: Nothing, because followers apply writes in any order.
+        why: A follower replays the leader's log in order. That is exactly why pinning stops time going backwards.
+  deep:
+    question: The handler takes the token with pg_current_wal_lsn() after the UPDATE has committed, as a separate statement. Why not inside the same transaction, before COMMIT?
+    options:
+      - text: Before COMMIT, the log position is earlier than the commit record, so a replica could reach it and still not show the new row.
+        correct: true
+        why: Right. A replica makes a change visible when it replays the commit record. A token taken before that record exists can be satisfied by a replica that has not replayed it.
+      - text: pg_current_wal_lsn() cannot be called inside a transaction.
+        why: It can. It just reports the position at that moment, which is before this transaction's commit record.
+      - text: Replicas reject tokens that came from an open transaction.
+        why: A token is only a log position. The replica compares it with how far it has replayed; it does not know where the token came from.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Leader
+      example: PostgreSQL primary
+      job: Takes every write and ships its log to the followers.
+    - role: Follower
+      example: hot standby replicas
+      job: Replays the leader's log in order, some time later, and serves reads.
+    - role: Read router
+      example: { go: "Handler.reader", python: "reader()", typescript: "reader()", rust: "reader()" }
+      job: Picks a node for each read, given what the session has already seen.
+    - role: Token
+      example: the seen_lsn cookie
+      job: The newest log position the session wrote or read. A read must come from a node at or past it.
+  useWhen:
+    - Reads go to asynchronous followers and users read data they just wrote (profiles, settings, comments, carts).
+    - Requests from one user can land on different followers, for example behind a load balancer.
+    - The same user is active on several devices, so the token must live on the server, not in one cookie.
+  avoidWhen:
+    - Data that nobody just wrote and nobody compares over time, like a public catalogue or a dashboard, can read from any follower.
+    - If every read must see every write from every user, a session guarantee is too weak. Read from the leader or use a linearizable store.
+  tradeoffs:
+    - Reads that fall back to the leader add load to the one node that also takes all the writes.
+    - The router checks follower positions before reading. Cache those positions for a few hundred milliseconds to keep this cheap.
+    - A fixed window (read from the leader for N seconds after a write) is simpler, and breaks silently when lag exceeds N.
+    - Sticky sessions give monotonic reads cheaply, and lose them when the pinned follower is replaced or fails over.
+  lookalikes:
+    - name: Synchronous replication (remote_apply)
+      how: Makes every commit wait until the synchronous standbys have applied it. Every reader of those standbys sees the write, and every write pays the wait.
+    - name: Causal consistency
+      how: Stronger than a session guarantee. It also orders writes that depend on what other users read. MongoDB's causally consistent sessions are a practical form.
+    - name: Linearizability
+      how: Every read sees the latest completed write, for every client. It needs the leader or consensus on the read path.
+    - name: Cache invalidation
+      how: The same symptom from a different layer. A stale cache entry can hide a write even with a single database.
+---
+
+## [concept] Replication lag and session guarantees
+
+**A follower applies the leader's writes a little later, so a read from it can show you the past, even your own last write.**
+
+That gap is <Term id="replication-lag">replication lag</Term>. With asynchronous followers it is always there. Usually it is milliseconds. When a follower is busy, catching up after a restart, or far away, it grows to seconds or minutes.
+
+<Depth level={2}>
+Most apps do not need every read to see every write. They need two narrower promises for each user, called <Term id="session-guarantee">session guarantees</Term>. <Term id="read-your-writes">Read-your-writes</Term>: after I save something, I see it. <Term id="monotonic-reads">Monotonic reads</Term>: once I have seen something, I never see an older version again. A third, <Term id="consistent-prefix">consistent prefix reads</Term>, says I see writes in the order they happened. All three can be kept on top of lagging followers, if reads are routed with care.
+</Depth>
+
+<Depth level={3}>
+The guarantees come from the Bayou project at Xerox PARC (Terry and others, 1994), which named four: read-your-writes, monotonic reads, writes-follow-reads and monotonic writes. Bayou kept, for each session, the set of writes it had written and read, summarised as version vectors, and only let a server answer if it had all of them. The token in this lesson is the same idea with a single number: one leader means one log, so one log position stands for "everything up to here".
+</Depth>
+
+## [problem] Write to the leader, read from any replica
+
+A profile service runs on PostgreSQL with one primary and two streaming replicas. Writes go to the primary. To spread load, every read goes to the next replica in turn. It is the standard setup, and it passed every test, because the test database had no replicas.
+
+Read it once. Nothing in the read path knows that a write just happened.
+
+<Depth level={2}>
+Streaming replication is asynchronous by default. The primary commits, answers the client, and ships the log to the replicas afterwards. Each replica replays that log in order. The lag is the time between the commit on the primary and the replay on the replica.
+</Depth>
+
+<Depth level={3}>
+You can watch the lag on the primary in `pg_stat_replication` (`write_lag`, `flush_lag`, `replay_lag`), and on a replica by comparing `pg_last_wal_replay_lsn()` with the primary's `pg_current_wal_lsn()`. Under normal load both are small, which is why the bug hides until the day they are not.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** make the profile page show a user's new display name right after they save it.
+
+Support has tickets: users save a new name, the reload shows the old one, they save again, and sometimes the name flips back and forth between reloads. The obvious fix is the marked line. It sleeps half a second before the redirect.
+
+<Depth level={2}>
+The sleep makes every save slower, and it still fails whenever lag is over half a second, which is exactly when the replicas are under the most load. It also does nothing for the second symptom. One reload hits a replica that has the new name, the next hits one that does not, and the name goes back. That breaks monotonic reads, and no sleep fixes it.
+</Depth>
+
+<Depth level={3}>
+A sleep is a guess about lag, written into the code. Every fix of this shape, including "read from the primary for N seconds after a write", has the same flaw. It holds while lag is below the guess, and fails silently above it, with no error in any log.
+</Depth>
+
+## [morph] Route each read by what the session has seen
+
+Drag the slider. A read router appears between the handler and the replicas.
+
+The save now returns a <Term id="lsn">log sequence number</Term> (LSN) from the primary. The browser keeps it in a cookie. On every read, the router sends the query only to a replica that has replayed at least that far, and to the primary if none has.
+
+<Depth level={2}>
+This gives read-your-writes without guessing the lag. If you also raise the token to the highest position a read has returned, the same check gives monotonic reads: a later read can never come from a replica behind an earlier one. When replicas are caught up, which is most of the time, reads still spread across them, and only the unlucky ones fall back to the primary.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The check is one query per replica tried. In production, poll each replica's `pg_last_wal_replay_lsn()` every 100 ms or so in a background goroutine and keep the latest value in an `atomic.Value`, so routing costs nothing on the request path.</Lang>
+<Lang only="python">The check is one query per replica tried. In production, poll each replica's `pg_last_wal_replay_lsn()` every 100 ms or so in a background thread or task and route against the cached values.</Lang>
+<Lang only="typescript">The check is one query per replica tried. In production, poll each replica's `pg_last_wal_replay_lsn()` every 100 ms or so with a `setInterval` and route against the cached values, so the request path makes no extra round trip.</Lang>
+<Lang only="rust">The check is one query per replica tried. In production, poll each replica's `pg_last_wal_replay_lsn()` every 100 ms or so in a spawned tokio task and publish the values through a `tokio::sync::watch` channel.</Lang>
+</Depth>
+
+## [walk] Follow one save and one reload
+
+One save and the reload after it, step by step. Use the numbered buttons.
+
+<Depth level={2}>
+The order matters on the write side. The handler asks for the log position after the commit, so the position is at or past the commit record. A replica only shows the new row once it has replayed that record.
+</Depth>
+
+<Depth level={3}>
+The comparison `pg_last_wal_replay_lsn() >= $1::pg_lsn` works because `pg_lsn` values are ordered byte positions in one log. That is only true with a single leader. With several leaders, or leaderless replicas, there is no single log, and the token becomes a vector of positions, one per writer. That is the version vector of a later lesson.
+</Depth>
+
+## [again] Same request, from the phone
+
+The same request comes back from support: the new name is missing on the user's phone. The token lived in the laptop's cookie, so the phone had none. The fix is small. Store the token on the server, keyed by user, and the router reads it from there. No new mechanism, and no sleep.
+
+<Depth level={2}>
+Keep the per-user token only for as long as lag can plausibly last, a minute here. After that every replica has the write anyway. If the token store is down, fall back to the primary, not to any replica.
+</Depth>
+
+<Depth level={3}>
+This is cross-device read-your-writes. It needs some shared place that every device's requests consult. Pinning a user to one replica cannot give it, because the laptop and the phone may be routed differently, and the pinned replica may change at failover.
+</Depth>
+
+## [play] Save, refresh, and watch the past come back
+
+A leader, two followers with lag you control, and one user with a laptop and a phone. Every refresh is replayed under all four routing rules at once, so you can compare them on exactly the same traffic.
+
+Make each rule fail, then find the one that does not.
+
+## [lens] How each language's clients choose a replica
+
+The SQL is the same everywhere. What differs is how much the driver or framework does for you. PostgreSQL drivers in all four languages leave routing to you. MongoDB drivers have read preferences and causally consistent sessions built in, which carry the token for you.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+MongoDB's version of the token is the session's `operationTime` and `clusterTime`. With `readConcern: "majority"` and `writeConcern: { w: "majority" }`, a causally consistent session gives read-your-writes, monotonic reads, monotonic writes and writes-follow-reads, even when it reads from secondaries.
+</Depth>
+
+<Depth level={3}>
+Cassandra and other leaderless stores have no log position to carry. There, read-your-writes comes from quorum overlap instead: write to W replicas, read from R, with R + W greater than the replication factor. That is the next lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="replication-lag-and-session-guarantees" />
+
+### Eventual consistency is not a deadline
+
+<Term id="eventual-consistency">Eventual consistency</Term> means that if writes stop, the replicas end up equal. It does not say when, and it says nothing about what a reader sees in the meantime. Session guarantees are the cheapest useful promises you can add on top: they cost one token per session, and they remove the anomalies users actually notice.

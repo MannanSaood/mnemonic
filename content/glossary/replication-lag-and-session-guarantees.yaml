@@ -1,0 +1,22 @@
+# Terms introduced by distributed-systems/replication-lag-and-session-guarantees.
+- id: replication-lag
+  term: Replication lag
+  short: How far a follower is behind its leader, as time or as log position. Reads from a lagging follower return older data.
+- id: read-your-writes
+  term: Read-your-writes
+  short: A session guarantee. After you write something, your later reads always see that write or something newer.
+- id: monotonic-reads
+  term: Monotonic reads
+  short: A session guarantee. Once you have seen a version of the data, your later reads never return an older one.
+- id: consistent-prefix
+  term: Consistent prefix reads
+  short: A guarantee that readers see writes in the order they happened, never a later write without the earlier ones.
+- id: lsn
+  term: Log sequence number (LSN)
+  short: A position in the database's write-ahead log. In PostgreSQL, a replica that has replayed up to an LSN has every commit before it.
+- id: session-guarantee
+  term: Session guarantee
+  short: A promise about what one client (a session) sees, such as read-your-writes or monotonic reads, made on top of weakly consistent replicas.
+- id: eventual-consistency
+  term: Eventual consistency
+  short: If writes stop, all replicas end up with the same data. It says nothing about how long that takes or what readers see meanwhile.
