@@ -1,0 +1,9 @@
+- id: single-responsibility
+  term: Single responsibility principle
+  short: A module should be responsible to one, and only one, actor (Robert C. Martin). Code that different groups of people ask to change belongs in different modules.
+- id: actor
+  term: Actor
+  short: In the single responsibility principle, a group of people (one team, one department) who ask for the same kind of change to a module.
+- id: accidental-duplication
+  term: Accidental duplication
+  short: Two pieces of code that look the same today but serve different actors, so they will need to change for different reasons. Merging them couples those actors.

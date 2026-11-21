@@ -1,0 +1,626 @@
+---
+title: Single responsibility and open/closed
+track: design-patterns
+group: Principles
+order: 14
+summary: Keep code that different teams ask to change in different modules, and add new variants as new code instead of edits to working code.
+intent: A change requested by one team should touch only that team's code, and a new tax rule should not edit the rules that already work.
+changeRequest: In the same sprint, Finance adds Canadian tax and Brand puts the new logo on the invoice PDF.
+languages: [go, python, typescript, rust]
+glossary: [single-responsibility, actor, accidental-duplication, open-closed, interface]
+
+prerequisites: [design-patterns/coupling-and-cohesion]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+playground:
+  model: single-responsibility-and-open-closed
+  scenarios:
+    - try: "Answer the prediction, then replay the 8 tickets against the one-class InvoiceService."
+      notice: "Every sprint ends in a merge conflict, every ticket drags in two teams that asked for nothing, and Finance's rounding change alters Brand's PDF."
+    - try: "Press One file per team and replay."
+      notice: "Cross-team conflicts are gone, but round2() is still shared, so the rounding ticket still surprises Brand. Splitting files is not enough if the code inside is shared."
+    - try: "Switch round2() to A copy per team and tax rules to A file per rule."
+      notice: "Every number drops to zero. Each team edits only its own file, and the two new countries arrive as new files."
+    - try: "Press One file per function and replay."
+      notice: "No conflicts, but three tickets now edit several files each. A responsibility is a reason to change, not a function."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 8, y: 30, w: 92, h: 48, title: billing job, sub: monthly run }
+      after:  { x: 8, y: 196, w: 92, h: 48, title: billing job, sub: monthly run }
+    - id: context
+      kind: context
+      before: { x: 118, y: 14, w: 434, h: 236, title: InvoiceService, sub: "Finance · Brand · Ops, one file" }
+      after:  { x: 336, y: 30, w: 110, h: 52, title: Calculator, sub: Finance }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 460, y: 30, w: 92, h: 52, title: "" }
+      after:  { x: 460, y: 30, w: 92, h: 52, title: TaxRule, sub: apply }
+    - id: vat
+      kind: concrete
+      before: { x: 134, y: 70, w: 196, h: 34, title: { go: 'case "DE", "FR"', python: 'case "DE" | "FR"', typescript: 'case "DE", "FR"', rust: '"DE" | "FR" =>' } }
+      after:  { x: 404, y: 196, w: 66, h: 44, title: VAT, sub: DE · FR }
+    - id: canada
+      kind: concrete
+      appears: change
+      before: { x: 134, y: 114, w: 196, h: 34, title: { go: 'case "CA"', python: 'case "CA"', typescript: 'case "CA"', rust: '"CA" =>' } }
+      after:  { x: 482, y: 196, w: 70, h: 44, title: Canada, sub: GST + PST }
+    - id: pdf
+      kind: concrete
+      before: { x: 346, y: 70, w: 190, h: 34, title: { go: RenderPDF, python: render_pdf, typescript: renderPdf, rust: render_pdf } }
+      after:  { x: 222, y: 92, w: 100, h: 48, title: InvoicePdf, sub: Brand }
+    - id: mail
+      kind: concrete
+      before: { x: 346, y: 114, w: 190, h: 34, title: { go: Send, python: send, typescript: send, rust: send } }
+      after:  { x: 112, y: 144, w: 100, h: 48, title: Mailer, sub: Customer Ops }
+  edges:
+    - { from: client, to: mail, label: calls }
+    - { from: mail, to: pdf }
+    - { from: pdf, to: context }
+    - { from: context, to: strategy, label: holds }
+    - { from: vat, to: strategy, kind: implements }
+    - { from: canada, to: strategy, kind: implements }
+
+code:
+  go:
+    before:
+      file: invoice_service.go
+      source: |
+        // invoice_service.go
+        type InvoiceService struct{ mail *SMTPMailer }
+
+        func (s *InvoiceService) Total(inv Invoice) Money {
+            sub := inv.Subtotal()
+            switch inv.Country {
+            case "DE":
+                return sub.Add(sub.Percent(19))
+            case "FR":
+                return sub.Add(sub.Percent(20))
+            default:
+                return sub
+            }
+        }
+
+        func (s *InvoiceService) RenderPDF(inv Invoice) []byte {
+            doc := pdf.New()
+            doc.Image("assets/logo-2019.png", 20, 20)
+            doc.Table(inv.Lines)
+            doc.Text("Total: " + s.Total(inv).String())
+            return doc.Bytes()
+        }
+
+        func (s *InvoiceService) Send(inv Invoice) error {
+            return s.mail.Send(inv.Email, "Your invoice", s.RenderPDF(inv))
+        }
+      roles: { context: [1, 26], vat: [7, 10], pdf: [16, 22], mail: [24, 26] }
+      change:
+        - { after: 10, add: ['    case "CA":', '        return sub.Add(sub.Percent(5)).Add(sub.Percent(pst[inv.Province]))'] }
+        - { line: 18, replace: '    doc.Image("assets/logo-2025.svg", 20, 20)' }
+    after:
+      file: invoice.go · vat.go · invoice_pdf.go · invoice_mail.go · main.go
+      source: |
+        // invoice.go: Finance owns this file
+        type TaxRule interface {
+            Apply(inv Invoice, sub Money) Money
+        }
+
+        type InvoiceCalculator struct{ rules map[string]TaxRule }
+
+        func (c InvoiceCalculator) Total(inv Invoice) Money {
+            sub := inv.Subtotal()
+            if r, ok := c.rules[inv.Country]; ok {
+                return r.Apply(inv, sub)
+            }
+            return sub
+        }
+
+        // vat.go: one rule type serves every flat-rate country
+        type VAT int
+
+        func (v VAT) Apply(_ Invoice, sub Money) Money { return sub.Add(sub.Percent(int(v))) }
+
+        // invoice_pdf.go: Brand owns this file
+        type InvoicePDF struct{ calc InvoiceCalculator }
+
+        func (p InvoicePDF) Render(inv Invoice) []byte { /* logo, lines, p.calc.Total(inv) */ }
+
+        // invoice_mail.go: Customer Ops owns this file
+        type InvoiceMailer struct {
+            pdf  InvoicePDF
+            mail *SMTPMailer
+        }
+
+        func (m InvoiceMailer) Send(inv Invoice) error { /* attach m.pdf.Render(inv) */ }
+
+        // main.go
+        rules := map[string]TaxRule{"DE": VAT(19), "FR": VAT(20)}
+      roles: { context: [1, 14], strategy: [2, 4], vat: [16, 19], pdf: [21, 24], mail: [26, 32], client: [34, 35], send: [32, 32], render: [24, 24], lookup: [10, 11] }
+    again:
+      file: canada.go
+      source: |
+        // canada.go: a new rule; invoice.go does not change
+        type CanadaTax struct{ pst map[string]int } // province -> PST %
+
+        func (c CanadaTax) Apply(inv Invoice, sub Money) Money {
+            return sub.Add(sub.Percent(5)).Add(sub.Percent(c.pst[inv.Province]))
+        }
+
+        // main.go gains one entry: rules["CA"] = CanadaTax{pst: provincialRates}
+        // The logo change goes into invoice_pdf.go, a file Finance never opens.
+    cost:
+      before: { text: 2 teams · 1 file · working code edited, value: 0.8 }
+      after: { text: 1 new file · each team in its own file, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A package is Go''s unit of responsibility as much as a file is. Small interfaces such as `TaxRule` are idiomatic; a single-method interface could also be a function type, `type TaxRule func(Invoice, Money) Money`.'
+      seenIn: '`database/sql` is closed for modification and open for drivers: a driver calls `sql.Register` from its `init` function. `image.RegisterFormat` adds decoders to `image.Decode` the same way.'
+
+  python:
+    before:
+      file: invoice_service.py
+      source: |
+        # invoice_service.py
+        class InvoiceService:
+            def __init__(self, mailer: SmtpMailer):
+                self.mailer = mailer
+
+            def total(self, inv: Invoice) -> Money:
+                sub = inv.subtotal()
+                match inv.country:
+                    case "DE":
+                        return sub + sub.percent(19)
+                    case "FR":
+                        return sub + sub.percent(20)
+                    case _:
+                        return sub
+
+            def render_pdf(self, inv: Invoice) -> bytes:
+                doc = pdf.Document()
+                doc.image("assets/logo-2019.png", x=20, y=20)
+                doc.table(inv.lines)
+                doc.text(f"Total: {self.total(inv)}")
+                return doc.to_bytes()
+
+            def send(self, inv: Invoice) -> None:
+                self.mailer.send(inv.email, "Your invoice", self.render_pdf(inv))
+      roles: { context: [2, 24], vat: [9, 12], pdf: [16, 21], mail: [23, 24] }
+      change:
+        - { after: 12, add: ['            case "CA":', '                return sub + sub.percent(5) + sub.percent(PST[inv.province])'] }
+        - { line: 18, replace: '        doc.image("assets/logo-2025.svg", x=20, y=20)' }
+    after:
+      file: invoice.py · invoice_pdf.py · invoice_mail.py · main.py
+      source: |
+        # invoice.py: Finance owns this file
+        class TaxRule(Protocol):
+            def apply(self, inv: Invoice, sub: Money) -> Money: ...
+
+        class InvoiceCalculator:
+            def __init__(self, rules: dict[str, TaxRule]):
+                self.rules = rules
+
+            def total(self, inv: Invoice) -> Money:
+                sub = inv.subtotal()
+                rule = self.rules.get(inv.country)
+                return rule.apply(inv, sub) if rule else sub
+
+        @dataclass(frozen=True)
+        class VAT:
+            rate: int
+            def apply(self, inv: Invoice, sub: Money) -> Money:
+                return sub + sub.percent(self.rate)
+
+        # invoice_pdf.py: Brand owns this file
+        class InvoicePdf:
+            def __init__(self, calc: InvoiceCalculator): self.calc = calc
+            def render(self, inv: Invoice) -> bytes: ...  # logo, lines, total
+
+        # invoice_mail.py: Customer Ops owns this file
+        class InvoiceMailer:
+            def __init__(self, pdf: InvoicePdf, mailer: SmtpMailer): ...
+            def send(self, inv: Invoice) -> None: ...  # attach pdf.render(inv)
+
+        # main.py
+        calc = InvoiceCalculator({"DE": VAT(19), "FR": VAT(20)})
+      roles: { context: [1, 12], strategy: [2, 3], vat: [14, 18], pdf: [20, 23], mail: [25, 28], client: [30, 31], send: [28, 28], render: [23, 23], lookup: [11, 12] }
+    again:
+      file: canada.py
+      source: |
+        # canada.py: a new rule; invoice.py does not change
+        @dataclass(frozen=True)
+        class CanadaTax:
+            pst: dict[str, int]  # province -> PST %
+            def apply(self, inv: Invoice, sub: Money) -> Money:
+                return sub + sub.percent(5) + sub.percent(self.pst.get(inv.province, 0))
+
+        # main.py gains one entry: "CA": CanadaTax(PROVINCIAL_RATES)
+        # The logo change goes into invoice_pdf.py, a file Finance never opens.
+    cost:
+      before: { text: 2 teams · 1 file · working code edited, value: 0.8 }
+      after: { text: 1 new file · each team in its own file, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A module is the natural unit here. A rule with one method and no state can be a plain function in the dict, `dict[str, Callable[[Invoice, Money], Money]]`; reach for a class when it carries data, like the provincial rates.'
+      seenIn: '`codecs.register` adds codecs without editing `codecs`. `functools.singledispatch` lets other modules `register` new types. `logging` takes new `Handler` subclasses.'
+
+  typescript:
+    before:
+      file: invoice-service.ts
+      source: |
+        // invoice-service.ts
+        export class InvoiceService {
+          constructor(private readonly mailer: SmtpMailer) {}
+
+          total(inv: Invoice): Money {
+            const sub = inv.subtotal();
+            switch (inv.country) {
+              case "DE":
+                return sub.add(sub.percent(19));
+              case "FR":
+                return sub.add(sub.percent(20));
+              default:
+                return sub;
+            }
+          }
+
+          renderPdf(inv: Invoice): Uint8Array {
+            const doc = new PdfDocument();
+            doc.image("assets/logo-2019.png", 20, 20);
+            doc.table(inv.lines);
+            doc.text(`Total: ${this.total(inv)}`);
+            return doc.bytes();
+          }
+
+          send(inv: Invoice): Promise<void> {
+            return this.mailer.send(inv.email, "Your invoice", this.renderPdf(inv));
+          }
+        }
+      roles: { context: [2, 28], vat: [8, 11], pdf: [17, 23], mail: [25, 27] }
+      change:
+        - { after: 11, add: ['      case "CA":', '        return sub.add(sub.percent(5)).add(sub.percent(PST[inv.province]));'] }
+        - { line: 19, replace: '    doc.image("assets/logo-2025.svg", 20, 20);' }
+    after:
+      file: invoice.ts · invoice-pdf.ts · invoice-mail.ts · main.ts
+      source: |
+        // invoice.ts: Finance owns this file
+        export interface TaxRule {
+          apply(inv: Invoice, sub: Money): Money;
+        }
+
+        export class InvoiceCalculator {
+          constructor(private readonly rules: Record<string, TaxRule>) {}
+
+          total(inv: Invoice): Money {
+            const sub = inv.subtotal();
+            const rule = this.rules[inv.country];
+            return rule ? rule.apply(inv, sub) : sub;
+          }
+        }
+
+        export const vat = (rate: number): TaxRule => ({
+          apply: (_inv, sub) => sub.add(sub.percent(rate)),
+        });
+
+        // invoice-pdf.ts: Brand owns this file
+        export class InvoicePdf {
+          constructor(private readonly calc: InvoiceCalculator) {}
+          render(inv: Invoice): Uint8Array { /* logo, lines, this.calc.total(inv) */ }
+        }
+
+        // invoice-mail.ts: Customer Ops owns this file
+        export class InvoiceMailer {
+          constructor(private readonly pdf: InvoicePdf, private readonly mailer: SmtpMailer) {}
+          send(inv: Invoice): Promise<void> { /* attach this.pdf.render(inv) */ }
+        }
+
+        // main.ts
+        const calc = new InvoiceCalculator({ DE: vat(19), FR: vat(20) });
+      roles: { context: [1, 14], strategy: [2, 4], vat: [16, 18], pdf: [20, 24], mail: [26, 30], client: [32, 33], send: [29, 29], render: [23, 23], lookup: [11, 12] }
+    again:
+      file: canada.ts
+      source: |
+        // canada.ts: a new rule; invoice.ts does not change
+        export const canada = (pst: Record<string, number>): TaxRule => ({
+          apply: (inv, sub) => sub.add(sub.percent(5)).add(sub.percent(pst[inv.province] ?? 0)),
+        });
+
+        // main.ts gains one entry: CA: canada(PROVINCIAL_RATES)
+        // The logo change goes into invoice-pdf.ts, a file Finance never opens.
+    cost:
+      before: { text: 2 teams · 1 file · working code edited, value: 0.8 }
+      after: { text: 1 new file · each team in its own file, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Any object with an `apply` method of the right shape is a `TaxRule`; a factory function returning an object literal is often lighter than a class. ES modules give each team a file with its own exports.'
+      seenIn: 'Express and Koa grow by `app.use(middleware)`, not by editing the framework. ESLint and Babel take rules and plugins as objects with a known shape.'
+
+  rust:
+    before:
+      file: invoice_service.rs
+      source: |
+        // invoice_service.rs
+        pub struct InvoiceService { mailer: SmtpMailer }
+
+        impl InvoiceService {
+            pub fn total(&self, inv: &Invoice) -> Money {
+                let sub = inv.subtotal();
+                match inv.country.as_str() {
+                    "DE" => sub + sub.percent(19),
+                    "FR" => sub + sub.percent(20),
+                    _ => sub,
+                }
+            }
+
+            pub fn render_pdf(&self, inv: &Invoice) -> Vec<u8> {
+                let mut doc = PdfDocument::new();
+                doc.image("assets/logo-2019.png", 20, 20);
+                doc.table(&inv.lines);
+                doc.text(&format!("Total: {}", self.total(inv)));
+                doc.into_bytes()
+            }
+
+            pub fn send(&self, inv: &Invoice) -> Result<(), MailError> {
+                self.mailer.send(&inv.email, "Your invoice", &self.render_pdf(inv))
+            }
+        }
+      roles: { context: [2, 25], vat: [8, 9], pdf: [14, 20], mail: [22, 24] }
+      change:
+        - { after: 9, add: ['            "CA" => sub + sub.percent(5) + sub.percent(pst(&inv.province)),'] }
+        - { line: 16, replace: '        doc.image("assets/logo-2025.svg", 20, 20);' }
+    after:
+      file: invoice.rs · invoice_pdf.rs · invoice_mail.rs · main.rs
+      source: |
+        // invoice.rs: Finance owns this module
+        pub trait TaxRule {
+            fn apply(&self, inv: &Invoice, sub: Money) -> Money;
+        }
+
+        pub struct InvoiceCalculator {
+            rules: HashMap<String, Box<dyn TaxRule>>,
+        }
+
+        impl InvoiceCalculator {
+            pub fn total(&self, inv: &Invoice) -> Money {
+                let sub = inv.subtotal();
+                match self.rules.get(&inv.country) {
+                    Some(rule) => rule.apply(inv, sub),
+                    None => sub,
+                }
+            }
+        }
+
+        pub struct Vat(pub u32);
+        impl TaxRule for Vat {
+            fn apply(&self, _: &Invoice, sub: Money) -> Money { sub + sub.percent(self.0) }
+        }
+
+        // invoice_pdf.rs: Brand owns this module
+        pub struct InvoicePdf<'a> { calc: &'a InvoiceCalculator }
+
+        // invoice_mail.rs: Customer Ops owns this module
+        pub struct InvoiceMailer<'a> { pdf: InvoicePdf<'a>, mailer: SmtpMailer }
+
+        // main.rs
+        let mut rules: HashMap<String, Box<dyn TaxRule>> = HashMap::new();
+        rules.insert("DE".into(), Box::new(Vat(19)));
+        rules.insert("FR".into(), Box::new(Vat(20)));
+      roles: { context: [1, 18], strategy: [2, 4], vat: [20, 23], pdf: [25, 26], mail: [28, 29], client: [31, 34], send: [29, 29], render: [26, 26], lookup: [13, 14] }
+    again:
+      file: canada.rs
+      source: |
+        // canada.rs: a new rule; invoice.rs does not change
+        pub struct CanadaTax { pst: HashMap<String, u32> } // province -> PST %
+
+        impl TaxRule for CanadaTax {
+            fn apply(&self, inv: &Invoice, sub: Money) -> Money {
+                let pst = self.pst.get(&inv.province).copied().unwrap_or(0);
+                sub + sub.percent(5) + sub.percent(pst)
+            }
+        }
+        // main.rs gains one line: rules.insert("CA".into(), Box::new(canada_rates));
+    cost:
+      before: { text: 2 teams · 1 file · working code edited, value: 0.8 }
+      after: { text: 1 new file · each team in its own module, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Modules and crates draw the ownership lines; a crate boundary also stops one team''s edit from recompiling another''s code. When the set of rules is fixed and known, an `enum` with a `match` is fine and the compiler checks it is exhaustive; use a trait when other crates must add rules.'
+      seenIn: '`serde` never changes when you add a type: you implement `Serialize` for it. `std::io::Write` is implemented by files, sockets and buffers that `std` itself never names.'
+
+walk:
+  - text: { go: '`main` builds the rules map and wires the three types together. It is the one place that names every concrete rule.', python: '`main` builds the rules dict and wires the three classes together. It is the one place that names every concrete rule.', typescript: '`main` builds the rules record and wires the three classes together. It is the one place that names every concrete rule.', rust: '`main` boxes each rule into the map and wires the three types together. It is the one place that names every concrete rule.' }
+    nodes: [client]
+    edges: []
+    role: client
+  - text: The billing job calls the mailer. Sending is all Customer Ops owns, so it asks InvoicePdf for the attachment.
+    nodes: [client, mail, pdf]
+    edges: [client>mail, mail>pdf]
+    role: send
+  - text: InvoicePdf draws the logo and the lines, and asks the calculator for the total. Brand's file knows nothing about tax.
+    nodes: [pdf, context]
+    edges: [pdf>context]
+    role: render
+  - text: The calculator looks up the rule for the invoice's country and calls it through TaxRule. It does not know how many rules exist.
+    nodes: [context, strategy, vat]
+    edges: [context>strategy, vat>strategy]
+    role: lookup
+
+checks:
+  overview:
+    question: Which statement is the single responsibility principle as Robert C. Martin defines it?
+    options:
+      - text: A module should be responsible to one, and only one, actor.
+        correct: true
+        why: Right. An actor is a group of people who ask for the same kind of change. Finance, Brand and Customer Ops are three actors, so their code belongs in three modules.
+      - text: Every function should do exactly one thing.
+        why: That is a good rule for functions, and Martin says so, but he is explicit that it is not the SRP. The SRP is about who causes a module to change.
+      - text: A class should have one public method.
+        why: The split classes here have several methods each, and that is fine. What matters is that one group of people asks for all of their changes.
+  engineer:
+    question: Finance wants VAT rounded half-to-even. The PDF uses the same round2() helper to print line amounts, and Brand wants the printed amounts left as they are. What is the cleanest change?
+    options:
+      - text: Give the calculator its own rounding function and leave the PDF's formatting alone, even though the two look alike today.
+        correct: true
+        why: Right. The two uses look alike by accident. They serve different actors and will change for different reasons, so two copies are not real duplication.
+      - text: Change round2() and ask Brand to review the pull request.
+        why: Brand's output still changes. A review only spreads the cost of a coupling that should not exist.
+      - text: Add a mode parameter to round2() so each caller can choose.
+        why: The helper now serves two masters through a flag. Every new rounding wish from either team edits the same function again.
+  deep:
+    question: Go's database/sql learns a new database when you add `import _ "github.com/lib/pq"` and nothing else. What makes that work?
+    options:
+      - text: The driver package's init function calls sql.Register, adding the driver to a registry that database/sql owns. The blank import exists only to run that init.
+        correct: true
+        why: Right. database/sql is closed for modification and open for drivers. Python entry points and Rust inventory-style registries use the same idea; main, or an import, does the wiring.
+      - text: The Go compiler finds every type in the build that implements driver.Driver and registers it.
+        why: Go does not scan for implementations. Implementing an interface is implicit, but nothing happens until some code stores the value somewhere.
+      - text: database/sql loads drivers by name at runtime, with reflection or a shared library.
+        why: No dynamic loading is involved. The driver is compiled into the binary; sql.Open looks the name up in a map that init filled in.
+
+reference:
+  roles:
+    - role: Module per actor
+      example: InvoiceCalculator, InvoicePdf, InvoiceMailer
+      job: Holds the code one group of people asks to change, and nothing else.
+    - role: Extension point
+      example: { go: "TaxRule (interface)", python: "TaxRule (Protocol)", typescript: "TaxRule (interface)", rust: "TaxRule (trait)" }
+      job: The place where new behaviour plugs in without editing the code that uses it.
+    - role: Extension
+      example: VAT, CanadaTax
+      job: One rule each. Adding one is adding a file.
+    - role: Composition root
+      example: main
+      job: Names the concrete rules and wires the modules together. The only place that changes when a rule is added.
+  useWhen:
+    - Different teams or stakeholders keep editing the same file for unrelated reasons.
+    - Merge conflicts and surprise regressions cluster in one class.
+    - New variants of one thing (tax rules, file formats, providers) arrive regularly.
+  avoidWhen:
+    - One team owns all of it and the parts always change together. Splitting adds files and hops for nothing.
+    - You are guessing at future variants. Make code open in the direction it has actually needed to bend, usually after the second or third real change.
+  tradeoffs:
+    - More files and types to name and navigate.
+    - Code that looks the same in two modules stays duplicated on purpose.
+    - An extension point fixes what extensions receive; a rule that needs new inputs changes the interface.
+    - Wiring moves to one place, such as main, which does change when variants are added.
+  lookalikes:
+    - name: Cohesion
+      how: The SRP is cohesion measured by who asks for changes. Code is cohesive when the same actor changes it for the same reasons.
+    - name: Strategy
+      how: One common way to make code open for extension. The TaxRule here is a strategy.
+    - name: Separation of concerns
+      how: The broader idea of splitting a program by concern. The SRP names the concern precisely, as an actor.
+---
+
+## [concept] Single responsibility and open/closed
+
+**Keep code that different people ask to change in different modules. Then make each module grow by adding code, not by editing it.**
+
+The <Term id="single-responsibility">single responsibility principle</Term> says where the lines between modules go: around each <Term id="actor">actor</Term>, the group of people who ask for one kind of change. The <Term id="open-closed">open/closed principle</Term> says what a good line looks like: new variants arrive as new code behind an <Term id="interface">interface</Term>, and the code that already works stays closed.
+
+<Depth level={2}>
+The two principles answer two different change problems. SRP stops one team's change from landing in another team's code: no shared merges, no surprise regressions. OCP stops a stream of new variants, like countries with their own tax, from editing a switch that already works for every other country. Both are judged by the changes you actually get, so apply them where change keeps arriving, not everywhere.
+</Depth>
+
+<Depth level={3}>
+Bertrand Meyer named the open/closed principle in *Object-Oriented Software Construction* (1988), where the mechanism was inheritance. Robert C. Martin restated it around abstract interfaces in the 1990s and made it part of SOLID. He has phrased the SRP several ways: first as "one reason to change", then, because "reason" was misread, as "responsible to one, and only one, actor" in *Clean Architecture* (2017). He is explicit that "a function should do one thing" is a different, lower-level rule.
+</Depth>
+
+## [problem] One class, three teams
+
+An invoice service computes the total with tax, renders a PDF and emails it. All three live in one class, and the class works.
+
+Read it once. Three groups of people care about this file: Finance about `Total`, Brand about the PDF, Customer Ops about the email.
+
+<Depth level={2}>
+The tax switch has a case per country. Every new country edits it, and each edit re-tests every country that already works. The PDF also calls `Total`, so the PDF's tests depend on tax rules too.
+</Depth>
+
+<Depth level={3}>
+Nothing here is wrong in a one-person project. The cost appears with parallel work: two teams editing the same file in the same sprint get merge conflicts, and a change one team asks for can alter what another team ships without anyone on that team asking.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** in the same sprint, Finance adds Canadian tax and Brand puts the new logo on the invoice PDF.
+
+Two teams, two unrelated changes, one file. The marked lines collide in review, and the Canada case edits a switch that already handles real money for Germany and France.
+
+<Depth level={2}>
+Each team now has to review the other's change, and each deploy carries both. If Brand's release is rolled back because the logo renders badly, Finance's Canada tax rolls back with it.
+</Depth>
+
+<Depth level={3}>
+This is what Martin calls the merge symptom: different actors' code in one file means different people changing the same file for different reasons. Version control can merge most text, but it cannot tell you that two correct changes are wrong together.
+</Depth>
+
+## [morph] Split by team, then open the tax rules
+
+Drag the slider. InvoiceService splits into three types, one per team, and the tax switch becomes a TaxRule interface with one implementation per kind of rule.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The split follows who asks for changes. That is why the PDF and the mailer are separate even though both are small, and why `VAT` serves both Germany and France: they differ only in a number, so they are one rule with two settings.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go draws the clearest lines at package level. If each team's code is its own package, Go's build cache only recompiles the packages a change actually reaches.</Lang>
+<Lang only="python">A `Protocol` is checked by mypy or pyright, not at runtime. `VAT` matches `TaxRule` because it has an `apply` method with the right signature; it never inherits from `TaxRule`.</Lang>
+<Lang only="typescript">`vat(19)` returns a plain object that matches `TaxRule` by shape. No class is needed for a rule with no state beyond its rate.</Lang>
+<Lang only="rust">`Box<dyn TaxRule>` lets the map hold different rule types side by side. If the rules were fixed at compile time, an `enum` with exhaustive `match` would be simpler; the trait is for rules added from outside the module.</Lang>
+</Depth>
+
+## [walk] Follow one invoice
+
+One invoice through the split design, from the billing job to the tax rule. Step through it with the numbered buttons.
+
+<Depth level={3}>
+The call path is longer than before: three objects instead of one. Each hop is a direct method call except the last, which goes through the TaxRule interface. The extra cost is nanoseconds next to rendering a PDF and talking to a mail server.
+</Depth>
+
+## [again] The same sprint, the second time
+
+Finance adds `CanadaTax` in a new file. Brand changes the logo in `InvoicePdf`, a file Finance never opens. The two pull requests touch no file in common, so they cannot conflict, and neither can break the other.
+
+<Depth level={2}>
+One line of wiring remains: `main` registers `"CA"`. Keep all registration in one place and it stays one line. That place is meant to know every concrete rule; the calculator is not.
+</Depth>
+
+<Depth level={3}>
+Tests follow the split. `CanadaTax` gets its own table of provinces and expected totals. The calculator's tests use a fake rule and never change when a country is added, and the PDF's tests use a calculator with one simple rule.
+</Depth>
+
+## [play] Arrange the code, replay the tickets
+
+You arrange InvoiceService's functions into files. Then eight real tickets from three teams replay against your layout, two at a time, as two developers would work them in a sprint.
+
+Try the one class first, then find a layout where nobody collides and nobody is surprised.
+
+## [lens] How each language writes it
+
+The principles are the same everywhere. The unit of ownership is not: a Go package, a Python module, an ES module, a Rust module or crate.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="single-responsibility-and-open-closed" />
+
+### Code that looks the same is not always the same
+
+The hardest part of the SRP is resisting a merge. When two teams' code contains the same few lines, it is tempting to share one helper. If the two teams can want different things from those lines, keep two copies. Martin calls the shared version <Term id="accidental-duplication">accidental duplication</Term>: it saves a few lines today and couples two teams for good.
