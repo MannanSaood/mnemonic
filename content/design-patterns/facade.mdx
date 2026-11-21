@@ -1,0 +1,533 @@
+---
+title: Facade
+track: design-patterns
+group: Structural
+order: 34
+summary: Give a subsystem one simple entry point for the common job, so callers stop orchestrating its parts by hand.
+intent: The order of the steps should live in one place. Callers that only want the common job should depend on that place, not on every part.
+changeRequest: Security wants every image scanned before it is pushed.
+languages: [go, python, typescript, rust]
+glossary: [facade-subsystem, coupling, god-object, interface]
+
+prerequisites: [design-patterns/coupling-and-cohesion]
+skills: [design]
+depths: [overview, engineer, deep]
+
+playground:
+  model: facade
+  scenarios:
+    - try: "Request 1: apply the scan to the CI pipeline only, then ship."
+      notice: "CI scans. The bot and the hotfix script deploy unscanned images and report success. A missing step raises no error."
+    - try: "Press Reset. Move CI, the bot and the hotfix script onto Deployer.Deploy, then work through all three requests."
+      notice: "Each request is one edit to the Deployer, plus the rollback script when the notifier changes. The dependency count drops from 21 to 12."
+    - try: "Press Reset, move the rollback script onto the facade too, and ship."
+      notice: "The rollback rebuilds from main and runs migrations forward. It needs a different order, so it keeps talking to the parts directly. A facade is a default, not a wall."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 110, h: 48, title: copies ×2, sub: bot · hotfix }
+      after:  { x: 12, y: 30, w: 110, h: 48, title: main, sub: builds Deployer }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 250, title: ci/deploy, sub: calls every part in order }
+      after:  { x: 150, y: 30, w: 140, h: 52, title: callers ×3, sub: one call each }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 330, y: 30, w: 210, h: 52, title: "" }
+      after:  { x: 330, y: 30, w: 210, h: 52, title: Deployer, sub: { go: "Deploy(ctx, ref, ver)", python: "deploy(ref, version)", typescript: "deploy(ref, version)", rust: "deploy(git_ref, ver)" } }
+    - id: builder
+      kind: concrete
+      before: { x: 170, y: 56, w: 230, h: 28, title: build }
+      after:  { x: 160, y: 140, w: 72, h: 40, title: Builder }
+    - id: registry
+      kind: concrete
+      before: { x: 170, y: 90, w: 230, h: 28, title: push }
+      after:  { x: 238, y: 140, w: 72, h: 40, title: Registry }
+    - id: migrator
+      kind: concrete
+      before: { x: 170, y: 124, w: 230, h: 28, title: migrate }
+      after:  { x: 316, y: 140, w: 72, h: 40, title: Migrator }
+    - id: cluster
+      kind: concrete
+      before: { x: 170, y: 158, w: 230, h: 28, title: rollout }
+      after:  { x: 394, y: 140, w: 72, h: 40, title: Cluster }
+    - id: notifier
+      kind: concrete
+      before: { x: 170, y: 192, w: 230, h: 28, title: notify }
+      after:  { x: 472, y: 140, w: 76, h: 40, title: Notifier }
+    - id: scanner
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 228, w: 230, h: 28, title: scan ×3 copies }
+      after:  { x: 199, y: 214, w: 72, h: 40, title: Scanner }
+  edges:
+    - { from: client, to: context, label: injects }
+    - { from: context, to: strategy, label: one call }
+    - { from: strategy, to: builder, label: uses }
+    - { from: strategy, to: registry }
+    - { from: strategy, to: migrator }
+    - { from: strategy, to: cluster }
+    - { from: strategy, to: notifier }
+    - { from: strategy, to: scanner }
+
+code:
+  go:
+    before:
+      file: ci/deploy.go · bot/deploy.go · scripts/hotfix.go
+      source: |
+        // ci/deploy.go
+        func deploy(ctx context.Context, p *platform.Clients, ref, version string) error {
+            img, err := p.Builder.Build(ctx, ref)
+            if err != nil {
+                return err
+            }
+            if err := p.Registry.Push(ctx, img); err != nil {
+                return err
+            }
+            if err := p.Migrator.Up(ctx); err != nil {
+                return err
+            }
+            if err := p.Cluster.Rollout(ctx, img); err != nil {
+                return err
+            }
+            p.CDN.Purge(ctx, "/*")
+            return p.Notifier.Send(ctx, "deployed "+version)
+        }
+
+        // bot/deploy.go and scripts/hotfix.go: the same calls, copied
+        // scripts/rollback.go: Rollout, Purge, Send; no build, no migrate
+      roles: { context: [2, 18], builder: [3, 6], registry: [7, 9], migrator: [10, 12], cluster: [13, 15], notifier: [17, 17], client: [20, 21] }
+      change:
+        - { after: 6, add: ['    if err := p.Scanner.Scan(ctx, img); err != nil {', '        return err', '    }'] }
+        - { after: 20, add: ['// bot/deploy.go: the same three lines, by hand', '// scripts/hotfix.go: the same three lines, by hand'] }
+    after:
+      file: deploy/deployer.go · ci/deploy.go · scripts/rollback.go
+      source: |
+        // Deployer is the one place that knows the order of the steps.
+        type Deployer struct {
+            builder  *build.Builder
+            registry *registry.Client
+            migrator *migrate.Migrator
+            cluster  *k8s.Cluster
+            cdn      *cdn.Client
+            notifier *notify.Notifier
+        }
+
+        func (d *Deployer) Deploy(ctx context.Context, ref, version string) error {
+            img, err := d.builder.Build(ctx, ref)
+            if err != nil {
+                return err
+            }
+            if err := d.registry.Push(ctx, img); err != nil {
+                return err
+            }
+            if err := d.migrator.Up(ctx); err != nil {
+                return err
+            }
+            if err := d.cluster.Rollout(ctx, img); err != nil {
+                return err
+            }
+            d.cdn.Purge(ctx, "/*")
+            return d.notifier.Send(ctx, "deployed "+version)
+        }
+
+        // ci/deploy.go, bot/deploy.go, scripts/hotfix.go
+        err := deployer.Deploy(ctx, ref, version)
+        // scripts/rollback.go still goes direct: it must never run migrations
+        err := clients.Cluster.Rollout(ctx, previous)
+      roles: { strategy: [2, 27], context: [29, 30], client: [29, 30], call: [30, 30], build: [12, 18], order: [19, 24], notify: [25, 26], escape: [31, 32], builder: [12, 15], registry: [16, 18], migrator: [19, 21], cluster: [22, 24], notifier: [26, 26] }
+    again:
+      file: deploy/deployer.go
+      source: |
+        // deploy/deployer.go: one edit inside Deploy, right after Build
+        if err := d.scanner.Scan(ctx, img); err != nil {
+            return err
+        }
+        // no caller changes: CI, the bot and the hotfix script scan on their next deploy
+    cost:
+      before: { text: 9 lines · 3 files, value: 0.8 }
+      after: { text: 3 lines · 1 file, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A plain struct with one method that calls the parts in order. Keep it in the subsystem''s package. The parts can stay exported for the few callers that need a different sequence, like the rollback script.'
+      seenIn: '`http.Get` is a one-call path over `http.Client`, `Request` and `Transport`; the full types are still there when you need them. `os.ReadFile` hides open, stat, read and close. `exec.Command(name, args...).Output()` starts a process, collects its output and waits.'
+
+  python:
+    before:
+      file: ci/deploy.py · bot/deploy.py · scripts/hotfix.py
+      source: |
+        # ci/deploy.py
+        def deploy(p: Platform, ref: str, version: str) -> None:
+            img = p.builder.build(ref)
+            p.registry.push(img)
+            p.migrator.up()
+            p.cluster.rollout(img)
+            p.cdn.purge("/*")
+            p.notifier.send(f"deployed {version}")
+
+        # bot/deploy.py and scripts/hotfix.py: the same six calls, copied
+        # scripts/rollback.py: rollout, purge, send; no build, no migrate
+      roles: { context: [2, 8], builder: [3, 3], registry: [4, 4], migrator: [5, 5], cluster: [6, 6], notifier: [8, 8], client: [10, 11] }
+      change:
+        - { after: 3, add: ['    p.scanner.scan(img)'] }
+        - { after: 10, add: ['# bot/deploy.py: the same line, by hand', '# scripts/hotfix.py: the same line, by hand'] }
+    after:
+      file: deploy/deployer.py · ci/deploy.py · scripts/rollback.py
+      source: |
+        class Deployer:
+            """The one place that knows the order of the deploy steps."""
+
+            def __init__(self, p: Platform):
+                self._p = p
+
+            def deploy(self, ref: str, version: str) -> None:
+                img = self._p.builder.build(ref)
+                self._p.registry.push(img)
+                self._p.migrator.up()
+                self._p.cluster.rollout(img)
+                self._p.cdn.purge("/*")
+                self._p.notifier.send(f"deployed {version}")
+
+        # ci/deploy.py, bot/deploy.py, scripts/hotfix.py
+        deployer.deploy(ref, version)
+
+        # scripts/rollback.py still goes direct: it must never run migrations
+        platform.cluster.rollout(previous)
+      roles: { strategy: [1, 13], context: [15, 16], client: [15, 16], call: [16, 16], build: [8, 9], order: [10, 11], notify: [12, 13], escape: [18, 19], builder: [8, 8], registry: [9, 9], migrator: [10, 10], cluster: [11, 11], notifier: [13, 13] }
+    again:
+      file: deploy/deployer.py
+      source: |
+        # deploy/deployer.py: one line inside deploy(), right after build
+        self._p.scanner.scan(img)
+        # no caller changes: CI, the bot and the hotfix script scan on their next deploy
+    cost:
+      before: { text: 3 lines · 3 files, value: 0.75 }
+      after: { text: 1 line · 1 file, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Often a module-level function is enough: `def deploy(ref, version)` in the subsystem''s package. A class earns its place when the facade holds configured clients, as here.'
+      seenIn: '`requests.get` creates a `Session`, prepares a `Request` and sends it through an adapter for you. `subprocess.run` is the simple path over `Popen`. `shutil.copytree` and `shutil.make_archive` wrap many calls to `os`.'
+
+  typescript:
+    before:
+      file: ci/deploy.ts · bot/deploy.ts · scripts/hotfix.ts
+      source: |
+        // ci/deploy.ts
+        export async function deploy(p: Platform, ref: string, version: string): Promise<void> {
+          const img = await p.builder.build(ref);
+          await p.registry.push(img);
+          await p.migrator.up();
+          await p.cluster.rollout(img);
+          await p.cdn.purge("/*");
+          await p.notifier.send(`deployed ${version}`);
+        }
+
+        // bot/deploy.ts and scripts/hotfix.ts: the same six calls, copied
+        // scripts/rollback.ts: rollout, purge, send; no build, no migrate
+      roles: { context: [2, 9], builder: [3, 3], registry: [4, 4], migrator: [5, 5], cluster: [6, 6], notifier: [8, 8], client: [11, 12] }
+      change:
+        - { after: 3, add: ['  await p.scanner.scan(img);'] }
+        - { after: 11, add: ['// bot/deploy.ts: the same line, by hand', '// scripts/hotfix.ts: the same line, by hand'] }
+    after:
+      file: deploy/deployer.ts · ci/deploy.ts · scripts/rollback.ts
+      source: |
+        // The one place that knows the order of the deploy steps.
+        export class Deployer {
+          constructor(private readonly p: Platform) {}
+
+          async deploy(ref: string, version: string): Promise<void> {
+            const img = await this.p.builder.build(ref);
+            await this.p.registry.push(img);
+            await this.p.migrator.up();
+            await this.p.cluster.rollout(img);
+            await this.p.cdn.purge("/*");
+            await this.p.notifier.send(`deployed ${version}`);
+          }
+        }
+
+        // ci/deploy.ts, bot/deploy.ts, scripts/hotfix.ts
+        await deployer.deploy(ref, version);
+
+        // scripts/rollback.ts still goes direct: it must never run migrations
+        await platform.cluster.rollout(previous);
+      roles: { strategy: [1, 13], context: [15, 16], client: [15, 16], call: [16, 16], build: [6, 7], order: [8, 9], notify: [10, 11], escape: [18, 19], builder: [6, 6], registry: [7, 7], migrator: [8, 8], cluster: [9, 9], notifier: [11, 11] }
+    again:
+      file: deploy/deployer.ts
+      source: |
+        // deploy/deployer.ts: one line inside deploy(), right after build
+        await this.p.scanner.scan(img);
+        // no caller changes: CI, the bot and the hotfix script scan on their next deploy
+    cost:
+      before: { text: 3 lines · 3 files, value: 0.75 }
+      after: { text: 1 line · 1 file, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A function or a small class exported from the subsystem''s entry module. Keep the parts importable from deeper paths, so advanced callers are not stuck with the facade.'
+      seenIn: '`fetch` hides connections, redirects and TLS behind one call. In the AWS SDK v3, `Upload` from `@aws-sdk/lib-storage` runs a whole multipart upload (create, upload parts, complete or abort) behind one `done()`. jQuery''s `$.ajax` grew up as a facade over `XMLHttpRequest`.'
+
+  rust:
+    before:
+      file: ci/deploy.rs · bot/deploy.rs · scripts/hotfix.rs
+      source: |
+        // ci/deploy.rs
+        fn deploy(p: &Platform, git_ref: &str, version: &str) -> Result<(), DeployError> {
+            let img = p.builder.build(git_ref)?;
+            p.registry.push(&img)?;
+            p.migrator.up()?;
+            p.cluster.rollout(&img)?;
+            p.cdn.purge("/*")?;
+            p.notifier.send(&format!("deployed {version}"))?;
+            Ok(())
+        }
+
+        // bot/deploy.rs and scripts/hotfix.rs: the same six calls, copied
+        // scripts/rollback.rs: rollout, purge, send; no build, no migrate
+      roles: { context: [2, 10], builder: [3, 3], registry: [4, 4], migrator: [5, 5], cluster: [6, 6], notifier: [8, 8], client: [12, 13] }
+      change:
+        - { after: 3, add: ['    p.scanner.scan(&img)?;'] }
+        - { after: 12, add: ['// bot/deploy.rs: the same line, by hand', '// scripts/hotfix.rs: the same line, by hand'] }
+    after:
+      file: deploy/deployer.rs · ci/deploy.rs · scripts/rollback.rs
+      source: |
+        /// The one place that knows the order of the deploy steps.
+        pub struct Deployer<'a> {
+            p: &'a Platform,
+        }
+
+        impl Deployer<'_> {
+            pub fn deploy(&self, git_ref: &str, version: &str) -> Result<(), DeployError> {
+                let img = self.p.builder.build(git_ref)?;
+                self.p.registry.push(&img)?;
+                self.p.migrator.up()?;
+                self.p.cluster.rollout(&img)?;
+                self.p.cdn.purge("/*")?;
+                self.p.notifier.send(&format!("deployed {version}"))?;
+                Ok(())
+            }
+        }
+
+        // ci/deploy.rs, bot/deploy.rs, scripts/hotfix.rs
+        deployer.deploy(git_ref, version)?;
+
+        // scripts/rollback.rs still goes direct: it must never run migrations
+        platform.cluster.rollout(&previous)?;
+      roles: { strategy: [1, 16], context: [18, 19], client: [18, 19], call: [19, 19], build: [8, 9], order: [10, 11], notify: [12, 13], escape: [21, 22], builder: [8, 8], registry: [9, 9], migrator: [10, 10], cluster: [11, 11], notifier: [13, 13] }
+    again:
+      file: deploy/deployer.rs
+      source: |
+        // deploy/deployer.rs: one line inside deploy(), right after build
+        self.p.scanner.scan(&img)?;
+        // no caller changes: CI, the bot and the hotfix script scan on their next deploy
+    cost:
+      before: { text: 3 lines · 3 files, value: 0.75 }
+      after: { text: 1 line · 1 file, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A struct that borrows the parts, or just a public function at the crate root. Keep the building blocks public in submodules, so callers with unusual needs can still reach them.'
+      seenIn: '`std::fs::read_to_string` opens the file, sizes a buffer and reads it. `reqwest::get` is the one-call path over `Client` and `RequestBuilder`. `std::process::Command::output` spawns a child, waits for it and collects both pipes.'
+
+walk:
+  - text: { go: 'CI calls `deployer.Deploy(ctx, ref, version)`. From its side, that one call is the whole deploy.', python: 'CI calls `deployer.deploy(ref, version)`. From its side, that one call is the whole deploy.', typescript: 'CI calls `deployer.deploy(ref, version)`. From its side, that one call is the whole deploy.', rust: 'CI calls `deployer.deploy(git_ref, version)`. From its side, that one call is the whole deploy.' }
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: call
+  - text: The Deployer builds the image and pushes it. It returns early on the first error, the same way for every caller.
+    nodes: [strategy, builder, registry]
+    edges: [strategy>builder, strategy>registry]
+    role: build
+  - text: Migrations run before the rollout. That ordering rule now lives in exactly one place, so no caller can get it wrong.
+    nodes: [strategy, migrator, cluster]
+    edges: [strategy>migrator, strategy>cluster]
+    role: order
+  - text: It purges the CDN and announces the release. The Deployer adds no new behaviour of its own; it only calls the parts in order.
+    nodes: [strategy, notifier]
+    edges: [strategy>notifier]
+    role: notify
+  - text: The rollback script needs a different sequence, so it still calls the Cluster directly. The facade is the easy path, not the only one.
+    nodes: [cluster]
+    edges: []
+    role: escape
+
+checks:
+  overview:
+    question: Which situation calls for a Facade?
+    options:
+      - text: Five services each make the same six calls to build, push, migrate and roll out a release, in the same order.
+        correct: true
+        why: Right. Many callers drive the same parts in the same order. One entry point holds that order, and callers depend on it alone.
+      - text: The code expects a Storage interface, and a new vendor SDK has different method names for the same operations.
+        why: That is Adapter. It makes one object fit an interface that already exists. A facade defines a new, simpler interface over many objects.
+      - text: Every call to a slow remote API should be cached, and the callers should not change.
+        why: That is Proxy. It stands in for one object with that object's own interface. A facade offers a different, simpler interface over several.
+  engineer:
+    question: The rollback script must roll out an old image without building or migrating. The Deployer has only Deploy(). What is the cleanest choice?
+    options:
+      - text: Let the rollback keep calling the Cluster and Notifier directly. Add a Rollback method to the Deployer only once several callers need the same sequence.
+        correct: true
+        why: Right. A facade is the default path for the common job. Callers with different needs keep using the parts, which stay available.
+      - text: Add skipBuild and skipMigrations flags to Deploy.
+        why: Each special case adds a flag, and every caller must set all of them right. The facade grows into a god object with one entry point that does everything.
+      - text: Make the subsystem's parts private, so everyone has to go through the Deployer.
+        why: Then the rollback cannot be written at all. A facade simplifies the common path; it should not remove the others.
+  deep:
+    question: In a large codebase, why does a facade often reduce how much has to be rebuilt and retested when the subsystem changes?
+    options:
+      - text: Callers import only the facade. A change inside the subsystem that keeps the facade's signature does not touch anything the callers depend on.
+        correct: true
+        why: Right. In Go and Rust the callers' packages or crates depend on one exported API; in TypeScript and Python, on one module. Build tools and test selection follow the import graph.
+      - text: The facade caches the results of the subsystem, so the parts run less often.
+        why: No. A facade forwards calls; it does not cache. Caching in front of one object is a Proxy.
+      - text: The facade is a singleton, so it is compiled only once.
+        why: No. Facades are often single instances, but that has nothing to do with compilation. The saving comes from fewer import edges.
+
+reference:
+  roles:
+    - role: Facade
+      example: Deployer
+      job: Knows which parts handle a request and in what order. Forwards the work to them.
+    - role: Subsystem classes
+      example: Builder, Registry, Migrator, Cluster, CDN, Notifier
+      job: Do the real work. They do not know the facade exists.
+    - role: Client
+      example: CI pipeline, ChatOps bot, hotfix script
+      job: Calls the facade for the common job. May still use the parts directly for anything else.
+  useWhen:
+    - Several callers drive the same parts of a subsystem in the same order.
+    - You want callers to depend on one stable entry point while the parts behind it change.
+    - You are layering a system and want one entry point per layer.
+  avoidWhen:
+    - There is one caller. Its own function already is the facade.
+    - Every caller needs a different sequence. A facade with a flag per caller is worse than direct calls.
+  tradeoffs:
+    - The facade can grow into a god object that every change must pass through. Split it by job when it does.
+    - It hides options. Callers who need them must go around it, so keep the parts reachable.
+    - One more layer to read when debugging a failure deep in the subsystem.
+  lookalikes:
+    - name: Adapter
+      how: Makes one existing object fit an interface that already exists. A facade defines a new, simpler interface over many objects.
+    - name: Mediator
+      how: Coordinates objects that talk to each other through it, and they know the mediator. Subsystem classes do not know their facade.
+    - name: Proxy
+      how: Stands in for one object with the same interface. A facade has its own interface over several objects.
+---
+
+## [concept] Facade
+
+**Give a <Term id="facade-subsystem">subsystem</Term> one simple entry point for the common job, so callers stop orchestrating its parts by hand.**
+
+The order of the steps lives in one place. Callers that only want the common job depend on that place, and nothing else.
+
+<Depth level={2}>
+The facade is an ordinary class or function with a small <Term id="interface">interface</Term>, here `Deploy(ref, version)`. Behind it, the subsystem's classes stay as they are, and they do not know the facade exists. Callers with unusual needs, like a rollback, can still use the parts directly. What changes is the <Term id="coupling">coupling</Term>: most callers now depend on one type instead of six.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Facade as an object structural pattern. Its motivating example is a compiler subsystem whose `Compiler` class offers one simple call over the scanner, parser and code generator, while leaving those classes available to the few programs that need them. The book lists three effects: fewer objects for clients to deal with, weaker coupling between clients and the subsystem, and no ban on using the subsystem directly. It also notes that a facade usually needs only one instance.
+</Depth>
+
+## [problem] Every caller runs the deploy by hand
+
+A team deploys one service from three places: the CI pipeline, a ChatOps `/deploy` command, and a hotfix script. Each one calls the platform's six parts in order: build, push, migrate, roll out, purge the CDN, announce.
+
+Read it once. The CI version is shown; the other two are copies of it.
+
+<Depth level={2}>
+The copies were reasonable when they were made. Each was a few lines, and each caller needed a deploy. Nothing ties them together now, so each drifts on its own schedule.
+</Depth>
+
+<Depth level={3}>
+Each copy imports every part of the platform: six packages per caller. A change to any part's API is a change to every caller, whether or not that caller cared about the detail.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** security wants every image scanned before it is pushed.
+
+The scan has to go between build and push in every copy. Miss one and nothing fails. That caller simply ships an unscanned image and reports success.
+
+<Depth level={2}>
+Compare a signature change, such as a new region argument on push. A missed copy fails loudly on its next run. A new step is worse: missing it is silent, and you learn about it in an audit.
+</Depth>
+
+<Depth level={3}>
+The rule "always scan before push" is really a property of the deploy, not of each caller. While the order of steps is copied, the rule exists only in the heads of the people who remember every copy.
+</Depth>
+
+## [morph] Give the deploy one entry point
+
+Drag the slider. The six calls move out of the callers into a `Deployer` with one method. Each caller shrinks to one line.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The Deployer adds no behaviour of its own. It holds the parts and calls them in order. That is the difference from patterns that wrap one object: a facade sits in front of many, with an interface of its own.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Put `Deployer` in the platform's own package. Callers import that one package; the six part packages drop out of their import lists, and `go build` no longer rebuilds callers when a part's internals change.</Lang>
+<Lang only="python">Put `Deployer` (or a plain `deploy` function) in the platform package's `__init__.py`. Callers import one name. The parts stay importable from their submodules.</Lang>
+<Lang only="typescript">Export `Deployer` from the platform's `index.ts`. With an `exports` map in `package.json` you can choose which deeper paths stay public for advanced callers.</Lang>
+<Lang only="rust">Make `Deployer` public at the crate root and keep the parts in public submodules. `pub use` lets you choose what the short path shows without hiding the rest.</Lang>
+</Depth>
+
+## [walk] Follow one deploy
+
+One deploy through the facade, start to finish. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Errors come back from the first part that fails, and the facade returns them unchanged. Wrap them with `fmt.Errorf("push: %w", err)` if callers need to know which step failed; `errors.Is` still sees the original.</Lang>
+<Lang only="python">An exception from any part propagates through `deploy()` to the caller unchanged. If callers need the step name, catch and re-raise with `raise DeployError("push") from err`.</Lang>
+<Lang only="typescript">Each `await` rejects on the first failing part, and the facade's promise rejects with the same error. Add `{ cause: err }` to a new `Error` if callers need the step name.</Lang>
+<Lang only="rust">The `?` operator returns the first error. If the parts return different error types, `DeployError` needs `From` impls for each, or the facade maps them with `map_err`.</Lang>
+</Depth>
+
+## [again] The scan, the second time
+
+The same request after the refactor. One edit inside `Deploy`, right after the build. No caller changes, and every caller that uses the facade scans on its next deploy.
+
+<Depth level={2}>
+The rollback script is untouched because it never builds or pushes. That is the other half of the design: callers with different needs were never forced through the facade.
+</Depth>
+
+<Depth level={3}>
+Tests follow the same split. The Deployer gets one test with fakes for the parts that checks the order of the calls. The callers' tests check that they call `Deploy`, and they no longer change when the order does.
+</Depth>
+
+## [play] Ship three platform changes
+
+Four callers deploy the same service, and the platform team sends three change requests. Each time, apply the change where you think it is needed and ship: every caller deploys once.
+
+Move callers onto the Deployer whenever you like, and compare what each request cost you.
+
+## [lens] How each language writes it
+
+Every language writes a facade the same way: a function or a small class at the front of a package. The only real question is what to leave public behind it.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="facade" />
+
+### When the facade grows too big
+
+A facade that takes every caller's special case becomes a <Term id="god-object">god object</Term>: one class with a flag for everything, which every change has to go through. Split it by job instead, such as a `Deployer` and a `Rollbacker`, and let rare callers use the parts directly.

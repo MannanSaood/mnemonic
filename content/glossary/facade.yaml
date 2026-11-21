@@ -1,0 +1,7 @@
+# Terms introduced by the Facade lesson.
+- id: facade-subsystem
+  term: Subsystem
+  short: A group of classes or modules that together do one larger job, such as building, pushing and rolling out a release.
+- id: god-object
+  term: God object
+  short: One class that knows about and controls too much of the system, so almost every change has to go through it.
