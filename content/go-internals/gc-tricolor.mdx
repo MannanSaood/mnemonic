@@ -1,0 +1,524 @@
+---
+title: Garbage collection
+track: go-internals
+group: Memory
+order: 19
+summary: Go's collector finds live objects by following pointers from the roots, colouring them white, grey and black while your program keeps running. A write barrier keeps the two from getting in each other's way.
+intent: Know what the Go GC actually does each cycle, why its cost follows your live pointers rather than your garbage, and why every pointer store pays for a write barrier while it runs.
+changeRequest: Keep sessions for 30 days instead of 24 hours.
+languages: [go, python, typescript, rust]
+glossary: [gc-root, tricolor-marking, write-barrier, mark-assist, stop-the-world, generational-gc, reference-counting]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [memory-management, go-runtime]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: gc-tricolor
+  scenarios:
+    - try: "Start a cycle with the barrier on and press grey objects until none are left, then sweep."
+      notice: "Every live object is scanned once: 8 scans. Session x9 and its cart are never visited, and sweep frees them. The work follows the live objects, not the garbage."
+    - try: "Turn the barrier off. Start, scan sessions, then Session u42. Now log in (move the guest cart), finish and sweep."
+      notice: "Session u42 was already black, and Session g7 no longer leads to the cart, so the cart and its line item stay white. Sweep frees both while u42 still points to them."
+    - try: "Play the same moves with the barrier on."
+      notice: "The pointer store shades the cart grey, marking reaches it, and nothing live is freed. The cost is one shade."
+    - try: "Start a cycle, scan sessions, then expire the guest session, with the barrier on."
+      notice: "The deleted session is garbage already, yet it survives this cycle as floating garbage. The barrier errs on the safe side; the next cycle frees it."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: handlers, sub: { go: store.Put, python: "put()", typescript: "put()", rust: insert } }
+      after:  { x: 12, y: 24, w: 112, h: 48, title: handlers, sub: pointer stores }
+    - id: gc
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: garbage collector, sub: "stop, then free garbage?" }
+      after:  { x: 150, y: 24, w: 150, h: 48, title: mark workers, sub: "25% of CPU" }
+    - id: wb
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 100, w: 110, h: 48, title: "" }
+      after:  { x: 330, y: 24, w: 220, h: 48, title: write barrier, sub: shades on store }
+    - id: roots
+      kind: concrete
+      before: { x: 170, y: 56, w: 230, h: 30, title: "cost grows with garbage" }
+      after:  { x: 12, y: 190, w: 96, h: 48, title: roots, sub: "stacks, globals" }
+    - id: grey
+      kind: concrete
+      before: { x: 170, y: 98, w: 230, h: 30, title: "one long pause" }
+      after:  { x: 120, y: 190, w: 96, h: 48, title: grey, sub: to scan }
+    - id: black
+      kind: concrete
+      before: { x: 170, y: 140, w: 230, h: 30, title: "live data costs nothing" }
+      after:  { x: 228, y: 190, w: 96, h: 48, title: black, sub: scanned }
+    - id: assist
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 200, w: 230, h: 30, title: "12M sessions, 30 days" }
+      after:  { x: 340, y: 190, w: 210, h: 48, title: mark assist, sub: the handler marks too }
+  edges:
+    - { from: roots, to: grey, label: shade }
+    - { from: gc, to: grey, label: scans }
+    - { from: grey, to: black, label: then }
+    - { from: app, to: wb, label: store }
+    - { from: wb, to: grey, label: shades }
+    - { from: assist, to: app, label: slows }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: sessions.go · config.go
+      source: |
+        // sessions.go
+        type Session struct {
+            UserID  string
+            Roles   []string
+            Expires time.Time
+            Cart    *Cart
+        }
+
+        type Store struct {
+            mu sync.Mutex
+            m  map[string]*Session // session id -> session
+        }
+
+        func (s *Store) Put(id string, sess *Session) {
+            s.mu.Lock()
+            s.m[id] = sess
+            s.mu.Unlock()
+        }
+
+        // config.go
+        const sessionTTL = 24 * time.Hour // about 400,000 live sessions
+      roles: { app: [14, 18], grey: [2, 7], roots: [9, 12], assist: [21, 21] }
+      change:
+        - { line: 21, replace: "const sessionTTL = 30 * 24 * time.Hour // about 12 million live sessions" }
+    after:
+      file: sessions.go
+      source: |
+        // A record with no pointers: the GC never looks inside these.
+        type sessionRec struct {
+            userID  [16]byte
+            roles   uint32 // bit set
+            expires int64  // unix seconds
+            cartID  uint64
+        }
+
+        type Store struct {
+            mu    sync.Mutex
+            index map[[16]byte]uint32 // session id -> slot, no pointers either
+            recs  []sessionRec        // one big pointer-free array
+        }
+
+        func (s *Store) Put(id [16]byte, r sessionRec) {
+            s.mu.Lock()
+            defer s.mu.Unlock()
+            if i, ok := s.index[id]; ok {
+                s.recs[i] = r
+                return
+            }
+            s.index[id] = uint32(len(s.recs))
+            s.recs = append(s.recs, r)
+        }
+      roles: { app: [15, 24], gc: [9, 13], wb: [23, 23], roots: [9, 13], grey: [11, 12], black: [1, 7], assist: [23, 23], mroots: [9, 13], scan: [11, 12], barrier: [23, 23], massist: [22, 23], noscan: [1, 7] }
+    again:
+      file: sessions.go
+      source: |
+        // the same 12 million sessions as pointer-free records:
+        // each cycle marks the map's tables and the array as live
+        // without reading them, so mark time stays flat as sessions grow.
+    cost:
+      before: { text: "every cycle scans 12M sessions · p99 up", value: 0.85 }
+      after: { text: "nothing to scan inside · flat", value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Built in, shape your data
+      note: 'Go''s collector is concurrent, non-moving and not generational. Each cycle marks every live object, so its cost follows the live heap and the pointers in it, not the garbage. Long-lived, pointer-heavy data makes every cycle slower. Objects with no pointers are marked without being read.'
+      seenIn: 'bigcache keeps a `map[uint64]uint32` index into byte slices for this reason, and freecache avoids pointers altogether. `/gc/scan/heap:bytes` and `/cpu/classes/gc/mark/assist:cpu-seconds` in `runtime/metrics`. `GODEBUG=gctrace=1`.'
+
+  python:
+    before:
+      file: sessions.py · config.py
+      source: |
+        # sessions.py
+        @dataclass
+        class Session:
+            user_id: str
+            roles: list[str]
+            expires: float
+            cart: Cart | None
+
+        SESSIONS: dict[str, Session] = {}
+
+        def put(sid: str, s: Session) -> None:
+            SESSIONS[sid] = s
+
+        # config.py
+        SESSION_TTL = 24 * 3600  # about 400,000 live sessions
+      roles: { app: [11, 12], grey: [2, 7], roots: [9, 9], assist: [15, 15] }
+      change:
+        - { line: 15, replace: "SESSION_TTL = 30 * 24 * 3600  # about 12 million live sessions" }
+    after:
+      file: sessions.py
+      source: |
+        # user id, role bits, expires, cart id: bytes the cycle GC never sees
+        REC = struct.Struct("<16sIqQ")
+        index: dict[str, int] = {}  # only str and int: the cycle GC skips it
+        records = bytearray()
+
+        def put(sid: str, user_id: bytes, roles: int, expires: int, cart_id: int) -> None:
+            rec = REC.pack(user_id, roles, expires, cart_id)
+            if (i := index.get(sid)) is not None:
+                records[i:i + REC.size] = rec
+            else:
+                index[sid] = len(records)
+                records.extend(rec)
+      roles: { app: [6, 12], gc: [3, 4], wb: [8, 8], roots: [3, 4], grey: [3, 3], black: [1, 2], assist: [12, 12], mroots: [3, 4], scan: [3, 3], barrier: [8, 8], massist: [12, 12], noscan: [1, 4] }
+    again:
+      file: sessions.py
+      source: |
+        # the same 12 million sessions, as packed records:
+        # reference counting frees replaced records at once,
+        # and a full cycle collection has no session objects to walk.
+    cost:
+      before: { text: "full collections walk 12M objects", value: 0.8 }
+      after: { text: "nothing tracked · short pauses", value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Mostly automatic
+      note: 'CPython frees most objects the moment their reference count drops to zero. A separate generational collector finds reference cycles. A full collection walks every tracked container object while the program waits, so millions of long-lived objects make it slow. Dicts holding only strings and numbers are not tracked.'
+      seenIn: '`gc.freeze()` (moves everything alive to a generation the GC ignores; Instagram uses it before forking). `gc.is_tracked`, `gc.set_threshold`, `gc.callbacks` to time collections.'
+
+  typescript:
+    before:
+      file: sessions.ts · config.ts
+      source: |
+        // sessions.ts
+        interface Session {
+          userId: string;
+          roles: string[];
+          expires: number;
+          cart: Cart | null;
+        }
+
+        const sessions = new Map<string, Session>();
+
+        export function put(id: string, s: Session) {
+          sessions.set(id, s);
+        }
+
+        // config.ts
+        export const SESSION_TTL_MS = 24 * 3600_000; // about 400,000 live sessions
+      roles: { app: [11, 13], grey: [2, 7], roots: [9, 9], assist: [16, 16] }
+      change:
+        - { line: 16, replace: "export const SESSION_TTL_MS = 30 * 24 * 3600_000; // about 12 million live sessions" }
+    after:
+      file: sessions.ts
+      source: |
+        // Columns in typed arrays: raw bytes the marker never walks.
+        const CAP = 16_000_000;
+        const expires = new Float64Array(CAP);
+        const roles = new Uint32Array(CAP);
+        const cartIds = new Float64Array(CAP);
+        const index = new Map<string, number>(); // id -> slot; small ints are not objects
+        let next = 0;
+
+        export function put(id: string, s: Session) {
+          let i = index.get(id);
+          if (i === undefined) { i = next++; index.set(id, i); }
+          expires[i] = s.expires;
+          roles[i] = s.roleBits;
+          cartIds[i] = s.cartId;
+        }
+      roles: { app: [9, 15], gc: [2, 6], wb: [11, 11], roots: [6, 6], grey: [6, 6], black: [1, 5], assist: [11, 11], mroots: [6, 6], scan: [6, 6], barrier: [11, 11], massist: [11, 11], noscan: [1, 5] }
+    again:
+      file: sessions.ts
+      source: |
+        // the same 12 million sessions in typed arrays:
+        // a major GC marks three array buffers and the index,
+        // instead of tens of millions of session, string and array objects.
+    cost:
+      before: { text: "major GCs mark 12M objects", value: 0.8 }
+      after: { text: "3 buffers + index to mark", value: 0.3 }
+    lens:
+      need: 3
+      needLabel: Built in, shape your data
+      note: 'V8''s Orinoco collector is generational. Young objects are copied out by a parallel scavenger; objects that survive move to old space, which is marked concurrently with write barriers, much like Go. Long-lived sessions all end up in old space, and every major GC has to mark them.'
+      seenIn: '`node --trace-gc`, `--max-old-space-size`, `v8.getHeapStatistics()`, `PerformanceObserver` with `gc` entries.'
+
+  rust:
+    before:
+      file: sessions.rs · config.rs
+      source: |
+        // sessions.rs
+        struct Session {
+            user_id: String,
+            roles: Vec<String>,
+            expires: SystemTime,
+            cart: Option<Box<Cart>>,
+        }
+
+        struct Store {
+            m: Mutex<HashMap<String, Session>>,
+        }
+
+        impl Store {
+            fn put(&self, id: String, s: Session) {
+                self.m.lock().unwrap().insert(id, s); // the old value is dropped here
+            }
+        }
+
+        // config.rs
+        const SESSION_TTL: Duration = Duration::from_secs(24 * 3600); // about 400,000 sessions
+      roles: { app: [13, 17], grey: [2, 7], roots: [9, 11], assist: [20, 20] }
+      change:
+        - { line: 20, replace: "const SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 3600); // about 12 million" }
+    after:
+      file: sessions.rs
+      source: |
+        // No collector to help or to pay: a compact record saves memory,
+        // and every replaced or expired record is freed when it is dropped.
+        #[derive(Clone, Copy)]
+        struct SessionRec {
+            user_id: [u8; 16],
+            roles: u32,
+            expires: i64,
+            cart_id: u64,
+        }
+
+        struct Store {
+            m: Mutex<HashMap<[u8; 16], SessionRec>>,
+        }
+
+        impl Store {
+            fn put(&self, id: [u8; 16], r: SessionRec) {
+                self.m.lock().unwrap().insert(id, r);
+            }
+        }
+      roles: { app: [15, 19], gc: [1, 2], wb: [17, 17], roots: [11, 13], grey: [12, 12], black: [3, 9], assist: [17, 17], mroots: [11, 13], scan: [12, 12], barrier: [17, 17], massist: [17, 17], noscan: [3, 9] }
+    again:
+      file: sessions.rs
+      source: |
+        // the same 12 million sessions: no marking at all.
+        // Memory is about 40 bytes of record per session plus the table,
+        // and an expired session's memory is returned when it is removed.
+    cost:
+      before: { text: "no GC cost · more memory", value: 0.35 }
+      after: { text: "no GC cost · compact", value: 0.15 }
+    lens:
+      need: 1
+      needLabel: Not needed
+      note: 'Rust has no tracing collector. Ownership decides when each value is dropped, at a point the compiler knows, so live data costs memory but no CPU per cycle. Shared graphs use `Rc` or `Arc` reference counting, which, like CPython, cannot free cycles on its own.'
+      seenIn: '`Drop`, `Rc`/`Arc` with `Weak` to break cycles. Dropping a huge map at once can still take a long time; some services drop it on another thread.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A cycle starts with a short stop-the-world that turns the write barrier on. Mark workers then shade everything the roots point to, the globals and each goroutine's stack, pausing one goroutine at a time to scan its stack.
+    nodes: [roots, grey, gc]
+    edges: [roots>grey]
+    role: mroots
+  - text: A worker takes a grey object, follows every pointer in it, shades the white objects it finds, and marks the object black. With 12 million sessions of several pointers each, that is tens of millions of pointers every cycle.
+    nodes: [gc, grey, black]
+    edges: [gc>grey, grey>black]
+    role: scan
+  - text: Handlers keep running and storing pointers. Each store goes through the write barrier, which shades the objects involved, so a live object can never hide behind one that is already black.
+    nodes: [app, wb, grey]
+    edges: [app>wb, wb>grey]
+    role: barrier
+  - text: A goroutine that allocates while marking is behind must first do some marking itself, in proportion to what it allocates. That is mark assist, and it lands directly in request latency.
+    nodes: [assist, app]
+    edges: [assist>app]
+    role: massist
+  - text: Records with no pointers sit in spans the GC marks as a whole without reading them. Mark work no longer grows with the number of sessions.
+    nodes: [black, roots]
+    edges: []
+    role: noscan
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: What decides whether Go's garbage collector frees an object?
+    options:
+      - text: Whether the program can still reach it by following pointers from a goroutine stack or a global.
+        correct: true
+        why: Right. Marking starts at the roots and follows pointers. Anything it never reaches is garbage and is freed by the sweep.
+      - text: Whether its reference count has dropped to zero.
+        why: That is how CPython and Rust's Rc work. Go keeps no counts; it traces from the roots.
+      - text: How long ago it was allocated.
+        why: Age matters in generational collectors such as V8's. Go's collector is not generational.
+  engineer:
+    question: A Go service keeps 12 million small structs with pointers in a map. It creates little garbage, yet GC uses a lot of CPU and p99 latency has grown. What is going on?
+    options:
+      - text: Every cycle has to mark all live objects, so those pointers are scanned again each time; store them as pointer-free records.
+        correct: true
+        why: Right. Mark cost follows the live heap and its pointers. Pointer-free records are marked without being read, and mark assists stop landing on requests.
+      - text: The GC keeps promoting the structs to an older generation.
+        why: Go's collector has no generations. Every cycle marks the whole live heap.
+      - text: The map is leaking memory, so the GC runs out of space.
+        why: Nothing is leaking; the sessions are live. The cost comes from scanning them again on every cycle.
+  deep:
+    question: Why does the Go GC need a write barrier while it marks?
+    options:
+      - text: Without it, the program could move the only pointer to a white object into a black object, and the collector would free a live object.
+        correct: true
+        why: Right. Black objects are never scanned again. The barrier shades the objects involved in each pointer store, so this cannot happen.
+      - text: To update pointers after the GC moves objects.
+        why: Go's collector does not move heap objects. Copying collectors need that kind of barrier; Go's prevents hiding.
+      - text: To count how many pointers refer to each object.
+        why: That would be reference counting. The barrier only shades objects grey during marking.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Roots
+      example: goroutine stacks, globals
+      job: Where marking starts. Anything reachable from them is live.
+    - role: Mark workers
+      example: background workers, 25% of GOMAXPROCS
+      job: Take grey objects, scan their pointers, shade what they find, turn them black.
+    - role: Write barrier
+      example: "gcWriteBarrier on every pointer store"
+      job: Shades the old and new targets of a pointer store during marking.
+    - role: Mark assist
+      example: "gcAssistAlloc in mallocgc"
+      job: Makes allocating goroutines do marking work when the workers are behind.
+  useWhen:
+    - Deciding how to hold large, long-lived data in a Go service (caches, indexes, sessions).
+    - GC CPU or mark assist time is high while the garbage rate is low.
+    - Reading a `gctrace` line or a GC section in an execution trace.
+  avoidWhen:
+    - The heap is small and short-lived. The collector handles that well; reshaping data for it only adds code.
+  tradeoffs:
+    - Concurrent marking keeps pauses short, at the cost of a write barrier on every pointer store while it runs.
+    - Not moving objects keeps pointers stable for cgo and unsafe code, but the heap can fragment.
+    - Without generations, every cycle marks old data again. In exchange there is no promotion and no copying.
+  lookalikes:
+    - name: CPython's reference counting
+      how: Frees most objects at once, with no marking. A separate cycle collector catches cycles.
+    - name: "V8's Orinoco"
+      how: Generational. Young objects are copied by a parallel scavenger; old space is marked concurrently with write barriers, like Go.
+    - name: "Rust's ownership"
+      how: No collector. The compiler inserts drops, so freeing has a known place and no marking cost.
+---
+
+## [concept] Garbage collection
+
+**Go's collector finds live objects by starting at the <Term id="gc-root">roots</Term> and following every pointer. It colours objects white, grey and black as it goes, and frees what stays white. Most of this runs while your program runs.**
+
+That is <Term id="tricolor-marking">tri-colour marking</Term>. It is cheap when little is live, and costly when much is live, however little garbage there is.
+
+<Depth level={2}>
+The collector is concurrent, non-moving and not generational. It stops the world twice per cycle, each time for well under a millisecond. In between, background workers use about a quarter of the CPU to mark, and goroutines that allocate quickly can be drafted to help, which is <Term id="mark-assist">mark assist</Term>. Sweeping happens lazily, as new memory is needed.
+</Depth>
+
+<Depth level={3}>
+Marking concurrently with a running program only works because of the <Term id="write-barrier">write barrier</Term>. Go's is a hybrid: on each pointer store during marking it shades the object being overwritten (Yuasa's deletion barrier) and, while the storing goroutine's stack is not yet scanned, the object being stored (Dijkstra's insertion barrier). This lets Go scan each stack once, without the re-scan that older versions needed at mark termination.
+</Depth>
+
+## [problem] An in-memory session store
+
+A shop keeps logged-in sessions in a map, keyed by session id. Each session holds the user id, a slice of roles, an expiry time and a pointer to the cart. Sessions last 24 hours, so about 400,000 are alive at any time. It is simple and fast, and the GC barely shows in profiles.
+
+The model behind it: the GC cleans up garbage, so data you keep costs memory and nothing else.
+
+<Depth level={2}>
+At 400,000 sessions the live heap is a few hundred megabytes at most, and each cycle marks it in a few milliseconds of CPU spread across the workers.
+</Depth>
+
+<Depth level={3}>
+Each session is several heap objects: the struct, the user id string's bytes, the roles slice's array and each role string, the cart. Every one of them is a pointer the marker follows on every cycle.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** keep sessions for 30 days instead of 24 hours.
+
+The marked line is the only change. Live sessions grow to 12 million. Nothing leaks and the garbage rate is the same, yet GC CPU climbs, and p99 latency on every endpoint grows. Profiles show `gcBgMarkWorker` and `gcAssistAlloc` near the top. Request handlers that allocate are paying for marking sessions they never touch.
+
+<Depth level={2}>
+Each cycle must mark every live session again, because the collector has no memory of what was live last time. Thirty times the live objects is about thirty times the marking. Raising GOGC makes cycles rarer, but each one is just as long.
+</Depth>
+
+<Depth level={3}>
+Mark assist is what turns GC cost into latency. The pacer gives each allocating goroutine a debt in proportion to what it allocates; when background workers fall behind, a goroutine pays its debt by scanning objects before `mallocgc` returns.
+</Depth>
+
+## [morph] From "GC cleans garbage" to "GC marks what is live"
+
+Drag the slider. The picture of a collector that stops the world and frees garbage becomes the real cycle: roots shade objects grey, workers scan them black, and the write barrier watches every pointer store your handlers make.
+
+The code changes the sessions to records with no pointers: fixed-size bytes and integers in one big array, indexed by a map whose keys and values hold no pointers either.
+
+<Depth level={2}>
+The GC knows from each type whether it contains pointers, and puts pointer-free objects in spans it marks without reading. A 12-million-entry array of such records is a handful of objects to the collector. bigcache uses the same trick for its index.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The map counts too: when neither the key nor the value type has pointers, its tables are allocated as pointer-free memory. A `map[string]*Session` has pointers in both.</Lang>
+<Lang only="python">A packed `bytearray` is one object to CPython. The index dict holds only strings and ints, and CPython stops tracking a dict whose keys and values cannot form cycles.</Lang>
+<Lang only="typescript">An `ArrayBuffer`'s contents are raw bytes. V8 marks the buffer object and never looks inside the data.</Lang>
+<Lang only="rust">Nothing to scan either way; the compact record roughly halves memory by removing the `String` and `Vec` headers and their separate heap blocks.</Lang>
+</Depth>
+
+## [walk] Follow one GC cycle
+
+One cycle, from the first stop-the-world to sweep, with handlers running throughout. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The phases are named in `runtime/mgc.go`: sweep termination (stop the world, finish any sweeping, turn the barrier on), concurrent mark, mark termination (stop the world, turn the barrier off), and concurrent sweep. Objects allocated during marking are allocated black. Since Go 1.26 the default Green Tea collector scans small objects a whole page at a time for better memory locality; the colours and the barrier work the same way.</Lang>
+<Lang only="python">CPython's cycle collector works per generation. For each tracked container it subtracts internal references from the reference counts; objects left with a count above zero are reachable from outside, and anything not reachable from them is a cycle of garbage.</Lang>
+<Lang only="typescript">V8's scavenger copies live young objects to a new space and promotes those that survive twice. Old space is marked concurrently by helper threads, with a write barrier much like Go's, and then swept or compacted.</Lang>
+<Lang only="rust">Dropping a value runs its `Drop` and frees its memory in place. A `HashMap::insert` that replaces a value returns the old one, which is dropped at the end of the statement.</Lang>
+</Depth>
+
+## [again] Thirty-day sessions, the second time
+
+The same 12 million sessions as pointer-free records. Each cycle marks the array and the map's tables as live and never reads inside them. Mark time is back to what it was at 400,000 sessions, mark assists stop landing on requests, and p99 returns to normal.
+
+<Depth level={2}>
+Check it with `/gc/scan/heap:bytes` from `runtime/metrics`, the heap bytes the GC actually scanned in the last cycle. It should drop by roughly the size of the session data.
+</Depth>
+
+<Depth level={3}>
+The trade is code: you manage slots by hand, reuse freed ones, and copy strings in and out. Do it for the few structures that dominate the live heap, not everywhere.
+</Depth>
+
+## [play] Mark it while it moves
+
+You are the collector. Press grey objects to scan them while a login handler moves a pointer. Turn the barrier off to watch a live object get freed, then on to see it saved.
+
+## [lens] How each language reclaims memory
+
+Go traces the live heap each cycle. Python counts references and traces only for cycles. V8 traces too, but by generation. Rust frees at compile-time-known points and never traces.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+The common lesson: in every traced runtime, large long-lived object graphs cost work on every major collection. Packing hot, long-lived data into flat, pointer-free storage helps in all three.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="gc-tricolor" />
+
+### One Go GC cycle
+
+| Phase | World | What happens |
+|---|---|---|
+| Sweep termination | stopped | Finish sweeping; turn the write barrier on. |
+| Mark | running | Workers (25% of CPU) and assists shade and scan from the roots. |
+| Mark termination | stopped | Confirm nothing is grey; turn the barrier off. |
+| Sweep | running | Free white objects lazily, as spans are needed. |

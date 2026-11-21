@@ -1,0 +1,16 @@
+# Terms introduced by the Go garbage collection lesson.
+- id: gc-root
+  term: GC root
+  short: A place the garbage collector starts from because the program can always reach it, such as goroutine stacks, global variables and registers. Anything not reachable from a root is garbage.
+- id: tricolor-marking
+  term: Tri-colour marking
+  short: A way to find live objects. White objects are not reached yet, grey ones are reached but not scanned, black ones are scanned. Marking ends when nothing is grey; whatever is white is garbage.
+- id: write-barrier
+  term: Write barrier
+  short: A few instructions the compiler adds to every pointer store while the GC is marking. They shade the objects involved, so the program cannot hide a live object from a concurrent collector.
+- id: mark-assist
+  term: Mark assist
+  short: Marking work a Go goroutine must do itself when it allocates during a GC cycle and the collector is falling behind. It shows up as extra latency in allocation-heavy code.
+- id: generational-gc
+  term: Generational GC
+  short: A collector that splits the heap by age and collects the young part often and cheaply, because most objects die young. V8, the JVM and CPython's cycle collector work this way; Go's GC does not.
