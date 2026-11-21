@@ -1,0 +1,19 @@
+# Terms introduced by the latency and percentiles lesson.
+- id: percentile
+  term: Percentile (p50, p99)
+  short: The value below which that share of measurements fall. A p99 of 800 ms means 99 requests in 100 took 800 ms or less, and 1 in 100 took longer. p50 is the median.
+- id: tail-latency
+  term: Tail latency
+  short: The slow end of a latency distribution, such as p99 and above. Rare per request, but common for users whose page or session makes many requests.
+- id: latency-histogram
+  term: Latency histogram
+  short: Counts of requests per latency range (bucket). Histograms from many servers can be summed bucket by bucket, and any percentile read from the sum.
+- id: request-fan-out
+  term: Fan-out (requests)
+  short: One incoming request split into many parallel calls to backends. The response waits for the slowest call, so each backend's tail adds up.
+- id: hedged-request
+  term: Hedged request
+  short: A backup copy of a call sent to another replica when the first has not answered within a short delay, such as the p95. The first answer wins and the other is cancelled.
+- id: coordinated-omission
+  term: Coordinated omission
+  short: A measurement error where the load generator waits for slow responses before sending more, so it skips exactly the requests that would have been slow and under-reports the tail.

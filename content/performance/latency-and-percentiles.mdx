@@ -1,0 +1,614 @@
+---
+title: Latency, averages and percentiles
+track: performance
+group: Measuring
+order: 2
+summary: The mean hides the slow requests users feel. Percentiles show them, fan-out multiplies them, and only histograms add up across servers.
+intent: Describe latency with percentiles of the request users wait for, know how fan-out turns a rare slow call into a common slow page, and aggregate latency across servers correctly.
+changeRequest: The product catalogue has outgrown its 4 search shards. Split the index across 40.
+languages: [go, python, typescript, rust]
+glossary: [percentile, tail-latency, latency-histogram, request-fan-out, hedged-request, coordinated-omission]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [performance/what-performance-means]
+skills: [performance, statistics]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: latency-and-percentiles
+  scenarios:
+    - try: "Answer the prediction, then drag the fan-out from 1 to 40 with 1 call in 100 slow."
+      notice: "One page in three is slow, matching 1 − 0.99⁴⁰. The backend's 1-in-100 stall now starts at the page's p67."
+    - try: "Set the stall length to 5 s and compare the mean with the median."
+      notice: "The median does not move. The mean jumps to several times the median, a value almost no call actually took."
+    - try: "At fan-out 40, turn on hedging at p95."
+      notice: "About 5% more calls, and the page p99 drops from about 240 ms to about 35 ms. A page stalls only when both copies of a call stall."
+    - try: "In panel 3, drag server D's share of traffic from 1% to 50%."
+      notice: "The average of the four p99s is 14× too high at first, then 3× too low. The p99 of the summed buckets stays right."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 52, title: Search page, sub: users wait }
+      after:  { x: 12, y: 30, w: 112, h: 52, title: Search page, sub: users wait }
+    - id: context
+      kind: context
+      before: { x: 150, y: 18, w: 270, h: 236, title: Search API, sub: the mean tells all }
+      after:  { x: 150, y: 30, w: 140, h: 56, title: Search API, sub: waits for slowest }
+    - id: mean
+      kind: concrete
+      before: { x: 170, y: 64, w: 230, h: 36, title: mean per shard 12 ms }
+      after:  { x: 12, y: 200, w: 112, h: 44, title: page timer }
+    - id: agg
+      kind: concrete
+      before: { x: 170, y: 112, w: 230, h: 36, title: fleet p99 = avg p99s }
+      after:  { x: 470, y: 30, w: 80, h: 56, title: merge, sub: sum buckets }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 320, y: 30, w: 130, h: 56, title: "" }
+      after:  { x: 320, y: 30, w: 130, h: 56, title: Histogram, sub: p50 · p99 · max }
+    - id: fan
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 196, w: 230, h: 36, title: 4 → 40 shards }
+      after:  { x: 150, y: 200, w: 140, h: 44, title: 40 shards, sub: 1 in 100 stalls }
+    - id: hedge
+      kind: concrete
+      appears: after
+      before: { x: 320, y: 200, w: 120, h: 44, title: "" }
+      after:  { x: 320, y: 200, w: 120, h: 44, title: hedge at p95 }
+    - id: shards
+      kind: concrete
+      before: { x: 446, y: 110, w: 104, h: 56, title: Shards, sub: about 10 ms }
+      after:  { x: 460, y: 190, w: 90, h: 56, title: Replicas, sub: per shard }
+  edges:
+    - { from: client, to: context, label: loads }
+    - { from: context, to: fan, label: fans out }
+    - { from: fan, to: shards, label: calls }
+    - { from: mean, to: context, label: times }
+    - { from: context, to: strategy, label: records }
+    - { from: strategy, to: agg }
+    - { from: hedge, to: shards, label: backup }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: search.go · config.go
+      source: |
+        // search.go
+        func (s *Search) Query(ctx context.Context, q string) ([]Hit, error) {
+            results := make([][]Hit, len(s.shards))
+            g, ctx := errgroup.WithContext(ctx)
+            for i, sh := range s.shards {
+                g.Go(func() error {
+                    start := time.Now()
+                    hits, err := sh.Search(ctx, q)
+                    shardMean.Observe(time.Since(start)) // running mean on the dashboard
+                    results[i] = hits
+                    return err
+                })
+            }
+            if err := g.Wait(); err != nil {
+                return nil, err
+            }
+            return merge(results), nil
+        }
+
+        // config.go
+        var shards = openShards(4)
+      roles: { client: [2, 2], context: [2, 18], shards: [8, 8], mean: [9, 9], fan: [21, 21] }
+      change:
+        - { line: 21, replace: "var shards = openShards(40) // the catalogue outgrew 4 shards" }
+    after:
+      file: search.go · hedge.go
+      source: |
+        // search.go
+        var pageLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+            Name:    "search_page_seconds",
+            Help:    "Whole search, all shards.",
+            Buckets: prometheus.ExponentialBuckets(0.001, 2, 14), // 1 ms .. 8 s
+        })
+
+        func (s *Search) Query(ctx context.Context, q string) ([]Hit, error) {
+            start := time.Now()
+            defer func() { pageLatency.Observe(time.Since(start).Seconds()) }() // the page, not each shard
+            results := make([][]Hit, len(s.shards))
+            g, ctx := errgroup.WithContext(ctx)
+            for i, sh := range s.shards {
+                g.Go(func() (err error) {
+                    results[i], err = hedged(ctx, sh.P95(), func(ctx context.Context) ([]Hit, error) {
+                        return sh.Search(ctx, q) // each call picks a replica
+                    })
+                    return err
+                })
+            }
+            if err := g.Wait(); err != nil {
+                return nil, err
+            }
+            return merge(results), nil
+        }
+
+        // hedge.go: still waiting at p95? Ask another replica; the first answer wins.
+        func hedged[T any](ctx context.Context, after time.Duration, call func(context.Context) (T, error)) (T, error) {
+            ctx, cancel := context.WithCancel(ctx)
+            defer cancel() // stops the loser
+            type result struct {
+                v   T
+                err error
+            }
+            out := make(chan result, 2)
+            send := func() { v, err := call(ctx); out <- result{v, err} }
+            go send()
+            select {
+            case r := <-out:
+                return r.v, r.err
+            case <-time.After(after):
+                go send()
+            }
+            r := <-out
+            return r.v, r.err
+        }
+      roles: { strategy: [2, 6], agg: [5, 5], merge: [5, 5], client: [8, 8], context: [8, 25], mean: [9, 10], record: [9, 10], fan: [13, 19], fanout: [13, 14], shards: [16, 16], wait: [21, 23], hedge: [28, 46], backup: [41, 42] }
+    again:
+      file: search_test.go
+      source: |
+        // search_test.go: 1 shard call in 100 stalls for 200 ms; the page p99 stays fast
+        func TestPageTail(t *testing.T) {
+            s := NewSearch(fakeShards(40, stallOneIn(100, 200*time.Millisecond)))
+            h := hdrhistogram.New(1, 10_000, 3) // ms
+            for range 500 {
+                start := time.Now()
+                s.Query(t.Context(), "boots")
+                h.RecordValue(time.Since(start).Milliseconds())
+            }
+            if p99 := h.ValueAtQuantile(99); p99 > 50 {
+                t.Fatalf("page p99 = %d ms", p99)
+            }
+        }
+    cost:
+      before: { text: 1 page in 3 waits 200 ms, value: 0.85 }
+      after: { text: page p99 ~35 ms · 5% more calls, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Libraries
+      note: 'The standard library has no latency histogram. Services use `prometheus/client_golang`, whose `Histogram` keeps cumulative bucket counts that can be summed across pods, or `HdrHistogram/hdrhistogram-go` for exact percentiles in tests and load tools, with `Merge` to combine them. The runtime itself reports scheduler latency as a histogram in `runtime/metrics`.'
+      seenIn: '`prometheus.ExponentialBuckets` and native histograms in `client_golang`. `hdrhistogram.Histogram.ValueAtQuantile` and `Merge`. `runtime/metrics` `/sched/latencies:seconds`, a `Float64Histogram`. `histogram_quantile` in PromQL.'
+
+  python:
+    before:
+      file: search.py · config.py
+      source: |
+        # search.py
+        async def timed(shard: Shard, q: str) -> list[Hit]:
+            start = time.perf_counter()
+            try:
+                return await shard.search(q)
+            finally:
+                shard_mean.observe(time.perf_counter() - start)  # running mean on the dashboard
+
+        async def search(q: str) -> list[Hit]:
+            results = await asyncio.gather(*(timed(s, q) for s in SHARDS))
+            return merge(results)
+
+        # config.py
+        SHARDS = open_shards(4)
+      roles: { client: [9, 9], context: [9, 11], shards: [5, 5], mean: [7, 7], fan: [14, 14] }
+      change:
+        - { line: 14, replace: "SHARDS = open_shards(40)  # the catalogue outgrew 4 shards" }
+    after:
+      file: search.py
+      source: |
+        # search.py
+        from prometheus_client import Histogram
+
+        PAGE = Histogram("search_page_seconds", "Whole search, all shards",
+                         buckets=[2 ** i / 1000 for i in range(14)])  # 1 ms .. 8 s
+
+        async def hedged(shard: Shard, q: str, after: float) -> list[Hit]:
+            first = asyncio.create_task(shard.search(q))
+            done, _ = await asyncio.wait({first}, timeout=after)
+            if done:
+                return first.result()
+            backup = asyncio.create_task(shard.search(q))  # each call picks a replica
+            done, pending = await asyncio.wait({first, backup}, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+            return done.pop().result()
+
+        async def search(q: str) -> list[Hit]:
+            with PAGE.time():  # the page, not each shard
+                results = await asyncio.gather(*(hedged(s, q, s.p95) for s in SHARDS))
+            return merge(results)
+      roles: { strategy: [4, 5], agg: [5, 5], merge: [5, 5], hedge: [7, 16], backup: [12, 13], shards: [12, 12], client: [18, 18], context: [18, 21], mean: [19, 19], record: [19, 19], fan: [20, 20], fanout: [20, 20], wait: [20, 20] }
+    again:
+      file: test_search.py
+      source: |
+        # test_search.py: 1 shard call in 100 stalls for 200 ms; the page p99 stays fast
+        async def test_page_tail(stalling_shards):  # fixture: 40 shards, 1 call in 100 stalls
+            h = HdrHistogram(1, 10_000, 3)  # ms
+            for _ in range(500):
+                start = time.perf_counter()
+                await search("boots")
+                h.record_value(int((time.perf_counter() - start) * 1000))
+            assert h.get_value_at_percentile(99) < 50
+    cost:
+      before: { text: 1 page in 3 waits 200 ms, value: 0.85 }
+      after: { text: page p99 ~35 ms · 5% more calls, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Libraries
+      note: '`statistics.quantiles` and `numpy.percentile` give exact percentiles of a list you kept in memory, fine for a benchmark and wrong for a service. In a service, record into `prometheus_client.Histogram` buckets. The Python client''s `Summary` exposes only a count and a sum, no quantiles. `hdrh` gives HDR histograms with `add` and `encode` to ship them between processes.'
+      seenIn: '`prometheus_client.Histogram.time()` as a context manager or decorator. `hdrh.histogram.HdrHistogram` with `record_corrected_value`. `statistics.quantiles(data, n=100)`. Locust and other load tools report percentiles per endpoint.'
+
+  typescript:
+    before:
+      file: search.ts · config.ts
+      source: |
+        // search.ts
+        async function timed(shard: Shard, q: string): Promise<Hit[]> {
+          const start = performance.now();
+          try {
+            return await shard.search(q);
+          } finally {
+            shardMean.observe(performance.now() - start); // running mean on the dashboard
+          }
+        }
+
+        export async function search(q: string): Promise<Hit[]> {
+          return merge(await Promise.all(SHARDS.map((s) => timed(s, q))));
+        }
+
+        // config.ts
+        export const SHARDS = openShards(4);
+      roles: { client: [11, 11], context: [11, 13], shards: [5, 5], mean: [7, 7], fan: [16, 16] }
+      change:
+        - { line: 16, replace: "export const SHARDS = openShards(40); // the catalogue outgrew 4 shards" }
+    after:
+      file: search.ts
+      source: |
+        // search.ts
+        import { Histogram } from "prom-client";
+
+        const page = new Histogram({
+          name: "search_page_seconds",
+          help: "Whole search, all shards",
+          buckets: Array.from({ length: 14 }, (_, i) => 2 ** i / 1000), // 1 ms .. 8 s
+        });
+
+        async function hedged(shard: Shard, q: string, afterMs: number): Promise<Hit[]> {
+          const ac = new AbortController();
+          let timer: NodeJS.Timeout | undefined;
+          const first = shard.search(q, ac.signal);
+          const backup = new Promise<Hit[]>((resolve, reject) => {
+            timer = setTimeout(() => shard.search(q, ac.signal).then(resolve, reject), afterMs); // another replica
+          });
+          try {
+            return await Promise.race([first, backup]);
+          } finally {
+            clearTimeout(timer);
+            ac.abort(); // cancel the loser
+          }
+        }
+
+        export async function search(q: string): Promise<Hit[]> {
+          const end = page.startTimer(); // the page, not each shard
+          try {
+            return merge(await Promise.all(SHARDS.map((s) => hedged(s, q, s.p95Ms))));
+          } finally {
+            end();
+          }
+        }
+      roles: { strategy: [4, 8], agg: [7, 7], merge: [7, 7], hedge: [10, 23], backup: [14, 16], shards: [13, 13], client: [25, 25], context: [25, 32], mean: [26, 26], record: [26, 26], fan: [28, 28], fanout: [28, 28], wait: [28, 28] }
+    again:
+      file: search.test.ts
+      source: |
+        // search.test.ts: 1 shard call in 100 stalls for 200 ms; the page p99 stays fast
+        test("page tail", async () => {
+          useShards(fakeShards(40, { stallOneIn: 100, stallMs: 200 }));
+          const h = createHistogram(); // node:perf_hooks, HDR inside
+          for (let i = 0; i < 500; i++) {
+            const start = process.hrtime.bigint();
+            await search("boots");
+            h.record(process.hrtime.bigint() - start); // ns
+          }
+          assert.ok(h.percentile(99) < 50e6);
+        });
+    cost:
+      before: { text: 1 page in 3 waits 200 ms, value: 0.85 }
+      after: { text: page p99 ~35 ms · 5% more calls, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Built in, partly
+      note: 'Node ships an HDR histogram: `perf_hooks.createHistogram()` records integers, answers `percentile(99)`, and since v16.14 and v17.4 can `add()` another histogram. `monitorEventLoopDelay()` reports event loop delay the same way, in nanoseconds. For a service''s metrics, `prom-client` gives a bucketed `Histogram` that can be summed across instances.'
+      seenIn: '`perf_hooks.createHistogram` and `monitorEventLoopDelay`. `prom-client` `Histogram.startTimer()`. `hdr-histogram-js`. autocannon reports latency percentiles from an HDR histogram.'
+
+  rust:
+    before:
+      file: search.rs · config.rs
+      source: |
+        // search.rs
+        async fn timed(shard: &Shard, q: &str) -> Result<Vec<Hit>> {
+            let start = Instant::now();
+            let hits = shard.search(q).await;
+            SHARD_MEAN.observe(start.elapsed()); // running mean on the dashboard
+            hits
+        }
+
+        pub async fn search(shards: &[Shard], q: &str) -> Result<Vec<Hit>> {
+            let results = try_join_all(shards.iter().map(|s| timed(s, q))).await?;
+            Ok(merge(results))
+        }
+
+        // config.rs
+        let shards = open_shards(4).await?;
+      roles: { client: [9, 9], context: [9, 12], shards: [4, 4], mean: [5, 5], fan: [15, 15] }
+      change:
+        - { line: 15, replace: "let shards = open_shards(40).await?; // the catalogue outgrew 4 shards" }
+    after:
+      file: search.rs
+      source: |
+        // search.rs
+        static PAGE: LazyLock<Mutex<Histogram<u64>>> = LazyLock::new(|| {
+            Mutex::new(Histogram::new_with_bounds(1, 60_000_000, 3).unwrap()) // µs, 1 µs .. 60 s
+        });
+
+        async fn hedged(shard: &Shard, q: &str, after: Duration) -> Result<Vec<Hit>> {
+            let first = shard.search(q);
+            tokio::pin!(first);
+            tokio::select! {
+                r = &mut first => return r,
+                _ = tokio::time::sleep(after) => {}
+            }
+            // still waiting at p95: ask another replica; the first answer wins, the other is dropped
+            tokio::select! {
+                r = &mut first => r,
+                r = shard.search(q) => r,
+            }
+        }
+
+        pub async fn search(shards: &[Shard], q: &str) -> Result<Vec<Hit>> {
+            let start = Instant::now();
+            let results = try_join_all(shards.iter().map(|s| hedged(s, q, s.p95))).await;
+            PAGE.lock().unwrap().record(start.elapsed().as_micros() as u64).ok(); // the page, not each shard
+            Ok(merge(results?))
+        }
+      roles: { strategy: [2, 4], agg: [3, 3], merge: [3, 3], hedge: [6, 18], backup: [13, 17], shards: [16, 16], client: [20, 20], context: [20, 25], mean: [21, 23], record: [23, 23], fan: [22, 22], fanout: [22, 22], wait: [22, 22] }
+    again:
+      file: tests/search.rs
+      source: |
+        // tests/search.rs: 1 shard call in 100 stalls for 200 ms; the page p99 stays fast
+        #[tokio::test]
+        async fn page_tail() {
+            let shards = fake_shards(40, StallOneIn(100, Duration::from_millis(200)));
+            let mut h = Histogram::<u64>::new_with_bounds(1, 10_000, 3).unwrap(); // ms
+            for _ in 0..500 {
+                let start = Instant::now();
+                search(&shards, "boots").await.unwrap();
+                h.record(start.elapsed().as_millis() as u64).unwrap();
+            }
+            assert!(h.value_at_quantile(0.99) < 50);
+        }
+    cost:
+      before: { text: 1 page in 3 waits 200 ms, value: 0.85 }
+      after: { text: page p99 ~35 ms · 5% more calls, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Libraries
+      note: 'The `hdrhistogram` crate is the port of HdrHistogram: `record`, `value_at_quantile(0.99)` and `add` to merge. It is not thread-safe, so services keep one per thread and merge, or put it behind a lock as here. For exported metrics, the `metrics` or `prometheus` crates give bucketed histograms.'
+      seenIn: '`hdrhistogram::Histogram::new_with_bounds`, `value_at_quantile`, `add`. `metrics::histogram!` with `metrics-exporter-prometheus`. criterion reports benchmark timings as distributions with confidence intervals.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A search arrives. The API sends it to all 40 shards in parallel and cannot answer until every shard has.
+    nodes: [client, context, fan]
+    edges: [client>context, context>fan]
+    role: fanout
+  - text: 39 shards answer in about 10 ms. One hits a 200 ms stall, so the page takes 200 ms. With 1 stall in 100 calls, 1 − 0.99⁴⁰, about 33% of pages, hit at least one.
+    nodes: [fan, shards]
+    edges: [fan>shards]
+    role: wait
+  - text: The page timer records the whole search into a histogram, one count in the bucket that holds its latency. p50 and p99 are read from those counts, for the request users actually wait on.
+    nodes: [mean, context, strategy]
+    edges: [mean>context, context>strategy]
+    role: record
+  - text: Each pod exports its bucket counts. The fleet p99 comes from summing the counts bucket by bucket and reading the 99th percentile of the sum. Averaging each pod's p99 gives a number that means nothing.
+    nodes: [strategy, agg]
+    edges: [strategy>agg]
+    role: merge
+  - text: A shard call still waiting at that shard's p95 sends a backup to another replica, and the first answer wins. A page now stalls only if both copies stall. That costs about 5% more calls.
+    nodes: [hedge, shards]
+    edges: [hedge>shards]
+    role: backup
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: 99 requests take 10 ms and one takes 5 seconds. What are the mean and the median?
+    options:
+      - text: Mean about 60 ms, median 10 ms.
+        correct: true
+        why: Right. The one slow request adds 50 ms to the mean, which then describes neither the 99 fast requests nor the slow one. The median ignores it entirely. Only the max or a high percentile shows it.
+      - text: Mean 10 ms, median about 60 ms.
+        why: Swapped. The median is the middle value, 10 ms. The mean is pulled up by the outlier.
+      - text: Both about 60 ms.
+        why: The median is the middle value of the sorted list. 99 of the 100 values are 10 ms, so the median is 10 ms.
+  engineer:
+    question: Two servers behind a load balancer report p99 latencies of 200 ms and 400 ms. What is the p99 of the service?
+    options:
+      - text: It cannot be computed from those two numbers. Sum the servers' histograms and read the p99 from the sum.
+        correct: true
+        why: Right. The answer depends on how many requests each server handled and on the shape of each distribution. It can be anywhere from below 200 ms to 400 ms. Bucket counts add up; percentiles do not.
+      - text: 300 ms, the average of the two.
+        why: That is only right by accident. If the 400 ms server took 1% of traffic, the fleet p99 is close to 200 ms. If it took 90%, it is close to 400 ms.
+      - text: 400 ms, the worse of the two.
+        why: The worst server's p99 is an upper bound on the fleet's p99, and can be far above it when that server handles little traffic.
+  deep:
+    question: A load generator sends about 100 requests a second, each only after the previous response. During a 60-second test the server freezes once for 2 seconds. The tool reports a p99 of 12 ms. Why does that hide the freeze?
+    options:
+      - text: The tool sent nothing during the freeze, so it recorded one slow request where real users, arriving at their own pace, would have produced hundreds.
+        correct: true
+        why: Right. That is coordinated omission. The tester slowed down with the server and skipped exactly the requests that would have been slow. Open-loop load, or correcting each sample for the requests that should have been sent (HdrHistogram's recordCorrectedValue), restores them.
+      - text: 2 seconds is too short to show up in a 60-second test.
+        why: At 100 requests a second, a real user population would have sent about 200 requests during the freeze, over 3% of the test, which is well above the 1% the p99 ignores.
+      - text: The p99 ignores the slowest 1% of requests by definition.
+        why: The p99 is the value that 1% of requests exceed. A 2-second freeze would dominate it if the requests that arrived during it had been measured.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Percentile
+      example: p50, p99, p99.9 of page latency
+      job: Says how slow the slowest share of requests were. Report several, plus the max, for the request users wait on.
+    - role: Histogram
+      example: { go: "prometheus.Histogram", python: "prometheus_client.Histogram", typescript: "prom-client Histogram", rust: "hdrhistogram::Histogram" }
+      job: Counts requests per latency bucket. Cheap to record, and sums correctly across threads, pods and time windows.
+    - role: Fan-out
+      example: one search, 40 shard calls
+      job: Turns each backend's rare slow call into a common slow response. With N calls, 1 − (1 − p)^N of requests hit at least one.
+    - role: Hedged request
+      example: a backup call after the shard's p95
+      job: Cuts the tail of a fan-out for a few percent more load, when the slowness comes from the replica rather than the request.
+  useWhen:
+    - Any latency dashboard or SLO. Show p50 and p99 (or p99.9) for the request users wait for, not only for each backend.
+    - Aggregating latency across instances or time. Record histograms and sum their buckets.
+    - Designing a fan-out. Budget for the backends' p99, because the page will see it constantly.
+  avoidWhen:
+    - Averaging percentiles, from different servers or from consecutive minutes. The result is not a percentile of anything.
+    - Judging a service by its mean latency alone, or by mean plus two standard deviations; latency is not normally distributed.
+    - Hedging calls that are not safe to repeat, or a backend that is slow because it is overloaded. Extra copies add load to the thing that is already struggling.
+  tradeoffs:
+    - Bucket boundaries set the error. A percentile from buckets is known only to within its bucket; log-spaced or HDR buckets keep that error relative.
+    - High percentiles need many samples. A p99.9 from 1,000 requests rests on one value.
+    - Hedging trades extra load for a shorter tail. Sending the backup only after the p95 keeps the extra load near 5%.
+    - Pre-computed percentiles (summaries) are cheap to read and impossible to aggregate.
+  lookalikes:
+    - name: Summary metric
+      how: Computes quantiles inside each process over a sliding window. Accurate per instance, and cannot be combined across instances.
+    - name: Latency heat map
+      how: A histogram per time interval, drawn as columns. Shows modes, outliers and drift that a percentile line hides.
+    - name: Apdex and SLO error budgets
+      how: Count requests slower than a threshold. A threshold count sums across servers, like a histogram bucket.
+---
+
+## [concept] Latency, averages and percentiles
+
+**Latency is a distribution, so describe it with <Term id="percentile">percentiles</Term>: p50 is the typical request, p99 is the slow one in a hundred. The mean describes neither.**
+
+Most requests are fast and a few are very slow. The slow ones are the <Term id="tail-latency">tail</Term>. A user who makes many requests, or a page that waits for many backends, meets the tail far more often than the percentile suggests.
+
+<Depth level={2}>
+Three rules follow. Measure the request the user waits for, not only each backend. Record a <Term id="latency-histogram">histogram</Term>, a count of requests per latency bucket, so you can read any percentile later and sum across servers. And expect <Term id="request-fan-out">fan-out</Term> to multiply the tail: if each of N parallel calls is slow with probability p, a request that waits for all of them is slow with probability 1 − (1 − p)^N.
+</Depth>
+
+<Depth level={3}>
+Latency distributions are skewed and often have several modes: a cache hit hump and a cache miss hump, or a fast path and a slow path. The mean and standard deviation assume one symmetric hump, so "mean plus two standard deviations" is not the p95. A <Term id="hedged-request">hedged request</Term> cuts the tail of a fan-out by racing a second copy of a slow call. Measurements have their own trap, <Term id="coordinated-omission">coordinated omission</Term>, where the measuring tool slows down with the system and skips the slow requests.
+</Depth>
+
+## [problem] A search API with a healthy average
+
+A product search page calls the search API, which sends each query to every shard of the index in parallel and merges the hits. Each shard call is timed, and the dashboard shows each shard's mean latency: about 12 ms. The page is fast, and the dashboard agrees.
+
+Read it with the usual mental model: if each shard takes 12 ms on average, the page takes about 12 ms plus the merge.
+
+<Depth level={2}>
+The mean is a running sum divided by a count, so it is cheap and easy to chart. It is also blind to rare slow calls. A shard that answers in 10 ms 99 times and stalls for 200 ms once has a mean of 12 ms, which no single call actually took.
+</Depth>
+
+<Depth level={3}>
+The fleet dashboard also shows a p99, computed by averaging each shard's p99. That number has no meaning: percentiles do not add, and the average ignores how many requests each shard served.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the product catalogue has outgrown its 4 search shards. Split the index across 40.
+
+The marked line is the only change. Every shard still averages 12 ms, and its p99 is unchanged. Yet users complain that search is slow, and the page's own latency, once someone measures it, is 200 ms on about one load in three. The mean of the shards cannot explain it, because the page does not wait for an average shard. It waits for the slowest of 40.
+
+<Depth level={2}>
+Each shard stalls on 1 call in 100, from a garbage collection pause or a read that misses the cache. With 4 shards, 1 − 0.99⁴ is about 4% of pages. With 40, 1 − 0.99⁴⁰ is about 33%. The shards' 1-in-100 stall now starts at the page's p67. Dean and Barroso give the same arithmetic in The Tail at Scale: a server with a 1-in-100 one-second tail, fanned out to 100 servers, makes 63% of user requests take over a second.
+</Depth>
+
+<Depth level={3}>
+In that paper's measurements from a real service, the 99th-percentile latency for one leaf request was 10 ms, while waiting for all leaf requests took 140 ms at the 99th percentile. Waiting for the slowest 5% of leaves accounted for half of it.
+</Depth>
+
+## [morph] Measure the page, and race the tail
+
+Drag the slider. The shard mean becomes a page timer feeding a histogram, the fleet p99 comes from summed buckets, and slow shard calls get a backup.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Two fixes, of different kinds. Measuring the page with a histogram makes the problem visible and makes the fleet percentiles correct. Hedging makes it smaller: a call still waiting at the shard's p95 goes to a second replica, and the first answer wins. Only about 5% of calls get a backup, so the extra load stays near 5%.
+</Depth>
+
+<Depth level={3}>
+Hedging works when the slowness belongs to the replica (a pause, a busy disk, a noisy neighbour), not to the request. Dean and Barroso report a BigTable benchmark where a hedge after 10 ms cut the 99.9th-percentile latency of reading 1,000 keys from 1,800 ms to 74 ms, for 2% more requests. If the backend is slow because it is overloaded, hedging adds load where there is none to spare; cap it, or skip it.
+</Depth>
+
+## [walk] Follow one search
+
+One search through 40 shards: the fan-out, the stall, the histogram and the backup. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Prometheus buckets are cumulative counters, one per upper bound (`le`), so summing them across pods is valid. `histogram_quantile` then interpolates linearly inside the bucket that holds the rank. Native histograms in newer `client_golang` versions pick exponential buckets for you.</Lang>
+<Lang only="python">`PAGE.time()` measures wall-clock time across the awaits inside it, which is the time the user waits. `asyncio.wait` with `FIRST_COMPLETED` returns as soon as one copy finishes; cancelling the other stops it at its next await.</Lang>
+<Lang only="typescript">`Promise.race` settles with the first copy. Aborting the shared `AbortController` cancels the other `fetch`, so the losing replica stops reading the response.</Lang>
+<Lang only="rust">`tokio::select!` polls both futures and drops the one that loses, which cancels it. `tokio::pin!` lets the first call keep running across both `select!` blocks instead of starting again.</Lang>
+</Depth>
+
+## [again] 40 shards, measured and hedged
+
+The same 40 shards, each still stalling on 1 call in 100. The page now records its own latency in a histogram, the dashboard reads p99 from summed buckets, and stalled shard calls are hedged at p95. The page p99 drops from about 240 ms to about 35 ms, for about 5% more shard calls. The test above stalls the shards on purpose and asserts the page p99 stays under 50 ms.
+
+<Depth level={2}>
+Alert on the page's p99, and keep each shard's histogram too. When the page tail grows, the shard histograms show which shard's tail moved.
+</Depth>
+
+<Depth level={3}>
+High percentiles need samples. A p99.9 needs thousands of requests in the window to rest on more than a handful of values. For rare, expensive requests, count requests over a threshold instead.
+</Depth>
+
+## [play] A tail lab
+
+A backend call with a long tail, a page that waits for N of them, and four servers that report one p99. Shape the tail, fan it out, and try to average your way to a fleet p99.
+
+## [lens] How each language measures latency
+
+Every language can time a request. What differs is the histogram you record into and whether it can be merged.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whichever library you use, record into fixed or HDR buckets at the point the user waits, and export the counts. Compute percentiles where you aggregate, never before.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="latency-and-percentiles" />
+
+### Fan-out arithmetic
+
+The share of requests that hit at least one slow call, when each of N parallel calls is slow with probability p:
+
+| Calls per request | p = 1 in 1,000 | p = 1 in 100 | p = 1 in 20 |
+|---|---|---|---|
+| 1 | 0.1% | 1% | 5% |
+| 10 | 1% | 10% | 40% |
+| 40 | 4% | 33% | 87% |
+| 100 | 10% | 63% | 99% |
+
+To read a fleet percentile from Prometheus histograms, sum the buckets first: `histogram_quantile(0.99, sum by (le) (rate(search_page_seconds_bucket[5m])))`.
