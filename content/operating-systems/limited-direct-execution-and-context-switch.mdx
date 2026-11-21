@@ -1,0 +1,525 @@
+---
+title: Limited direct execution and context switching
+track: operating-systems
+group: CPU virtualisation
+order: 6
+summary: The OS lets a program run straight on the CPU and takes the CPU back only through traps, and the timer interrupt guarantees one every few milliseconds.
+intent: Know how the kernel regains the CPU from code that never gives it up, what a context switch saves, and what it costs.
+changeRequest: Customers may now upload CSV imports of up to 50 MB instead of 1 MB.
+languages: [go, python, typescript, rust]
+glossary: [limited-direct-execution, timer-interrupt, trap-table, context-switch, cooperative-scheduling, time-slice, event-loop, gil, system-call, mode-switch]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [operating-systems/the-process-abstraction, operating-systems/kernel-boundary-and-system-calls]
+skills: [os, scheduling]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: limited-direct-execution-and-context-switch
+  scenarios:
+    - try: "Make a prediction, then turn the timer off and run with the batch job that loops."
+      notice: "B answers nothing. Ten network interrupts trap into the kernel, but nothing makes it switch, and A never traps on its own."
+    - try: "Keep the timer off and let the batch job call sched_yield() every 5 ms."
+      notice: "B is answered again, every switch is voluntary, and its wait depends on how often A chooses to yield."
+    - try: "Run with a 10 ms timer, then 100 µs, then 1 ms."
+      notice: "At 10 ms B waits up to an interval. At 100 µs over a quarter of the CPU goes to traps, switches and cold caches, and B is slower than at 1 ms."
+    - try: "Step through one switch in the hop panel."
+      notice: "Registers are saved twice: by the hardware on the trap, and by the kernel in switch()."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 12, y: 30, w: 120, h: 50, title: Import handler, sub: { go: "parseCSV(body)", python: "parse_csv(body)", typescript: "parseCsv(req.body)", rust: "parse_csv(&body)" } }
+      after:  { x: 12, y: 30, w: 120, h: 50, title: Import handler, sub: { go: "goroutine", python: "run_in_executor", typescript: "pool.run", rust: "spawn_blocking" } }
+    - id: kernel
+      kind: context
+      before: { x: 150, y: 14, w: 398, h: 246, title: "the OS", sub: "time-slices every request?" }
+      after:  { x: 214, y: 30, w: 140, h: 50, title: Kernel, sub: "trap handler + scheduler" }
+    - id: timer
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 110, w: 100, h: 50, title: "" }
+      after:  { x: 404, y: 30, w: 144, h: 50, title: Timer interrupt, sub: "every 1 to 10 ms" }
+    - id: loop
+      kind: concrete
+      before: { x: 170, y: 64, w: 358, h: 40, title: "/imports gets a turn" }
+      after:  { x: 12, y: 196, w: 150, h: 50, title: { go: Go runtime, python: Event loop, typescript: Event loop, rust: Tokio worker }, sub: { go: "preempts at 10 ms", python: "one thread, no timer", typescript: "one thread, no timer", rust: "no timer" } }
+    - id: worker
+      kind: concrete
+      before: { x: 170, y: 116, w: 358, h: 40, title: "/healthz gets a turn" }
+      after:  { x: 204, y: 196, w: 150, h: 50, title: { go: OS thread (M), python: Worker process, typescript: Worker thread, rust: Blocking thread }, sub: "the kernel's timer applies" }
+    - id: big
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 190, w: 358, h: 40, title: "50 MB import" }
+      after:  { x: 396, y: 196, w: 152, h: 50, title: 50 MB import, sub: off the loop }
+  edges:
+    - { from: app, to: loop, label: runs on }
+    - { from: timer, to: kernel, label: trap }
+    - { from: kernel, to: worker, label: switch }
+    - { from: kernel, to: loop, label: switch }
+    - { from: big, to: worker, label: runs on }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: main.go
+      source: |
+        // main.go: imports run inline, in the request's goroutine
+        func imports(w http.ResponseWriter, r *http.Request) {
+            body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+                return
+            }
+            rows := parseCSV(body)     // pure CPU, no blocking call
+            errs := validateRows(rows) // pure CPU, no blocking call
+            json.NewEncoder(w).Encode(Report{Rows: len(rows), Errors: errs})
+        }
+
+        func main() {
+            http.HandleFunc("POST /imports", imports)
+            http.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok") })
+            log.Fatal(http.ListenAndServe(":8080", nil))
+        }
+      roles: { app: [2, 11], loop: [8, 9], worker: [15, 15], kernel: [13, 17] }
+      change:
+        - { line: 3, replace: "    body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 50<<20))" }
+    after:
+      file: main.go
+      source: |
+        // main.go: the same handler. Since Go 1.14 the runtime preempts
+        // a goroutine that has run for 10 ms, much as the kernel's timer does.
+        func imports(w http.ResponseWriter, r *http.Request) {
+            body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 50<<20))
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+                return
+            }
+            rows := parseCSV(body)     // sysmon sees it running for 10 ms
+            errs := validateRows(rows) // and signals its thread to switch
+            json.NewEncoder(w).Encode(Report{Rows: len(rows), Errors: errs})
+        }
+
+        func main() {
+            http.HandleFunc("POST /imports", imports)
+            http.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok") })
+            log.Fatal(http.ListenAndServe(":8080", nil))
+        }
+      roles: { app: [3, 12], worker: [9, 10], loop: [1, 2], timer: [1, 2], kernel: [9, 10], big: [4, 4], trap: [9, 10], decide: [9, 10], switch: [9, 10], resume: [11, 11], serve: [16, 16] }
+    again:
+      file: healthz.txt
+      source: |
+        // A 50 MB import is running. GOMAXPROCS=1, Go 1.14 or later.
+        // $ curl -s -o /dev/null -w '%{time_total}\n' localhost:8080/healthz
+        // 0.011   (one 10 ms preemption slice, at worst)
+    cost:
+      before: { text: "/healthz ≤ ~10 ms (runtime preempts)", value: 0.15 }
+      after: { text: "/healthz ≤ ~10 ms", value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: 'Go is the one runtime here with a timer of its own. The `sysmon` thread notices a goroutine that has run for 10 ms and, since Go 1.14, sends its thread a signal so the goroutine stops at once, even in a loop with no function calls. Below that, each M is an OS thread the kernel time-slices as usual. Go 1.13 and older could only stop a goroutine at a function call, so a tight loop could stall the others.'
+      seenIn: 'There is no nice value in the Go standard library; use `syscall.Setpriority` or `golang.org/x/sys/unix.Setpriority` on Linux. `GODEBUG=asyncpreemptoff=1` turns signal preemption off, which brings the old stalls back.'
+
+  python:
+    before:
+      file: server.py
+      source: |
+        # server.py: imports run inline, on the same event loop as /healthz
+        from aiohttp import web
+        from csvcheck import parse_csv, validate_rows
+
+        async def imports(request: web.Request) -> web.Response:
+            body = await request.read()
+            rows = parse_csv(body)        # pure CPU, no await
+            errors = validate_rows(rows)  # pure CPU, no await
+            return web.json_response({"rows": len(rows), "errors": errors})
+
+        async def healthz(request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(client_max_size=1 * 1024**2)
+        app.add_routes([web.post("/imports", imports), web.get("/healthz", healthz)])
+        web.run_app(app, port=8080)
+      roles: { app: [5, 9], loop: [7, 8], worker: [11, 12], kernel: [14, 16] }
+      change:
+        - { line: 14, replace: "app = web.Application(client_max_size=50 * 1024**2)" }
+    after:
+      file: server.py
+      source: |
+        # server.py: CPU work leaves the event loop for worker processes
+        import asyncio
+        from concurrent.futures import ProcessPoolExecutor
+        from aiohttp import web
+        from csvcheck import check_import  # parse_csv + validate_rows
+
+        pool = ProcessPoolExecutor()  # one process per CPU, each with its own GIL
+
+        async def imports(request: web.Request) -> web.Response:
+            body = await request.read()
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(pool, check_import, body)
+            return web.json_response(result)
+
+        async def healthz(request: web.Request) -> web.Response:
+            return web.Response(text="ok")
+
+        app = web.Application(client_max_size=50 * 1024**2)
+        app.add_routes([web.post("/imports", imports), web.get("/healthz", healthz)])
+        web.run_app(app, port=8080)
+      roles: { app: [9, 13], worker: [7, 7], loop: [18, 20], timer: [7, 7], kernel: [7, 7], big: [12, 12], trap: [12, 12], decide: [7, 7], switch: [7, 7], resume: [12, 13], serve: [15, 16] }
+    again:
+      file: healthz.txt
+      source: |
+        # A 50 MB import is running in a worker process.
+        # $ curl -s -o /dev/null -w '%{time_total}\n' localhost:8080/healthz
+        # 0.002   (was the whole parse, several seconds)
+    cost:
+      before: { text: "/healthz waits for the whole parse", value: 0.95 }
+      after: { text: "/healthz ~ms", value: 0.08 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'asyncio is cooperative. The loop runs one coroutine until it reaches an `await` that is not ready, so a parse with no `await` holds the loop for its whole length. The kernel still preempts the thread on its timer, then gives the CPU straight back to the same parse. Threads would not fix CPU work either: the GIL lets one thread run bytecode at a time. A process pool gives each parse its own interpreter, which the kernel time-slices.'
+      seenIn: '`loop.run_in_executor`, `asyncio.to_thread` (for blocking I/O), `sys.getswitchinterval()` (5 ms by default) and `os.nice` or `os.setpriority` for the nice value. `loop.slow_callback_duration` with debug mode logs callbacks that hold the loop too long.'
+
+  typescript:
+    before:
+      file: server.ts
+      source: |
+        // server.ts: imports run inline, on the same event loop as /healthz
+        import express from "express";
+        import { parseCsv, validateRows } from "./csv.js";
+
+        const app = express();
+        app.use(express.raw({ type: "text/csv", limit: "1mb" }));
+
+        app.post("/imports", (req, res) => {
+          const rows = parseCsv(req.body);     // pure CPU, no await
+          const errors = validateRows(rows);   // pure CPU, no await
+          res.json({ rows: rows.length, errors });
+        });
+
+        app.get("/healthz", (_req, res) => res.send("ok"));
+        app.listen(8080);
+      roles: { app: [8, 12], loop: [9, 10], worker: [14, 14], kernel: [5, 15] }
+      change:
+        - { line: 6, replace: 'app.use(express.raw({ type: "text/csv", limit: "50mb" }));' }
+    after:
+      file: server.ts
+      source: |
+        // server.ts: CPU work leaves the event loop for worker threads
+        import express from "express";
+        import Piscina from "piscina";
+        import { availableParallelism } from "node:os";
+
+        const pool = new Piscina({
+          filename: new URL("./import-worker.js", import.meta.url).href,
+          maxThreads: Math.max(1, availableParallelism() - 1),
+        });
+
+        const app = express();
+        app.use(express.raw({ type: "text/csv", limit: "50mb" }));
+
+        app.post("/imports", async (req, res) => {
+          const result = await pool.run(req.body); // parse + validate on a worker thread
+          res.json(result);
+        });
+
+        app.get("/healthz", (_req, res) => res.send("ok"));
+        app.listen(8080);
+      roles: { app: [14, 17], worker: [6, 9], loop: [11, 20], timer: [15, 15], kernel: [6, 9], big: [15, 15], trap: [15, 15], decide: [8, 8], switch: [6, 9], resume: [15, 16], serve: [19, 19] }
+    again:
+      file: healthz.txt
+      source: |
+        // A 50 MB import is running on a worker thread.
+        // $ curl -s -o /dev/null -w '%{time_total}\n' localhost:8080/healthz
+        // 0.002   (was the whole parse, several seconds)
+    cost:
+      before: { text: "/healthz waits for the whole parse", value: 0.95 }
+      after: { text: "/healthz ~ms", value: 0.08 }
+    lens:
+      need: 4
+      needLabel: Manual
+      note: 'Node runs all your JavaScript on one event loop thread, and a callback runs to the end before the next one starts. There is no timer inside the loop. The kernel preempts the thread, then resumes the same callback. CPU work belongs on `worker_threads`, each a real OS thread that the kernel time-slices against the loop.'
+      seenIn: '`worker_threads` and pools on top of it such as Piscina. `perf_hooks.monitorEventLoopDelay()` measures how long the loop was held. `os.setPriority(pid, priority)` sets a nice value.'
+
+  rust:
+    before:
+      file: main.rs
+      source: |
+        // main.rs: imports run inline, on tokio's worker threads
+        use axum::{body::Bytes, extract::DefaultBodyLimit, routing::{get, post}, Json, Router};
+
+        async fn imports(body: Bytes) -> Json<Report> {
+            let rows = parse_csv(&body);       // pure CPU, no .await
+            let errors = validate_rows(&rows); // pure CPU, no .await
+            Json(Report { rows: rows.len(), errors })
+        }
+
+        #[tokio::main]
+        async fn main() {
+            let app = Router::new()
+                .route("/imports", post(imports))
+                .route("/healthz", get(|| async { "ok" }))
+                .layer(DefaultBodyLimit::max(1 << 20));
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        }
+      roles: { app: [4, 8], loop: [5, 6], worker: [14, 14], kernel: [10, 18] }
+      change:
+        - { line: 15, replace: "        .layer(DefaultBodyLimit::max(50 << 20));" }
+    after:
+      file: main.rs
+      source: |
+        // main.rs: CPU work leaves tokio's workers for the blocking pool
+        use axum::{body::Bytes, extract::DefaultBodyLimit, routing::{get, post}, Json, Router};
+
+        async fn imports(body: Bytes) -> Json<Report> {
+            // spawn_blocking runs the closure on a separate OS thread,
+            // which the kernel time-slices like any other thread
+            let report = tokio::task::spawn_blocking(move || check_import(&body))
+                .await
+                .expect("import check panicked");
+            Json(report)
+        }
+
+        #[tokio::main]
+        async fn main() {
+            let app = Router::new()
+                .route("/imports", post(imports))
+                .route("/healthz", get(|| async { "ok" }))
+                .layer(DefaultBodyLimit::max(50 << 20));
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        }
+      roles: { app: [4, 11], worker: [7, 9], loop: [13, 21], timer: [5, 6], kernel: [5, 7], big: [7, 7], trap: [5, 6], decide: [7, 7], switch: [7, 9], resume: [10, 10], serve: [17, 17] }
+    again:
+      file: healthz.txt
+      source: |
+        // Four 50 MB imports at once on a 4-core box, on the blocking pool.
+        // $ curl -s -o /dev/null -w '%{time_total}\n' localhost:8080/healthz
+        // 0.003   (was the whole parse, several seconds)
+    cost:
+      before: { text: "4 imports hold all 4 workers", value: 0.9 }
+      after: { text: "/healthz ~ms", value: 0.08 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'Tokio has one worker thread per core and never preempts a task. A task runs until it reaches an `.await` that is not ready. One long parse holds one worker; as many parses as cores hold them all, and `/healthz` waits. `spawn_blocking` and rayon run CPU work on separate OS threads, where the kernel''s timer shares the cores.'
+      seenIn: '`tokio::task::spawn_blocking`, `tokio::task::yield_now`, `rayon`. `std::thread` gives plain OS threads; set a nice value with `libc::setpriority` or the `thread-priority` crate.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The kernel set up a trap table and started the timer at boot. Your thread now runs directly on the CPU in user mode. Until a trap, the kernel is not running at all.
+    nodes: [timer, kernel]
+    edges: [timer>kernel]
+    role: trap
+  - text: The timer fires. The CPU saves the thread's user registers on its kernel stack, switches to kernel mode and jumps to the timer handler from the trap table.
+    nodes: [timer, kernel, loop]
+    edges: [timer>kernel, kernel>loop]
+    role: decide
+  - text: The scheduler decides whether another thread should run. If one is ready, switch() saves the current thread's kernel registers in its task structure, loads the other's and moves to its kernel stack.
+    nodes: [kernel, worker, loop]
+    edges: [kernel>worker, kernel>loop]
+    role: switch
+  - text: Return from trap restores the new thread's user registers and drops to user mode. The import parse and the event loop are now separate threads, so the kernel alternates them every slice.
+    nodes: [worker, big]
+    edges: [big>worker, kernel>worker]
+    role: resume
+  - text: { go: 'In Go both already happen: the runtime''s own preemption moves goroutines between Ms every 10 ms, and the kernel time-slices the Ms. The /healthz goroutine runs within a slice.', python: 'The event loop is free between awaits again, so /healthz runs as soon as its request arrives. The parse runs in another process with its own GIL.', typescript: 'The event loop is free again, so the /healthz callback runs as soon as its request arrives. The parse runs on a worker thread.', rust: 'The tokio workers are free again, so the /healthz task runs as soon as its request arrives. The parse runs on a blocking-pool thread.' }
+    nodes: [app, loop]
+    edges: [app>loop]
+    role: serve
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A program runs a loop that never makes a system call. How does the OS get the CPU back?
+    options:
+      - text: The timer interrupt traps into the kernel every few milliseconds, whatever the program is doing.
+        correct: true
+        why: Right. The kernel starts the timer at boot. Each tick enters the kernel through the trap table, and the scheduler can then run something else.
+      - text: The kernel checks the program between instructions.
+        why: No. While the program runs, the kernel is not running at all. It only gets the CPU back through a trap.
+      - text: It waits until the program makes its next system call.
+        why: That is cooperative scheduling. A program that never makes a call would then keep the CPU until a reboot.
+  engineer:
+    question: A latency-sensitive proxy shares 4 cores with batch jobs. pidstat -w shows thousands of involuntary context switches a second for the proxy and its p99 is spiky. What is going on?
+    options:
+      - text: Other runnable threads share its cores, so the timer keeps preempting it and it waits for a slice before it runs again.
+        correct: true
+        why: Right. Involuntary switches are preemptions. Give the proxy its own cores (cpusets), raise its share, or lower the batch jobs' priority.
+      - text: The proxy makes too many system calls, and each one is a context switch.
+        why: A system call is a mode switch inside the same thread. It only becomes a context switch if the call blocks, and that counts as voluntary.
+      - text: Context switches are free, so the spikes must come from the network.
+        why: Each switch costs microseconds directly and more in cold caches, and every preemption adds a wait of up to a slice.
+  deep:
+    question: During a timer-driven switch from A to B, why are registers saved twice?
+    options:
+      - text: The hardware saves A's user registers on A's kernel stack at the trap; the kernel's switch routine then saves A's kernel registers in A's task structure.
+        correct: true
+        why: Right. The first save makes the trap returnable. The second lets the kernel leave A's kernel stack mid-handler and later return to it as if A had just trapped.
+      - text: Once for the L1 cache and once for main memory.
+        why: No. Both saves go to memory. They hold different registers at different moments.
+      - text: The second save is a backup in case the first is lost.
+        why: "No. They save different state: user-mode registers at the trap, kernel-mode registers at the switch."
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Timer
+      example: the local APIC timer on x86
+      job: Interrupts the CPU every period, so the kernel runs at least that often.
+    - role: Trap table
+      example: the interrupt descriptor table on x86
+      job: Tells the CPU which kernel handler to run for each trap. Set at boot with a privileged instruction.
+    - role: Scheduler
+      example: Linux's fair class (EEVDF)
+      job: On each trap, decides whether the current task keeps the CPU.
+    - role: Switch routine
+      example: "Linux's context_switch(), __switch_to()"
+      job: Saves one task's kernel registers and stack pointer, loads another's.
+    - role: Process or thread
+      example: your event loop thread
+      job: Runs directly on the CPU in user mode until a trap.
+  useWhen:
+    - A cooperative runtime (an event loop, asyncio, tokio) runs CPU work that takes more than a few milliseconds. Move it to its own OS thread or process.
+    - Latency-sensitive and batch work share cores. Count involuntary switches with pidstat -w or /proc/PID/status.
+    - Sizing thread pools. Every thread beyond the core count adds switches, not throughput, for CPU work.
+  avoidWhen:
+    - The work is short or waits on I/O. A coroutine that awaits often already gives the loop back.
+  tradeoffs:
+    - A shorter time slice answers waiting tasks sooner but spends more CPU on traps, switches and cold caches.
+    - Moving CPU work to another thread or process costs a copy of the input and a hand-off, about tens of microseconds.
+    - Cooperative scheduling has no preemption overhead but one stuck task stops everything on its thread.
+  lookalikes:
+    - name: Mode switch
+      how: A system call changes mode within the same task. A context switch changes which task runs.
+    - name: Green threads
+      how: Goroutines, tokio tasks and coroutines are switched by a user-space runtime, far more cheaply, on top of the kernel's threads.
+    - name: Process switch vs thread switch
+      how: Switching between threads of one process keeps the page tables and so most TLB entries. Switching processes changes them.
+---
+
+## [concept] Limited direct execution
+
+**The OS runs your program directly on the CPU, and gets the CPU back only when a trap brings it in: a <Term id="system-call">system call</Term>, a device interrupt, or the <Term id="timer-interrupt">timer interrupt</Term>.**
+
+That is <Term id="limited-direct-execution">limited direct execution</Term>. Direct, because your code runs at full speed with no kernel in the way. Limited, because it runs in user mode, and the timer guarantees the kernel a turn every few milliseconds.
+
+<Depth level={2}>
+Four parts do the work. The **timer** interrupts the CPU on a fixed period. The **trap table** tells the CPU which kernel handler to run for each kind of trap. The **scheduler**, called from the handler, decides whether the current task keeps the CPU. The **switch routine** saves one task's registers and loads another's. A <Term id="context-switch">context switch</Term> is that last step, and it only happens when the scheduler picks a different task.
+</Depth>
+
+<Depth level={3}>
+The kernel installs the trap table and starts the timer at boot, while the CPU is still in kernel mode. Both are privileged instructions, so a user program cannot point traps at its own code or stop the timer. Older systems, such as early Mac OS, had no such timer for programs and relied on each program giving up the CPU. On those, an infinite loop meant a reboot.
+</Depth>
+
+## [problem] An import handler that parses on the request path
+
+A billing service accepts CSV imports of invoices. The handler reads the body, parses it, validates every row and returns a report. The same process answers `/healthz` for the load balancer.
+
+Imports are capped at 1 MB. A 1 MB file parses in a few tens of milliseconds, and the tests pass.
+
+<Depth level={2}>
+The mental model behind it: the OS time-slices everything, so a long request cannot starve the others. That is true of OS threads. It is not true inside a thread. Node's <Term id="event-loop">event loop</Term>, Python's asyncio and tokio's workers schedule your handlers themselves, and they are cooperative: a handler keeps its thread until it awaits.
+</Depth>
+
+<Depth level={3}>
+The kernel does preempt the event loop thread on its timer. It just has nothing else of yours to run on that thread, so after the slice it resumes the same parse. The kernel shares the CPU between threads. Inside one thread, sharing is up to the runtime.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** customers may now upload CSV imports of up to 50 MB instead of 1 MB.
+
+The marked line is the only change. The first big import takes several seconds of CPU, and while it runs `/healthz` gets no answer. The load balancer marks the instance unhealthy and restarts it mid-import. Every other request on that instance stalls as well.
+
+<Depth level={2}>
+CPU graphs show one core at 100% and the rest idle, so the box does not look overloaded. The thread running the event loop never reaches an `await` during the parse, so the loop never gets to run the `/healthz` handler. For <Lang only="go">Go this does not happen: the runtime preempts the goroutine after 10 ms, and the cost meter stays low.</Lang><Lang only="python">asyncio, the parse holds the loop for its whole length.</Lang><Lang only="typescript">Node, the parse holds the loop for its whole length.</Lang><Lang only="rust">tokio, the parse holds one worker; four concurrent imports on four workers hold them all.</Lang>
+</Depth>
+
+<Depth level={3}>
+The cost meter shows how long `/healthz` waits while an import runs. It is the parse time, because nothing inside the thread can stop the parse. A runtime with no timer behaves exactly like an OS with no timer interrupt: a task that never yields keeps the CPU.
+</Depth>
+
+## [morph] From a time-sliced request to a timer and a trap
+
+Drag the slider. The OS sharing the CPU between requests becomes what it really shares: threads, switched by the kernel when the timer traps. Inside the event loop thread, nothing is switched.
+
+The code moves the parse onto its own OS thread or process, where the kernel's timer does apply.
+
+<Depth level={2}>
+<Lang only="go">Go needs no change. Its runtime has a timer of its own: the sysmon thread checks running goroutines and preempts any that has run for 10 ms.</Lang>
+<Lang only="python">The parse runs in a `ProcessPoolExecutor`, one process per CPU, each with its own <Term id="gil">GIL</Term>. A thread pool would not help a CPU-bound parse, because the GIL lets one thread run bytecode at a time.</Lang>
+<Lang only="typescript">Piscina keeps a pool of `worker_threads`, one fewer than the cores, so the event loop thread always has a core to run on.</Lang>
+<Lang only="rust">`spawn_blocking` moves the parse onto tokio's blocking pool, separate OS threads, so the async workers stay free for `/healthz`.</Lang>
+</Depth>
+
+<Depth level={3}>
+The fix costs a copy of the 50 MB body into the worker, a few milliseconds, and the kernel now switches between the loop thread and the worker. Both are small next to a stalled health check. You could instead yield inside the parse every few thousand rows (`await` a resolved promise, `asyncio.sleep(0)`, `tokio::task::yield_now()`). That is <Term id="cooperative-scheduling">cooperative scheduling</Term> done by hand, and it breaks the day someone adds a loop without a yield.
+</Depth>
+
+## [walk] Follow one timer tick
+
+One timer interrupt, from the trap to the thread that runs next. Step through it with the numbered buttons.
+
+<Depth level={3}>
+On Linux the tick runs at `CONFIG_HZ`, 100 to 1000 times a second, and tickless kernels skip it on idle CPUs. The scheduler also gets control on a wake-up: when a network interrupt makes a thread runnable, the kernel may preempt the current thread right away if the woken one is owed CPU time. A switch between threads of one process keeps the page tables. A switch between processes loads new ones, and with Meltdown mitigations (KPTI) every trap also switches page tables, which makes each trap dearer.
+</Depth>
+
+## [again] 50 MB, the second time
+
+The same import with the parse off the event loop. It takes as long as before, but on a thread the kernel time-slices. `/healthz` answers in milliseconds, the load balancer keeps the instance, and other requests keep flowing.
+
+<Depth level={2}>
+Count the switches to see the difference. `/proc/PID/status` shows `voluntary_ctxt_switches` (the thread blocked or yielded) and `nonvoluntary_ctxt_switches` (the timer or a wake-up preempted it). `pidstat -w 1` prints both rates per second.
+</Depth>
+
+<Depth level={3}>
+A direct switch costs about one to a few microseconds on current hardware. The larger cost is indirect: the incoming thread finds caches and TLB holding the other thread's data. Measurements put that anywhere from a few microseconds to hundreds, depending on the working set. That is why the slice is milliseconds long and not microseconds.
+</Depth>
+
+## [play] Run two processes on one CPU
+
+A batch job and an API server share one core. You set the timer interval, run 120 ms, and watch every microsecond: who ran, when the kernel trapped, and how much went to switching.
+
+Start with no timer and a batch job that never traps. Then find the interval that answers the API fastest.
+
+## [lens] How each runtime meets the kernel's timer
+
+The kernel time-slices OS threads in every language. What differs is what runs inside a thread: Go's runtime preempts goroutines, while Node, asyncio and tokio are cooperative.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="limited-direct-execution-and-context-switch" />
+
+### The time slice trade-off
+
+| Slice | Waiting task waits up to | Switch overhead |
+|---|---|---|
+| Very short (100 µs) | little, until overhead slows everything | large: tens of percent with cold caches |
+| A few ms | a few ms | about 1% |
+| Long (50 ms and up) | a whole slice | negligible |
+
+Linux does not use one fixed slice for normal tasks. Its fair scheduler (EEVDF since Linux 6.6) gives each task a base slice of 0.7 ms times one plus log2 of the CPU count, 2.8 ms on 8 CPUs, and picks the next task by how much CPU it is owed. The next lessons show how schedulers choose.

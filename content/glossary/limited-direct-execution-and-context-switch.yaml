@@ -1,0 +1,25 @@
+# Terms introduced by the limited direct execution lesson.
+- id: limited-direct-execution
+  term: Limited direct execution
+  short: The OS runs a program directly on the CPU at full speed, in user mode, and gets control back only through traps such as system calls and the timer interrupt.
+- id: timer-interrupt
+  term: Timer interrupt
+  short: A hardware timer the kernel programs at boot to interrupt the CPU every few milliseconds. Each interrupt traps into the kernel, which can then switch to another task.
+- id: trap-table
+  term: Trap table
+  short: The list of handler addresses the kernel gives the CPU at boot, one per kind of trap (system call, timer, device interrupt, fault). Setting it is a privileged instruction.
+- id: context-switch
+  term: Context switch
+  short: The kernel saving one task's registers and loading another's, including its kernel stack, so the CPU resumes a different task when it returns to user mode.
+- id: cooperative-scheduling
+  term: Cooperative scheduling
+  short: Scheduling in which a task keeps the CPU until it gives it up, by blocking, yielding or awaiting. A task that never gives it up stops everything else.
+- id: time-slice
+  term: Time slice
+  short: How long a task may run before the scheduler considers switching to another. Also called a quantum. It is a multiple of the timer interrupt period.
+- id: event-loop
+  term: Event loop
+  short: One thread that runs ready callbacks or coroutines one at a time. Node.js, Python's asyncio and single-threaded async runtimes work this way.
+- id: gil
+  term: GIL
+  short: CPython's global interpreter lock. Only the thread holding it runs Python bytecode; a waiting thread asks for it after the switch interval, 5 ms by default.
