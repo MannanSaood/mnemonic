@@ -1,0 +1,555 @@
+---
+title: Queues and the utilisation cliff
+track: performance
+group: Measuring
+order: 3
+summary: Waiting time stays small until a resource is nearly full, then explodes. Little's law links throughput, latency and how much is in flight.
+intent: Predict how waiting time grows with utilisation, size a worker pool with Little's law and headroom, and bound queues so saturation shows up as fast rejections instead of slow timeouts.
+changeRequest: A flash sale is coming. Plan the fraud-check pool for 95 checkouts a second at peak, up from 80.
+languages: [go, python, typescript, rust]
+glossary: [utilisation, saturation, queueing-delay, littles-law, load-shedding, backpressure]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [performance/what-performance-means]
+skills: [performance]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: queues-and-utilisation
+  scenarios:
+    - try: "Answer the prediction, then drag the arrival rate from 50 to 90 jobs a second with one worker."
+      notice: "The dot climbs the curve: the mean wait goes from about 10 ms to about 87 ms. 1.8 times the traffic, nearly 9 times the wait."
+    - try: "Set 95 jobs a second, then switch from 1 worker to 2."
+      notice: "The wait falls from about 170 ms to about 3 ms. Doubling capacity moved the dot from the cliff to the flat part, a 50-fold change."
+    - try: "Go past 100 jobs a second on one worker, then bound the queue."
+      notice: "Unbounded, the queue grows for the whole run and waits reach seconds. Bounded at 50, the wait stays below a second and the excess is rejected at once."
+    - try: "At 20 jobs a second, turn on the burst."
+      notice: "The workers are 20% busy on average, yet 40 jobs queue at once. A busy-percentage averaged over minutes cannot see this."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 52, title: Checkout API, sub: submits jobs }
+      after:  { x: 12, y: 30, w: 112, h: 52, title: Checkout API, sub: submits jobs }
+    - id: context
+      kind: context
+      before: { x: 150, y: 18, w: 270, h: 236, title: Fraud pool, sub: room until 100% }
+      after:  { x: 150, y: 30, w: 140, h: 56, title: Fraud pool, sub: a queue + workers }
+    - id: load
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 64, w: 230, h: 36, title: 80 → 95 per second }
+      after:  { x: 12, y: 200, w: 112, h: 44, title: 95/s peak }
+    - id: workers
+      kind: concrete
+      before: { x: 170, y: 112, w: 230, h: 36, title: 4 workers = 100/s }
+      after:  { x: 320, y: 200, w: 120, h: 44, title: 6 workers, sub: 63% busy }
+    - id: queue
+      kind: concrete
+      before: { x: 170, y: 160, w: 230, h: 36, title: buffer 100,000 }
+      after:  { x: 150, y: 200, w: 140, h: 44, title: queue of 12, sub: then 503 }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 320, y: 30, w: 130, h: 56, title: "" }
+      after:  { x: 320, y: 30, w: 130, h: 56, title: Little's law, sub: λ × S ÷ target }
+    - id: gauge
+      kind: concrete
+      appears: after
+      before: { x: 460, y: 110, w: 90, h: 56, title: "" }
+      after:  { x: 460, y: 110, w: 90, h: 56, title: queue depth, sub: saturation }
+  edges:
+    - { from: client, to: context, label: submits }
+    - { from: load, to: client }
+    - { from: context, to: queue, label: waits in }
+    - { from: queue, to: workers, label: feeds }
+    - { from: strategy, to: workers, label: sizes }
+    - { from: queue, to: gauge }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: fraud.go
+      source: |
+        // fraud.go
+        const (
+            workers  = 4
+            peakRate = 80 // checkouts/s at last year's peak
+        )
+
+        var jobs = make(chan Checkout, 100_000) // never full, never blocks a request
+
+        func init() {
+            // 4 workers × 25 checkouts/s (40 ms each) = 100/s, above the peak: fine
+            if peakRate > workers*25 {
+                log.Fatal("fraud pool too small for peak")
+            }
+            for range workers {
+                go func() {
+                    for c := range jobs {
+                        c.Result <- score(c) // about 40 ms of CPU
+                    }
+                }()
+            }
+        }
+      roles: { workers: [3, 3], load: [4, 4], queue: [7, 7], client: [7, 7], context: [9, 21] }
+      change:
+        - { line: 4, replace: "    peakRate = 95 // flash sale forecast: still under 100/s" }
+    after:
+      file: fraud.go
+      source: |
+        // fraud.go
+        const (
+            peakRate    = 95                    // checkouts/s, flash sale forecast
+            serviceTime = 40 * time.Millisecond // measured p50 of score()
+            targetBusy  = 0.7                   // stay on the flat part of the curve
+        )
+
+        // Little's law: busy workers = arrival rate × service time. Divide by the target.
+        var workers = int(math.Ceil(peakRate * serviceTime.Seconds() / targetBusy)) // 6
+
+        var jobs = make(chan Checkout, 2*workers) // a short queue: a long one only hides saturation
+
+        var queueDepth = promauto.NewGaugeFunc(prometheus.GaugeOpts{Name: "fraud_queue_depth"},
+            func() float64 { return float64(len(jobs)) })
+
+        func Submit(c Checkout) error {
+            select {
+            case jobs <- c:
+                return nil
+            default:
+                return ErrBusy // shed: the API answers 503 and the client retries later
+            }
+        }
+
+        func init() {
+            for range workers {
+                go func() {
+                    for c := range jobs {
+                        c.Result <- score(c)
+                    }
+                }()
+            }
+        }
+      roles: { load: [3, 3], strategy: [8, 9], size: [8, 9], workers: [9, 9], queue: [11, 11], gauge: [13, 14], measure: [13, 14], client: [16, 16], arrive: [16, 19], context: [16, 33], shed: [20, 21] }
+    again:
+      file: checkout.go
+      source: |
+        // checkout.go at the flash sale peak: the same code, the forecast numbers
+        // workers = ⌈95 × 0.040 / 0.7⌉ = 6, each about 63% busy
+        // mean wait ≈ 4 ms (178 ms with 4 workers at 95% busy)
+        // a burst past 12 queued checkouts gets an instant 503, not a timeout
+        if err := fraud.Submit(c); errors.Is(err, fraud.ErrBusy) {
+            http.Error(w, "busy, retry shortly", http.StatusServiceUnavailable)
+            return
+        }
+    cost:
+      before: { text: "+19% traffic · 6× the wait (178 ms)", value: 0.85 }
+      after: { text: "6 workers · wait ~4 ms", value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Built in
+      note: 'A buffered channel is a bounded queue: its capacity is the queue length, `len(ch)` is the depth, and a `select` with `default` sheds instead of blocking. `errgroup.Group.SetLimit` and `x/sync/semaphore` bound concurrency. Goroutines waiting for a P form a queue too, which `runtime/metrics` reports as `/sched/latencies:seconds`.'
+      seenIn: '`make(chan T, n)` and `select { default: }`. `golang.org/x/sync/semaphore.Weighted`. `net/http` has no request queue limit of its own; servers add one with middleware.'
+
+  python:
+    before:
+      file: fraud.py
+      source: |
+        # fraud.py
+        WORKERS = 4
+        PEAK_RATE = 80  # checkouts/s at last year's peak
+
+        # 4 workers × 25 checkouts/s (40 ms each) = 100/s, above the peak: fine
+        assert PEAK_RATE <= WORKERS * 25, "fraud pool too small for peak"
+
+        pool = ProcessPoolExecutor(max_workers=WORKERS)  # its queue is unbounded
+
+        async def check(c: Checkout) -> Score:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(pool, score, c)  # about 40 ms of CPU
+      roles: { workers: [2, 2], load: [3, 3], queue: [8, 8], client: [10, 10], context: [10, 12] }
+      change:
+        - { line: 3, replace: "PEAK_RATE = 95  # flash sale forecast: still under 100/s" }
+    after:
+      file: fraud.py
+      source: |
+        # fraud.py
+        PEAK_RATE = 95        # checkouts/s, flash sale forecast
+        SERVICE_TIME = 0.040  # seconds, measured p50 of score()
+        TARGET_BUSY = 0.7     # stay on the flat part of the curve
+
+        # Little's law: busy workers = arrival rate × service time. Divide by the target.
+        WORKERS = math.ceil(PEAK_RATE * SERVICE_TIME / TARGET_BUSY)  # 6
+
+        pool = ProcessPoolExecutor(max_workers=WORKERS)
+        slots = asyncio.Semaphore(3 * WORKERS)  # in service plus a short queue
+        IN_FLIGHT = Gauge("fraud_in_flight", "Checkouts queued or being scored")
+
+        async def check(c: Checkout) -> Score:
+            if slots.locked():
+                raise Busy()  # shed: the API answers 503 and the client retries later
+            async with slots:
+                with IN_FLIGHT.track_inprogress():
+                    loop = asyncio.get_running_loop()
+                    return await loop.run_in_executor(pool, score, c)
+      roles: { load: [2, 2], strategy: [6, 7], size: [6, 7], workers: [7, 9], queue: [10, 10], gauge: [11, 11], client: [13, 13], arrive: [13, 13], context: [13, 19], shed: [14, 15], measure: [17, 17] }
+    again:
+      file: checkout.py
+      source: |
+        # checkout.py at the flash sale peak: the same code, the forecast numbers
+        # WORKERS = ⌈95 × 0.040 / 0.7⌉ = 6, each about 63% busy
+        # mean wait ≈ 4 ms (178 ms with 4 workers at 95% busy)
+        # a burst past 18 in flight gets an instant 503, not a timeout
+        try:
+            score = await fraud.check(c)
+        except fraud.Busy:
+            raise HTTPException(503, "busy, retry shortly")
+    cost:
+      before: { text: "+19% traffic · 6× the wait (178 ms)", value: 0.85 }
+      after: { text: "6 workers · wait ~4 ms", value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Manual
+      note: '`ProcessPoolExecutor` and `ThreadPoolExecutor` queue submitted work without limit, so you add the bound: an `asyncio.Semaphore`, or an `asyncio.Queue(maxsize=n)` whose `put_nowait` raises `QueueFull`. CPU work needs processes, so the pool size counts cores, and Little''s law counts how many of them you need.'
+      seenIn: '`asyncio.Queue(maxsize=…)` and `QueueFull`. `asyncio.Semaphore`. `prometheus_client` `Gauge.track_inprogress()`. Gunicorn''s `--backlog` and `--workers`.'
+
+  typescript:
+    before:
+      file: fraud.ts
+      source: |
+        // fraud.ts
+        const WORKERS = 4;
+        const PEAK_RATE = 80; // checkouts/s at last year's peak
+
+        // 4 workers × 25 checkouts/s (40 ms each) = 100/s, above the peak: fine
+        if (PEAK_RATE > WORKERS * 25) throw new Error("fraud pool too small for peak");
+
+        const pool = new Piscina({ filename: SCORER, maxThreads: WORKERS }); // no maxQueue: unbounded
+
+        export function check(c: Checkout): Promise<Score> {
+          return pool.run(c); // about 40 ms of CPU
+        }
+      roles: { workers: [2, 2], load: [3, 3], queue: [8, 8], client: [10, 10], context: [10, 12] }
+      change:
+        - { line: 3, replace: "const PEAK_RATE = 95; // flash sale forecast: still under 100/s" }
+    after:
+      file: fraud.ts
+      source: |
+        // fraud.ts
+        const PEAK_RATE = 95; // checkouts/s, flash sale forecast
+        const SERVICE_TIME_S = 0.04; // measured p50 of score()
+        const TARGET_BUSY = 0.7; // stay on the flat part of the curve
+
+        // Little's law: busy workers = arrival rate × service time. Divide by the target.
+        const WORKERS = Math.ceil((PEAK_RATE * SERVICE_TIME_S) / TARGET_BUSY); // 6
+
+        const pool = new Piscina({ filename: SCORER, maxThreads: WORKERS, maxQueue: 2 * WORKERS });
+
+        new Gauge({ name: "fraud_queue_depth", help: "Checkouts waiting for a worker",
+          collect() { this.set(pool.queueSize); } });
+
+        export function check(c: Checkout): Promise<Score> {
+          return pool.run(c); // rejects at once when the queue is full: the API answers 503
+        }
+      roles: { load: [2, 2], strategy: [6, 7], size: [6, 7], workers: [7, 9], queue: [9, 9], gauge: [11, 12], measure: [11, 12], client: [14, 14], arrive: [14, 14], context: [14, 16], shed: [15, 15] }
+    again:
+      file: checkout.ts
+      source: |
+        // checkout.ts at the flash sale peak: the same code, the forecast numbers
+        // WORKERS = ⌈95 × 0.040 / 0.7⌉ = 6, each about 63% busy
+        // mean wait ≈ 4 ms (178 ms with 4 workers at 95% busy)
+        // a burst past 12 queued checkouts gets an instant 503, not a timeout
+        const score = await fraud.check(c).catch(() => null);
+        if (score === null) return reply.code(503).send("busy, retry shortly");
+    cost:
+      before: { text: "+19% traffic · 6× the wait (178 ms)", value: 0.85 }
+      after: { text: "6 workers · wait ~4 ms", value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Node is queues all the way down: the event loop is one, and libuv''s thread pool (4 threads by default) is another. Piscina queues tasks without limit unless you set `maxQueue`. `p-limit` bounds concurrency but queues the rest without bound; check `pendingCount`. `monitorEventLoopDelay()` measures the event loop''s queueing delay directly.'
+      seenIn: '`piscina` `maxQueue` and `queueSize`. `p-limit` `activeCount` and `pendingCount`. `server.maxConnections`. `UV_THREADPOOL_SIZE`.'
+
+  rust:
+    before:
+      file: fraud.rs
+      source: |
+        // fraud.rs
+        const WORKERS: usize = 4;
+        const PEAK_RATE: usize = 80; // checkouts/s at last year's peak
+
+        pub fn start() -> Sender<Checkout> {
+            // 4 workers × 25 checkouts/s (40 ms each) = 100/s, above the peak: fine
+            assert!(PEAK_RATE <= WORKERS * 25, "fraud pool too small for peak");
+            let (tx, rx) = crossbeam_channel::unbounded::<Checkout>();
+            for _ in 0..WORKERS {
+                let rx = rx.clone();
+                thread::spawn(move || {
+                    for c in rx {
+                        let _ = c.reply.send(score(&c)); // about 40 ms of CPU
+                    }
+                });
+            }
+            tx
+        }
+      roles: { workers: [2, 2], load: [3, 3], queue: [8, 8], client: [5, 5], context: [5, 18] }
+      change:
+        - { line: 3, replace: "const PEAK_RATE: usize = 95; // flash sale forecast: still under 100/s" }
+    after:
+      file: fraud.rs
+      source: |
+        // fraud.rs
+        const PEAK_RATE: f64 = 95.0; // checkouts/s, flash sale forecast
+        const SERVICE_TIME: f64 = 0.040; // seconds, measured p50 of score()
+        const TARGET_BUSY: f64 = 0.7; // stay on the flat part of the curve
+
+        pub fn start() -> Sender<Checkout> {
+            // Little's law: busy workers = arrival rate × service time. Divide by the target.
+            let workers = (PEAK_RATE * SERVICE_TIME / TARGET_BUSY).ceil() as usize; // 6
+            let (tx, rx) = crossbeam_channel::bounded::<Checkout>(2 * workers);
+            for _ in 0..workers {
+                let rx = rx.clone();
+                thread::spawn(move || {
+                    for c in rx {
+                        let _ = c.reply.send(score(&c));
+                    }
+                });
+            }
+            tx
+        }
+
+        pub fn submit(tx: &Sender<Checkout>, c: Checkout) -> Result<(), Busy> {
+            gauge!("fraud_queue_depth").set(tx.len() as f64);
+            tx.try_send(c).map_err(|_| Busy) // full: the API answers 503 at once
+        }
+      roles: { load: [2, 2], strategy: [7, 8], size: [7, 8], workers: [8, 8], queue: [9, 9], context: [6, 24], client: [21, 21], arrive: [21, 21], gauge: [22, 22], measure: [22, 22], shed: [23, 23] }
+    again:
+      file: checkout.rs
+      source: |
+        // checkout.rs at the flash sale peak: the same code, the forecast numbers
+        // workers = ⌈95 × 0.040 / 0.7⌉ = 6, each about 63% busy
+        // mean wait ≈ 4 ms (178 ms with 4 workers at 95% busy)
+        // a burst past 12 queued checkouts gets an instant 503, not a timeout
+        if fraud::submit(&self.fraud, c).is_err() {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    cost:
+      before: { text: "+19% traffic · 6× the wait (178 ms)", value: 0.85 }
+      after: { text: "6 workers · wait ~4 ms", value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Bounded channels are the norm: `crossbeam_channel::bounded`, `std::sync::mpsc::sync_channel` and `tokio::sync::mpsc::channel(n)` all make you pick a capacity, and `try_send` reports `Full` instead of blocking. The unbounded variants exist and carry the same risk as everywhere else. `tower` adds `ConcurrencyLimit` and `LoadShed` layers for services.'
+      seenIn: '`tokio::sync::mpsc::channel` and `try_send`. `tokio::sync::Semaphore`. `tower::limit::ConcurrencyLimitLayer` and `tower::load_shed::LoadShedLayer`. `crossbeam_channel::Sender::len`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Checkouts arrive at random, about 95 a second at the peak. Each needs about 40 ms of one worker's CPU.
+    nodes: [client, load, context]
+    edges: [load>client, client>context]
+    role: arrive
+  - text: A checkout that finds every worker busy waits in the queue. The busier the workers, the more often that happens and the longer the line. With 4 workers at 95% busy, 9 checkouts in 10 wait, 178 ms on average.
+    nodes: [context, queue, workers]
+    edges: [context>queue, queue>workers]
+    role: queue
+  - text: "Little's law sizes the pool: busy workers = arrival rate × service time = 95 × 0.04 = 3.8. For a 70% target, 3.8 ÷ 0.7 rounds up to 6. Now each is 63% busy and the mean wait is about 4 ms."
+    nodes: [strategy, workers]
+    edges: [strategy>workers]
+    role: size
+  - text: A burst can still fill the queue. The queue is short, so a checkout that does not fit gets a 503 at once, and the client retries a moment later, instead of waiting seconds and timing out.
+    nodes: [client, context, queue]
+    edges: [context>queue]
+    role: shed
+  - text: The queue depth is exported as a gauge. Utilisation says how busy the workers are; queue depth says how much is waiting for them, and it climbs before users notice.
+    nodes: [queue, gauge]
+    edges: [queue>gauge]
+    role: measure
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: Why does a worker pool that is 90% busy feel so much slower than one that is 60% busy?
+    options:
+      - text: Waiting time grows steeply near full. With random arrivals, jobs wait about 1.5 service times at 60% and about 9 at 90%.
+        correct: true
+        why: Right. Queueing delay grows roughly like ρ / (1 − ρ). The work per job is the same; the time spent waiting for a free worker is what explodes.
+      - text: Each job takes longer to process when the workers are busier.
+        why: The service time is the same. The extra latency is time spent in the queue before the work starts.
+      - text: It does not; 90% busy still leaves 10% spare capacity, so latency stays the same.
+        why: Spare capacity on average is not spare capacity at every moment. Random arrivals bunch up, and near full there is no slack to absorb the bunches.
+  engineer:
+    question: A service handles 500 requests a second with an average latency of 200 ms. How many requests are in flight at any moment, on average?
+    options:
+      - text: "100"
+        correct: true
+        why: Right. Little's law, L = λW = 500 × 0.2. It holds for any stable system, whatever the distributions, and it is how you size pools and connection limits.
+      - text: "2,500"
+        why: That divides 500 by 0.2. In-flight work is rate times time, not rate divided by time.
+      - text: It depends on the latency distribution, so it cannot be computed.
+        why: Little's law needs only the averages. The distribution matters for percentiles, not for the mean number in flight.
+  deep:
+    question: A dashboard shows the database host at 40% CPU, averaged over 5 minutes, yet users see stalls of a second or more. What is the most likely explanation?
+    options:
+      - text: Load arrives in bursts. For a few seconds at a time the CPU is saturated and requests queue; the 5-minute average spreads those seconds over quiet ones.
+        correct: true
+        why: Right. Utilisation is an average over an interval, and queues form at the scale of milliseconds. Per-second sampling, queue lengths or scheduler latency show the bursts.
+      - text: 40% CPU means the database is idle most of the time, so the stalls must come from the network.
+        why: It may be the network, but an average cannot rule out the CPU. A 10-second burst at 100% in every 5 minutes changes the average by only a few points.
+      - text: The CPU is being throttled to 40% of its speed.
+        why: Throttling would show up as a cap in the metrics, and it would slow every request, not cause occasional stalls on an idle-looking host.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Arrival rate (λ)
+      example: 95 checkouts a second
+      job: How fast work arrives. Plan for the peak, and for bursts within the peak.
+    - role: Service time (S)
+      example: 40 ms of CPU per checkout
+      job: How long one job holds a worker, excluding waiting. Measure it; do not assume it.
+    - role: Utilisation (ρ = λS / c)
+      example: 95 × 0.04 / 6 = 63%
+      job: The share of time workers are busy. Where on the curve you are.
+    - role: Queue
+      example: { go: "chan Checkout, 12", python: "asyncio.Semaphore(18)", typescript: "Piscina maxQueue", rust: "crossbeam bounded(12)" }
+      job: Absorbs bursts. Its length is the saturation signal; its bound decides between a fast rejection and a slow timeout.
+  useWhen:
+    - Sizing any pool, connection limit or partition count. Little's law gives the busy count; headroom gives the rest.
+    - Deciding capacity before a known peak. Aim for utilisation on the flat part of the curve, often 60 to 75% for latency-sensitive work.
+    - Reading a dashboard. Look for queue lengths and wait times next to utilisation.
+  avoidWhen:
+    - Unbounded queues in request paths. They turn overload into memory growth and timeouts instead of a clear signal.
+    - Planning from 5-minute averages when work arrives in bursts.
+  tradeoffs:
+    - Headroom costs money; the lack of it costs latency. The curve says how much latency each point of utilisation buys.
+    - A short queue sheds load early and keeps latency bounded, but rejects work that a longer queue would have served late.
+    - More, smaller workers sharing one queue beat the same capacity split into separate queues; a free worker never sits idle while another has a line.
+    - Less variable service times halve waiting at the same utilisation. Splitting slow and fast jobs into separate pools helps both.
+  lookalikes:
+    - name: Backpressure
+      how: A full queue slowing the producer down, instead of rejecting. Works inside a pipeline; at a public API, clients just see a slow response.
+    - name: Load shedding
+      how: Rejecting early when saturated. The bounded queue here is the simplest form.
+    - name: Autoscaling
+      how: Adds workers when utilisation rises. It reacts in minutes, so it cannot absorb bursts measured in seconds.
+---
+
+## [concept] Queues and the utilisation cliff
+
+**When work arrives at random, the time it waits for a busy resource grows like ρ / (1 − ρ), where ρ is the resource's <Term id="utilisation">utilisation</Term>. Waiting stays small for a long time, then explodes as the resource nears 100%.**
+
+Every resource with a queue in front of it behaves this way: worker pools, connection pools, disks, locks, CPUs. Fast at 60% busy can mean very slow at 95%, with no change in the code.
+
+<Depth level={2}>
+<Term id="saturation">Saturation</Term> is the work waiting, the length of the queue. <Term id="queueing-delay">Queueing delay</Term> is the time it waits. <Term id="littles-law">Little's law</Term> ties the averages together: items in the system = arrival rate × time each spends inside. Use it both ways. 500 requests a second at 200 ms each means 100 in flight. 95 jobs a second at 40 ms of work each keeps 3.8 workers busy.
+</Depth>
+
+<Depth level={3}>
+The ρ / (1 − ρ) shape is exact for the simplest queue, one server with random (Poisson) arrivals and exponentially distributed service times, where the mean wait is S × ρ / (1 − ρ). With c servers sharing one queue, the Erlang C formula gives the chance a job waits at all. Variability scales the curve: constant service times halve the wait at the same utilisation, burstier arrivals raise it. The cliff stays.
+</Depth>
+
+## [problem] A fraud-check pool sized for the average
+
+A payments service scores every checkout with a fraud model before it authorises the card. Scoring takes about 40 ms of CPU, so a pool of 4 workers can score 100 checkouts a second. Last year's peak was 80. A startup check makes sure the peak stays under capacity, and the queue in front of the workers is large enough never to fill.
+
+Read it with the usual mental model: 80 a second is 80% of capacity, so there is 20% to spare, and latency stays at 40 ms until the pool is full.
+
+<Depth level={2}>
+At 80% busy the pool already queues. Checkouts arrive at random, so some seconds bring 90 and some 70, and within a second they bunch. With 4 workers at 80%, 6 checkouts in 10 wait for a worker, about 30 ms on average and about 200 ms at the 99th percentile.
+</Depth>
+
+<Depth level={3}>
+The large queue looks defensive. It hides the problem instead: when the pool falls behind, work piles up in memory and every checkout waits longer, until callers time out. The only visible signal is latency, and by then the queue is minutes long.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** a flash sale is coming. Plan the fraud-check pool for 95 checkouts a second at peak, up from 80.
+
+The marked line is the only change, and the startup check still passes: 95 is under 100. During the sale, checkout latency jumps. The mean wait for a worker goes from about 30 ms to about 180 ms, the p99 wait from about 200 ms to about 900 ms, and the payment gateway's own timeouts start to fire. Traffic rose 19%. Waiting rose 6 times.
+
+<Depth level={2}>
+The pool went from 80% to 95% busy, from the bend of the curve to the cliff. Each point of utilisation near 100% costs more waiting than the one before. Any burst during the sale, or a slower score for one kind of basket, pushes it past 100% for a while, and the queue then grows until the burst ends.
+</Depth>
+
+<Depth level={3}>
+These numbers come from the M/M/c model with 4 servers (Erlang C). Real arrivals are often burstier than Poisson during a sale, which makes it worse. The cost meter shows the mean wait at the forecast peak.
+</Depth>
+
+## [morph] Size it from Little's law, and bound the queue
+
+Drag the slider. The plan that compares the peak with capacity becomes a pool sized for a target utilisation, a short queue that rejects early, and a gauge on its depth.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Little's law gives the busy workers: 95 × 0.04 = 3.8. Dividing by a 70% target gives 6 workers, each 63% busy, and a mean wait of about 4 ms. The short queue absorbs normal bunching; anything beyond it is <Term id="load-shedding">shed</Term> with a fast 503, so overload shows up as a count of rejections, not as timeouts everywhere.
+</Depth>
+
+<Depth level={3}>
+Where the work comes from a producer you control, such as a stream consumer, a full queue can block the producer instead, which is <Term id="backpressure">backpressure</Term>. At a public API there is no producer to slow down, only clients, so rejecting is the honest answer.
+</Depth>
+
+## [walk] Follow one checkout
+
+One checkout through the queue and the pool, at the peak. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`select` with a `default` case tries the send and falls through at once if the buffer is full. The gauge reads `len(jobs)` only when Prometheus scrapes, so it costs nothing per checkout.</Lang>
+<Lang only="python">`Semaphore.locked()` is true when no permits are left, so the check fails fast instead of queueing on the semaphore itself. The process pool still has its own internal queue; the semaphore keeps it short.</Lang>
+<Lang only="typescript">Piscina rejects `run()` once `maxQueue` tasks are waiting. The gauge's `collect` runs at scrape time and reads `queueSize`.</Lang>
+<Lang only="rust">`try_send` on a bounded crossbeam channel returns `Err(TrySendError::Full(c))` and hands the checkout back, so the caller can answer 503 without having lost it.</Lang>
+</Depth>
+
+## [again] The flash sale, the second time
+
+The same 95 checkouts a second on 6 workers sized from Little's law: each worker is 63% busy, checkouts wait about 4 ms on average and about 60 ms at the 99th percentile, and a burst that fills the short queue gets instant 503s that the client retries. The queue depth gauge shows the burst as it happens.
+
+<Depth level={2}>
+Alert on queue depth or wait time, not only on CPU. Utilisation tells you where you are on the curve; saturation tells you that you have gone over the edge.
+</Depth>
+
+<Depth level={3}>
+Re-measure the service time after every model change. Little's law is only as good as S: if a new fraud model takes 60 ms, the same 6 workers are 95% busy again.
+</Depth>
+
+## [play] A queue in front of workers
+
+Checkout jobs arrive at random and wait for a worker. You set the arrival rate, the number of workers, how much job times vary and whether the queue has a bound, and watch where the run lands on the curve.
+
+## [lens] How each language queues work
+
+Every pool has a queue in front of it. The language decides whether you can see it and whether it has a bound by default.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Look for the hidden queues: executor work queues, unbounded channels, connection pool wait lists, the kernel's listen backlog. Each needs a bound or at least a gauge.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="queues-and-utilisation" />
+
+### The curve in numbers
+
+Mean wait for one worker with random arrivals and random job times (M/M/1), in multiples of the service time:
+
+| Utilisation | 50% | 70% | 80% | 90% | 95% | 99% |
+|---|---|---|---|---|---|---|
+| Mean wait ÷ service time | 1 | 2.3 | 4 | 9 | 19 | 99 |
+
+Several workers sharing one queue sit lower on the same shape, and constant job times halve every number. Past 100% there is no number: the queue grows for as long as the overload lasts.

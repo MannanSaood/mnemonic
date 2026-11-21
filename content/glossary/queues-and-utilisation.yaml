@@ -1,0 +1,16 @@
+# Terms introduced by the queues and utilisation lesson.
+- id: utilisation
+  term: Utilisation
+  short: The share of time a resource is busy over an interval. A worker busy 900 ms of every second is 90% utilised. It says nothing about how much work is waiting.
+- id: saturation
+  term: Saturation
+  short: Work waiting because a resource is busy, such as a queue length or the time jobs spend waiting. It rises sharply as utilisation nears 100%.
+- id: queueing-delay
+  term: Queueing delay
+  short: Time a request spends waiting for a busy resource before its work starts. With random arrivals it grows roughly like ρ / (1 − ρ), where ρ is utilisation.
+- id: littles-law
+  term: Little's law
+  short: Items in a stable system = arrival rate × average time each spends inside (L = λW). 500 requests a second at 200 ms each means 100 in flight.
+- id: load-shedding
+  term: Load shedding
+  short: Rejecting some requests early and cheaply when a server is saturated, so the requests it accepts are still served in time.
