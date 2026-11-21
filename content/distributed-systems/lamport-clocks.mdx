@@ -1,0 +1,687 @@
+---
+title: Lamport clocks
+track: distributed-systems
+group: Time and order
+order: 7
+summary: Give every event a counter instead of a time. Each server ticks on every event and jumps past any number a message brings, so a cause always gets the smaller number.
+intent: Order events across servers so that a cause always comes before its effect, without trusting any machine's clock.
+changeRequest: A reply must never show above the message it answers.
+languages: [go, python, typescript, rust]
+glossary: [lamport-clock, happened-before, concurrent-events, clock-skew, clock-condition, total-order]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [distributed-systems/physical-clocks-and-skew]
+skills: [clocks]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: lamport-clocks
+  scenarios:
+    - try: "On A press Post, then Send to B. Deliver the arrow. On B press Post."
+      notice: "The wall-clock list shows B's reply before A's question, because B's clock is 80 ms slow. The Lamport list has the question at 1 and the reply at 4."
+    - try: "Switch B's clock to in sync, then back to 150 ms slow, without changing the run."
+      notice: "The same events re-sort by wall clock as the skew changes. The Lamport order does not move: it never read a clock."
+    - try: "Post twice on A and once on C, then select A2 and C1."
+      notice: "C1 has the smaller Lamport time, yet neither event could have influenced the other. A smaller number only means it could have come first."
+    - try: "Post on A and on C without sending anything."
+      notice: "Both get Lamport time 1. The server id breaks the tie, so every server still sorts them the same way."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 100, h: 48, title: Client, sub: posts text }
+      after:  { x: 12, y: 111, w: 100, h: 48, title: Client, sub: text + seen L }
+    - id: context
+      kind: context
+      before: { x: 132, y: 18, w: 256, h: 236, title: Chat server, sub: stamps its own clock }
+      after:  { x: 132, y: 111, w: 110, h: 48, title: Chat server, sub: one per region }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 262, y: 104, w: 132, h: 62, title: "" }
+      after:  { x: 262, y: 104, w: 132, h: 62, title: Lamport clock, sub: "max(L, seen) + 1" }
+    - id: stamp
+      kind: concrete
+      before: { x: 152, y: 76, w: 216, h: 40, title: "sent_at = now()" }
+      after:  { x: 420, y: 20, w: 128, h: 48, title: Stamp, sub: "(L, server)" }
+    - id: order
+      kind: concrete
+      before: { x: 152, y: 128, w: 216, h: 40, title: sort by sent_at }
+      after:  { x: 420, y: 111, w: 128, h: 48, title: Timeline, sub: sort by stamp }
+    - id: receive
+      kind: concrete
+      appears: after
+      before: { x: 152, y: 180, w: 216, h: 40, title: "" }
+      after:  { x: 420, y: 202, w: 128, h: 48, title: Receive, sub: tick past L }
+  edges:
+    - { from: client, to: context, label: post }
+    - { from: context, to: strategy, label: tick }
+    - { from: strategy, to: stamp }
+    - { from: stamp, to: order, label: sort }
+    - { from: receive, to: strategy, label: seen L }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: chat.go
+      source: |
+        // chat.go: every server stamps the messages it accepts
+        type Message struct {
+            ID     string
+            Room   string
+            Text   string
+            SentAt time.Time // the accepting server's clock
+        }
+
+        // Post accepts a message on this server and replicates it to the others.
+        func (s *Server) Post(room, text string) Message {
+            m := Message{ID: newID(), Room: room, Text: text, SentAt: time.Now()}
+            s.store.Append(m)
+            s.replicate(m)
+            return m
+        }
+
+        // Timeline shows a room in the order things were said.
+        func (s *Server) Timeline(room string) []Message {
+            msgs := s.store.Room(room)
+            sort.Slice(msgs, func(i, j int) bool { return msgs[i].SentAt.Before(msgs[j].SentAt) })
+            return msgs
+        }
+      roles: { client: [10, 10], context: [9, 15], stamp: [11, 11], order: [17, 22] }
+      change:
+        - { line: 11, replace: '    m := Message{ID: newID(), Room: room, Text: text, SentAt: s.ntp.Now()} // NTP-disciplined, still ms apart' }
+    after:
+      file: chat.go
+      source: |
+        // chat.go: order by Lamport time, not by any server's clock
+        type Stamp struct {
+            L      uint64 // Lamport time
+            Server uint16 // breaks ties, so the order is total
+        }
+
+        func (a Stamp) Less(b Stamp) bool {
+            if a.L != b.L {
+                return a.L < b.L
+            }
+            return a.Server < b.Server
+        }
+
+        type Message struct {
+            ID    string
+            Room  string
+            Text  string
+            Stamp Stamp
+        }
+
+        // Clock is a Lamport clock: one counter per server.
+        type Clock struct {
+            mu sync.Mutex
+            l  uint64
+        }
+
+        // Tick stamps an event. seen is the largest Lamport time it depends on (0 if none).
+        func (c *Clock) Tick(seen uint64) uint64 {
+            c.mu.Lock()
+            defer c.mu.Unlock()
+            c.l = max(c.l, seen) + 1
+            return c.l
+        }
+
+        // Post: the client sends the highest L it has shown, so a reply sorts after what it answers.
+        func (s *Server) Post(room, text string, seen uint64) Message {
+            m := Message{ID: newID(), Room: room, Text: text, Stamp: Stamp{s.clock.Tick(seen), s.id}}
+            s.store.Append(m)
+            s.replicate(m)
+            return m
+        }
+
+        // Receive applies a message replicated from another server.
+        func (s *Server) Receive(m Message) {
+            s.clock.Tick(m.Stamp.L) // move past everything this server has now seen
+            s.store.Append(m)
+        }
+
+        func (s *Server) Timeline(room string) []Message {
+            msgs := s.store.Room(room)
+            sort.Slice(msgs, func(i, j int) bool { return msgs[i].Stamp.Less(msgs[j].Stamp) })
+            return msgs
+        }
+      roles: { client: [36, 36], context: [35, 47], strategy: [21, 33], stamp: [2, 12], order: [49, 53], receive: [43, 47], seen: [35, 37], tick: [27, 33], replicate: [43, 47], sort: [49, 53] }
+    again:
+      file: chat_test.go
+      source: |
+        // chat_test.go: the same skewed cluster, ordered by Lamport time
+        func TestReplySortsAfterQuestion(t *testing.T) {
+            a, b := NewServer(1), NewServer(2) // b's wall clock may be 80 ms slow; nothing reads it now
+            q := a.Post("ops", "is the deploy stuck?", 0)
+            b.Receive(q)
+            r := b.Post("ops", "rolling it back", q.Stamp.L) // the app had shown q
+            tl := b.Timeline("ops")
+            if tl[0].ID != q.ID || tl[1].ID != r.ID {
+                t.Fatalf("reply shown above its question: %+v", tl)
+            }
+        }
+    cost:
+      before: { text: reply above its question whenever skew exceeds the reply time · no error, value: 0.75 }
+      after: { text: 0 replies out of order · 10 bytes per stamp, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: One function
+      note: 'A mutex around one `uint64` is enough, or a compare-and-swap loop on `atomic.Uint64` if the clock is hot. `max` is a builtin since Go 1.21. Give `Stamp` a `Less` method and keep the tie-break in one place, because every server must sort the same way.'
+      seenIn: 'HashiCorp Serf''s `LamportClock`, with `Increment` for local events and `Witness` for times seen in messages; Serf uses it to order membership and user events. etcd needs none: one Raft leader issues every revision.'
+
+  python:
+    before:
+      file: chat.py
+      source: |
+        # chat.py: every server stamps the messages it accepts
+        @dataclass
+        class Message:
+            id: str
+            room: str
+            text: str
+            sent_at: datetime  # the accepting server's clock
+
+
+        class Server:
+            def post(self, room: str, text: str) -> Message:
+                """Accept a message on this server and replicate it to the others."""
+                m = Message(new_id(), room, text, datetime.now(timezone.utc))
+                self.store.append(m)
+                self.replicate(m)
+                return m
+
+            def timeline(self, room: str) -> list[Message]:
+                """Show a room in the order things were said."""
+                return sorted(self.store.room(room), key=lambda m: m.sent_at)
+      roles: { client: [11, 11], context: [10, 16], stamp: [13, 13], order: [18, 20] }
+      change:
+        - { line: 13, replace: '        m = Message(new_id(), room, text, self.ntp.now())  # NTP-disciplined, still ms apart' }
+    after:
+      file: chat.py
+      source: |
+        # chat.py: order by Lamport time, not by any server's clock
+        class Stamp(NamedTuple):
+            lamport: int
+            server: int  # breaks ties; tuples compare field by field
+
+
+        @dataclass
+        class Message:
+            id: str
+            room: str
+            text: str
+            stamp: Stamp
+
+
+        class LamportClock:
+            def __init__(self) -> None:
+                self._l = 0
+                self._lock = threading.Lock()
+
+            def tick(self, seen: int = 0) -> int:
+                """Stamp an event. seen is the largest Lamport time it depends on."""
+                with self._lock:
+                    self._l = max(self._l, seen) + 1
+                    return self._l
+
+
+        class Server:
+            def post(self, room: str, text: str, seen: int) -> Message:
+                """The client sends the highest L it has shown, so a reply sorts after what it answers."""
+                m = Message(new_id(), room, text, Stamp(self.clock.tick(seen), self.id))
+                self.store.append(m)
+                self.replicate(m)
+                return m
+
+            def receive(self, m: Message) -> None:
+                """Apply a message replicated from another server."""
+                self.clock.tick(m.stamp.lamport)  # move past everything this server has now seen
+                self.store.append(m)
+
+            def timeline(self, room: str) -> list[Message]:
+                return sorted(self.store.room(room), key=lambda m: m.stamp)
+      roles: { client: [28, 28], context: [27, 38], strategy: [15, 24], stamp: [2, 4], order: [40, 41], receive: [35, 38], seen: [28, 30], tick: [20, 24], replicate: [35, 38], sort: [40, 41] }
+    again:
+      file: test_chat.py
+      source: |
+        # test_chat.py: the same skewed cluster, ordered by Lamport time
+        def test_reply_sorts_after_question() -> None:
+            a, b = Server(1), Server(2)  # b's wall clock may be 80 ms slow; nothing reads it now
+            q = a.post("ops", "is the deploy stuck?", seen=0)
+            b.receive(q)
+            r = b.post("ops", "rolling it back", seen=q.stamp.lamport)  # the app had shown q
+            assert [m.id for m in b.timeline("ops")] == [q.id, r.id]
+    cost:
+      before: { text: reply above its question whenever skew exceeds the reply time · no error, value: 0.75 }
+      after: { text: 0 replies out of order · one int per message, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: One function
+      note: 'A `NamedTuple` gives the tie-break for free, because tuples compare field by field. Use a `threading.Lock` if several threads stamp events; on a single asyncio loop the read and write happen without an `await` between them, so no lock is needed. Python ints never overflow.'
+      seenIn: 'Automerge names every operation `counter@actor`, which is a Lamport timestamp with the actor id as tie-break, and its Python bindings read and write the same documents. Nothing in the standard library: it is ten lines.'
+
+  typescript:
+    before:
+      file: chat.ts
+      source: |
+        // chat.ts: every server stamps the messages it accepts
+        interface Message {
+          id: string;
+          room: string;
+          text: string;
+          sentAt: number; // Date.now() on the accepting server
+        }
+
+        // Accept a message on this server and replicate it to the others.
+        export function post(s: Server, room: string, text: string): Message {
+          const m: Message = { id: newId(), room, text, sentAt: Date.now() };
+          s.store.append(m);
+          s.replicate(m);
+          return m;
+        }
+
+        // Show a room in the order things were said.
+        export function timeline(s: Server, room: string): Message[] {
+          return [...s.store.room(room)].sort((a, b) => a.sentAt - b.sentAt);
+        }
+      roles: { client: [10, 10], context: [9, 15], stamp: [11, 11], order: [17, 20] }
+      change:
+        - { line: 11, replace: '  const m: Message = { id: newId(), room, text, sentAt: s.ntp.now() }; // NTP-disciplined, still ms apart' }
+    after:
+      file: chat.ts
+      source: |
+        // chat.ts: order by Lamport time, not by any server's clock
+        interface Stamp {
+          lamport: number;
+          server: number; // breaks ties, so the order is total
+        }
+
+        const byStamp = (a: Stamp, b: Stamp) => a.lamport - b.lamport || a.server - b.server;
+
+        interface Message {
+          id: string;
+          room: string;
+          text: string;
+          stamp: Stamp;
+        }
+
+        // A Lamport clock. One event loop per process, so no lock is needed.
+        export class LamportClock {
+          private l = 0;
+          /** Stamp an event. seen is the largest Lamport time it depends on. */
+          tick(seen = 0): number {
+            this.l = Math.max(this.l, seen) + 1;
+            return this.l;
+          }
+        }
+
+        // The client sends the highest L it has shown, so a reply sorts after what it answers.
+        export function post(s: Server, room: string, text: string, seen: number): Message {
+          const m: Message = { id: newId(), room, text, stamp: { lamport: s.clock.tick(seen), server: s.id } };
+          s.store.append(m);
+          s.replicate(m);
+          return m;
+        }
+
+        // Apply a message replicated from another server.
+        export function receive(s: Server, m: Message): void {
+          s.clock.tick(m.stamp.lamport); // move past everything this server has now seen
+          s.store.append(m);
+        }
+
+        export function timeline(s: Server, room: string): Message[] {
+          return [...s.store.room(room)].sort((a, b) => byStamp(a.stamp, b.stamp));
+        }
+      roles: { client: [27, 27], context: [26, 38], strategy: [16, 24], stamp: [2, 7], order: [40, 42], receive: [34, 38], seen: [26, 28], tick: [19, 23], replicate: [34, 38], sort: [40, 42] }
+    again:
+      file: chat.test.ts
+      source: |
+        // chat.test.ts: the same skewed cluster, ordered by Lamport time
+        test("a reply sorts after its question", () => {
+          const a = newServer(1), b = newServer(2); // b's wall clock may be 80 ms slow; nothing reads it now
+          const q = post(a, "ops", "is the deploy stuck?", 0);
+          receive(b, q);
+          const r = post(b, "ops", "rolling it back", q.stamp.lamport); // the app had shown q
+          assert.deepEqual(timeline(b, "ops").map((m) => m.id), [q.id, r.id]);
+        });
+    cost:
+      before: { text: reply above its question whenever skew exceeds the reply time · no error, value: 0.75 }
+      after: { text: 0 replies out of order · two numbers per message, value: 0.1 }
+    lens:
+      need: 2
+      needLabel: One function
+      note: 'One event loop means `tick` runs to completion, so no lock. A `number` counts exactly to 2^53, far beyond any clock. Write the comparator once (`byStamp`) and use it everywhere, including in SQL `ORDER BY lamport, server` if the timeline is read from a database.'
+      seenIn: 'Automerge: every operation id is `counter@actor`, a Lamport timestamp, and concurrent inserts are ordered by it. Yjs instead keeps one counter per client, closer to the vector idea of the next lesson.'
+
+  rust:
+    before:
+      file: chat.rs
+      source: |
+        // chat.rs: every server stamps the messages it accepts
+        pub struct Message {
+            pub id: String,
+            pub room: String,
+            pub text: String,
+            pub sent_at: SystemTime, // the accepting server's clock
+        }
+
+        impl Server {
+            /// Accept a message on this server and replicate it to the others.
+            pub fn post(&self, room: &str, text: &str) -> Message {
+                let m = Message { id: new_id(), room: room.into(), text: text.into(), sent_at: SystemTime::now() };
+                self.store.append(&m);
+                self.replicate(&m);
+                m
+            }
+
+            /// Show a room in the order things were said.
+            pub fn timeline(&self, room: &str) -> Vec<Message> {
+                let mut msgs = self.store.room(room);
+                msgs.sort_by_key(|m| m.sent_at);
+                msgs
+            }
+        }
+      roles: { client: [11, 11], context: [10, 16], stamp: [12, 12], order: [18, 23] }
+      change:
+        - { line: 12, replace: '        let m = Message { id: new_id(), room: room.into(), text: text.into(), sent_at: self.ntp.now() }; // still ms apart' }
+    after:
+      file: chat.rs
+      source: |
+        // chat.rs: order by Lamport time, not by any server's clock
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// Derived Ord compares fields in order: Lamport time first, then the server id for ties.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+        pub struct Stamp {
+            pub lamport: u64,
+            pub server: u16,
+        }
+
+        pub struct Message {
+            pub id: String,
+            pub room: String,
+            pub text: String,
+            pub stamp: Stamp,
+        }
+
+        /// A Lamport clock that many threads can tick without a lock.
+        pub struct LamportClock(AtomicU64);
+
+        impl LamportClock {
+            /// Stamp an event. `seen` is the largest Lamport time it depends on.
+            pub fn tick(&self, seen: u64) -> u64 {
+                let prev = self.0
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(l.max(seen) + 1))
+                    .unwrap(); // the closure always returns Some
+                prev.max(seen) + 1
+            }
+        }
+
+        impl Server {
+            /// The client sends the highest L it has shown, so a reply sorts after what it answers.
+            pub fn post(&self, room: &str, text: &str, seen: u64) -> Message {
+                let stamp = Stamp { lamport: self.clock.tick(seen), server: self.id };
+                let m = Message { id: new_id(), room: room.into(), text: text.into(), stamp };
+                self.store.append(&m);
+                self.replicate(&m);
+                m
+            }
+
+            /// Apply a message replicated from another server.
+            pub fn receive(&self, m: Message) {
+                self.clock.tick(m.stamp.lamport); // move past everything this server has now seen
+                self.store.append(&m);
+            }
+
+            pub fn timeline(&self, room: &str) -> Vec<Message> {
+                let mut msgs = self.store.room(room);
+                msgs.sort_by_key(|m| m.stamp);
+                msgs
+            }
+        }
+      roles: { client: [33, 33], context: [31, 45], strategy: [18, 29], stamp: [4, 9], order: [47, 51], receive: [41, 45], seen: [32, 35], tick: [22, 28], replicate: [41, 45], sort: [47, 51] }
+    again:
+      file: chat_test.rs
+      source: |
+        // chat_test.rs: the same skewed cluster, ordered by Lamport time
+        #[test]
+        fn reply_sorts_after_question() {
+            let (a, b) = (Server::new(1), Server::new(2)); // b's wall clock may be 80 ms slow; nothing reads it now
+            let q = a.post("ops", "is the deploy stuck?", 0);
+            let (q_id, q_l) = (q.id.clone(), q.stamp.lamport);
+            b.receive(q);
+            let r = b.post("ops", "rolling it back", q_l); // the app had shown q
+            let ids: Vec<String> = b.timeline("ops").into_iter().map(|m| m.id).collect();
+            assert_eq!(ids, vec![q_id, r.id]);
+        }
+    cost:
+      before: { text: reply above its question whenever skew exceeds the reply time · no error, value: 0.75 }
+      after: { text: 0 replies out of order · 10 bytes per stamp, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: One function
+      note: '`AtomicU64::fetch_update` is a compare-and-swap loop: it retries the closure until no other thread changed the value in between, so `tick` needs no mutex. Deriving `Ord` on a struct compares fields in declaration order, which is the tie-break.'
+      seenIn: 'The `uhlc` crate used by Zenoh: a hybrid logical clock, a physical time with a logical counter in the low bits, which keeps the clock condition while staying close to real time.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A's user asks "is the deploy stuck?". A stamps it L 5 and replicates it to B. B's app shows it, then sends the reply with seen = 5.
+    nodes: [client]
+    edges: []
+    role: seen
+  - text: B has been quiet, so its clock is at 2. Tick takes max(2, 5) + 1 = 6. B's wall clock, 80 ms slow, is never read.
+    nodes: [context, strategy]
+    edges: [client>context, context>strategy]
+    role: tick
+  - text: B replicates the reply. A's Receive ticks A's clock to max(5, 6) + 1 = 7, so whatever A stamps next also sorts after the reply.
+    nodes: [receive, strategy]
+    edges: [receive>strategy]
+    role: replicate
+  - text: Every server sorts by (L, server). The question (5) comes before the reply (6) everywhere. Two messages with equal L sort by server id, the same way on every server.
+    nodes: [stamp, order]
+    edges: [strategy>stamp, stamp>order]
+    role: sort
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A server's Lamport clock reads 4 when a message stamped 9 arrives. What does it read after the receive?
+    options:
+      - text: "10: the larger of the two, plus one."
+        correct: true
+        why: Right. The receive is an event after the send, so it must get a larger number than the message carried.
+      - text: "5: the server ticks its own counter as usual."
+        why: Then the receive (5) would carry a smaller number than the send (9) that caused it, which breaks the one guarantee the clock gives.
+      - text: "9: it copies the sender's value."
+        why: Then the receive and the send would share a number. Every event after a cause must be strictly larger.
+  engineer:
+    question: Event a has Lamport time 5 and event b has Lamport time 9, on different servers. What do you know?
+    options:
+      - text: b did not happen before a. Whether a caused b is unknown.
+        correct: true
+        why: Right. If b had happened before a, b's number would be smaller. A smaller number for a is consistent with a causing b and with the two being concurrent.
+      - text: a happened before b.
+        why: The clock guarantees only one direction. Two servers that never talked can reach 5 and 9 on their own.
+      - text: They are concurrent, because they are on different servers.
+        why: Events on different servers are linked whenever a chain of messages connects them. The numbers alone cannot tell you whether one does.
+  deep:
+    question: A user posts on server A, then phones a colleague, who posts on server B. B's post gets the smaller Lamport time and sorts first. What went wrong?
+    options:
+      - text: The causal link went through the phone call, outside the system, so no message carried A's time to B.
+        correct: true
+        why: Right. Lamport calls this anomalous behaviour in the 1978 paper. Fix it by carrying the stamp across (the colleague's app sends A's time as seen), or by using physical clocks synchronised tightly enough.
+      - text: B's wall clock was skewed.
+        why: Lamport times never read a wall clock, so skew cannot change them.
+      - text: The tie-break by server id was applied the wrong way round.
+        why: A tie-break only decides between equal times. Here B's time was strictly smaller.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Server (process)
+      example: a chat server in one region
+      job: Keeps one counter and ticks it on every event it records or sends.
+    - role: Lamport clock
+      example: { go: "Clock.Tick(seen)", python: "LamportClock.tick(seen)", typescript: "clock.tick(seen)", rust: "LamportClock::tick(seen)" }
+      job: Returns max(own, seen) + 1, so every event is past everything it could depend on.
+    - role: Stamp
+      example: (L 6, server B)
+      job: Travels with the message and sorts by L, then by server id.
+    - role: Seen time
+      example: the largest L the client has shown the user
+      job: Carries a causal link that does not travel as a server message, such as a user reading before replying.
+  useWhen:
+    - Every replica must show the same order, and that order must never put an effect before its cause.
+    - Breaking ties between concurrent updates deterministically, for example in last-write-wins or in sequence CRDTs.
+    - Totally ordered broadcast or mutual exclusion, as in Lamport's original paper.
+  avoidWhen:
+    - You need to know whether two events were concurrent. Use vector clocks.
+    - The order must match real time for things outside the system, such as audit logs a regulator reads. Use synchronised clocks or a hybrid logical clock.
+    - One leader already numbers every write. Its sequence number is a simpler total order.
+  tradeoffs:
+    - Costs one integer per message and no extra round trips.
+    - The order is consistent with causality but arbitrary between concurrent events.
+    - Causal links outside the system, like a phone call or a client that skips seen, are invisible unless you carry the stamp across.
+  lookalikes:
+    - name: Wall-clock timestamp
+      how: Close to real time but wrong under skew, and a cause can carry the later time.
+    - name: Vector clock
+      how: One counter per server. Detects concurrency, at the price of a vector on every message.
+    - name: Hybrid logical clock
+      how: A physical time plus a logical counter. Keeps the clock condition and stays within the clock skew of real time.
+    - name: Raft term
+      how: Also a number that only grows and is pushed forward by messages, but it counts elections, not events.
+---
+
+## [concept] Lamport clocks
+
+**Give every event a counter instead of a time. Each server ticks on every event and jumps past any number a message brings, so a cause always gets the smaller number.**
+
+Servers cannot agree on the time. Their clocks drift and disagree by milliseconds, which is plenty for a reply to look older than its question. A <Term id="lamport-clock">Lamport clock</Term> gives up on time and counts events instead, in a way that respects cause and effect.
+
+<Depth level={2}>
+Two rules. Every server increments its counter between any two of its events. Every message carries the sender's counter, and the receiver sets its own to max(own, message) + 1. Then if event a <Term id="happened-before">happened before</Term> b, the number of a is smaller. Sort by (counter, server id) and every server computes the same <Term id="total-order">total order</Term>.
+</Depth>
+
+<Depth level={3}>
+Lamport's 1978 paper calls these rules IR1 and IR2, and calls the guarantee the <Term id="clock-condition">clock condition</Term>: a → b implies C(a) < C(b). The paper notes the converse cannot hold, since it would force any two <Term id="concurrent-events">concurrent</Term> events to share a time. The tie-break is any fixed order of the processes, and different valid clocks give different total orders. Only the happened-before partial order is fixed by the run.
+</Depth>
+
+## [problem] Sort by the server's timestamp
+
+A team chat runs on three servers, one per region. Each server stamps the messages it accepts with its own clock and replicates them to the others. The timeline sorts by that stamp. In testing, on one laptop, it is perfect.
+
+Read it once. The sort assumes the stamps of two servers can be compared.
+
+<Depth level={2}>
+They can only be compared if the clocks agree to better than the time between two related messages. A reply typed 60 ms after a question needs clocks that agree within 60 ms, every time, on every pair of servers.
+</Depth>
+
+<Depth level={3}>
+NTP over a WAN typically keeps clocks within milliseconds to tens of milliseconds, and a correction can step a clock or slew it. Leap second handling, a VM pause or a bad time source can widen the gap to seconds. None of that raises an error. The stamps are simply wrong.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** a reply must never show above the message it answers.
+
+Users in one region report replies above the questions they answer, mostly in fast back-and-forth threads. The server there runs 80 ms behind. Someone moves the stamp to an NTP-disciplined clock, the marked line. Fewer reports. They do not stop.
+
+<Depth level={2}>
+<Term id="clock-skew">Clock skew</Term> shrinks with better sync but never reaches zero, and a reply can follow its question by less than any bound you pick. The bug is the assumption that two machines' times order two events. They only do when the gap between the events is larger than the skew.
+</Depth>
+
+<Depth level={3}>
+Google's Spanner shows what it costs to make physical time safe: TrueTime returns an interval, and a commit waits out the uncertainty, a few milliseconds, before it becomes visible. A chat server does not need real time at all. It needs causes before effects.
+</Depth>
+
+## [morph] Count events instead of reading clocks
+
+Drag the slider. A Lamport clock appears between the server and its stamp, and a receive path appears that pushes the clock forward.
+
+The stamp is now (L, server), where L comes from the counter. The client sends the highest L it has shown the user, because reading the question before replying is the causal link, and the server ticks past it.
+
+<Depth level={2}>
+The `seen` parameter is the part people forget. The question reached B as a replicated message, which already moved B's clock. But a client can talk to a different server than the one that replicated to it, and only the client knows what it showed. Carrying `seen` makes the user's read part of the system.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`Stamp.Less` is the only comparison anyone should use. A second copy with the tie-break reversed would give two servers different orders.</Lang>
+<Lang only="python">`Stamp` is a `NamedTuple`, so `sorted(..., key=lambda m: m.stamp)` compares L first and the server id second with no comparator code.</Lang>
+<Lang only="typescript">`byStamp` returns a negative, zero or positive number, as `Array.prototype.sort` expects. The `||` falls through to the server id only when the Lamport times are equal.</Lang>
+<Lang only="rust">`#[derive(PartialOrd, Ord)]` on `Stamp` orders by `lamport`, then `server`, so `sort_by_key(|m| m.stamp)` is the whole timeline.</Lang>
+</Depth>
+
+## [walk] Follow one reply across two servers
+
+A question on server A, a reply on server B, whose wall clock is 80 ms slow. Use the numbered buttons.
+
+<Depth level={2}>
+Notice that B's clock jumped from 2 to 6. That is normal: a server that has been quiet catches up the moment it hears from a busier one. Lamport times say nothing about how much time passed.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Tick holds a mutex for two instructions. Under contention a CAS loop on `atomic.Uint64` avoids parking goroutines, but the mutex is rarely the bottleneck next to a network round trip.</Lang>
+<Lang only="python">The lock matters with threads because `max` and the assignment are separate bytecodes, and another thread can run between them.</Lang>
+<Lang only="typescript">Node never interrupts synchronous code, so `tick` is atomic by construction. Worker threads would each need their own clock or a shared `Atomics` cell.</Lang>
+<Lang only="rust">`fetch_update` returns the previous value, so the new one is recomputed as `prev.max(seen) + 1`, the same value the closure stored.</Lang>
+</Depth>
+
+## [again] The same skew, with Lamport time
+
+The same cluster, the same 80 ms skew, the same question and reply. The test passes: the question sorts first on every server, and nothing reads a wall clock any more.
+
+<Depth level={2}>
+The skew is still there. It just no longer matters for order. Keep wall-clock time in the message as a display field ("sent 14:02"), and never sort by it.
+</Depth>
+
+<Depth level={3}>
+What the order still cannot do is honour links outside the system. If one user posts and then phones a colleague, who posts on another server, the second post can sort first. Lamport's paper names this anomalous behaviour and gives two fixes: carry the timestamp across yourself, or use physical clocks synchronised well enough to respect the outside link.
+</Depth>
+
+## [play] Send messages and watch the two orders
+
+Three chat servers on a space-time diagram. The x axis is real time, which no server can see. Each dot shows its Lamport time; beside it is the wall-clock stamp its server would write. Two lists below sort the same events both ways.
+
+Make the wall-clock order lie, change the skew without changing the run, and find a pair where the smaller Lamport time did not cause the other.
+
+## [lens] How each language holds the clock
+
+The clock is one integer and one function in every language. The differences are in how you make `tick` atomic and how you get one comparator that every server shares.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Lamport times usually live inside a protocol rather than in your code. Sequence CRDTs such as Automerge use them to order concurrent inserts, and last-write-wins registers use them as the "time". In both, the server or actor id is the tie-break, exactly as here.
+</Depth>
+
+<Depth level={3}>
+Hybrid logical clocks combine the two kinds of time: take the physical clock, but never go below the largest timestamp seen, and add a counter when the physical part does not move. CockroachDB orders transactions with one. The result stays within the clock skew of real time and still satisfies the clock condition.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="lamport-clocks" />
+
+### Lamport time and real time
+
+| | Wall-clock stamp | Lamport stamp |
+|---|---|---|
+| A cause sorts first | Only if skew is smaller than the gap | Always |
+| Same order on every server | Yes, but possibly wrong | Yes |
+| Tells you how long ago | Yes | No |
+| Detects concurrency | No | No (use vector clocks) |
+| Costs | A clock read | One integer per message |

@@ -1,0 +1,10 @@
+# Terms introduced by distributed-systems/lamport-clocks.
+- id: clock-skew
+  term: Clock skew
+  short: The difference between two machines' clocks at the same instant. NTP keeps it small, typically milliseconds, but never zero, and a correction can make a clock jump.
+- id: clock-condition
+  term: Clock condition
+  short: Lamport's requirement for a logical clock. If event a happened before event b, then C(a) < C(b). The converse is not required and does not hold.
+- id: total-order
+  term: Total order
+  short: An order in which every two distinct items compare as one before the other. Lamport times plus a fixed tie-break on the server id give one that every server computes the same way.
