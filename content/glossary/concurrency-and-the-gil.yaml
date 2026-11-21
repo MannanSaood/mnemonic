@@ -1,0 +1,10 @@
+# Terms introduced by the Threads, processes, async and the GIL lesson (python track).
+- id: switch-interval
+  term: Switch interval
+  short: How long a thread waiting for CPython's GIL waits before asking the holder to drop it. 5 ms by default; see sys.getswitchinterval().
+- id: free-threaded-build
+  term: Free-threaded build
+  short: A CPython build without the GIL (PEP 703), so threads run Python in parallel. Experimental in 3.13, officially supported but optional since 3.14.
+- id: process-pool
+  term: Process pool
+  short: A fixed set of worker processes that run submitted functions. In Python each worker has its own interpreter and GIL; arguments and results cross over by pickling.

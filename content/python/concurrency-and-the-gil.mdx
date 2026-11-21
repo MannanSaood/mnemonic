@@ -1,0 +1,500 @@
+---
+title: "Threads, processes, async and the GIL"
+track: python
+group: Concurrency
+order: 19
+summary: On the standard CPython build, only the thread holding the GIL runs Python bytecode. Threads and asyncio overlap waiting; only processes, or the free-threaded build, overlap computing.
+intent: Pick threads, processes or asyncio from what the work spends its time on, waiting or computing, and know where the GIL serialises it.
+changeRequest: Validate every event against its JSON schema before delivering it.
+languages: [python, go, typescript, rust]
+glossary: [gil, switch-interval, free-threaded-build, process-pool, event-loop, cooperative-scheduling, concurrency-vs-parallelism, read-modify-write]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [concurrency, os, python]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: concurrency-and-the-gil
+  scenarios:
+    - try: "Make your prediction. Keep Schema validation on Threads, and go from 1 thread to 8."
+      notice: "The batch takes 970 ms either way. The top strip never shows more than one core busy, and the red bars are threads waiting for the GIL."
+    - try: "Switch to Processes with 4 workers, then to the free-threaded build on Threads."
+      notice: "Four cores light up and the batch drops to about 300 ms. Processes pay 60 ms to start and 2 ms a job to pickle; free-threaded threads run about 10% slower each."
+    - try: "Switch the work to Webhooks (I/O) and compare Threads with asyncio at 8."
+      notice: "Both finish in about 400 ms. The jobs spend 120 ms of their 124 waiting, and a waiting thread or task does not need the GIL or the loop."
+    - try: "Pick asyncio with Schema validation, 8 tasks. Watch the worst probe wait."
+      notice: "Over 300 ms. A task keeps the loop until it awaits, and validation never awaits, so the health probe queues behind every job."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: event queue, sub: 24 events }
+      after:  { x: 12, y: 24, w: 112, h: 48, title: event queue, sub: 24 events }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: { python: ThreadPoolExecutor, go: goroutines, typescript: Promise.all, rust: for_each_concurrent }, sub: "16 workers, all parallel?" }
+      after:  { x: 150, y: 24, w: 180, h: 48, title: { python: CPython process, go: Go runtime, typescript: Node process, rust: tokio runtime }, sub: { python: one GIL, go: GOMAXPROCS threads, typescript: one JS thread, rust: worker threads } }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 360, y: 24, w: 190, h: 48, title: "" }
+      after:  { x: 360, y: 24, w: 190, h: 48, title: { python: the GIL, go: GOMAXPROCS = 4, typescript: event loop, rust: async workers }, sub: { python: one thread runs bytecode, go: Ps run Go code, typescript: runs one callback, rust: must not block } }
+    - id: io
+      kind: concrete
+      before: { x: 170, y: 56, w: 230, h: 32, title: "webhook waits overlap" }
+      after:  { x: 150, y: 120, w: 180, h: 48, title: { python: I/O threads, go: goroutines, typescript: fetch on the loop, rust: async tasks }, sub: wait without a core }
+    - id: cpu
+      kind: concrete
+      before: { x: 170, y: 98, w: 230, h: 32, title: "validation on 4 cores?" }
+      after:  { x: 360, y: 120, w: 190, h: 48, title: { python: process pool, go: cpuSlots, typescript: worker threads, rust: spawn_blocking }, sub: { python: own GIL each, go: one per core, typescript: Piscina pool, rust: blocking pool } }
+    - id: cores
+      kind: concrete
+      before: { x: 170, y: 140, w: 230, h: 32, title: "batch 4× faster?" }
+      after:  { x: 360, y: 200, w: 190, h: 48, title: 4 cores, sub: all computing }
+    - id: validate
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 200, w: 230, h: 32, title: + schema validation }
+      after:  { x: 150, y: 200, w: 180, h: 48, title: validate(), sub: 40 ms of CPU }
+  edges:
+    - { from: client, to: context, label: feeds }
+    - { from: strategy, to: io, label: released }
+    - { from: context, to: cpu, label: submits }
+    - { from: cpu, to: cores, label: runs on }
+    - { from: validate, to: cpu, label: runs in }
+
+# ---------------------------------------------------------------- code
+code:
+  python:
+    before:
+      file: webhook_worker.py
+      source: |
+        # webhook_worker.py
+        pool = ThreadPoolExecutor(max_workers=16)
+
+
+        def handle(event: Event) -> None:
+            for hook in subscriptions_for(event.type):
+                http.post(hook.url, json=event.payload, timeout=5.0)
+
+
+        def run(events: list[Event]) -> None:
+            for _ in pool.map(handle, events):
+                pass
+      roles: { context: [2, 2], io: [5, 7], client: [10, 12] }
+      change:
+        - { after: 5, add: ['    SCHEMAS[event.type].validate(event.payload)  # jsonschema: pure Python'] }
+    after:
+      file: webhook_worker.py
+      source: |
+        # webhook_worker.py
+        cpu_pool = ProcessPoolExecutor()              # one process per core, each with its own GIL
+        io_pool = ThreadPoolExecutor(max_workers=16)  # threads waiting on sockets release the GIL
+
+
+        def validate(event_type: str, payload: dict) -> None:
+            SCHEMAS[event_type].validate(payload)     # pure Python: holds a GIL for 40 ms
+
+
+        def deliver(event: Event) -> None:
+            for hook in subscriptions_for(event.type):
+                http.post(hook.url, json=event.payload, timeout=5.0)
+
+
+        def run(events: list[Event]) -> None:
+            checks = [cpu_pool.submit(validate, e.type, e.payload) for e in events]
+            for event, check in zip(events, checks):
+                check.result()                        # re-raises a validation error here
+                io_pool.submit(deliver, event)
+      roles: { context: [1, 3], strategy: [3, 3], cpu: [2, 2], io: [3, 3], cores: [2, 2], validate: [6, 7], client: [15, 19], submit: [16, 16], parallel: [6, 7], result: [18, 18], deliver: [10, 12] }
+    again:
+      file: webhook_worker.py
+      source: |
+        # The same 24 events on 4 cores, after the change:
+        # validation runs in 4 processes at once, about 4 times the CPU throughput,
+        # and the delivery threads only ever wait for sockets.
+        # Check it: sys._is_gil_enabled() says which build you are on.
+    cost:
+      before: { text: "1 of 4 cores · batch 1.2 s", value: 0.85 }
+      after: { text: "4 processes · batch 0.55 s", value: 0.3 }
+    lens:
+      need: 4
+      needLabel: Pick per workload
+      note: 'On the standard build the GIL lets one thread run bytecode at a time, handing over every 5 ms when another thread asks. Blocking I/O, `time.sleep` and many C routines (hashlib, zlib, NumPy) release it. So: threads or asyncio for waiting, processes for pure-Python computing. The free-threaded build (3.13 experimental, 3.14 supported, not the default) removes the GIL. The GIL never made your own code thread-safe: `n += 1` still needs a lock.'
+      seenIn: '`ProcessPoolExecutor`, `InterpreterPoolExecutor` (3.14), `asyncio.to_thread`, `loop.run_in_executor`, `sys.getswitchinterval()`, `sys._is_gil_enabled()`. The default start method on Linux is `forkserver` since 3.14.'
+
+  go:
+    before:
+      file: worker.go
+      source: |
+        // worker.go
+        func Run(events []Event) {
+        	var wg sync.WaitGroup
+        	sem := make(chan struct{}, 16)
+        	for _, ev := range events {
+        		wg.Add(1)
+        		sem <- struct{}{}
+        		go func() {
+        			defer func() { <-sem; wg.Done() }()
+        			deliver(ev)
+        		}()
+        	}
+        	wg.Wait()
+        }
+      roles: { client: [2, 14], context: [4, 8], io: [8, 11] }
+      change:
+        - { after: 9, add: ['			if schemas[ev.Type].Validate(ev.Payload) != nil { return } // CPU: already parallel'] }
+    after:
+      file: worker.go
+      source: |
+        // worker.go
+        var cpuSlots = make(chan struct{}, runtime.GOMAXPROCS(0)) // CPU work: one per core
+        var ioSlots = make(chan struct{}, 16)                      // network waits: many
+
+        func handle(ev Event) {
+        	cpuSlots <- struct{}{}
+        	err := schemas[ev.Type].Validate(ev.Payload)
+        	<-cpuSlots
+        	if err != nil {
+        		log.Printf("event %s: %v", ev.ID, err)
+        		return
+        	}
+        	deliver(ev)
+        }
+
+        func Run(events []Event) {
+        	var wg sync.WaitGroup
+        	for _, ev := range events {
+        		ioSlots <- struct{}{}
+        		wg.Add(1)
+        		go func() {
+        			defer func() { <-ioSlots; wg.Done() }()
+        			handle(ev)
+        		}()
+        	}
+        	wg.Wait()
+        }
+      roles: { context: [2, 3], strategy: [2, 2], cpu: [5, 8], io: [3, 3], cores: [2, 2], validate: [7, 7], client: [16, 27], submit: [6, 6], parallel: [7, 7], result: [8, 12], deliver: [13, 13] }
+    again:
+      file: worker.go
+      source: |
+        // The same 24 events: validation already ran on all 4 Ps before the change.
+        // cpuSlots only keeps 16 validations from crowding out the delivery goroutines.
+    cost:
+      before: { text: "4 of 4 cores already", value: 0.2 }
+      after: { text: "4 of 4 cores · bounded", value: 0.15 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: 'Goroutines are multiplexed onto up to GOMAXPROCS threads that run Go code in parallel, so CPU work spreads over the cores with no change. There is no global lock. Shared data still needs a mutex or a channel; the race detector finds the misses.'
+      seenIn: '`runtime.GOMAXPROCS`, `errgroup.Group.SetLimit`, `go test -race`.'
+
+  typescript:
+    before:
+      file: worker.ts
+      source: |
+        // worker.ts
+        export async function run(events: Event[]): Promise<void> {
+          const limit = pLimit(16);
+          await Promise.all(events.map((ev) => limit(() => deliver(ev))));
+        }
+
+        async function deliver(ev: Event): Promise<void> {
+          for (const hook of subscriptionsFor(ev.type)) {
+            await fetch(hook.url, { method: "POST", body: JSON.stringify(ev.payload) });
+          }
+        }
+      roles: { client: [2, 5], context: [3, 4], io: [7, 11] }
+      change:
+        - { after: 7, add: ['  if (!validators[ev.type](ev.payload)) return; // ajv: synchronous CPU on the loop'] }
+    after:
+      file: worker.ts
+      source: |
+        // worker.ts
+        const validators = new Piscina({ filename: new URL("./validate.js", import.meta.url).href });
+
+        export async function run(events: Event[]): Promise<void> {
+          const limit = pLimit(16);
+          await Promise.all(events.map((ev) => limit(() => handle(ev))));
+        }
+
+        async function handle(ev: Event): Promise<void> {
+          await validators.run({ type: ev.type, payload: ev.payload }); // a worker thread, off the loop
+          for (const hook of subscriptionsFor(ev.type)) {
+            await fetch(hook.url, { method: "POST", body: JSON.stringify(ev.payload) });
+          }
+        }
+      roles: { context: [2, 2], strategy: [9, 14], cpu: [2, 2], io: [11, 13], cores: [2, 2], validate: [10, 10], client: [4, 7], submit: [10, 10], parallel: [10, 10], result: [10, 10], deliver: [11, 13] }
+    again:
+      file: worker.ts
+      source: |
+        // The same 24 events: validation runs in worker threads, one per core by default,
+        // and the event loop only ever waits for sockets and replies from the pool.
+    cost:
+      before: { text: "1 thread · every fetch waits for CPU", value: 0.9 }
+      after: { text: "worker threads · loop stays free", value: 0.25 }
+    lens:
+      need: 3
+      needLabel: Move CPU off
+      note: 'Node runs your JavaScript on one thread per isolate, with no GIL to argue about. Like asyncio, it overlaps waiting for free and does nothing for computing: a 40 ms synchronous call stalls every request. `worker_threads` gives each worker its own isolate and event loop; data crosses by structured cloning or `SharedArrayBuffer`.'
+      seenIn: '`worker_threads`, Piscina, the libuv thread pool (`UV_THREADPOOL_SIZE`), `node --cpu-prof`.'
+
+  rust:
+    before:
+      file: worker.rs
+      source: |
+        // worker.rs
+        async fn run(events: Vec<Event>) {
+            stream::iter(events)
+                .for_each_concurrent(16, |ev| async move {
+                    deliver(&ev).await;
+                })
+                .await;
+        }
+      roles: { client: [2, 8], context: [3, 4], io: [4, 6] }
+      change:
+        - { after: 4, add: ['            if !SCHEMAS[&ev.kind].is_valid(&ev.payload) { return; } // CPU on an async worker'] }
+    after:
+      file: worker.rs
+      source: |
+        // worker.rs
+        async fn run(events: Vec<Event>) {
+            stream::iter(events)
+                .for_each_concurrent(16, |ev| async move {
+                    let (ev, valid) = task::spawn_blocking(move || {
+                        let valid = SCHEMAS[&ev.kind].is_valid(&ev.payload); // CPU: off the async workers
+                        (ev, valid)
+                    })
+                    .await
+                    .expect("validation panicked");
+                    if valid {
+                        deliver(&ev).await;
+                    }
+                })
+                .await;
+        }
+      roles: { client: [2, 16], context: [3, 4], strategy: [4, 4], cpu: [5, 8], io: [11, 13], cores: [5, 8], validate: [6, 6], submit: [5, 5], parallel: [6, 7], result: [9, 10], deliver: [11, 13] }
+    again:
+      file: worker.rs
+      source: |
+        // The same 24 events: validation runs on tokio's blocking pool, in parallel,
+        // and the async workers stay free to drive the 16 deliveries.
+    cost:
+      before: { text: "async workers stall on CPU", value: 0.6 }
+      after: { text: "blocking pool · workers free", value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Choose the pool
+      note: 'Rust threads are OS threads that run in parallel, and `Send` and `Sync` stop data races at compile time. In async code the rule is the same as asyncio''s, per worker thread: a task that computes for 40 ms without an `.await` blocks every task queued on that worker. Move CPU work to `spawn_blocking` or a rayon pool.'
+      seenIn: '`std::thread::scope`, rayon''s `par_iter`, `tokio::task::spawn_blocking` and `block_in_place`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { python: '`run` submits each validation to the process pool. The function name and the payload are pickled and sent to a worker process over a pipe.', go: 'Each event gets a goroutine. Before validating, it takes one of GOMAXPROCS slots, so at most four validations compute at once.', typescript: '`handle` sends the payload to a Piscina worker thread. The payload is structured-cloned into the worker''s own isolate.', rust: 'Each task hands its event to `spawn_blocking`, which moves it into a closure on tokio''s blocking thread pool.' }
+    nodes: [client, context, cpu]
+    edges: [client>context, context>cpu]
+    role: submit
+  - text: { python: 'Each worker process has its own interpreter and its own GIL. Four of them run `validate` at the same time, one per core, with nothing to hand over.', go: '`Validate` runs on whichever thread holds the goroutine''s P. Four Ps, four validations in parallel, and the runtime preempts any that run too long.', typescript: 'The worker thread runs the validator on its own event loop, in parallel with the main thread and the other workers.', rust: 'The blocking pool runs the validation on its own OS thread, in parallel with the async workers.' }
+    nodes: [cpu, cores, validate]
+    edges: [cpu>cores, validate>cpu]
+    role: parallel
+  - text: { python: 'The result (here `None`, or an exception) is pickled back. `check.result()` returns it, or re-raises the validation error in the parent.', go: 'The slot is released as soon as validation returns, so the next event can compute while this one goes on to deliver.', typescript: 'The worker posts the result back, and the awaited promise settles on the main loop.', rust: 'Awaiting the `JoinHandle` gives back the event and the result; a panic in the closure becomes an error here.' }
+    nodes: [cpu, context]
+    edges: [context>cpu]
+    role: result
+  - text: { python: 'An I/O thread posts to each webhook. While it waits for the reply it has released the GIL, so 16 deliveries wait together while the main thread keeps going.', go: 'The goroutine parks on the network poller while it waits for the webhook. It holds no thread while waiting.', typescript: 'The main loop awaits each `fetch`. Waiting costs nothing; the loop runs other callbacks meanwhile.', rust: 'The async task awaits the HTTP response. While it waits, the worker thread drives other tasks.' }
+    nodes: [strategy, io]
+    edges: [strategy>io]
+    role: deliver
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: "A batch job does pure-Python number crunching on an 8-core server with standard CPython. Which change makes it faster?"
+    options:
+      - text: Run the work in a ProcessPoolExecutor.
+        correct: true
+        why: Right. Each process has its own interpreter and GIL, so eight can compute at once.
+      - text: Run it in a ThreadPoolExecutor with 8 threads.
+        why: Only the thread holding the GIL runs Python bytecode, so the threads take turns on one core.
+      - text: Rewrite it with asyncio.
+        why: asyncio is one thread. It overlaps waiting, not computing.
+  engineer:
+    question: "An asyncio web service gets slow on every endpoint after someone adds a 200 ms pure-Python PDF render to one handler. Why?"
+    options:
+      - text: The render runs on the event loop's thread and never awaits, so no other request can run until it finishes.
+        correct: true
+        why: Right. Scheduling in asyncio is cooperative; a task gives up the loop only at an await. Move the render to a process pool with loop.run_in_executor.
+      - text: The GIL makes the other requests' threads wait.
+        why: There is only one thread. The loop itself is busy, so the GIL is not the bottleneck here.
+      - text: The PDF library opens too many sockets.
+        why: Nothing here touches the network. CPU work alone is enough to stall the loop.
+  deep:
+    question: "Two threads each run `hits += 1` a million times on the standard (GIL) build. Can increments be lost?"
+    options:
+      - text: Yes. `hits += 1` is a read-modify-write over several bytecodes, and the GIL can change hands between them.
+        correct: true
+        why: Right. The GIL keeps the interpreter's own state consistent, not yours. How often a switch lands in that window depends on the CPython version; use a threading.Lock.
+      - text: No. The GIL makes every Python statement atomic.
+        why: The GIL is released between bytecodes, not between statements.
+      - text: Only on the free-threaded build.
+        why: The free-threaded build makes the race more likely, but the standard build has it too.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: GIL
+      example: "sys._is_gil_enabled()"
+      job: Lets one thread at a time run bytecode in one CPython interpreter.
+    - role: Thread pool
+      example: "ThreadPoolExecutor(max_workers=16)"
+      job: Overlaps blocking I/O. Each waiting thread releases the GIL.
+    - role: Process pool
+      example: "ProcessPoolExecutor()"
+      job: Runs Python on every core, one interpreter per process. Pickles arguments and results.
+    - role: Event loop
+      example: "asyncio.run(main())"
+      job: Runs many tasks on one thread, switching only at await.
+  useWhen:
+    - "Threads: many blocking calls (HTTP, database, files) and libraries without async support."
+    - "asyncio: thousands of concurrent connections, with async libraries all the way down."
+    - "Processes: pure-Python CPU work that should use more than one core."
+    - "Free-threaded build: CPU-bound threads sharing data, once every extension you use supports it."
+  avoidWhen:
+    - Threads for pure-Python CPU work on the standard build. They add switching cost and no speed.
+    - Processes for tiny tasks or huge arguments. Pickling and start-up cost more than the work.
+    - CPU work or blocking calls inside asyncio coroutines. Move them to an executor.
+  tradeoffs:
+    - Processes cost memory per interpreter, start-up time, and pickling on every call; objects cannot be shared directly.
+    - Threads share memory, so every shared mutable object needs a lock, with or without the GIL.
+    - The free-threaded build runs single-threaded code a few percent slower, and a C extension that is not marked safe turns the GIL back on.
+  lookalikes:
+    - name: Node's event loop
+      how: One JavaScript thread, like asyncio. CPU work blocks it; worker_threads play the role of processes.
+    - name: Ruby's GVL
+      how: CRuby has the same kind of lock. Ractors give parallelism, as processes or subinterpreters do in Python.
+    - name: Go's GOMAXPROCS
+      how: A limit on threads running Go code at once, normally one per core. There is no lock between goroutines.
+---
+
+## [concept] Threads, processes, async and the GIL
+
+**On the standard CPython build only the thread holding the <Term id="gil">GIL</Term> runs Python bytecode. Threads and asyncio overlap waiting; only processes, or the <Term id="free-threaded-build">free-threaded build</Term>, overlap computing.**
+
+Python has three ways to do several things at once. Threads share memory and the GIL. Processes each have their own interpreter. asyncio runs many tasks on one thread with an <Term id="event-loop">event loop</Term>. Which one helps depends on what the work spends its time on.
+
+<Depth level={2}>
+That is the difference between <Term id="concurrency-vs-parallelism">concurrency and parallelism</Term>. Waiting on a socket needs no CPU, so a thread that waits releases the GIL and a task that waits returns to the loop. A thousand webhooks can wait at once on either. Computing needs a core and, on the standard build, the GIL, so pure-Python CPU work on threads takes turns on one core. A <Term id="process-pool">process pool</Term> gives each worker its own GIL and its own core.
+</Depth>
+
+<Depth level={3}>
+The GIL protects the interpreter's own state, above all the reference counts in every object header, which are updated without atomics on the standard build. A thread that wants the GIL waits for the <Term id="switch-interval">switch interval</Term>, 5 ms by default, then sets a drop request; the holder notices at its next check between bytecodes, releases the GIL, and the operating system decides which waiting thread gets it. Blocking I/O and long C routines (hashing, compression, NumPy) release it around the call.
+</Depth>
+
+## [problem] A webhook worker on a thread pool
+
+A worker delivers events to customers' webhooks. Each delivery is an HTTP POST that takes about 120 ms, nearly all of it waiting for the other side. A thread pool of 16 sends them concurrently. It works, and it is tested.
+
+Read it with the usual model: 16 threads on a 4-core machine means 16 things happening at once.
+
+<Depth level={2}>
+For this workload the model is good enough. The threads spend almost all their time inside `http.post`, waiting on a socket with the GIL released. 16 waits overlap, and throughput is about 16 times one thread's.
+</Depth>
+
+<Depth level={3}>
+Each delivery still needs a few milliseconds of Python: building the request, parsing the reply. Those parts take turns on the GIL, which is why the speed-up is a little under 16, not exactly 16.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** validate every event against its JSON schema before delivering it.
+
+The marked line is pure Python and takes about 40 ms of CPU for a large payload. After the deploy, the worker's throughput falls to about 20 events a second, `top` shows the process at 100% of one core while three sit idle, and the health check gets slower.
+
+<Depth level={2}>
+The naive model says 16 threads should validate 16 events at once. On the standard build they validate one at a time, and the others queue for the GIL. Adding threads makes nothing faster; it adds handovers. The deliveries suffer too: each one that returns from its socket must wait for the GIL before it can read the reply.
+</Depth>
+
+<Depth level={3}>
+That last effect is the convoy David Beazley measured in 2010 and others have reproduced since: an I/O thread that finishes a quick operation can wait up to a switch interval to get the GIL back from a CPU-bound thread, every time. Lowering `sys.setswitchinterval` shortens the wait and adds switching overhead. Moving the CPU work out of the process removes it.
+</Depth>
+
+## [morph] From 16 parallel threads to one GIL and a pool per kind of work
+
+Drag the slider. The picture of 16 threads on 4 cores gives way to what CPython does: one GIL, threads that release it while they wait, and a separate process pool, one interpreter per core, for the validation.
+
+The code morphs to send validation to processes and keep delivery on threads.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Two pools, sized by what they do. CPU work gets one process per core: more only adds switching. I/O work gets as many threads as you want concurrent requests in flight, bounded by what the other side can take. The process pool pickles the event type and payload on the way in and the result on the way out, so keep the arguments small.
+</Depth>
+
+<Depth level={3}>
+<Lang only="python">Since 3.14 the default start method on Linux is `forkserver` instead of `fork`, as it has long been `spawn` on macOS and Windows. Workers import your module fresh, so `SCHEMAS` is built once per worker, and anything not picklable cannot be an argument. Python 3.14 also added `InterpreterPoolExecutor`: subinterpreters in one process, each with its own GIL.</Lang>
+<Lang only="go">Go needs no new pool to run validation in parallel. The slot channel sized by `runtime.GOMAXPROCS(0)` limits CPU work to one per P, so 16 validations do not crowd out the goroutines waiting to deliver.</Lang>
+<Lang only="typescript">Piscina keeps a pool of `worker_threads`, each with its own V8 isolate and event loop. The main loop only sends messages and awaits replies.</Lang>
+<Lang only="rust">`spawn_blocking` moves the closure to tokio's blocking pool. For sustained CPU work a dedicated rayon pool is a better fit, because the blocking pool is sized for waiting threads, up to 512 by default.</Lang>
+</Depth>
+
+## [walk] Follow one event through two pools
+
+One event, validated in another process and delivered from a thread. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="python">`ProcessPoolExecutor` feeds tasks through a queue to its workers and collects results on a management thread in the parent. `submit` returns a `Future` immediately; the exception, if any, travels back pickled and is raised by `result()`.</Lang>
+<Lang only="go">The validation goroutine can be preempted by the runtime's async preemption (since Go 1.14), so even a long loop without function calls cannot hold its P forever.</Lang>
+<Lang only="typescript">Structured cloning copies the payload into the worker. For large binary data, transfer an `ArrayBuffer` instead, which moves it without a copy.</Lang>
+<Lang only="rust">The closure takes ownership of `ev` with `move` and hands it back in the tuple, so no clone or `Arc` is needed.</Lang>
+</Depth>
+
+## [again] Validation, the second time
+
+The same change after the refactor. Validation runs in four processes at once, about four times the CPU throughput of the thread pool, and the delivery threads only ever wait for sockets. The health check is fast again, because the main process is no longer computing.
+
+<Depth level={2}>
+Measure which kind of work you have before choosing. `py-spy top` shows whether threads are running Python or idle in I/O, and a process stuck at 100% of one core with idle siblings is the GIL signature.
+</Depth>
+
+<Depth level={3}>
+The free-threaded build is the other way out. It was experimental in 3.13, became officially supported but optional in 3.14 (PEP 779), and is still not the default. Single-threaded code runs a few percent slower, and importing a C extension that is not marked safe for it turns the GIL back on with a warning. `sys._is_gil_enabled()` tells you which you got.
+</Depth>
+
+## [play] Run the same batch three ways
+
+24 events on a 4-core machine, with a health probe arriving every 100 ms. Choose the work, the model and the number of workers, and watch which cores run Python and who waits for what.
+
+## [lens] How each language meets it
+
+Every language here overlaps waiting cheaply. They differ in what it takes to overlap computing: nothing in Go, a separate thread or isolate in Node, the right pool in Rust, and a process (or the free-threaded build) in Python.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+asyncio, Node and async Rust share one rule: a task gives up its thread only at an await, which is <Term id="cooperative-scheduling">cooperative scheduling</Term>. CPU work without awaits blocks everything else on that thread.
+</Depth>
+
+<Depth level={3}>
+Removing the GIL does not remove races. `hits += 1` is a <Term id="read-modify-write">read-modify-write</Term> in every language here; Go and Rust make it visible (the race detector, `Send`/`Sync`), Python leaves it to you.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="concurrency-and-the-gil" />
+
+### Choosing by what the work waits on
+
+Profile first, then pick. Work that waits (HTTP, databases, files) overlaps on threads or asyncio; use asyncio when every library on the path is async, threads when they are not. Work that computes in pure Python needs processes on the standard build: one per core, with small arguments. Work in C extensions that release the GIL (hashing, compression, NumPy) can run in parallel on threads. Never compute or block inside a coroutine; hand it to an executor.
