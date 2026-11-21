@@ -4,6 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { compile } from "@mdx-js/mdx";
+import remarkGfm from "remark-gfm";
 import { getTopic, listRoadmaps, listTopics, prepareCode } from "../src/lib/content.ts";
 
 const args = process.argv.slice(2);
@@ -16,8 +17,8 @@ for (const f of files) {
   const [track, file] = f.replace(/\\/g, "/").split("/").slice(-2);
   try {
     const t = getTopic(track, file.replace(/\.mdx$/, ""));
-    for (const s of t.steps) await compile(s.mdx).catch((e) => { throw new Error(`MDX in step [${s.key}]: ${e.message}`); });
-    if (t.reference) await compile(t.reference).catch((e) => { throw new Error(`MDX in [reference]: ${e.message}`); });
+    for (const s of t.steps) await compile(s.mdx, { remarkPlugins: [remarkGfm] }).catch((e) => { throw new Error(`MDX in step [${s.key}]: ${e.message}`); });
+    if (t.reference) await compile(t.reference, { remarkPlugins: [remarkGfm] }).catch((e) => { throw new Error(`MDX in [reference]: ${e.message}`); });
     await prepareCode(t.meta);
     console.log(`ok   ${t.meta.id}`);
   } catch (e) {

@@ -376,3 +376,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .rm-tags { display: grid; gap: 4px; justify-items: end; }
 .soon.done { color: var(--good); }
 @media (max-width: 560px) { .roadmap li > a, .roadmap li > div { grid-template-columns: 1.8em minmax(0, 1fr); } .rm-tags { grid-column: 2; justify-items: start; grid-auto-flow: column; justify-content: start; } }
+
+/* Markdown tables inside lesson prose */
+.step-body table, .ref article > table { width: 100%; border-collapse: collapse; font-size: .92rem; display: block; overflow-x: auto; }
+.step-body th, .step-body td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.step-body th { font-family: var(--f-code); font-size: .66rem; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); font-weight: 500; }
