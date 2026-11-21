@@ -1,0 +1,12 @@
+- id: at-most-once-delivery
+  term: At-most-once delivery
+  short: A sender sends each message once and never retries, so a message is never duplicated but may be lost.
+- id: idempotent-operation
+  term: Idempotent operation
+  short: An operation that has the same effect whether it runs once or many times, such as setting a value. Adding to a value is not idempotent.
+- id: exactly-once-effect
+  term: Exactly-once effect
+  short: At-least-once delivery plus a receiver that recognises repeats, so each request takes effect once even though it may arrive several times.
+- id: retransmission
+  term: Retransmission
+  short: Sending a message again because no acknowledgement arrived before a timer ran out.

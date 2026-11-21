@@ -1,0 +1,624 @@
+---
+title: Reliable links and idempotency
+track: distributed-systems
+group: Failure and retries
+order: 3
+summary: Retrying makes delivery reliable but delivers some requests twice, so the receiver must make repeats harmless.
+intent: When a request times out, the sender cannot know whether it took effect. Retry, and let the receiver recognise the repeat.
+changeRequest: Customers on mobile networks keep seeing payment errors. Make the checkout retry when the payment call times out.
+languages: [go, python, typescript, rust]
+glossary: [idempotency-key, idempotent-operation, at-least-once-delivery, at-most-once-delivery, exactly-once-effect, retransmission]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [distributed-systems/why-distributed-is-hard]
+skills: [networking, distributed-systems]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: reliable-links-and-idempotency
+  scenarios:
+    - try: "With Retry on timeout, send a payment, deliver the request, drop the reply, and let the timer fire."
+      notice: "The retry is charged as a new payment. The ledger shows two charges for one order."
+    - try: "Switch to No retries and drop the reply again."
+      notice: "One charge, but the customer is told it failed. Without retries a lost message loses the outcome instead."
+    - try: "Switch to Retry + idempotency key and drop the reply twice in a row."
+      notice: "Every retry carries the same key. The service replays the first charge, and the ledger stays at one."
+    - try: "Untick the transaction box, choose Deliver, then crash the service, and let the timer fire."
+      notice: "The charge was written but the key was not, so the retry charges again. The key only works if it commits with the effect."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 52, title: Checkout, sub: calls once }
+      after:  { x: 12, y: 30, w: 112, h: 52, title: Checkout, sub: one key per payment }
+    - id: retry
+      kind: concrete
+      appears: change
+      before: { x: 12, y: 190, w: 112, h: 44, title: retry loop }
+      after:  { x: 12, y: 190, w: 112, h: 44, title: retry loop }
+    - id: net
+      kind: concrete
+      before: { x: 150, y: 110, w: 96, h: 48, title: Network, sub: drops · delays }
+      after:  { x: 150, y: 110, w: 96, h: 48, title: Network, sub: drops · delays }
+    - id: context
+      kind: context
+      before: { x: 272, y: 18, w: 276, h: 236, title: Payment service, sub: POST /charges }
+      after:  { x: 272, y: 30, w: 150, h: 56, title: Payments, sub: one transaction }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 330, y: 118, w: 210, h: 56, title: "" }
+      after:  { x: 330, y: 118, w: 210, h: 56, title: Idempotency keys, sub: key → first result }
+    - id: ledger
+      kind: concrete
+      before: { x: 292, y: 150, w: 236, h: 40, title: INSERT charge }
+      after:  { x: 440, y: 204, w: 100, h: 40, title: charges }
+  edges:
+    - { from: client, to: net, label: POST }
+    - { from: net, to: context, label: maybe }
+    - { from: context, to: strategy, label: checks first }
+    - { from: context, to: ledger, label: inserts }
+    - { from: retry, to: client, label: resends }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: client.go · charges.go
+      source: |
+        // client.go
+        func (c *Checkout) Pay(ctx context.Context, o Order) (Receipt, error) {
+            ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+            defer cancel()
+            return c.payments.Charge(ctx, ChargeReq{Order: o.ID, Cents: o.Cents})
+        }
+
+        // charges.go, in the payment service
+        func (s *Server) Charge(ctx context.Context, r ChargeReq) (Receipt, error) {
+            var rc Receipt
+            err := s.db.QueryRowContext(ctx,
+                `INSERT INTO charges (order_id, cents) VALUES ($1, $2) RETURNING id`,
+                r.Order, r.Cents).Scan(&rc.ID)
+            return rc, err
+        }
+      roles: { client: [1, 6], net: [5, 5], context: [8, 15], ledger: [11, 13] }
+      change:
+        - { line: 5, replace: '    return retry(ctx, 3, func() (Receipt, error) {' }
+        - { after: 5, add: ['        return c.payments.Charge(ctx, ChargeReq{Order: o.ID, Cents: o.Cents})', '    })'] }
+    after:
+      file: client.go · charges.go
+      source: |
+        // client.go
+        func (c *Checkout) Pay(ctx context.Context, o Order) (Receipt, error) {
+            req := ChargeReq{Order: o.ID, Cents: o.Cents, Key: uuid.NewString()}
+            var err error
+            for attempt := 1; attempt <= 4; attempt++ {
+                actx, cancel := context.WithTimeout(ctx, 2*time.Second)
+                var rc Receipt
+                rc, err = c.payments.Charge(actx, req) // same key on every attempt
+                cancel()
+                if err == nil || !retryable(err) {
+                    return rc, err
+                }
+                select {
+                case <-time.After(backoff(attempt)):
+                case <-ctx.Done():
+                    return Receipt{}, ctx.Err()
+                }
+            }
+            return Receipt{}, err
+        }
+
+        // charges.go, in the payment service
+        func (s *Server) Charge(ctx context.Context, r ChargeReq) (Receipt, error) {
+            tx, err := s.db.BeginTx(ctx, nil)
+            if err != nil {
+                return Receipt{}, err
+            }
+            defer tx.Rollback()
+
+            var rc Receipt
+            err = tx.QueryRowContext(ctx,
+                `SELECT charge_id FROM idempotency_keys WHERE key = $1`, r.Key).Scan(&rc.ID)
+            if err == nil {
+                return rc, nil // a repeat: send back the first result
+            }
+            if !errors.Is(err, sql.ErrNoRows) {
+                return Receipt{}, err
+            }
+
+            err = tx.QueryRowContext(ctx,
+                `INSERT INTO charges (order_id, cents) VALUES ($1, $2) RETURNING id`,
+                r.Order, r.Cents).Scan(&rc.ID)
+            if err != nil {
+                return Receipt{}, err
+            }
+            _, err = tx.ExecContext(ctx,
+                `INSERT INTO idempotency_keys (key, charge_id) VALUES ($1, $2)`, r.Key, rc.ID)
+            if err != nil {
+                return Receipt{}, err // a concurrent twin won the unique key; roll back
+            }
+            return rc, tx.Commit()
+        }
+      roles: { client: [1, 20], key: [3, 3], send: [6, 8], retry: [5, 18], net: [6, 6], context: [22, 52], strategy: [30, 38], dedupe: [30, 35], ledger: [40, 42], store: [40, 51], replay: [33, 35] }
+    again:
+      file: charges_test.go
+      source: |
+        // charges_test.go: lose the reply, retry, count the charges
+        func TestLostReplyChargesOnce(t *testing.T) {
+            ctx, srv := t.Context(), newTestServer(t)
+            req := ChargeReq{Order: "1042", Cents: 4000, Key: uuid.NewString()}
+            first, _ := srv.Charge(ctx, req)   // the reply to this one is lost
+            again, err := srv.Charge(ctx, req) // the checkout's retry
+            if err != nil || again.ID != first.ID || srv.countCharges("1042") != 1 {
+                t.Fatalf("the retry charged again: first %v, again %v", first, again)
+            }
+        }
+    cost:
+      before: { text: 2 charges per lost reply, value: 0.8 }
+      after: { text: 1 charge · 1 extra round trip, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`net/http` never retries a POST for you, so you write the loop. `context.WithTimeout` bounds each attempt and the parent `ctx` bounds the whole payment. The key is a field or header; the deduplication is your own SQL.'
+      seenIn: '`stripe-go` retries network errors when `MaxNetworkRetries` is set and sends an `Idempotency-Key` on POSTs. gRPC retry policies in the service config. `database/sql` transactions with `BeginTx`.'
+
+  python:
+    before:
+      file: client.py · charges.py
+      source: |
+        # client.py
+        def pay(order: Order) -> Receipt:
+            r = http.post("/charges", json={"order": order.id, "cents": order.cents}, timeout=5.0)
+            r.raise_for_status()
+            return Receipt(**r.json())
+
+        # charges.py, in the payment service
+        def charge(db: Connection, order_id: str, cents: int) -> Receipt:
+            with db.transaction():
+                (cid,) = db.execute(
+                    "INSERT INTO charges (order_id, cents) VALUES (%s, %s) RETURNING id",
+                    (order_id, cents)).fetchone()
+            return Receipt(id=cid)
+      roles: { client: [1, 5], net: [3, 3], context: [7, 13], ledger: [10, 12] }
+      change:
+        - { after: 1, add: ['@retry(stop=stop_after_attempt(3), retry=retry_if_exception_type(httpx.TransportError))'] }
+    after:
+      file: client.py · charges.py
+      source: |
+        # client.py
+        def pay(order: Order) -> Receipt:
+            key = str(uuid.uuid4())  # one key per payment, reused by every attempt
+
+            @retry(stop=stop_after_attempt(4),
+                   wait=wait_exponential_jitter(initial=0.2, max=5),
+                   retry=retry_if_exception_type(httpx.TransportError))
+            def attempt() -> Receipt:
+                r = http.post("/charges", json={"order": order.id, "cents": order.cents},
+                              headers={"Idempotency-Key": key}, timeout=2.0)
+                r.raise_for_status()
+                return Receipt(**r.json())
+
+            return attempt()
+
+        # charges.py, in the payment service
+        def charge(db: Connection, key: str, order_id: str, cents: int) -> Receipt:
+            with db.transaction():
+                row = db.execute(
+                    "SELECT charge_id FROM idempotency_keys WHERE key = %s", (key,)).fetchone()
+                if row:
+                    return Receipt(id=row[0])  # a repeat: send back the first result
+                (cid,) = db.execute(
+                    "INSERT INTO charges (order_id, cents) VALUES (%s, %s) RETURNING id",
+                    (order_id, cents)).fetchone()
+                db.execute(
+                    "INSERT INTO idempotency_keys (key, charge_id) VALUES (%s, %s)", (key, cid))
+            return Receipt(id=cid)
+      roles: { client: [1, 14], key: [3, 3], send: [9, 10], retry: [5, 7], net: [9, 10], context: [16, 28], strategy: [19, 22], dedupe: [19, 22], ledger: [23, 25], store: [18, 27], replay: [21, 22] }
+    again:
+      file: test_charges.py
+      source: |
+        # test_charges.py: lose the reply, retry, count the charges
+        def test_lost_reply_charges_once(db):
+            key = str(uuid.uuid4())
+            first = charge(db, key, "1042", 4000)  # the reply to this one is lost
+            again = charge(db, key, "1042", 4000)  # the checkout's retry
+            assert again.id == first.id
+            assert count_charges(db, "1042") == 1
+    cost:
+      before: { text: 2 charges per lost reply, value: 0.8 }
+      after: { text: 1 charge · 1 extra round trip, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`tenacity` writes the retry loop as a decorator, with `wait_exponential_jitter` for spacing. Create the key outside the decorated function, or every attempt gets a new one. `urllib3.Retry` leaves POST out of `allowed_methods` by default for exactly this reason.'
+      seenIn: '`stripe-python` with `max_network_retries`, which adds idempotency keys. `urllib3.util.Retry(allowed_methods=...)`. Celery tasks with `acks_late=True`, which can run twice and must be idempotent.'
+
+  typescript:
+    before:
+      file: client.ts · charges.ts
+      source: |
+        // client.ts
+        async function pay(order: Order): Promise<Receipt> {
+          const res = await fetch(`${PAYMENTS}/charges`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ order: order.id, cents: order.cents }),
+            signal: AbortSignal.timeout(5_000),
+          });
+          if (!res.ok) throw new Error(`charge failed: ${res.status}`);
+          return res.json();
+        }
+
+        // charges.ts, in the payment service
+        async function charge(db: Pool, orderId: string, cents: number): Promise<Receipt> {
+          const { rows } = await db.query(
+            "INSERT INTO charges (order_id, cents) VALUES ($1, $2) RETURNING id",
+            [orderId, cents],
+          );
+          return { id: rows[0].id };
+        }
+      roles: { client: [1, 11], net: [3, 8], context: [13, 20], ledger: [15, 18] }
+      change:
+        - { line: 3, replace: '  const res = await withRetries(3, () => fetch(`${PAYMENTS}/charges`, {' }
+        - { line: 8, replace: '  }));' }
+    after:
+      file: client.ts · charges.ts
+      source: |
+        // client.ts
+        async function pay(order: Order): Promise<Receipt> {
+          const key = crypto.randomUUID(); // one key per payment, reused by every attempt
+          for (let attempt = 1; ; attempt++) {
+            let failure: unknown;
+            try {
+              const res = await fetch(`${PAYMENTS}/charges`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "idempotency-key": key },
+                body: JSON.stringify({ order: order.id, cents: order.cents }),
+                signal: AbortSignal.timeout(2_000),
+              });
+              if (res.status < 500) return await parseReceipt(res);
+              failure = new Error(`payments returned ${res.status}`);
+            } catch (err) {
+              failure = err; // timed out, or the connection broke
+            }
+            if (attempt === 4) throw failure;
+            await sleep(backoffWithJitter(attempt));
+          }
+        }
+
+        // charges.ts, in the payment service
+        async function charge(db: Pool, key: string, orderId: string, cents: number): Promise<Receipt> {
+          const client = await db.connect();
+          try {
+            await client.query("BEGIN");
+            const seen = await client.query(
+              "SELECT charge_id FROM idempotency_keys WHERE key = $1", [key]);
+            if (seen.rows.length) {
+              await client.query("COMMIT");
+              return { id: seen.rows[0].charge_id }; // a repeat: send back the first result
+            }
+            const { rows } = await client.query(
+              "INSERT INTO charges (order_id, cents) VALUES ($1, $2) RETURNING id", [orderId, cents]);
+            await client.query(
+              "INSERT INTO idempotency_keys (key, charge_id) VALUES ($1, $2)", [key, rows[0].id]);
+            await client.query("COMMIT");
+            return { id: rows[0].id };
+          } catch (err) {
+            await client.query("ROLLBACK");
+            throw err;
+          } finally {
+            client.release();
+          }
+        }
+      roles: { client: [1, 21], key: [3, 3], send: [7, 12], retry: [4, 20], net: [11, 11], context: [23, 46], strategy: [28, 33], dedupe: [28, 33], ledger: [34, 35], store: [34, 39], replay: [30, 33] }
+    again:
+      file: charges.test.ts
+      source: |
+        // charges.test.ts: lose the reply, retry, count the charges
+        test("a lost reply is charged once", async () => {
+          const key = crypto.randomUUID();
+          const first = await charge(db, key, "1042", 4000); // the reply to this one is lost
+          const again = await charge(db, key, "1042", 4000); // the checkout's retry
+          assert.equal(again.id, first.id);
+          assert.equal(await countCharges(db, "1042"), 1);
+        });
+    cost:
+      before: { text: 2 charges per lost reply, value: 0.8 }
+      after: { text: 1 charge · 1 extra round trip, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`fetch` has no retries and no timeout of its own. `AbortSignal.timeout(ms)` bounds each attempt. Write the loop, or use a library such as `cockatiel` or `p-retry`, and create the key outside it.'
+      seenIn: '`stripe-node` with `maxNetworkRetries`, which adds idempotency keys. `AbortSignal.timeout()` in Node 18+ and browsers. The IETF draft that standardises the `Idempotency-Key` HTTP header.'
+
+  rust:
+    before:
+      file: client.rs · charges.rs
+      source: |
+        // client.rs
+        async fn pay(http: &reqwest::Client, order: &Order) -> Result<Receipt, Error> {
+            let res = http
+                .post(format!("{PAYMENTS}/charges"))
+                .json(&ChargeReq { order: order.id.clone(), cents: order.cents })
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await?;
+            Ok(res.error_for_status()?.json().await?)
+        }
+
+        // charges.rs, in the payment service
+        async fn charge(db: &PgPool, order_id: &str, cents: i64) -> Result<Receipt, sqlx::Error> {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO charges (order_id, cents) VALUES ($1, $2) RETURNING id")
+                .bind(order_id).bind(cents)
+                .fetch_one(db).await?;
+            Ok(Receipt { id })
+        }
+      roles: { client: [1, 10], net: [3, 8], context: [12, 19], ledger: [14, 17] }
+      change:
+        - { line: 3, replace: '    let res = (|| http' }
+        - { line: 7, replace: '        .send())' }
+        - { line: 8, replace: '        .retry(ExponentialBuilder::default()).await?;' }
+    after:
+      file: client.rs · charges.rs
+      source: |
+        // client.rs
+        async fn pay(http: &reqwest::Client, order: &Order) -> Result<Receipt, Error> {
+            let key = Uuid::new_v4().to_string(); // one key per payment, reused by every attempt
+            let body = ChargeReq { order: order.id.clone(), cents: order.cents };
+            let res = (|| {
+                http.post(format!("{PAYMENTS}/charges"))
+                    .header("Idempotency-Key", &key)
+                    .json(&body)
+                    .timeout(Duration::from_secs(2))
+                    .send()
+            })
+            .retry(ExponentialBuilder::default().with_max_times(3).with_jitter())
+            .when(|e: &reqwest::Error| e.is_timeout() || e.is_connect())
+            .await?;
+            Ok(res.error_for_status()?.json().await?)
+        }
+
+        // charges.rs, in the payment service
+        async fn charge(db: &PgPool, key: &str, order_id: &str, cents: i64) -> Result<Receipt, sqlx::Error> {
+            let mut tx = db.begin().await?;
+            let seen: Option<i64> = sqlx::query_scalar(
+                "SELECT charge_id FROM idempotency_keys WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&mut *tx).await?;
+            if let Some(id) = seen {
+                return Ok(Receipt { id }); // a repeat: send back the first result
+            }
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO charges (order_id, cents) VALUES ($1, $2) RETURNING id")
+                .bind(order_id).bind(cents)
+                .fetch_one(&mut *tx).await?;
+            sqlx::query("INSERT INTO idempotency_keys (key, charge_id) VALUES ($1, $2)")
+                .bind(key).bind(id)
+                .execute(&mut *tx).await?;
+            tx.commit().await?;
+            Ok(Receipt { id })
+        }
+      roles: { client: [1, 16], key: [3, 3], send: [5, 11], retry: [12, 14], net: [9, 9], context: [18, 37], strategy: [21, 27], dedupe: [21, 27], ledger: [28, 31], store: [28, 35], replay: [25, 27] }
+    again:
+      file: tests/charges.rs
+      source: |
+        // tests/charges.rs: lose the reply, retry, count the charges
+        #[sqlx::test]
+        async fn lost_reply_is_charged_once(db: PgPool) {
+            let key = Uuid::new_v4().to_string();
+            let first = charge(&db, &key, "1042", 4000).await.unwrap(); // reply lost
+            let again = charge(&db, &key, "1042", 4000).await.unwrap(); // the retry
+            assert_eq!(again.id, first.id);
+            assert_eq!(count_charges(&db, "1042").await, 1);
+        }
+    cost:
+      before: { text: 2 charges per lost reply, value: 0.8 }
+      after: { text: 1 charge · 1 extra round trip, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`reqwest` does not retry a POST for you. Give each attempt a `.timeout()`, retry with a crate such as `backon` or `reqwest-retry`, or a `tower` `Retry` layer with your own policy, and build the key before the closure so every attempt borrows the same one.'
+      seenIn: '`tower::retry::Retry` with a `Policy` you implement. `tokio::time::timeout`. `sqlx` transactions, which roll back when dropped without `commit()`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The checkout creates one key for this payment before the first attempt. Every retry will carry the same key.
+    nodes: [client]
+    edges: []
+    role: key
+  - text: Attempt 1 crosses the network with the key and a short timeout. The service charges the card, but the reply is lost on the way back.
+    nodes: [client, net, context]
+    edges: [client>net, net>context]
+    role: send
+  - text: The timer fires. The checkout cannot tell a lost request from a lost reply, so it sends attempt 2 with the same key.
+    nodes: [retry, client, net]
+    edges: [retry>client, client>net]
+    role: retry
+  - text: Inside one transaction, the service looks the key up before doing anything. It finds the first charge.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: dedupe
+  - text: It returns the stored result instead of charging again. The first time round, the charge and the key were committed together, so there was never a charge without its key.
+    nodes: [context, strategy, ledger]
+    edges: [context>strategy, context>ledger]
+    role: store
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: A payment request times out after 2 seconds. What does the checkout know?
+    options:
+      - text: Nothing certain. The request may have been lost, or the charge may have happened and the reply been lost.
+        correct: true
+        why: Right. Silence looks the same in both cases, which is why a plain retry can charge twice.
+      - text: The charge did not happen, because the service never answered.
+        why: The service may have charged the card and then had its reply dropped, or be slower than the timeout.
+      - text: The charge happened, because TCP guarantees delivery.
+        why: TCP only guarantees delivery inside one connection while it stays up. A timeout or a reset tells you nothing about what the service did.
+  engineer:
+    question: How do you make POST /charges safe to retry?
+    options:
+      - text: The client creates one key per payment and sends it on every attempt. The server stores the key with the result and returns the stored result for a repeat.
+        correct: true
+        why: Right. The key names the intent, not the attempt, so the server can tell a retry from a new payment.
+      - text: The client creates a fresh key for each attempt, so every request is unique.
+        why: Then every retry looks like a new payment, and the key does nothing.
+      - text: The server rejects a second charge of the same amount on the same card within a minute.
+        why: That blocks a customer who really does buy the same thing twice, and still lets a retry through after a minute.
+  deep:
+    question: Why must the server save the idempotency key in the same transaction as the charge?
+    options:
+      - text: If it crashes between the two, a charge exists without its key, and the retry charges again.
+        correct: true
+        why: Right. The check-and-record has to be atomic with the effect. Saving the key first has the opposite bug, a key with no charge, so the retry is told it succeeded.
+      - text: Because a transaction makes the query faster.
+        why: Speed is not the point. The point is that the charge and the key exist together or not at all.
+      - text: So that two different payments can never share a key.
+        why: A unique constraint on the key does that. The transaction is about crashes between the two writes.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Sender
+      example: the checkout client
+      job: Sends, starts a timer, and resends with the same key when no reply arrives.
+    - role: Link
+      example: the network, proxies and load balancers in between
+      job: Delivers, drops, delays or duplicates messages. Promises nothing.
+    - role: Receiver
+      example: the payment service
+      job: Does the work and records the key with the result, in one transaction.
+    - role: Deduplication store
+      example: the idempotency_keys table
+      job: Maps each key to the first result for long enough to cover every retry.
+  useWhen:
+    - Any request that changes state and might be retried by a client, a proxy, a queue or a person pressing the button again.
+    - Consumers of a queue with at-least-once delivery, where every message can arrive twice.
+  avoidWhen:
+    - The operation is already idempotent, such as setting a status or a PUT of the whole resource. Retry it as is.
+    - Reads. A GET is safe to repeat without a key.
+  tradeoffs:
+    - The server must store keys and results, and decide how long to keep them. A retry after the key expires is treated as new.
+    - A second request with the same key but different parameters must be rejected, or a bug in the client goes unnoticed.
+    - Two attempts arriving at once need a unique constraint or a lock, or both can pass the lookup.
+    - Retries cost extra messages and latency, and need timeouts and backoff, which are the next lesson.
+  lookalikes:
+    - name: TCP sequence numbers
+      how: The same idea inside one connection. TCP drops duplicate segments, but its guarantee ends when the connection breaks.
+    - name: Transactional outbox
+      how: Solves the sending side. It makes sure a message is sent at least once after a commit; the receiver still needs deduplication.
+    - name: Exactly-once in stream processors
+      how: Systems such as Kafka transactions get an exactly-once effect by committing offsets and outputs atomically, the same trick as storing the key with the charge.
+---
+
+## [concept] Reliable links and idempotency
+
+**On a real network, a sender that hears nothing cannot tell whether its request was lost or the reply was. Retrying until acknowledged makes delivery reliable, and the receiver makes the repeats harmless.**
+
+Retries turn a lossy link into <Term id="at-least-once-delivery">at-least-once delivery</Term>. The receiver then needs a way to recognise a request it has already handled, usually an <Term id="idempotency-key">idempotency key</Term>.
+
+<Depth level={2}>
+There are three delivery policies. Send once and never retry: <Term id="at-most-once-delivery">at most once</Term>, no duplicates, but lost messages stay lost. Resend until acknowledged (<Term id="retransmission">retransmission</Term>): at least once, nothing lost, but some messages arrive twice. Add deduplication at the receiver and you get an <Term id="exactly-once-effect">exactly-once effect</Term>. Exactly-once *delivery* does not exist; exactly-once *processing* does.
+</Depth>
+
+<Depth level={3}>
+The impossibility is the Two Generals problem in miniature. To know that the request arrived, the sender needs an acknowledgement; to know the acknowledgement arrived, the receiver needs one back, and so on with no last message. Some operations need no key because they are <Term id="idempotent-operation">idempotent</Term> already: "set the order status to paid" can run twice safely, "charge $40" cannot.
+</Depth>
+
+## [problem] A checkout that calls the payment service once
+
+The checkout calls the payment service with a 5 second timeout. The service inserts a charge and returns its id. In tests, on a local network, every request gets a reply.
+
+<Depth level={2}>
+The timeout is good practice: without it a lost packet would hang the request forever. But the code treats a timeout as "the charge failed", which is only half the possibilities.
+</Depth>
+
+<Depth level={3}>
+TCP retransmits lost segments and drops duplicates, so inside one healthy connection nothing is lost or doubled. The trouble starts above it: the connection resets, a proxy times out, the client gives up, or the service crashes after committing. None of that is TCP's to fix.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** customers on mobile networks keep seeing payment errors. Make the checkout retry when the payment call times out.
+
+The retry is two lines and it works: the errors drop. A week later, support finds customers charged twice for one order. Each double charge is a request whose reply was lost: the service charged the card, the checkout saw a timeout, and the retry was charged as a new payment.
+
+<Depth level={2}>
+The retry did not create the ambiguity; it made it visible in the ledger. Before the change, the same lost replies showed customers an error for a payment that had gone through. Neither version can be right, because neither lets the service tell a retry from a new payment.
+</Depth>
+
+<Depth level={3}>
+Retries also happen where you did not write them: a load balancer that retries on a reset, a mobile app that resends on reconnect, a customer who presses Pay again. Each is another copy of the same request reaching the service.
+</Depth>
+
+## [morph] Give every payment a key
+
+Drag the slider. The checkout now creates one key per payment and sends it on every attempt. The service checks the key first, in the same transaction that writes the charge.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Three things make it work. The key is made once per intent, before the first attempt. The lookup and the insert happen in one transaction, with a unique constraint on the key, so two attempts racing each other cannot both charge. And the service returns the stored result, so the retry gets the same answer the lost reply carried.
+</Depth>
+
+<Depth level={3}>
+Stripe works this way: it saves the status code and body of the first request for a key and returns them for retries, compares the parameters and errors if they differ, and lets keys be pruned once they are at least 24 hours old. A retry after that window is treated as a new request, so the window must outlast every retry policy that can reach the service.
+</Depth>
+
+## [walk] Follow one payment with a lost reply
+
+One payment whose first reply is lost, step by step. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`database/sql` gives you `BeginTx` and `Rollback` on defer. At Postgres's default isolation, two twins can both miss the key in the `SELECT`; the unique constraint makes the second `INSERT` into `idempotency_keys` fail, and its rollback removes its charge too.</Lang>
+<Lang only="python">`with db.transaction():` in psycopg commits when the block exits normally and rolls back on an exception, so the charge and the key commit together. A racing twin fails on the unique key and its charge rolls back.</Lang>
+<Lang only="typescript">With `pg`, a transaction is one checked-out client running `BEGIN` and `COMMIT`. Using `db.query` directly would send each statement on whichever pooled connection is free, outside any transaction.</Lang>
+<Lang only="rust">An `sqlx` transaction rolls back when it is dropped without `commit()`, so every early `?` return undoes the charge. A racing twin fails on the unique key and its charge goes with it.</Lang>
+</Depth>
+
+## [again] The retry, the second time
+
+The same change request after the refactor: retries are on, replies still get lost, and each lost reply costs one extra round trip instead of a second charge. The test above loses a reply on purpose and asserts one charge.
+
+<Depth level={2}>
+The client still needs limits. Retries need a timeout per attempt, a cap on attempts and spacing between them, or a slow service gets buried under its own retries. That is the next lesson.
+</Depth>
+
+<Depth level={3}>
+The same pattern protects queue consumers. A broker with at-least-once delivery will redeliver a message whose acknowledgement was lost; the consumer stores the message id with its effect, in one transaction, and skips ids it has seen.
+</Depth>
+
+## [play] Be the network
+
+You control every message between the checkout and the payment service. Deliver it, drop it, or crash the service mid-request, then watch the ledger. Then run 100 checkouts on a lossy link under each policy and compare.
+
+## [lens] How each language does it
+
+None of the four standard HTTP clients retries a POST for you, and all four leave the key to you. What differs is how you bound an attempt: a context deadline in Go, a timeout argument in Python, an `AbortSignal` in TypeScript, a request timeout or `tokio::time::timeout` in Rust.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Official payment SDKs (Stripe's for all four ecosystems, among others) add keys on retries for you. Your own services need the server half too.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="reliable-links-and-idempotency" />
+
+### Idempotent by design
+
+Before adding a key, ask whether the operation can be made idempotent on its own. "Set the subscription to Pro" is safe to repeat; "add one month" is not. "Charge order 1042" with a unique constraint on the order id is safe; "charge $40" is not. A natural key from the domain often does the job of an idempotency key, and it survives client restarts that would lose a random one.
