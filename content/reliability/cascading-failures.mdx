@@ -1,0 +1,584 @@
+---
+title: Cascading failures
+track: reliability
+group: Overload
+order: 16
+summary: A slow component makes every caller above it hold workers longer and retry, so overload climbs the call chain until services that never touch the slow part fail too. Shed load early, carry deadlines down, and budget retries.
+intent: A slow database should cost you the features that need it, for as long as it is slow, and nothing more.
+changeRequest: The inventory database had a slow ten seconds and the storefront was down for twenty minutes, browse pages included. Make a slow database cost us checkout, not the site.
+languages: [go, python, typescript, rust]
+glossary: [cascading-failure, load-shedding, goodput, resource-exhaustion, retry-budget, deadline-propagation, metastable-failure, retry-storm]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [reliability/handling-overload]
+skills: [resilience, reliability]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: cascading-failures
+  scenarios:
+    - try: "Predict, then Run 40 seconds with No defences and a 10 s slowdown. Press Play."
+      notice: "The red climbs the heat map row by row: database at 5 s, inventory at 6 s, checkout at 7 s, frontend at 9 s. Browse pages start failing, and nothing recovers when the database does."
+    - try: "Turn on Deadlines only and run again."
+      notice: "Checkout fails during the slowdown, but the frontend never fills, browse stays at zero errors, and users are back the second the database is."
+    - try: "Turn deadlines off and Shedding on."
+      notice: "Browse is safe again, but the database chart shows 27 times the checkout traffic: every fast rejection is retried 3 × 3 × 3 times."
+    - try: "Press All three defences and try a 20 s slowdown."
+      notice: "Database load stays near one call per checkout, most checkouts still complete, and recovery is immediate."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: users
+      kind: client
+      before: { x: 12, y: 30, w: 108, h: 52, title: Users, sub: browse + checkout }
+      after:  { x: 12, y: 30, w: 108, h: 52, title: Users, sub: browse + checkout }
+    - id: upstream
+      kind: concrete
+      before: { x: 12, y: 150, w: 108, h: 56, title: Frontend, sub: + checkout }
+      after:  { x: 12, y: 150, w: 108, h: 56, title: Frontend, sub: + checkout }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 250, h: 236, title: Inventory, sub: 80 slots }
+      after:  { x: 140, y: 104, w: 124, h: 56, title: Inventory, sub: 80 slots }
+    - id: retry
+      kind: concrete
+      before: { x: 160, y: 80, w: 210, h: 44, title: retry ×3 at every layer }
+      after:  { x: 140, y: 30, w: 124, h: 48, title: retry budget, sub: 10% }
+    - id: queue
+      kind: concrete
+      before: { x: 160, y: 160, w: 210, h: 44, title: wait for a free slot }
+      after:  { x: 140, y: 190, w: 124, h: 48, title: shed, sub: 503 at once }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 290, y: 104, w: 116, h: 56, title: "" }
+      after:  { x: 290, y: 104, w: 116, h: 56, title: Deadline, sub: from the caller }
+    - id: db
+      kind: concrete
+      before: { x: 430, y: 104, w: 120, h: 56, title: Database, sub: slow 10 s }
+      after:  { x: 430, y: 104, w: 120, h: 56, title: Database, sub: slow 10 s }
+    - id: browse
+      kind: concrete
+      appears: change
+      before: { x: 430, y: 196, w: 120, h: 50, title: Browse pages, sub: fail too }
+      after:  { x: 430, y: 196, w: 120, h: 50, title: Browse pages, sub: unaffected }
+  edges:
+    - { from: users, to: upstream, label: requests }
+    - { from: upstream, to: context, label: waits on }
+    - { from: context, to: strategy, label: carries }
+    - { from: strategy, to: db, label: bounds }
+    - { from: context, to: db, label: queries }
+    - { from: retry, to: context, label: repeats }
+    - { from: queue, to: context, label: admits }
+    - { from: upstream, to: browse, label: same workers }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: inventory.go
+      source: |
+        // inventory.go
+        var dbSlots = make(chan struct{}, 80) // at most 80 queries in flight
+
+        func (s *Server) Reserve(w http.ResponseWriter, r *http.Request) {
+            sku := r.URL.Query().Get("sku")
+            for attempt := 0; attempt < 3; attempt++ { // the database is sometimes slow: try again
+                ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+                dbSlots <- struct{}{} // wait for a slot, however long that takes
+                err := s.db.Reserve(ctx, sku)
+                <-dbSlots
+                cancel()
+                if err == nil {
+                    w.WriteHeader(http.StatusNoContent)
+                    return
+                }
+            }
+            http.Error(w, "inventory unavailable", http.StatusInternalServerError)
+        }
+      roles: { upstream: [4, 4], context: [4, 18], retry: [6, 6], queue: [8, 8], db: [9, 9], strategy: [7, 7] }
+      change:
+        - { line: 2, replace: 'var dbSlots = make(chan struct{}, 400) // more room, so requests do not wait' }
+        - { line: 7, replace: '        ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // give it time' }
+    after:
+      file: inventory.go
+      source: |
+        // inventory.go
+        var dbSlots = make(chan struct{}, 80)             // at most 80 queries in flight
+        var retries = &RetryBudget{Ratio: 0.1, Max: 10} // a token bucket: retries add at most 10%
+
+        func (s *Server) Reserve(w http.ResponseWriter, r *http.Request) {
+            ctx := r.Context() // carries the caller's deadline; cancelled when the caller hangs up
+            select {
+            case dbSlots <- struct{}{}:
+                defer func() { <-dbSlots }()
+            default: // every slot busy: shed now instead of queueing
+                w.Header().Set("Retry-After", "1")
+                http.Error(w, "overloaded", http.StatusServiceUnavailable)
+                return
+            }
+            retries.OnRequest()
+            var err error
+            for attempt := 0; attempt < 3; attempt++ {
+                actx, cancel := context.WithTimeout(ctx, 500*time.Millisecond) // never past the caller's deadline
+                err = s.db.Reserve(actx, r.URL.Query().Get("sku"))
+                cancel()
+                if err == nil || ctx.Err() != nil || !retries.AllowRetry() {
+                    break
+                }
+            }
+            switch {
+            case err == nil:
+                w.WriteHeader(http.StatusNoContent)
+            case ctx.Err() != nil: // the caller gave up: nobody will read an answer
+            default:
+                http.Error(w, "overloaded", http.StatusServiceUnavailable)
+            }
+        }
+      roles: { users: [5, 5], upstream: [5, 6], context: [5, 32], queue: [7, 14], shed: [7, 14], retry: [3, 3], budget: [15, 23], strategy: [6, 6], deadline: [17, 20], db: [19, 19], browse: [25, 31] }
+    again:
+      file: inventory_test.go
+      source: |
+        // inventory_test.go: a hung database costs callers a fast 503, not a worker
+        func TestShedsWhenEverySlotIsBusy(t *testing.T) {
+            for range cap(dbSlots) {
+                dbSlots <- struct{}{} // 80 queries stuck in the database
+            }
+            defer func() { for range cap(dbSlots) { <-dbSlots } }()
+            start := time.Now()
+            rec := httptest.NewRecorder()
+            (&Server{db: hungDB{}}).Reserve(rec, httptest.NewRequest("POST", "/reserve?sku=42", nil))
+            if rec.Code != http.StatusServiceUnavailable || time.Since(start) > 10*time.Millisecond {
+                t.Fatalf("got %d after %v", rec.Code, time.Since(start))
+            }
+        }
+    cost:
+      before: { text: 10 s slow DB · site down 20 min, value: 0.95 }
+      after: { text: 10 s of failed checkouts · browse fine, value: 0.2 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'A goroutine per request means no fixed worker pool: what fills up is memory, file descriptors and `database/sql`''s connection pool, where callers wait for a connection for as long as their context allows. So the context is the defence: use `r.Context()`, never `context.Background()`, and every wait below it ends when the caller gives up. gRPC sends the deadline to the server as `grpc-timeout`; plain HTTP needs a header and middleware.'
+      seenIn: '`r.Context()` and `context.WithTimeout`. `golang.org/x/sync/semaphore` (`TryAcquire`). `db.SetMaxOpenConns`. gRPC deadline propagation. `golang.org/x/net/netutil.LimitListener`.'
+
+  python:
+    before:
+      file: inventory.py
+      source: |
+        # inventory.py
+        db_slots = asyncio.Semaphore(80)  # at most 80 queries in flight
+
+        @app.post("/reserve")
+        async def reserve(sku: str) -> Response:
+            for attempt in range(3):  # the database is sometimes slow: try again
+                try:
+                    async with db_slots:  # wait for a slot, however long that takes
+                        async with asyncio.timeout(0.5):
+                            await db.reserve(sku)
+                    return Response(status_code=204)
+                except (TimeoutError, DBError):
+                    continue
+            return Response("inventory unavailable", status_code=500)
+      roles: { upstream: [5, 5], context: [4, 14], retry: [6, 6], queue: [8, 8], db: [10, 10], strategy: [9, 9] }
+      change:
+        - { line: 2, replace: 'db_slots = asyncio.Semaphore(400)  # more room, so requests do not wait' }
+        - { line: 9, replace: '                async with asyncio.timeout(2.0):  # give it time' }
+    after:
+      file: inventory.py
+      source: |
+        # inventory.py
+        db_slots = asyncio.Semaphore(80)              # at most 80 queries in flight
+        retries = RetryBudget(ratio=0.1, max_tokens=10)  # a token bucket: retries add at most 10%
+
+        @app.post("/reserve")
+        async def reserve(sku: str, request: Request) -> Response:
+            deadline = request.state.deadline  # set by middleware from the caller's header
+            if db_slots.locked():  # every slot busy: shed now instead of queueing
+                return Response("overloaded", status_code=503, headers={"Retry-After": "1"})
+            async with db_slots:
+                retries.on_request()
+                for attempt in range(3):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return Response(status_code=504)  # the caller gave up: stop working for nobody
+                    try:
+                        async with asyncio.timeout(min(0.5, remaining)):
+                            await db.reserve(sku)
+                        return Response(status_code=204)
+                    except (TimeoutError, DBError):
+                        if attempt == 2 or not retries.allow_retry():
+                            break
+            return Response("overloaded", status_code=503)
+      roles: { users: [6, 6], upstream: [6, 7], context: [5, 23], queue: [8, 9], shed: [8, 9], retry: [3, 3], budget: [11, 22], strategy: [7, 7], deadline: [13, 17], db: [18, 18], browse: [19, 23] }
+    again:
+      file: test_inventory.py
+      source: |
+        # test_inventory.py: a hung database costs callers a fast 503, not a worker
+        async def test_sheds_when_every_slot_is_busy(client, hung_db):
+            for _ in range(80):
+                await db_slots.acquire()  # 80 queries stuck in the database
+            start = time.monotonic()
+            r = await client.post("/reserve", params={"sku": "42"})
+            assert r.status_code == 503
+            assert time.monotonic() - start < 0.05
+    cost:
+      before: { text: 10 s slow DB · site down 20 min, value: 0.95 }
+      after: { text: 10 s of failed checkouts · browse fine, value: 0.2 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Under gunicorn''s sync workers Python has exactly the fixed worker pool of the playground: a few processes, each stuck while it waits. Under asyncio, waiting is cheap but tasks pile up in memory and in the event loop, so you need an explicit limit. Uvicorn''s `--limit-concurrency` answers 503 above a number of in-flight tasks. Nothing propagates deadlines for you; read the caller''s and use `asyncio.timeout()` with the remainder.'
+      seenIn: '`asyncio.Semaphore` and `asyncio.timeout`. Uvicorn `--limit-concurrency`. Gunicorn `--workers` and `--timeout`. `grpc.aio` with `context.time_remaining()`.'
+
+  typescript:
+    before:
+      file: inventory.ts
+      source: |
+        // inventory.ts
+        const dbSlots = new Semaphore(80); // at most 80 queries in flight (async-mutex)
+
+        app.post("/reserve", async (req, res) => {
+          for (let attempt = 0; attempt < 3; attempt++) { // the database is sometimes slow: try again
+            const [, release] = await dbSlots.acquire(); // wait for a slot, however long that takes
+            try {
+              await db.reserve(String(req.query.sku), { signal: AbortSignal.timeout(500) });
+              return res.sendStatus(204);
+            } catch {
+              continue;
+            } finally {
+              release();
+            }
+          }
+          res.status(500).send("inventory unavailable");
+        });
+      roles: { upstream: [4, 4], context: [4, 17], retry: [5, 5], queue: [6, 6], db: [8, 8], strategy: [8, 8] }
+      change:
+        - { line: 2, replace: 'const dbSlots = new Semaphore(400); // more room, so requests do not wait' }
+        - { line: 8, replace: '      await db.reserve(String(req.query.sku), { signal: AbortSignal.timeout(2_000) }); // give it time' }
+    after:
+      file: inventory.ts
+      source: |
+        // inventory.ts
+        const dbSlots = new Semaphore(80);                       // at most 80 queries in flight
+        const retries = new RetryBudget({ ratio: 0.1, max: 10 }); // a token bucket: retries add at most 10%
+
+        app.post("/reserve", async (req, res) => {
+          const deadline: AbortSignal = res.locals.deadline; // caller's deadline; also aborts if it hangs up
+          if (dbSlots.isLocked()) { // every slot busy: shed now instead of queueing
+            return res.status(503).set("Retry-After", "1").send("overloaded");
+          }
+          const [, release] = await dbSlots.acquire();
+          retries.onRequest();
+          try {
+            for (let attempt = 0; attempt < 3; attempt++) {
+              if (deadline.aborted) return; // the caller gave up: stop working for nobody
+              try {
+                await db.reserve(String(req.query.sku), { signal: AbortSignal.any([deadline, AbortSignal.timeout(500)]) });
+                return res.sendStatus(204);
+              } catch {
+                if (!retries.allowRetry()) break;
+              }
+            }
+            res.status(503).send("overloaded");
+          } finally {
+            release();
+          }
+        });
+      roles: { users: [5, 5], upstream: [5, 6], context: [5, 25], queue: [7, 10], shed: [7, 9], retry: [3, 3], budget: [11, 21], strategy: [6, 6], deadline: [14, 16], db: [16, 16], browse: [17, 22] }
+    again:
+      file: inventory.test.ts
+      source: |
+        // inventory.test.ts: a hung database costs callers a fast 503, not a worker
+        test("sheds when every slot is busy", async () => {
+          const held = await Promise.all(Array.from({ length: 80 }, () => dbSlots.acquire())); // 80 queries stuck
+          const start = performance.now();
+          const res = await request(app).post("/reserve?sku=42");
+          assert.equal(res.status, 503);
+          assert.ok(performance.now() - start < 50);
+          held.forEach(([, release]) => release());
+        });
+    cost:
+      before: { text: 10 s slow DB · site down 20 min, value: 0.95 }
+      after: { text: 10 s of failed checkouts · browse fine, value: 0.2 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Node has no worker pool to exhaust: waiting requests are promises, so the cascade shows up as memory growth, event-loop delay and a full database connection pool. Shed on those signals (`@fastify/under-pressure` answers 503 on event-loop delay or heap size). A disconnecting client does not abort your `fetch` or query unless you wire `req.on("close")` to an `AbortController`; `AbortSignal.any()` joins that with a per-attempt timeout.'
+      seenIn: '`AbortSignal.any` and `AbortSignal.timeout`. `async-mutex` `Semaphore`. `@fastify/under-pressure`. `p-limit`.'
+
+  rust:
+    before:
+      file: inventory.rs
+      source: |
+        // inventory.rs
+        static DB_SLOTS: Semaphore = Semaphore::const_new(80); // at most 80 queries in flight
+
+        async fn reserve(State(db): State<Db>, Query(q): Query<Sku>) -> StatusCode {
+            for _ in 0..3 { // the database is sometimes slow: try again
+                let _slot = DB_SLOTS.acquire().await.unwrap(); // wait for a slot, however long that takes
+                if let Ok(Ok(())) = timeout(Duration::from_millis(500), db.reserve(&q.sku)).await {
+                    return StatusCode::NO_CONTENT;
+                }
+            }
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+      roles: { upstream: [4, 4], context: [4, 12], retry: [5, 5], queue: [6, 6], db: [7, 7], strategy: [7, 7] }
+      change:
+        - { line: 2, replace: 'static DB_SLOTS: Semaphore = Semaphore::const_new(400); // more room, so requests do not wait' }
+        - { line: 7, replace: '        if let Ok(Ok(())) = timeout(Duration::from_secs(2), db.reserve(&q.sku)).await { // give it time' }
+    after:
+      file: inventory.rs
+      source: |
+        // inventory.rs
+        static DB_SLOTS: Semaphore = Semaphore::const_new(80);  // at most 80 queries in flight
+        static RETRIES: RetryBudget = RetryBudget::new(0.1, 10); // a token bucket: retries add at most 10%
+
+        async fn reserve(
+            State(db): State<Db>,
+            Extension(Deadline(deadline)): Extension<Deadline>, // set by middleware from the caller's header
+            Query(q): Query<Sku>,
+        ) -> StatusCode {
+            let Ok(_slot) = DB_SLOTS.try_acquire() else {
+                return StatusCode::SERVICE_UNAVAILABLE; // every slot busy: shed now instead of queueing
+            };
+            RETRIES.on_request();
+            for attempt in 0..3 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return StatusCode::GATEWAY_TIMEOUT; // the caller gave up: stop working for nobody
+                }
+                if let Ok(Ok(())) = timeout(left.min(Duration::from_millis(500)), db.reserve(&q.sku)).await {
+                    return StatusCode::NO_CONTENT;
+                }
+                if attempt == 2 || !RETRIES.allow_retry() {
+                    break;
+                }
+            }
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+      roles: { users: [5, 5], upstream: [5, 9], context: [5, 27], queue: [10, 12], shed: [10, 12], retry: [3, 3], budget: [13, 25], strategy: [7, 7], deadline: [15, 19], db: [19, 19], browse: [19, 26] }
+    again:
+      file: tests/inventory.rs
+      source: |
+        // tests/inventory.rs: a hung database costs callers a fast 503, not a worker
+        #[tokio::test]
+        async fn sheds_when_every_slot_is_busy() {
+            let _held = DB_SLOTS.acquire_many(80).await.unwrap(); // 80 queries stuck in the database
+            let start = Instant::now();
+            let req = Request::post("/reserve?sku=42").body(Body::empty()).unwrap();
+            let res = app(HungDb).oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(start.elapsed() < Duration::from_millis(50));
+        }
+    cost:
+      before: { text: 10 s slow DB · site down 20 min, value: 0.95 }
+      after: { text: 10 s of failed checkouts · browse fine, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Tokio tasks are cheap, so like Go the pool that fills is connections and memory. Rust has one advantage: when a client disconnects, hyper drops the handler''s future, and dropping it cancels every `.await` below, including the query. Tower packages the defences as layers: `ConcurrencyLimitLayer`, `LoadShedLayer` (which rejects when the inner service is not ready instead of queueing), `TimeoutLayer`, and a retry `Budget`.'
+      seenIn: '`tokio::sync::Semaphore::try_acquire`. `tower::limit::ConcurrencyLimitLayer`, `tower::load_shed::LoadShedLayer`, `tower::retry::budget::TpsBudget`. `tonic` deadlines from the `grpc-timeout` header.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The database slows down and inventory's 80 slots fill with waiting queries. The next request finds no free slot and gets a 503 at once instead of a place in a queue.
+    nodes: [upstream, context, queue]
+    edges: [upstream>context, queue>context]
+    role: shed
+  - text: Checkout gets its answer in microseconds and frees its worker. Retries draw from a budget of 10% of traffic, so a full minute of failures adds a tenth more load, not three times as much.
+    nodes: [retry, context, upstream]
+    edges: [retry>context, upstream>context]
+    role: budget
+  - text: A request that did get a slot carries the caller's deadline. Each attempt gets 500 ms or what is left, whichever is less, and when the caller gives up the query is cancelled.
+    nodes: [context, strategy, db]
+    edges: [context>strategy, strategy>db]
+    role: deadline
+  - text: The frontend's workers are never held for long, so browse pages never notice. When the database recovers it has no backlog of abandoned queries, and checkout is back at once.
+    nodes: [upstream, browse, db]
+    edges: [upstream>browse, context>db]
+    role: browse
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: What makes a failure cascade?
+    options:
+      - text: The failing part pushes its load or its waiting onto other parts, which then overload and fail in turn.
+        correct: true
+        why: Right. Survivors take a crashed task's traffic, callers hold workers while they wait, and retries add load. Each step overloads the next component.
+      - text: Several unrelated components happen to fail at the same time.
+        why: That is a coincidence, not a cascade. In a cascade each failure causes the next.
+      - text: A bug is deployed to every service at once.
+        why: That is a correlated failure from one change. A cascade spreads through load, even when only one component had a problem.
+  engineer:
+    question: Ten tasks each run at 80% of capacity. Three crash, and the load balancer spreads their traffic over the other seven. What happens next?
+    options:
+      - text: Each survivor gets about 114% of its capacity, slows down and starts failing too, unless it sheds load.
+        correct: true
+        why: Right. 80% × 10 / 7 ≈ 114%. Without shedding, overloaded tasks miss deadlines, fail health checks or crash, and their load moves on to the rest.
+      - text: Each survivor runs at about 91%, which is fine.
+        why: That spreads three tasks' load as if it were one. Ten tasks' worth of traffic over seven tasks is 10/7 of the load each.
+      - text: The load balancer stops sending traffic, so nothing else fails.
+        why: Load balancers keep sending to healthy-looking tasks. That is how the load reaches the survivors.
+  deep:
+    question: The database recovered a minute ago, but checkout is still failing and the database is at full CPU. There are no deadlines. What is it doing?
+    options:
+      - text: Working through queued queries whose callers gave up long ago, so new queries wait too long, time out and are retried into the same queue.
+        correct: true
+        why: Right. The backlog keeps every answer late, late answers look like failures, and retries refill the backlog. That is a metastable failure. Deadlines that let the database drop expired work, or cutting load, break it.
+      - text: Rebuilding its indexes after the slowdown.
+        why: Possible in some databases, but the symptom here is explained by the work it is being asked to do.
+      - text: Waiting for health checks to mark it healthy again.
+        why: Health checks change where traffic goes, not what the database is busy with.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Load shedding
+      example: 503 when all 80 slots are busy
+      job: Refuses work early and cheaply so the work it accepts still finishes in time.
+    - role: Deadline propagation
+      example: { go: "r.Context() all the way down", python: "deadline from the caller, asyncio.timeout(remaining)", typescript: "AbortSignal.any([deadline, timeout])", rust: "Instant deadline, timeout(left)" }
+      job: Lets every service stop work for a request whose caller has already given up.
+    - role: Retry budget
+      example: retries ≤ 10% of requests, per client
+      job: Caps how much retries can add to load during an outage.
+    - role: Graceful degradation
+      example: product pages without stock counts
+      job: Keeps a cheaper version of the feature working when its dependency is overloaded.
+  useWhen:
+    - Any service that calls another service and can be called by more than it can serve.
+    - Shared dependencies, where one consumer's spike can starve the rest.
+    - Chains of synchronous calls, where every layer holds a resource while it waits.
+  avoidWhen:
+    - Shedding by a signal that lags the overload (minute-averaged CPU). By the time it triggers the queue is long.
+    - Queues sized for the worst burst. The SRE book suggests queues of half the thread pool or less for steady traffic; a long queue only adds latency.
+    - Retrying at every layer. Pick one, usually the one directly above the overloaded service.
+  tradeoffs:
+    - Shedding fails some requests on purpose. It needs monitoring, or it hides a capacity shortfall for weeks.
+    - Degraded modes are code paths that rarely run, so they rot. Exercise them, for example by running a few servers near overload.
+    - Restarting overloaded servers often makes it worse: new tasks start with cold caches, serve little, and fail health checks.
+    - Capacity headroom (N+2) prevents many cascades, but not the ones triggered by retries and backlogs.
+  lookalikes:
+    - name: Circuit breaker
+      how: The caller's version of shedding. It stops calling a failing dependency; shedding stops accepting work you cannot finish.
+    - name: Bulkhead
+      how: Separate pools per dependency, so one slow dependency cannot use every worker. It contains a cascade's spread sideways.
+    - name: Rate limiting
+      how: Caps each client's share whether or not anything is overloaded. Shedding reacts to overload whoever sent the work.
+---
+
+## [concept] Cascading failures
+
+**A <Term id="cascading-failure">cascading failure</Term> is overload that spreads. A slow or failed component makes the services that call it hold workers longer and retry more, which overloads them, which does the same to their callers, until parts of the system that never touched the original problem fail too.**
+
+The usual trigger is ordinary: a slow query, a lost zone, a deploy, a traffic spike. The cascade comes from how the rest of the system reacts. Every caller that waits holds a resource, and every caller that retries adds load at the moment there is least capacity for it.
+
+<Depth level={2}>
+Three defences cut the loop. <Term id="load-shedding">Load shedding</Term> refuses work early and cheaply when a service is full, so callers fail fast instead of waiting. <Term id="deadline-propagation">Deadline propagation</Term> lets each service stop work nobody is waiting for. A <Term id="retry-budget">retry budget</Term> caps how much retries can add. Together they keep <Term id="goodput">goodput</Term>, the useful work done in time, close to capacity.
+</Depth>
+
+<Depth level={3}>
+The worst form is a <Term id="metastable-failure">metastable failure</Term>: the trigger ends, but the overload sustains itself. A backlog of abandoned work keeps every new answer late, late answers time out and are retried, and the retries refill the backlog. The SRE book's advice for that state is blunt: reduce load drastically until it drains.
+</Depth>
+
+## [problem] An inventory service that waits and retries
+
+Checkout calls inventory to reserve stock, and inventory queries the database. Inventory allows 80 queries at once, and a request waits for a free slot when all are busy. Each attempt gets 500 ms, and it tries three times, because the database is occasionally slow. Checkout and the frontend each retry too. It has handled every load test.
+
+<Depth level={2}>
+Each line is defensive on its own: a limit on queries, a timeout, a retry. The problem is what they do together under a slow database. Waiting for a slot has no limit, the timeout starts fresh from `Background`, and three layers that each try three times can turn one checkout into 27 queries.
+</Depth>
+
+<Depth level={3}>
+The timeout covers the query, not the wait for a slot, so a request can sit in the queue for seconds before its 500 ms even starts. The caller's deadline is lost at the first hop: inventory does not know that checkout gave up long ago.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the inventory database had a slow ten seconds and the storefront was down for twenty minutes, browse pages included. Make a slow database cost us checkout, not the site.
+
+The marked lines are the instinctive fix: more slots so requests do not wait, and a longer timeout so the slow database has time to answer. Both make the next incident worse. Every request now holds its caller's worker four times as long, so checkout's pool fills sooner, then the frontend's. Browse pages, which only need the frontend, fail because every frontend worker is waiting on checkout.
+
+<Depth level={2}>
+The outage outlived the slowdown because of the queue. When the database recovered, it spent its capacity on queries whose callers had timed out long before. New queries waited behind them, timed out, and were retried into the same queue.
+</Depth>
+
+<Depth level={3}>
+Little's law makes the arithmetic plain: requests in progress = arrival rate × time each one takes. With 50 checkouts a second and each holding a frontend worker for 6 seconds (three 2-second attempts), the frontend needs 300 workers for checkout alone. It has 200.
+</Depth>
+
+## [morph] Fail fast, carry the deadline, budget the retries
+
+Drag the slider. The blocking wait for a slot becomes a try-or-503, the fresh timeout becomes the caller's context with a per-attempt cap, and the retry loop draws from a shared budget.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Shed at the service that is short of capacity, with a signal that moves fast: requests in flight, queue length, or event-loop delay. Return a status that says overloaded (503 with Retry-After, or gRPC `RESOURCE_EXHAUSTED`), and make callers treat it as "do not retry" once their budget is spent.
+</Depth>
+
+<Depth level={3}>
+The SRE book lists the order to prevent overload in: load test to find the limit and the failure mode, serve degraded results, reject when overloaded, reject higher up rather than overload servers, and plan capacity. Changing a queue from FIFO to LIFO, or using CoDel, also drops the requests least likely to still have a caller.
+</Depth>
+
+## [walk] Follow one request through the defences
+
+One checkout during the slowdown, from a full inventory to a frontend that never notices. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`r.Context()` is cancelled when the client disconnects or the server's handler returns, so every query started with it is cancelled too. `database/sql` honours it while waiting for a connection, not only during the query.</Lang>
+<Lang only="python">`Semaphore.locked()` is true when no slot is free, so the shed check does not wait. Between the check and `async with` nothing else runs, because asyncio only switches tasks at an `await`.</Lang>
+<Lang only="typescript">`AbortSignal.any()` aborts when either the caller's deadline or the 500 ms timeout fires, and the database driver must accept a `signal` for the query itself to stop.</Lang>
+<Lang only="rust">`try_acquire` returns at once with `Err` when no permit is free. The permit is released when `_slot` is dropped, on every return path, including when hyper drops the whole future because the client left.</Lang>
+</Depth>
+
+## [again] The same slow database again
+
+The same ten-second slowdown with the new code: inventory sheds what it cannot serve, checkout fails fast for those users, and the frontend's pool never fills, so browse pages carry on. Queries whose callers gave up are cancelled, so the database has no backlog when it recovers, and checkout is back the same second. The test fills every slot and checks the next request gets a 503 within 10 ms.
+
+<Depth level={2}>
+Show users something better than an error where you can: a product page without stock counts, a cart that says "we will confirm availability by email". That is <Term id="graceful-degradation">graceful degradation</Term>, and it turns shed load into a smaller outage.
+</Depth>
+
+<Depth level={3}>
+In an emergency, the SRE book's steps are: add capacity if you can, stop health checks from killing overloaded tasks, restart carefully (cold caches make new tasks weak), drop traffic hard until it stabilises, and turn off retries and expensive features.
+</Depth>
+
+## [play] Watch overload climb the chain
+
+Four services in a chain, each with a fixed number of workers. Slow the database down, run 40 seconds, and watch the busy workers climb from the database to the frontend. Then add the defences one at a time.
+
+## [lens] How each language does it
+
+Go, async Python, Node and tokio all make waiting cheap, so there is no small thread pool to run out of. The cascade still happens: it fills connection pools, memory and event loops instead. Each language differs in whether a caller's departure cancels the work below it.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whatever the language, put the limits where the scarce resource is (database connections, a downstream's capacity) and make the wait for that resource bounded by the caller's deadline.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="cascading-failures" />
+
+### How a cascade spreads
+
+| Mechanism | What fills up | Defence |
+|---|---|---|
+| Callers wait on a slow dependency | worker pools, connections, memory up the chain | shed early, bounded waits |
+| Retries at several layers | load on the scarce component, multiplied | one retry layer, retry budget |
+| Work for callers who left | the slow component's capacity, after it recovers | deadline propagation, LIFO or CoDel queues |
+| Survivors take a crashed task's traffic | the remaining tasks, one after another | capacity headroom, shedding |
+| Restarts with cold caches | new tasks, which fail health checks | slow, staged restarts |

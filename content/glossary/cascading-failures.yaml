@@ -1,0 +1,12 @@
+- id: cascading-failure
+  term: Cascading failure
+  short: A failure that spreads through load. One component slows or fails, its callers hold resources longer, retry, or take over its traffic, and they overload and fail in turn.
+- id: load-shedding
+  term: Load shedding
+  short: Refusing some requests early and cheaply, for example with a 503 when every slot is busy, so the requests a service does accept still finish in time.
+- id: goodput
+  term: Goodput
+  short: The rate of useful work completed in time for someone to use it. Under overload a server can stay busy at full throughput while its goodput falls to zero.
+- id: resource-exhaustion
+  term: Resource exhaustion
+  short: Running out of a limited resource such as worker threads, connections, file descriptors or memory, which makes a service slow or fail even if its CPU is idle.
