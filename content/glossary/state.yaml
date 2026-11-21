@@ -4,7 +4,7 @@
   short: A fixed set of states, the events each state accepts, and the state each accepted event leads to.
 - id: typestate
   term: Typestate
-  short: Encoding an object's state in its type, so calling a method in the wrong state is a compile error.
+  short: Encoding an object's state in its type, so calling a method in the wrong state, such as build() before a required field is set, does not compile.
 - id: at-least-once-delivery
   term: At-least-once delivery
   short: A sender retries until it gets an acknowledgement, so the receiver may see the same message more than once.
