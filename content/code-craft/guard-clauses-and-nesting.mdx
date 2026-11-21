@@ -1,0 +1,620 @@
+---
+title: Guard clauses and nesting
+track: code-craft
+group: Everyday code
+order: 7
+summary: Handle the special cases first and return early, so the main path reads straight down with nothing left open.
+intent: Each line of a function should have as few conditions in scope as possible.
+changeRequest: Test-mode events must be rejected in production with a 403.
+languages: [go, python, typescript, rust]
+glossary: [guard-clause, cognitive-complexity, cyclomatic-complexity, short-circuit-evaluation, exhaustive-match]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [code-craft/routines-worth-extracting]
+skills: [code-quality]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: guard-clauses-and-nesting
+  scenarios:
+    - try: "Predict, then click each if in turn to make it a guard clause."
+      notice: "Depth, open branches and cognitive complexity fall with each click. Paths stay at 7 and the tests stay green: the behaviour never changed."
+    - try: "Name the two long conditions."
+      notice: "The guard lines become short sentences, and the boolean logic moves into helpers you can test and read on their own."
+    - try: "Break it: check the signature before the method."
+      notice: "One test goes red. A GET with no signature now gets 401 instead of 405. When a request fails two checks, the order of the guards decides the reply."
+    - try: "Run the bug hunt in the nested version, then in the flat one."
+      notice: "The same kind of bug, two swapped replies. In the flat version each check sits on the same line as its reply; in the nested one you match an else to an if 20 lines up."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: req
+      kind: client
+      before: { x: 12, y: 110, w: 92, h: 50, title: Request, sub: POST /webhooks }
+      after:  { x: 12, y: 110, w: 92, h: 50, title: Request, sub: POST /webhooks }
+    - id: handler
+      kind: context
+      before: { x: 120, y: 12, w: 425, h: 246, title: Handle, sub: 5 levels deep }
+      after:  { x: 120, y: 12, w: 210, h: 40, title: Handle, sub: reads top to bottom }
+    - id: method
+      kind: concrete
+      before: { x: 140, y: 50, w: 140, h: 34, title: method }
+      after:  { x: 120, y: 62, w: 210, h: 30, title: method or 405 }
+    - id: sig
+      kind: concrete
+      before: { x: 190, y: 94, w: 140, h: 34, title: signature }
+      after:  { x: 120, y: 98, w: 210, h: 30, title: signature or 401 }
+    - id: key
+      kind: concrete
+      before: { x: 240, y: 138, w: 140, h: 34, title: key · duplicate }
+      after:  { x: 120, y: 134, w: 210, h: 30, title: key or 400 · 200 }
+    - id: parse
+      kind: concrete
+      before: { x: 290, y: 182, w: 140, h: 34, title: parse · process }
+      after:  { x: 120, y: 170, w: 210, h: 30, title: event or 422 }
+    - id: testmode
+      kind: concrete
+      appears: change
+      before: { x: 340, y: 222, w: 140, h: 30, title: test mode }
+      after:  { x: 120, y: 206, w: 210, h: 30, title: live or 403 }
+    - id: guards
+      kind: strategy
+      appears: after
+      before: { x: 470, y: 60, w: 60, h: 40, title: "" }
+      after:  { x: 370, y: 110, w: 170, h: 54, title: Guard clauses, sub: "fail fast, return" }
+  edges:
+    - { from: req, to: handler, label: calls }
+    - { from: method, to: guards, kind: implements }
+    - { from: sig, to: guards, kind: implements }
+    - { from: key, to: guards, kind: implements }
+    - { from: parse, to: guards, kind: implements }
+    - { from: testmode, to: guards, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: webhooks.go
+      source: |
+        func (h *Webhooks) Handle(w http.ResponseWriter, r *http.Request) {
+            if r.Method == http.MethodPost {
+                body := h.readBody(r) // capped at 1 MB
+                sig := r.Header.Get("X-Signature")
+                if sig != "" && h.verify(sig, body) && time.Since(sentAt(r)) < 5*time.Minute {
+                    key := r.Header.Get("Idempotency-Key")
+                    if key != "" {
+                        if !h.seen.Has(key) {
+                            var ev Event
+                            if err := json.Unmarshal(body, &ev); err == nil {
+                                h.process(ev)
+                                h.seen.Add(key)
+                                w.WriteHeader(http.StatusAccepted)
+                            } else {
+                                http.Error(w, "invalid event", http.StatusUnprocessableEntity)
+                            }
+                        } else {
+                            w.WriteHeader(http.StatusOK) // duplicate, already handled
+                        }
+                    } else {
+                        http.Error(w, "missing Idempotency-Key", http.StatusBadRequest)
+                    }
+                } else {
+                    http.Error(w, "bad signature", http.StatusUnauthorized)
+                }
+            } else {
+                http.Error(w, "use POST", http.StatusMethodNotAllowed)
+            }
+        }
+      roles: { handler: [1, 29], method: [2, 2], sig: [4, 5], key: [6, 8], parse: [9, 10], main: [11, 13] }
+      change:
+        - { line: 11, replace: '                    if ev.Livemode || !h.prod { // one level deeper' }
+        - { after: 11, add: ['                        h.process(ev)'] }
+        - { line: 12, replace: '                        h.seen.Add(key)' }
+        - { line: 13, replace: '                        w.WriteHeader(http.StatusAccepted)' }
+        - { after: 13, add: ['                    } else {', '                        http.Error(w, "test event in production", http.StatusForbidden)', '                    }'] }
+    after:
+      file: webhooks.go
+      source: |
+        func (h *Webhooks) Handle(w http.ResponseWriter, r *http.Request) {
+            if r.Method != http.MethodPost {
+                http.Error(w, "use POST", http.StatusMethodNotAllowed)
+                return
+            }
+            body := h.readBody(r) // capped at 1 MB
+            if !h.validSignature(r, body) {
+                http.Error(w, "bad signature", http.StatusUnauthorized)
+                return
+            }
+            key := r.Header.Get("Idempotency-Key")
+            if key == "" {
+                http.Error(w, "missing Idempotency-Key", http.StatusBadRequest)
+                return
+            }
+            if h.seen.Has(key) {
+                w.WriteHeader(http.StatusOK) // duplicate, already handled
+                return
+            }
+            var ev Event
+            if err := json.Unmarshal(body, &ev); err != nil {
+                http.Error(w, "invalid event", http.StatusUnprocessableEntity)
+                return
+            }
+            h.process(ev)
+            h.seen.Add(key)
+            w.WriteHeader(http.StatusAccepted)
+        }
+
+        func (h *Webhooks) validSignature(r *http.Request, body []byte) bool {
+            sig := r.Header.Get("X-Signature")
+            return sig != "" && h.verify(sig, body) && time.Since(sentAt(r)) < 5*time.Minute
+        }
+      roles: { handler: [1, 28], method: [2, 5], sig: [6, 10], key: [11, 19], parse: [20, 24], main: [25, 27], named: [30, 33], guards: [2, 24] }
+    again:
+      file: webhooks.go
+      source: |
+        // The new rule is one more guard, inserted after the event is parsed, before line 25:
+        //
+        //     if !ev.Livemode && h.prod {
+        //         http.Error(w, "test event in production", http.StatusForbidden)
+        //         return
+        //     }
+        //
+        // No line below it moves, and no else appears anywhere else.
+    cost:
+      before: { text: 6 levels deep · 3 lines moved · 4 added, value: 0.75 }
+      after: { text: 4 lines added · 0 moved, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: '`if err != nil { return err }` is a guard clause, and Go code is written in this shape everywhere: the error path is indented, the main path runs down the left margin. The Go wiki''s Code Review Comments has a section, Indent Error Flow, asking for exactly this. Go has no ternary and no `let else`, so a guard is always a full `if` block; `gofmt` keeps it on three lines.'
+      seenIn: 'The `revive` linter''s `early-return`, `indent-error-flow` and `superfluous-else` rules flag the nested form. `gocognit` reports cognitive complexity per function, and `gocyclo` reports cyclomatic complexity.'
+
+  python:
+    before:
+      file: webhooks.py
+      source: |
+        def handle(self, req: Request) -> Response:
+            if req.method == "POST":
+                sig = req.headers.get("X-Signature", "")
+                if sig and self.verify(sig, req.body) and age(req) < FIVE_MINUTES:
+                    key = req.headers.get("Idempotency-Key")
+                    if key:
+                        if key not in self.seen:
+                            try:
+                                event = Event.model_validate_json(req.body)
+                            except ValidationError:
+                                return Response("invalid event", status=422)
+                            self.process(event)
+                            self.seen.add(key)
+                            return Response(status=202)
+                        else:
+                            return Response(status=200)  # duplicate, already handled
+                    else:
+                        return Response("missing Idempotency-Key", status=400)
+                else:
+                    return Response("bad signature", status=401)
+            else:
+                return Response("use POST", status=405)
+      roles: { handler: [1, 22], method: [2, 2], sig: [3, 4], key: [5, 7], parse: [8, 11], main: [12, 14] }
+      change:
+        - { line: 12, replace: '                    if event.livemode or not self.prod:  # one level deeper' }
+        - { after: 12, add: ['                        self.process(event)'] }
+        - { line: 13, replace: '                        self.seen.add(key)' }
+        - { line: 14, replace: '                        return Response(status=202)' }
+        - { after: 14, add: ['                    else:', '                        return Response("test event in production", status=403)'] }
+    after:
+      file: webhooks.py
+      source: |
+        def handle(self, req: Request) -> Response:
+            if req.method != "POST":
+                return Response("use POST", status=405)
+            if not self.valid_signature(req):
+                return Response("bad signature", status=401)
+            key = req.headers.get("Idempotency-Key")
+            if not key:
+                return Response("missing Idempotency-Key", status=400)
+            if key in self.seen:
+                return Response(status=200)  # duplicate, already handled
+            try:
+                event = Event.model_validate_json(req.body)
+            except ValidationError:
+                return Response("invalid event", status=422)
+
+            self.process(event)
+            self.seen.add(key)
+            return Response(status=202)
+
+        def valid_signature(self, req: Request) -> bool:
+            sig = req.headers.get("X-Signature", "")
+            return bool(sig) and self.verify(sig, req.body) and age(req) < FIVE_MINUTES
+      roles: { handler: [1, 18], method: [2, 3], sig: [4, 5], key: [6, 10], parse: [11, 14], main: [16, 18], named: [20, 22], guards: [2, 14] }
+    again:
+      file: webhooks.py
+      source: |
+        # The new rule is one more guard, inserted after the event is parsed, before line 16:
+        #
+        #     if not event.livemode and self.prod:
+        #         return Response("test event in production", status=403)
+        #
+        # No line below it moves, and no else appears anywhere else.
+    cost:
+      before: { text: 5 levels deep · 2 lines moved · 3 added, value: 0.75 }
+      after: { text: 2 lines added · 0 moved, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Indentation is syntax in Python, so deep nesting is visible at a glance and pushes lines toward the length limit. Early `return` is the usual fix. A `try` block is a level of nesting too: keep it around the one call that raises, as in the parse step, not around the whole function. For many cases on the shape of a value, `match` (Python 3.10) can replace a ladder of `if`s.'
+      seenIn: 'Pylint''s `no-else-return` (R1705) and Ruff''s `RET505` flag an `else` after a `return`. Pylint''s `too-many-nested-blocks` (R1702) stops at five levels by default.'
+
+  typescript:
+    before:
+      file: webhooks.ts
+      source: |
+        async handle(req: Request): Promise<Reply> {
+          if (req.method === "POST") {
+            const sig = req.headers.get("x-signature") ?? "";
+            if (sig !== "" && this.verify(sig, req.body) && ageMs(req) < FIVE_MIN) {
+              const key = req.headers.get("idempotency-key");
+              if (key !== null) {
+                if (!this.seen.has(key)) {
+                  const event = parseEvent(req.body);
+                  if (event !== null) {
+                    await this.process(event);
+                    this.seen.add(key);
+                    return reply(202);
+                  } else {
+                    return reply(422, "invalid event");
+                  }
+                } else {
+                  return reply(200); // duplicate, already handled
+                }
+              } else {
+                return reply(400, "missing Idempotency-Key");
+              }
+            } else {
+              return reply(401, "bad signature");
+            }
+          } else {
+            return reply(405, "use POST");
+          }
+        }
+      roles: { handler: [1, 28], method: [2, 2], sig: [3, 4], key: [5, 7], parse: [8, 9], main: [10, 12] }
+      change:
+        - { line: 10, replace: '            if (event.livemode || !this.prod) { // one level deeper' }
+        - { after: 10, add: ['              await this.process(event);'] }
+        - { line: 11, replace: '              this.seen.add(key);' }
+        - { line: 12, replace: '              return reply(202);' }
+        - { after: 12, add: ['            } else {', '              return reply(403, "test event in production");', '            }'] }
+    after:
+      file: webhooks.ts
+      source: |
+        async handle(req: Request): Promise<Reply> {
+          if (req.method !== "POST") return reply(405, "use POST");
+          if (!this.validSignature(req)) return reply(401, "bad signature");
+
+          const key = req.headers.get("idempotency-key");
+          if (key === null) return reply(400, "missing Idempotency-Key");
+          if (this.seen.has(key)) return reply(200); // duplicate, already handled
+
+          const event = parseEvent(req.body);
+          if (event === null) return reply(422, "invalid event");
+
+          await this.process(event); // narrowed: event is an Event here
+          this.seen.add(key);
+          return reply(202);
+        }
+
+        private validSignature(req: Request): boolean {
+          const sig = req.headers.get("x-signature") ?? "";
+          return sig !== "" && this.verify(sig, req.body) && ageMs(req) < FIVE_MIN;
+        }
+      roles: { handler: [1, 15], method: [2, 2], sig: [3, 3], key: [5, 7], parse: [9, 10], main: [12, 14], named: [17, 20], guards: [2, 10] }
+    again:
+      file: webhooks.ts
+      source: |
+        // The new rule is one more guard, inserted after the event is parsed, before line 12:
+        //
+        //   if (!event.livemode && this.prod) return reply(403, "test event in production");
+        //
+        // No line below it moves, and no else appears anywhere else.
+    cost:
+      before: { text: 6 levels deep · 3 lines moved · 4 added, value: 0.75 }
+      after: { text: 1 line added · 0 moved, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Guards work with the type checker. After `if (event === null) return ...`, TypeScript narrows `event` to `Event` for the rest of the function, so the main path needs no `!` or `?.`. For a closed union, a `switch` whose `default` assigns the value to `never` makes the compiler report every case you forgot.'
+      seenIn: 'ESLint''s `no-else-return` flags an `else` after a `return`, and `max-depth` (default 4) flags deep blocks. SonarJS''s `cognitive-complexity` rule implements the score this lesson''s playground shows.'
+
+  rust:
+    before:
+      file: webhooks.rs
+      source: |
+        fn handle(&mut self, req: &Request) -> Reply {
+            if req.method == Method::POST {
+                let sig = header(req, "x-signature").unwrap_or("");
+                if !sig.is_empty() && self.verify(sig, &req.body) && age(req) < FIVE_MIN {
+                    if let Some(key) = header(req, "idempotency-key") {
+                        if !self.seen.contains(key) {
+                            match serde_json::from_slice::<Event>(&req.body) {
+                                Ok(event) => {
+                                    self.process(event);
+                                    self.seen.insert(key.to_owned());
+                                    Reply::status(202)
+                                }
+                                Err(_) => Reply::error(422, "invalid event"),
+                            }
+                        } else {
+                            Reply::status(200) // duplicate, already handled
+                        }
+                    } else {
+                        Reply::error(400, "missing Idempotency-Key")
+                    }
+                } else {
+                    Reply::error(401, "bad signature")
+                }
+            } else {
+                Reply::error(405, "use POST")
+            }
+        }
+      roles: { handler: [1, 27], method: [2, 2], sig: [3, 4], key: [5, 6], parse: [7, 8], main: [9, 11] }
+      change:
+        - { line: 9, replace: '                            if event.livemode || !self.prod { // one level deeper' }
+        - { after: 9, add: ['                                self.process(event);'] }
+        - { line: 10, replace: '                                self.seen.insert(key.to_owned());' }
+        - { line: 11, replace: '                                Reply::status(202)' }
+        - { after: 11, add: ['                            } else {', '                                Reply::error(403, "test event in production")', '                            }'] }
+    after:
+      file: webhooks.rs
+      source: |
+        fn handle(&mut self, req: &Request) -> Reply {
+            if req.method != Method::POST {
+                return Reply::error(405, "use POST");
+            }
+            if !self.valid_signature(req) {
+                return Reply::error(401, "bad signature");
+            }
+            let Some(key) = header(req, "idempotency-key") else {
+                return Reply::error(400, "missing Idempotency-Key");
+            };
+            if self.seen.contains(key) {
+                return Reply::status(200); // duplicate, already handled
+            }
+            let Ok(event) = serde_json::from_slice::<Event>(&req.body) else {
+                return Reply::error(422, "invalid event");
+            };
+
+            self.process(event);
+            self.seen.insert(key.to_owned());
+            Reply::status(202)
+        }
+
+        fn valid_signature(&self, req: &Request) -> bool {
+            let sig = header(req, "x-signature").unwrap_or("");
+            !sig.is_empty() && self.verify(sig, &req.body) && age(req) < FIVE_MIN
+        }
+      roles: { handler: [1, 21], method: [2, 4], sig: [5, 7], key: [8, 13], parse: [14, 16], main: [18, 20], named: [23, 26], guards: [2, 16] }
+    again:
+      file: webhooks.rs
+      source: |
+        // The new rule is one more guard, inserted after the event is parsed, before line 18:
+        //
+        //     if !event.livemode && self.prod {
+        //         return Reply::error(403, "test event in production");
+        //     }
+        //
+        // No line below it moves, and no else appears anywhere else.
+    cost:
+      before: { text: 6 levels deep · 3 lines moved · 4 added, value: 0.75 }
+      after: { text: 3 lines added · 0 moved, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`let ... else` (stable since Rust 1.65) is a guard clause that also binds: if the pattern does not match, the `else` block must diverge with `return`, `break` or `panic!`, and the compiler checks that it does. In functions that return `Result` or `Option`, `?` is the shortest guard of all. Because `if` and `match` are expressions, the nested version needs no `return` at all, which is part of why it gets written.'
+      seenIn: 'Clippy has a `cognitive_complexity` lint, not enabled by default, and `excessive_nesting`, which flags deep blocks once you set a threshold. `let else` replaced the `let x = match ... { Some(x) => x, None => return ... };` idiom common in older crates.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A GET arrives. The first guard answers 405 and returns. Everything below it can assume the method is POST without looking back up.
+    nodes: [req, method, guards]
+    edges: [method>guards]
+    role: method
+  - text: The signature check is a guard with a name. The three-part condition lives in its own function, so this line reads as one sentence and the boolean logic can be tested alone.
+    nodes: [sig, guards]
+    edges: [sig>guards]
+    role: named
+  - text: { go: 'A missing key and a replayed key each get their own guard. Each reply sits right under the check that causes it, so a wrong status code is visible where it is written.', python: 'A missing key and a replayed key each get their own guard. Each reply sits right under the check that causes it, so a wrong status code is visible where it is written.', typescript: 'A missing key and a replayed key each get their own guard. Each reply sits on the same line as the check that causes it, so a wrong status code is visible where it is written.', rust: '`let Some(key) = ... else` guards and binds at once. A replayed key gets its own guard. Each reply sits right under the check that causes it.' }
+    nodes: [key, guards]
+    edges: [key>guards]
+    role: key
+  - text: Every check has either returned or passed. The main path sits at the left margin with no conditions open, and it is the last thing in the function.
+    nodes: [handler, parse]
+    edges: [parse>guards]
+    role: main
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: What does a guard clause do?
+    options:
+      - text: It handles a special or invalid case at the top of a function and returns, so the rest of the function can assume the case does not apply.
+        correct: true
+        why: Right. Each guard closes one question for good. The reader carries nothing forward from it.
+      - text: It wraps the main logic in an if, so the logic only runs when every condition holds.
+        why: That is the nested form a guard clause replaces. Every condition stays open around the main logic.
+      - text: It catches exceptions so the function never fails.
+        why: A guard checks conditions before work begins. Catching and hiding failures is a different thing, and usually a bad one.
+  engineer:
+    question: A function has two nested loops, and the inner loop body has three nested ifs. What is the best first refactoring?
+    options:
+      - text: Extract the inner loop body into a named function, and use guard clauses (or continue) inside it.
+        correct: true
+        why: Right. The extracted function gets a name that says what one item's processing does, and inside it each early return skips one item. Two refactorings that each make the other easier.
+      - text: Combine the three if conditions into one long condition with &&.
+        why: It removes two levels, but the reader still has to untangle one long condition, and any else branches are lost or duplicated.
+      - text: Add comments at each closing brace saying which if it closes.
+        why: Comments describe the problem instead of removing it. They also drift when someone moves a block.
+  deep:
+    question: A function ends with a switch over an order status that returns "unknown" in its default branch. You change it to an exhaustive match. What happens when someone adds a new status next year?
+    options:
+      - text: The build fails at every match that does not handle the new status, so each one gets a deliberate decision.
+        correct: true
+        why: Right. In Rust a non-exhaustive match is a compile error; in TypeScript a default that assigns to never does the same job. The default branch hid new cases; exhaustiveness turns each into a to-do list.
+      - text: The new status goes to the default branch, as before.
+        why: That is what the default branch did. Removing it is the point; without a default there is nowhere for an unhandled case to hide.
+      - text: Nothing changes until the new status is seen at runtime.
+        why: Exhaustiveness is checked by the compiler from the type's list of cases, before the program runs.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Guard clause
+      example: { go: 'if r.Method != http.MethodPost { ... return }', python: 'if req.method != "POST": return ...', typescript: 'if (req.method !== "POST") return reply(405)', rust: 'let Some(key) = ... else { return ... };' }
+      job: Handles one special case and leaves. Afterwards the rest of the function may assume it did not happen.
+    - role: Main path
+      example: process the event
+      job: The reason the function exists. It runs last, at the left margin, with no open conditions around it.
+    - role: Named condition
+      example: { go: validSignature, python: valid_signature, typescript: validSignature, rust: valid_signature }
+      job: A compound boolean moved into a function whose name says what it checks.
+  useWhen:
+    - A function validates input or preconditions before doing its work (handlers, commands, parsers).
+    - The else branch of an if is a short failure reply and the then branch is the long main logic.
+    - You see `else` right after a `return`, or closing braces stacked three or more deep.
+  avoidWhen:
+    - The branches are two equal alternatives, such as two pricing rules. An if/else shows that they are peers; a guard would make one look like an error.
+    - The function must clean up on every exit and the language has no defer, with, finally or Drop to do it. Then several returns can leak a resource. Use the language's cleanup construct first.
+  tradeoffs:
+    - Guard order is behaviour. When an input fails two checks, the first guard decides the reply, so reordering guards needs tests.
+    - Many small guards can hide that a function validates too much. If there are ten, the validation may belong in its own type or function.
+    - Several exits make it harder to put one breakpoint or log line at the end. A wrapper or a deferred call usually solves it.
+  lookalikes:
+    - name: Table-driven methods
+      how: Replaces a chain of ifs that choose a value with a lookup in data. Guard clauses keep the ifs and change their shape.
+    - name: Replace conditional with polymorphism
+      how: For a switch on a type repeated in many places. Each case becomes a method on its own type, so no function has to branch on it.
+    - name: Validation layer
+      how: Moves the guards out of the handler into a type or schema that parses input once at the boundary, so the handler receives values that are already valid.
+---
+
+## [concept] Guard clauses and nesting
+
+**Handle the special cases first and return early, so the main path reads straight down with nothing left open.**
+
+Every `if` you are inside is a condition you have to remember while you read. Six nested ifs mean six things held in mind on the most important line of the function, and each `else` sits far from the `if` it belongs to. A <Term id="guard-clause">guard clause</Term> checks one special case at the top, answers it, and returns. After it, that case is gone.
+
+<Depth level={2}>
+Flattening does not remove decisions. A handler with six checks has seven outcomes before and after. What changes is the reader's load: in the nested form the reader must keep every open condition and match each `else` to its `if` by counting braces. In the flat form each check and its reply sit together, and once read they can be forgotten. Naming a compound condition (`validSignature`) cuts the load again, because the reader can trust the name and skip the detail.
+
+The old rule "one entry, one exit" came from languages where every exit had to free resources by hand. With `defer`, `with`, `finally` or `Drop`, early returns are safe, and they are usually clearer.
+</Depth>
+
+<Depth level={3}>
+Two metrics measure different things here. <Term id="cyclomatic-complexity">Cyclomatic complexity</Term> counts independent paths, and does not change when you flatten: it tells you how many tests you need. <Term id="cognitive-complexity">Cognitive complexity</Term>, defined by G. Ann Campbell at SonarSource, adds one for each branch plus one for each level of nesting around it, and does not count early returns. The nested handler in the playground scores 29; the flat one scores 6.
+</Depth>
+
+## [problem] A webhook handler that checks everything
+
+A payment provider sends webhooks. Before the handler processes an event, it checks five things: the method is POST, the signature is valid and recent, an idempotency key is present, the key has not been seen before, and the body parses. Each check was added as the main logic's guard, by wrapping the existing code in one more `if`.
+
+Read it once. The main path, the three lines that do the work, sits four or five levels deep in the middle of the function. The reply for a wrong method is at the very bottom.
+
+<Depth level={2}>
+Nothing here is a bug, and every check is needed. This shape grows naturally: the first version had one if, and each later check wrapped what was there. It is also how many people first learn to write "only do X if Y".
+</Depth>
+
+<Depth level={3}>
+The signature condition relies on <Term id="short-circuit-evaluation">short-circuit evaluation</Term>: `verify` runs only if the header is not empty, and the age check runs only if `verify` passed. That order matters for cost (HMAC before a cheap comparison would waste work) and for correctness when a later part assumes an earlier one.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** test-mode events must be rejected in production with a 403.
+
+In the nested shape the new check wraps the main path in one more level. The three lines of real work move right, and a new `else` with the 403 appears below them, between other elses that belong to other ifs. A reviewer has to count braces to see which condition each reply answers.
+
+<Depth level={2}>
+The diff touches lines that did not change in meaning, only in indentation. On a busy file that is a merge conflict waiting to happen, and it hides the one line that matters in a wall of moved code.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`gofmt` re-indents the whole block, so the diff shows every line of the main path as changed. `git diff -w` hides whitespace-only changes, but reviewers on the web usually see the full diff.</Lang>
+<Lang only="python">In Python the indentation is the structure, so the moved lines are a real change. Get one level wrong and the `return` binds to a different block without any error.</Lang>
+<Lang only="typescript">Prettier re-indents the whole block, so the diff shows every line of the main path as changed, and the closing braces at the end become harder to match.</Lang>
+<Lang only="rust">`rustfmt` re-indents the block, and because the nested version uses `if` as an expression, the new `else` must also produce a `Reply` or the function stops compiling.</Lang>
+</Depth>
+
+## [morph] Invert each check and return
+
+Drag the slider. Each `if` is inverted so that it tests for the failure, answers it and returns. The compound signature condition moves into a named function. The main path ends up at the left margin, last in the function.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Do it one check at a time, from the outside in, and run the tests after each. Invert the condition carefully: `!(a && b && c)` is `!a || !b || !c`, and that is where most mistakes happen. Naming the condition first makes the inversion trivial.
+</Depth>
+
+<Depth level={3}>
+To the compiler both versions are the same control-flow graph: the same blocks and the same edges, laid out differently. Nesting is a property of the source text, not of the machine code. That is why the optimiser is indifferent and the reader is not.
+</Depth>
+
+## [walk] Follow one request
+
+A request goes through the guards from top to bottom. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Each guard ends in a bare `return`. If the handler held a resource, a `defer` placed right after acquiring it would run on every one of these exits.</Lang>
+<Lang only="python">If the handler opened a resource, a `with` block around the main path, or `try`/`finally`, runs cleanup on every return inside it.</Lang>
+<Lang only="typescript">Each guard returns a `Reply`, so the function's return type checks that every path answers. With `noImplicitReturns` the compiler also flags a path that forgets to.</Lang>
+<Lang only="rust">The `else` of a `let ... else` must diverge; the compiler rejects one that falls through. `Drop` runs for every value in scope on each early return, so there is no cleanup to forget.</Lang>
+</Depth>
+
+## [again] Test mode, the second time
+
+The same request, after the refactor. The new rule is one more guard after the event is parsed. Nothing moves, and the reply sits next to its condition.
+
+<Depth level={2}>
+Where the guard goes still matters. It must come after parsing, because it reads the event, and its position decides the reply for an event that is both test-mode and a duplicate. Write that case down as a test before you choose.
+</Depth>
+
+<Depth level={3}>
+If guards keep growing, the validation may want to become a type: parse the raw request once into a `VerifiedEvent` that can only be built when all checks pass. The handler then takes that type and has no guards left.
+</Depth>
+
+## [play] Flatten it yourself, then hunt a bug
+
+The webhook handler, nested six deep. Click an `if` to turn it into a guard clause and watch the depth, the open branches and the cognitive complexity fall while the paths and the tests stay the same. Then reorder two guards to see the one change that does alter behaviour, and race a planted bug in each version.
+
+## [lens] How each language writes it
+
+Every language can return early. They differ in what helps: Go's error checks are guards by habit, TypeScript narrows types after a guard, Rust has `let else` and `?`, and Python's linters catch the else after a return.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="guard-clauses-and-nesting" />
+
+### The refactoring, step by step
+
+This is Replace Nested Conditional with Guard Clauses in Martin Fowler's catalogue.
+
+1. Pick the outermost `if` whose `else` is a short reply.
+2. Invert its condition, put the reply right under it, and return.
+3. Remove the `else` and un-indent the old then-branch.
+4. Run the tests. Repeat from step 1 with the next level.
+5. When a condition is hard to invert or read, extract it into a named function first.

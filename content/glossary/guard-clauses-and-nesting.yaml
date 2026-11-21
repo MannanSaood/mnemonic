@@ -1,0 +1,10 @@
+# Terms introduced by code-craft/guard-clauses-and-nesting
+- id: guard-clause
+  term: Guard clause
+  short: A check at the top of a function that handles an invalid or special case and returns at once, so the rest of the function can assume it passed.
+- id: cognitive-complexity
+  term: Cognitive complexity
+  short: A score for how hard code is to read. Each branch adds one, and each level of nesting around it adds one more, so deep code scores higher than flat code with the same branches.
+- id: cyclomatic-complexity
+  term: Cyclomatic complexity
+  short: The number of independent paths through a function, roughly one plus the number of decisions. It counts what must be tested, not how hard the code is to read.
