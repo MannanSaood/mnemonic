@@ -1,0 +1,599 @@
+---
+title: Modular arithmetic
+track: math-for-cs
+group: Number theory
+order: 12
+summary: Arithmetic on a clock of m ticks, where you reduce after every step. You can add, subtract and multiply freely, but you can only divide by numbers that share no factor with m, and the extended Euclidean algorithm finds that division for you. The same idea, one level up, is why RSA decryption undoes encryption.
+intent: Compute safely modulo m without overflow, know when a multiply can be undone, find the inverse with the extended Euclidean algorithm, and read RSA as an application.
+changeRequest: The call-centre tool must turn a public order number back into the order id offline, without the orders database.
+languages: [go, python, typescript, rust]
+glossary: [modular-arithmetic, congruence, modular-inverse, extended-euclid, modular-exponentiation, euler-totient, rsa, oaep]
+
+prerequisites: [math-for-cs/divisibility-gcd-and-primes]
+skills: [number-theory]
+depths: [overview, engineer, deep]
+
+playground:
+  model: modular-arithmetic-and-inverses
+  scenarios:
+    - try: "On the 12-tick clock, click 5, then 8."
+      notice: "Stepping by 5 draws a star through all 12 ticks and lands on 1 after 5 steps, so 5 is its own inverse. Stepping by 8 visits only 8, 4 and 0: 8 and 12 share the factor 4, and nothing times 8 is 1."
+    - try: "Choose mod 26, click 7 and press Next row until Euclid stops."
+      notice: "Every row keeps r ≡ s · 7 (mod 26). When r reaches 1, s is −11, and −11 mod 26 = 15 is the inverse: 7 × 15 = 105 = 4 × 26 + 1."
+    - try: "Keep p = 61, q = 53, e = 17. Encrypt 65, decrypt, then tick Break it and do both again."
+      notice: "Reduced at every step, 65 becomes 2790 and comes back as 65. Computed as 65^17 in floating point first, the ciphertext is wrong and decryption returns NaN."
+    - try: "Press Encrypt twice, then Attack. Then set e = 3."
+      notice: "The same message gives the same ciphertext, so the attacker just encrypts guesses until one matches. With e = 3 there is no private key at all: 3 divides φ = 3120."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 104, h: 48, title: support tool, sub: decode(number) }
+      after:  { x: 12, y: 111, w: 104, h: 48, title: support tool, sub: decode(number) }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 260, h: 236, title: order numbers, sub: "pictured as: × then ÷" }
+      after:  { x: 140, y: 20, w: 120, h: 48, title: order numbers, sub: mod 10^9 }
+    - id: encode
+      kind: concrete
+      before: { x: 160, y: 72, w: 220, h: 32, title: id × mult + offset }
+      after:  { x: 140, y: 111, w: 120, h: 48, title: encode, sub: × mult mod M }
+    - id: store
+      kind: concrete
+      before: { x: 160, y: 120, w: 220, h: 32, title: orders db lookup }
+      after:  { x: 140, y: 202, w: 120, h: 48, title: orders db, sub: not needed }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 290, y: 111, w: 120, h: 48, title: "" }
+      after:  { x: 290, y: 111, w: 120, h: 48, title: inverse, sub: mult⁻¹ mod M }
+    - id: euclid
+      kind: concrete
+      appears: after
+      before: { x: 290, y: 202, w: 120, h: 48, title: "" }
+      after:  { x: 290, y: 202, w: 120, h: 48, title: ext. euclid, sub: once at start }
+    - id: change
+      kind: concrete
+      appears: change
+      before: { x: 424, y: 202, w: 124, h: 44, title: decode offline, sub: "÷ mult: wrong" }
+      after:  { x: 430, y: 111, w: 118, h: 48, title: decode, sub: × inverse }
+  edges:
+    - { from: client, to: context, label: number }
+    - { from: context, to: encode, label: encode }
+    - { from: context, to: store, label: lookup }
+    - { from: euclid, to: strategy, label: finds }
+    - { from: strategy, to: change, label: × inv }
+
+code:
+  go:
+    before:
+      file: order_number.go
+      source: |
+        // order_number.go: invoice numbers that do not reveal how many orders we take
+        const (
+            space  = 1_000_000_000 // public numbers have 9 digits
+            mult   = 387_420_489   // spreads consecutive ids across the space
+            offset = 52_341_877
+        )
+
+        // PublicNumber maps an internal order id to the number printed on the invoice.
+        func PublicNumber(id int64) int64 {
+            return (id*mult + offset) % space
+        }
+
+        // OrderID looks the public number up in the orders table.
+        func OrderID(ctx context.Context, db *sql.DB, public int64) (int64, error) {
+            var id int64
+            err := db.QueryRowContext(ctx, "SELECT id FROM orders WHERE public_number = $1", public).Scan(&id)
+            return id, err
+        }
+      roles: { context: [2, 11], encode: [9, 11], store: [13, 18], client: [13, 18] }
+      change:
+        - after: 18
+          add:
+            - ""
+            - "// DecodeOffline runs in the call-centre tool, which cannot reach the database."
+            - "func DecodeOffline(public int64) int64 {"
+            - "    return (public - offset) / mult // undo the multiply... but the % wrapped around"
+            - "}"
+    after:
+      file: order_number.go
+      source: |
+        // order_number.go: multiply by a unit mod 10^9, undo it with the inverse
+        const (
+            space  = 1_000_000_000
+            mult   = 387_420_489 // 3^18: no factor 2 or 5, so gcd(mult, space) == 1
+            offset = 52_341_877
+        )
+
+        // inv is mult⁻¹ mod space (513_180_409), found once by the extended Euclidean algorithm.
+        var inv = func() int64 {
+            r := new(big.Int).ModInverse(big.NewInt(mult), big.NewInt(space))
+            if r == nil {
+                panic("mult shares a factor with space: two orders would get the same number")
+            }
+            return r.Int64()
+        }()
+
+        func PublicNumber(id int64) int64 {
+            return (id%space*mult + offset) % space // below 10^9 · 4·10^8: fits in int64
+        }
+
+        // DecodeOffline undoes PublicNumber with two multiplications and no database.
+        func DecodeOffline(public int64) int64 {
+            x := (public - offset) % space
+            if x < 0 {
+                x += space // Go's % keeps the sign of the dividend
+            }
+            return x * inv % space
+        }
+      roles: { context: [2, 28], unit: [4, 4], strategy: [8, 15], euclid: [9, 15], inverse: [8, 15], encode: [17, 19], wide: [18, 18], decode: [21, 28], change: [21, 28], client: [21, 28] }
+    again:
+      file: order_number_test.go
+      source: |
+        // order_number_test.go: every id comes back, and no two ids share a number
+        func TestRoundTrip(t *testing.T) {
+            seen := make(map[int64]int64)
+            for id := int64(0); id < 1_000_000; id++ {
+                p := PublicNumber(id)
+                if back := DecodeOffline(p); back != id {
+                    t.Fatalf("id %d -> %d -> %d", id, p, back)
+                }
+                if other, dup := seen[p]; dup {
+                    t.Fatalf("ids %d and %d share %d", other, id, p)
+                }
+                seen[p] = id
+            }
+        }
+    cost:
+      before: { text: "decode needs the database · ÷ returns the wrong order", value: 0.85 }
+      after: { text: "decode offline · two multiplications, exact", value: 0.1 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`int64` holds products up to about 9.2·10^18, so reduce operands below the modulus before multiplying and check that m² fits. For a 64-bit modulus, `math/bits.Mul64` gives the 128-bit product and `bits.Rem64` reduces it. `math/big` has `ModInverse` (nil when no inverse exists) and `Exp(x, y, m)` for modular powers. Go''s `%` takes the sign of the dividend, so `-3 % 10` is `-3`; add the modulus back.'
+      seenIn: '`big.Int.ModInverse`, `big.Int.Exp`, `big.Int.GCD` (which also returns the Bezout coefficients), `bits.Mul64`. `crypto/rsa` with `EncryptOAEP` for real RSA.'
+
+  python:
+    before:
+      file: order_number.py
+      source: |
+        # order_number.py: invoice numbers that do not reveal how many orders we take
+        SPACE = 1_000_000_000  # public numbers have 9 digits
+        MULT = 387_420_489  # spreads consecutive ids across the space
+        OFFSET = 52_341_877
+
+
+        def public_number(order_id: int) -> int:
+            return (order_id * MULT + OFFSET) % SPACE
+
+
+        def order_id(conn, public: int) -> int:
+            row = conn.execute("SELECT id FROM orders WHERE public_number = %s", (public,)).fetchone()
+            return row[0]
+      roles: { context: [2, 8], encode: [7, 8], store: [11, 13], client: [11, 13] }
+      change:
+        - after: 13
+          add:
+            - ""
+            - ""
+            - "def decode_offline(public: int) -> int:"
+            - "    \"\"\"Runs in the call-centre tool, which cannot reach the database.\"\"\""
+            - "    return (public - OFFSET) // MULT  # undo the multiply... but the % wrapped around"
+    after:
+      file: order_number.py
+      source: |
+        # order_number.py: multiply by a unit mod 10^9, undo it with the inverse
+        SPACE = 1_000_000_000
+        MULT = 387_420_489  # 3**18: no factor 2 or 5, so gcd(MULT, SPACE) == 1
+        OFFSET = 52_341_877
+
+        # MULT⁻¹ mod SPACE (513_180_409). pow raises ValueError if no inverse exists.
+        INV = pow(MULT, -1, SPACE)
+
+
+        def public_number(order_id: int) -> int:
+            return (order_id * MULT + OFFSET) % SPACE  # Python ints never overflow
+
+
+        def decode_offline(public: int) -> int:
+            """Undo public_number with two multiplications and no database."""
+            return (public - OFFSET) * INV % SPACE  # % is never negative for a positive SPACE
+      roles: { context: [2, 16], unit: [3, 3], strategy: [6, 7], euclid: [6, 7], inverse: [6, 7], encode: [10, 11], wide: [11, 11], decode: [14, 16], change: [14, 16], client: [14, 16] }
+    again:
+      file: test_order_number.py
+      source: |
+        # test_order_number.py: every id comes back, and no two ids share a number
+        def test_round_trip():
+            ids = [*range(1_000_000), 24_000_017, SPACE - 1]
+            publics = [public_number(i) for i in ids]
+            assert [decode_offline(p) for p in publics] == ids
+            assert len(set(publics)) == len(ids)
+    cost:
+      before: { text: "decode needs the database · ÷ returns the wrong order", value: 0.85 }
+      after: { text: "decode offline · two multiplications, exact", value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: 'Python ints grow as needed, so products never overflow; they only get slower. `pow(a, -1, m)` returns the inverse (Python 3.8 and later) and raises `ValueError` when there is none. `pow(b, e, m)` is modular exponentiation by squaring. `%` takes the sign of the divisor, so `-3 % 10` is `7`, which is the clock answer.'
+      seenIn: '`pow(a, -1, m)`, `pow(b, e, m)`, `math.gcd`, `math.lcm`. The `cryptography` package''s `padding.OAEP` for real RSA.'
+
+  typescript:
+    before:
+      file: orderNumber.ts
+      source: |
+        // orderNumber.ts: invoice numbers that do not reveal how many orders we take
+        const SPACE = 1_000_000_000; // public numbers have 9 digits
+        const MULT = 387_420_489; // spreads consecutive ids across the space
+        const OFFSET = 52_341_877;
+
+        export function publicNumber(id: number): number {
+          return (id * MULT + OFFSET) % SPACE;
+        }
+
+        export async function orderId(db: Pool, pub: number): Promise<number> {
+          const { rows } = await db.query("SELECT id FROM orders WHERE public_number = $1", [pub]);
+          return rows[0].id;
+        }
+      roles: { context: [2, 8], encode: [6, 8], store: [10, 13], client: [10, 13] }
+      change:
+        - after: 13
+          add:
+            - ""
+            - "// decodeOffline runs in the call-centre tool, which cannot reach the database."
+            - "export function decodeOffline(pub: number): number {"
+            - "  return Math.floor((pub - OFFSET) / MULT); // undo the multiply... but the % wrapped around"
+            - "}"
+    after:
+      file: orderNumber.ts
+      source: |
+        // orderNumber.ts: multiply by a unit mod 10^9, undo it with the inverse, in BigInt
+        const SPACE = 1_000_000_000n;
+        const MULT = 387_420_489n; // 3^18: no factor 2 or 5, so gcd(MULT, SPACE) === 1
+        const OFFSET = 52_341_877n;
+
+        /** a⁻¹ mod m by the extended Euclidean algorithm. Each row keeps r ≡ s·a (mod m). */
+        export function modInverse(a: bigint, m: bigint): bigint {
+          let [r0, r1, s0, s1] = [m, a % m, 0n, 1n];
+          while (r1 !== 0n) {
+            const q = r0 / r1; // BigInt division truncates
+            [r0, r1] = [r1, r0 - q * r1];
+            [s0, s1] = [s1, s0 - q * s1];
+          }
+          if (r0 !== 1n) throw new Error(`${a} shares a factor with ${m}`);
+          return ((s0 % m) + m) % m;
+        }
+        const INV = modInverse(MULT, SPACE); // 513_180_409n
+
+        export const publicNumber = (id: bigint): bigint => (id * MULT + OFFSET) % SPACE;
+
+        /** Undo publicNumber with two multiplications and no database. */
+        export function decodeOffline(pub: bigint): bigint {
+          const x = ((pub - OFFSET) * INV) % SPACE; // can be negative: % keeps the dividend's sign
+          return x < 0n ? x + SPACE : x;
+        }
+      roles: { context: [2, 25], unit: [3, 3], euclid: [6, 16], strategy: [6, 17], inverse: [17, 17], encode: [19, 19], wide: [19, 19], decode: [21, 25], change: [21, 25], client: [21, 25] }
+    again:
+      file: orderNumber.test.ts
+      source: |
+        // orderNumber.test.ts: every id comes back, and no two ids share a number
+        test("round trip", () => {
+          const seen = new Set<bigint>();
+          for (let id = 0n; id < 1_000_000n; id++) {
+            const pub = publicNumber(id);
+            assert.equal(decodeOffline(pub), id);
+            seen.add(pub);
+          }
+          assert.equal(seen.size, 1_000_000);
+          assert.equal(decodeOffline(publicNumber(24_000_017n)), 24_000_017n); // wrong with plain numbers
+        });
+    cost:
+      before: { text: "decode needs the database · and ids past 23 million encode wrong", value: 0.9 }
+      after: { text: "decode offline · two BigInt multiplications, exact", value: 0.1 }
+    lens:
+      need: 4
+      needLabel: Easy to forget
+      note: 'A `number` is a double, exact only up to 2^53 (about 9·10^15). `id * MULT` passes that for ids above about 23 million, and the remainder silently comes out wrong: id 24,000,017 encodes to 374,490,188 instead of 374,490,190, so some orders share a number. `BigInt` is exact at any size but cannot mix with `number` without `BigInt(x)`. Its `%` keeps the sign of the dividend, and there is no built-in modular power or inverse.'
+      seenIn: '`BigInt`, `Number.MAX_SAFE_INTEGER`, `Number.isSafeInteger`. Web Crypto `crypto.subtle.encrypt({ name: "RSA-OAEP" }, ...)` for real RSA.'
+
+  rust:
+    before:
+      file: order_number.rs
+      source: |
+        // order_number.rs: invoice numbers that do not reveal how many orders we take
+        const SPACE: u64 = 1_000_000_000; // public numbers have 9 digits
+        const MULT: u64 = 387_420_489; // spreads consecutive ids across the space
+        const OFFSET: u64 = 52_341_877;
+
+        pub fn public_number(id: u64) -> u64 {
+            (id * MULT + OFFSET) % SPACE
+        }
+
+        pub async fn order_id(db: &PgPool, public: u64) -> sqlx::Result<i64> {
+            sqlx::query_scalar("SELECT id FROM orders WHERE public_number = $1")
+                .bind(public as i64)
+                .fetch_one(db)
+                .await
+        }
+      roles: { context: [2, 8], encode: [6, 8], store: [10, 15], client: [10, 15] }
+      change:
+        - after: 15
+          add:
+            - ""
+            - "/// Runs in the call-centre tool, which cannot reach the database."
+            - "pub fn decode_offline(public: u64) -> u64 {"
+            - "    (public - OFFSET) / MULT // undo the multiply... but the % wrapped around"
+            - "}"
+    after:
+      file: order_number.rs
+      source: |
+        // order_number.rs: multiply by a unit mod 10^9, undo it with the inverse
+        const SPACE: u64 = 1_000_000_000;
+        const MULT: u64 = 387_420_489; // 3^18: no factor 2 or 5, so gcd(MULT, SPACE) == 1
+        const OFFSET: u64 = 52_341_877;
+        const INV: u64 = mod_inverse(MULT, SPACE); // 513_180_409, computed at compile time
+
+        /// a⁻¹ mod m by the extended Euclidean algorithm. Each row keeps r ≡ s·a (mod m).
+        const fn mod_inverse(a: u64, m: u64) -> u64 {
+            let (mut r0, mut r1, mut s0, mut s1) = (m as i128, (a % m) as i128, 0i128, 1i128);
+            while r1 != 0 {
+                let q = r0 / r1;
+                (r0, r1) = (r1, r0 - q * r1);
+                (s0, s1) = (s1, s0 - q * s1);
+            }
+            assert!(r0 == 1, "MULT shares a factor with SPACE");
+            s0.rem_euclid(m as i128) as u64
+        }
+
+        pub fn public_number(id: u64) -> u64 {
+            ((id as u128 * MULT as u128 + OFFSET as u128) % SPACE as u128) as u64
+        }
+
+        /// Undoes public_number with two multiplications and no database.
+        pub fn decode_offline(public: u64) -> u64 {
+            let x = (public + SPACE - OFFSET) % SPACE; // no underflow: public < SPACE
+            (x as u128 * INV as u128 % SPACE as u128) as u64
+        }
+      roles: { context: [2, 27], unit: [3, 3], inverse: [5, 5], strategy: [5, 17], euclid: [7, 17], encode: [19, 21], wide: [20, 20], decode: [23, 27], change: [23, 27], client: [23, 27] }
+    again:
+      file: tests/order_number.rs
+      source: |
+        // tests/order_number.rs: every id comes back, and no two ids share a number
+        #[test]
+        fn round_trip() {
+            let mut seen = std::collections::HashSet::new();
+            for id in 0..1_000_000u64 {
+                let p = public_number(id);
+                assert_eq!(decode_offline(p), id);
+                assert!(seen.insert(p), "two ids share {p}");
+            }
+        }
+    cost:
+      before: { text: "decode needs the database · ÷ returns the wrong order", value: 0.85 }
+      after: { text: "decode offline · inverse checked at compile time", value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Integer overflow panics in debug builds and wraps in release, so `id * MULT` for a large id is a crash in tests and a wrong number in production. Widen to `u128` for the product, or use `checked_mul` or `wrapping_mul` to say what you mean. `rem_euclid` gives the clock remainder for negative values. For numbers beyond 128 bits, `num-bigint` has `BigUint::modpow` and `modinv`.'
+      seenIn: '`u128`, `i64::rem_euclid`, `u64::checked_mul`, `num_bigint::BigUint::modpow` and `modinv`. The `rsa` crate (RustCrypto) with `Oaep` padding for real RSA.'
+
+walk:
+  - text: "The encoder multiplies by 387,420,489 = 3^18 and keeps the remainder mod 10^9. 10^9 = 2^9 · 5^9 and the multiplier has no factor 2 or 5, so gcd = 1: different ids always give different numbers."
+    nodes: [context, encode]
+    edges: [context>encode]
+    role: unit
+  - text: "Encoding is clock arithmetic: multiply, add the offset, keep the last nine digits. Reducing after each operation gives the same answer as reducing once at the end."
+    nodes: [encode]
+    edges: []
+    role: encode
+  - text: "Ordinary division cannot undo it, because the remainder threw away how many times the clock wrapped. Multiplying by the inverse can. The extended Euclidean algorithm finds 513,180,409, with 387,420,489 × 513,180,409 ≡ 1 (mod 10^9), once at startup."
+    nodes: [euclid, strategy]
+    edges: [euclid>strategy]
+    role: inverse
+  - text: "The support tool subtracts the offset, multiplies by the inverse and reduces. Two multiplications, no database, the exact order id."
+    nodes: [client, strategy, change]
+    edges: [strategy>change]
+    role: decode
+  - text: "The products reach about 4·10^17. That fits a 64-bit integer but not a double, which is exact only to 2^53. Each language needs the right integer width for the intermediate product."
+    nodes: [encode]
+    edges: []
+    role: wide
+
+checks:
+  overview:
+    question: "public = (id × 387,420,489 + offset) mod 10^9. Why does (public − offset) ÷ 387,420,489 not give the id back?"
+    options:
+      - text: The mod threw away how many times the product wrapped around, so ordinary division has nothing to undo
+        correct: true
+        why: Right. On a clock you undo a multiply by multiplying by the inverse, a number x with 387,420,489 · x ≡ 1 (mod 10^9).
+      - text: Integer division rounds down, so it is off by one
+        why: The result is not close at all. For id 1,000,042 the division gives about 1.96.
+      - text: The offset should be subtracted after dividing
+        why: The order of those two steps is not the problem; the wrap-around is.
+  engineer:
+    question: Which multiplier could replace 387,420,489 and still give every order its own 9-digit number?
+    options:
+      - text: Any number with no factor 2 or 5
+        correct: true
+        why: Right. 10^9 = 2^9 · 5^9, so a multiplier is invertible mod 10^9 exactly when gcd(a, 10^9) = 1, which means it is odd and not a multiple of 5.
+      - text: Any prime
+        why: The primes 2 and 5 divide 10^9. Multiplying by 2 sends id and id + 500,000,000 to the same number.
+      - text: Any number below 10^9
+        why: 500,000,000 is below 10^9, yet it sends every even id to the same number and every odd id to one other.
+  deep:
+    question: In RSA, why does raising c = m^e mod n to the power d return m?
+    options:
+      - text: e · d ≡ 1 (mod φ(n)), and by Euler's theorem m^φ(n) ≡ 1 (mod n), so m^(e·d) = m · (m^φ(n))^k ≡ m
+        correct: true
+        why: Right. d is the inverse of e modulo φ(n), found by the extended Euclidean algorithm. The case where m shares a factor with n also works, by the Chinese remainder theorem on p and q.
+      - text: d is the inverse of e modulo n
+        why: The exponents live modulo φ(n) (or λ(n)), not modulo n. Inverting e mod n gives a d that does not decrypt.
+      - text: e and d are equal in a well-formed key
+        why: Then the public key would decrypt, and anyone could read every message.
+
+reference:
+  roles:
+    - role: Modulus
+      example: 10^9 for 9-digit numbers, a table size, 2^64, n = p·q
+      job: The size of the clock. Every result is reduced into 0 … m − 1.
+    - role: Unit
+      example: 387,420,489 mod 10^9
+      job: A number with gcd(a, m) = 1. Multiplying by it is a bijection and can be undone.
+    - role: Inverse
+      example: 513,180,409
+      job: The number that multiplies a unit back to 1. Division on the clock.
+    - role: Extended Euclid
+      example: math/big ModInverse, pow(a, -1, m)
+      job: Finds the inverse, or reports the gcd when there is none, in O(log m) steps.
+    - role: Wide intermediate
+      example: u128, bits.Mul64, BigInt, Python int
+      job: Holds a product of two residues before it is reduced.
+  useWhen:
+    - Wrap-around indices: ring buffers, round-robin, time buckets, hash table slots.
+    - Reversible scrambling of ids, and hash functions that multiply by an odd constant mod 2^64.
+    - Checksums and check digits (Luhn, ISBN), and public-key cryptography (RSA, Diffie-Hellman), through a library.
+  avoidWhen:
+    - The scrambling must be secret. A multiply-and-offset code is undone by anyone who sees two consecutive numbers; use an HMAC or a block cipher.
+    - You need RSA. Use a vetted library with OAEP or PSS, never the textbook formula.
+  tradeoffs:
+    - Reducing after every operation keeps numbers small and exact, at the cost of one division each time.
+    - A prime modulus makes every non-zero number invertible; a power of two makes reduction a bit mask but only odd numbers invertible.
+    - Changing the modulus changes every result. That is why hash(key) mod N moves most keys when N changes.
+  lookalikes:
+    - name: Consistent hashing
+      how: Replaces hash mod N for sharding, so that changing N moves only a small share of keys.
+    - name: Chinese remainder theorem
+      how: For coprime moduli, the remainders mod each one fix the number mod their product. RSA uses it to decrypt about four times faster.
+    - name: Format-preserving encryption
+      how: The secure version of a reversible id scrambler (NIST FF1), with a secret key.
+---
+
+## [concept] Modular arithmetic
+
+**Arithmetic modulo m works on a clock of m ticks: add, subtract or multiply as usual, then keep the remainder. You can undo a multiplication by a only when a and m share no factor, and then you undo it by multiplying by a's inverse.**
+
+<Term id="modular-arithmetic">Modular arithmetic</Term> is in more code than it looks. Ring buffers, hash table slots, round-robin schedulers, check digits, random number generators and every public-key system work on a clock. Two numbers are <Term id="congruence">congruent</Term> mod m when they land on the same tick. A <Term id="modular-inverse">modular inverse</Term> is the clock's version of division.
+
+<Depth level={2}>
+Addition, subtraction and multiplication respect remainders: (a · b) mod m equals ((a mod m) · (b mod m)) mod m. You may reduce after every step, which is how code keeps numbers small enough for a machine word. Division does not carry over. a has an inverse mod m exactly when gcd(a, m) = 1, and the <Term id="extended-euclid">extended Euclidean algorithm</Term> finds it in O(log m) steps.
+
+Cancelling needs the same condition. If a · x ≡ a · y (mod m) and gcd(a, m) = 1, then x ≡ y. Without it, 8 · 2 ≡ 8 · 5 (mod 12) yet 2 ≢ 5.
+</Depth>
+
+<Depth level={3}>
+The extended algorithm keeps an invariant on every row: r ≡ s · a (mod m). The first two rows, (m, 0) and (a, 1), satisfy it trivially. Each new row subtracts q times the previous one from the one before, and congruences survive subtraction. The remainders fall to the gcd and then 0. If the gcd is 1, its row says 1 ≡ s · a, so s is the inverse. The proof that gcd(a, m) = 1 is necessary runs the other way: any common factor d divides every s · a + t · m, so 1 is never reachable.
+</Depth>
+
+## [problem] Order numbers that hide the order count
+
+A shop prints a public number on every invoice instead of the database id, so competitors cannot read the sales volume from two invoices. The encoder multiplies the id by a large constant, adds an offset and keeps the last nine digits. Consecutive orders get numbers that look random.
+
+When support needs the order, the tool looks the public number up in an indexed column. It has worked since launch.
+
+<Depth level={2}>
+The scheme is a bijection only because the multiplier, 387,420,489 = 3^18, shares no factor with 10^9 = 2^9 · 5^9. Whoever chose it was lucky or careful. A multiplier ending in 0 or 5, or any even one, would have given two orders the same number.
+</Depth>
+
+<Depth level={3}>
+In TypeScript the encoder is already wrong. `id * MULT` exceeds 2^53 once ids pass about 23 million, and the double rounds the product before `%` sees it. Id 24,000,017 encodes to 374,490,188 instead of 374,490,190. Every other language here computes it exactly in 64-bit integers.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the call-centre tool must turn a public order number back into the order id offline, without the orders database.
+
+The marked lines do what algebra suggests: subtract the offset and divide by the multiplier. For order 1,000,042 the public number is 813,002,415, and the "decoded" id is 1. The multiply was followed by a mod that discarded 387,436 full turns of the clock. Ordinary division cannot recover the turns, so the tool shows the wrong order.
+
+<Depth level={2}>
+On a clock, multiplication is undone by multiplying again, by the number x with 387,420,489 · x ≡ 1 (mod 10^9). That x exists because the gcd is 1, and the extended Euclidean algorithm computes it once: 513,180,409.
+</Depth>
+
+<Depth level={3}>
+In Rust the marked line also underflows: `public - OFFSET` is negative for public numbers below the offset, and `u64` subtraction panics in a debug build. The fixed version adds `SPACE` first. In Go and TypeScript the same subtraction gives a negative remainder, because `%` keeps the sign of the dividend; Python's `%` takes the sign of the divisor and gives the clock answer directly.
+</Depth>
+
+## [morph] Divide by multiplying
+
+Drag the slider. Encode and divide become encode and multiply-by-inverse, with the inverse computed once at startup.
+
+The decoder no longer needs the database. It subtracts the offset, multiplies by 513,180,409 and keeps the last nine digits. The startup check fails loudly if someone ever changes the multiplier to one that shares a factor with 10^9.
+
+<Depth level={2}>
+Keep every intermediate below the modulus and make sure the product of two residues fits your integer type. Here residues are below 10^9 and products below 10^18, so `int64` and `u64` work. For a 64-bit modulus you need a 128-bit product: `u128` in Rust, `bits.Mul64` in Go, Python ints or `BigInt`.
+</Depth>
+
+<Depth level={3}>
+This scheme hides the order count from casual readers only. Anyone who sees two consecutive invoices learns the multiplier, and anyone who learns the multiplier decodes everything. For a secret mapping use format-preserving encryption (NIST FF1) or an HMAC with a lookup table.
+</Depth>
+
+## [walk] Decode one order number
+
+Encode, find the inverse, decode, and the integer width that makes it exact. Use the numbered buttons.
+
+<Depth level={2}>
+The same arithmetic explains why hash(key) mod N sharding hurts. A key stays on its shard only when hash mod N equals hash mod (N + 1), which is true for about 1 in N + 1 hash values, so going from 4 shards to 5 moves about 80% of keys. Consistent hashing exists to avoid that.
+</Depth>
+
+<Depth level={3}>
+<Term id="modular-exponentiation">Modular exponentiation</Term> by repeated squaring computes b^e mod n with about log2(e) squarings, reducing after each. A 2048-bit exponent costs about 2,048 squarings, never a 2^2048-step loop. Fermat's little theorem says a^(p−1) ≡ 1 (mod p) for a prime p and a not divisible by p; Euler's theorem generalises it to a^φ(n) ≡ 1 (mod n) when gcd(a, n) = 1, where <Term id="euler-totient">φ(n)</Term> counts the numbers below n coprime to it.
+</Depth>
+
+## [again] The same request, with the inverse
+
+The tool decodes every public number exactly, offline, with two multiplications. The test round-trips a million ids and confirms that no two share a number, which is the bijection the gcd promised.
+
+<Depth level={2}>
+Python's `pow(a, -1, m)` and Go's `big.Int.ModInverse` are the one-line versions. In TypeScript and Rust the ten-line loop is short enough to write and test yourself, with the invariant in a comment.
+</Depth>
+
+<Depth level={3}>
+<Term id="rsa">RSA</Term> is the same lesson one level up. Pick primes p and q, publish n = p · q and an exponent e with gcd(e, φ(n)) = 1, and keep d = e⁻¹ mod φ(n). Encryption is c = m^e mod n and decryption is c^d mod n. Because e · d = 1 + k · φ(n), Euler's theorem turns m^(e·d) back into m. Anyone who can factor n can compute φ(n) and then d, so security rests on factoring being hard for 2048-bit n. Implementations often use λ(n) = lcm(p − 1, q − 1) instead of φ(n), which gives a smaller d that works the same way.
+
+Textbook RSA is deterministic: the same message always gives the same ciphertext, so an attacker can encrypt guesses and compare. It is also malleable: multiplying two ciphertexts multiplies the messages. Real systems add random padding (<Term id="oaep">OAEP</Term> for encryption, PSS for signatures) and use a library.
+</Depth>
+
+## [play] Turn the clock
+
+Click a tick to multiply by it and watch which ticks the multiples reach. Run the extended Euclidean algorithm row by row. Then build a toy RSA key from two small primes, encrypt a number, decrypt it, and break it.
+
+## [lens] Big numbers in each language
+
+The algorithms are the same everywhere. What differs is how wide an integer is, what happens when a product overflows it, and what `%` does with negative numbers.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+| Language | Overflow | `-3 % 10` | Modular power | Inverse |
+|---|---|---|---|---|
+| Go | wraps silently | -3 | `big.Int.Exp` | `big.Int.ModInverse` |
+| Python | never (ints grow) | 7 | `pow(b, e, m)` | `pow(a, -1, m)` |
+| TypeScript | rounds past 2^53 (`number`) | -3 | write it with `BigInt` | write it |
+| Rust | panics in debug, wraps in release | -3 (`rem_euclid` gives 7) | `num-bigint` `modpow` | `num-bigint` `modinv` |
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="modular-arithmetic-and-inverses" />
+
+### Toy RSA, worked
+
+| Step | Value |
+|---|---|
+| Primes | p = 61, q = 53 |
+| Modulus | n = 3233 |
+| Totient | φ = 60 · 52 = 3120 |
+| Public exponent | e = 17, gcd(17, 3120) = 1 |
+| Private exponent | d = 17⁻¹ mod 3120 = 2753 |
+| Encrypt 65 | 65^17 mod 3233 = 2790 |
+| Decrypt | 2790^2753 mod 3233 = 65 |
+
+A real key has n of 2048 bits or more and pads every message with random bytes. Never use these numbers for anything but learning.

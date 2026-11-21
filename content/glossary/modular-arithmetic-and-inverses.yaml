@@ -1,0 +1,25 @@
+# Terms introduced by math-for-cs/modular-arithmetic-and-inverses.
+- id: modular-arithmetic
+  term: Modular arithmetic
+  short: Arithmetic on a clock of m ticks. Add, subtract or multiply as usual, then keep only the remainder after dividing by m.
+- id: congruence
+  term: Congruence
+  short: a ≡ b (mod m) means a and b leave the same remainder when divided by m, so m divides a − b.
+- id: modular-inverse
+  term: Modular inverse
+  short: A number x with a · x ≡ 1 (mod m). It exists exactly when gcd(a, m) = 1, and multiplying by it undoes multiplying by a.
+- id: extended-euclid
+  term: Extended Euclidean algorithm
+  short: Euclid's gcd algorithm that also tracks coefficients, giving s and t with s·a + t·m = gcd(a, m). When the gcd is 1, s is the inverse of a mod m.
+- id: modular-exponentiation
+  term: Modular exponentiation
+  short: Computing b^e mod n by repeated squaring, reducing after every product. It takes about log2(e) squarings and no number grows past n².
+- id: euler-totient
+  term: Euler's totient
+  short: φ(n), the count of numbers from 1 to n that share no factor with n. For n = p·q with distinct primes it is (p − 1)(q − 1).
+- id: rsa
+  term: RSA
+  short: Public-key encryption and signatures built on n = p·q. Encrypt with c = m^e mod n; decrypt with d, the inverse of e mod φ(n). Safe only with large keys and padding.
+- id: oaep
+  term: OAEP
+  short: Optimal Asymmetric Encryption Padding. Mixes random bytes into an RSA message before encryption, so the same message never gives the same ciphertext.
