@@ -1,0 +1,22 @@
+# Terms introduced by distributed-systems/vector-clocks.
+- id: happened-before
+  term: Happened-before
+  short: Lamport's relation. Event a happened before b if they are on one process in that order, or a sent a message that b received, or through a chain of those.
+- id: lamport-clock
+  term: Lamport clock
+  short: One counter per process, raised on every event and pushed past any timestamp a message carries. If a happened before b, a's number is smaller; the reverse does not hold.
+- id: vector-clock
+  term: Vector clock
+  short: One counter per process, carried on every event. Comparing two vectors entry by entry says whether one event happened before the other or they were concurrent.
+- id: version-vector
+  term: Version vector
+  short: A vector of per-replica update counters attached to a piece of data, ticked only by writes. Used to tell whether one version replaces another or conflicts with it.
+- id: concurrent-events
+  term: Concurrent events
+  short: Two events where neither happened before the other. Neither could have known about the other, whatever the wall clocks said.
+- id: siblings
+  term: Siblings
+  short: Concurrent versions of one key that a store keeps side by side, because neither replaces the other. The application merges them.
+- id: dotted-version-vector
+  term: Dotted version vector
+  short: A version vector plus one extra (replica, counter) pair naming the single write that created the version. It avoids false conflicts when many clients write through few replicas.

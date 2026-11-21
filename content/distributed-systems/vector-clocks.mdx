@@ -1,0 +1,673 @@
+---
+title: Vector clocks and version vectors
+track: distributed-systems
+group: Time and order
+order: 8
+summary: Keep one counter per node instead of one per system. Comparing two vectors entry by entry tells you whether one event saw the other, or whether they were concurrent.
+intent: Detect when two updates were made without knowing about each other, so the system can keep both instead of silently dropping one.
+changeRequest: Carts edited on two devices while offline must keep every item.
+languages: [go, python, typescript, rust]
+glossary: [happened-before, lamport-clock, vector-clock, version-vector, concurrent-events, siblings, dotted-version-vector]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [distributed-systems/lamport-clocks]
+skills: [clocks]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: vector-clocks
+  scenarios:
+    - try: "On A press Add item, then Send to B. On B press Add item. Then deliver A's message to B."
+      notice: "B ends up with two carts. [1,0,0] and [0,1,0] are concurrent, so neither may replace the other. Last-write-wins would have dropped the lamp."
+    - try: "Add two items on A and one on C, then press A's second event and C's event in the diagram."
+      notice: "C's Lamport time is smaller, yet the vectors say concurrent. A Lamport order is a tie-breaker, not evidence of cause."
+    - try: "Send A to B, deliver, then B to C, deliver. Press A's first event, then C's receive."
+      notice: "A happened before C's receive though they never talked. The vector carried A's entry through B."
+    - try: "On a replica with siblings press Merge siblings, send the result on and deliver it."
+      notice: "The merged vector is the max of both plus one tick, so it dominates both siblings and every other replica simply replaces."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 100, h: 48, title: Sync, sub: incoming cart }
+      after:  { x: 12, y: 111, w: 100, h: 48, title: Sync, sub: cart + vector }
+    - id: context
+      kind: context
+      before: { x: 132, y: 18, w: 256, h: 236, title: Cart store, sub: keep the newest timestamp }
+      after:  { x: 132, y: 111, w: 110, h: 48, title: Receive, sub: per cart }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 262, y: 104, w: 132, h: 62, title: "" }
+      after:  { x: 262, y: 104, w: 132, h: 62, title: Version vector, sub: "≤ · ≥ · neither" }
+    - id: replace
+      kind: concrete
+      before: { x: 152, y: 76, w: 216, h: 40, title: theirs newer → replace }
+      after:  { x: 420, y: 20, w: 128, h: 48, title: Replace, sub: theirs saw ours }
+    - id: keep
+      kind: concrete
+      before: { x: 152, y: 128, w: 216, h: 40, title: else → keep ours }
+      after:  { x: 420, y: 111, w: 128, h: 48, title: Ignore, sub: ours saw theirs }
+    - id: siblings
+      kind: concrete
+      appears: after
+      before: { x: 152, y: 180, w: 216, h: 40, title: "" }
+      after:  { x: 420, y: 202, w: 128, h: 48, title: Siblings, sub: neither saw other }
+  edges:
+    - { from: client, to: context, label: cart }
+    - { from: context, to: strategy, label: compare }
+    - { from: strategy, to: replace }
+    - { from: strategy, to: keep }
+    - { from: strategy, to: siblings, label: concurrent }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: cart.go
+      source: |
+        // cart.go
+        type Cart struct {
+            Items     map[string]int
+            UpdatedAt time.Time
+        }
+
+        // Receive applies a cart sent by another replica.
+        func (s *Store) Receive(id string, in Cart) {
+            s.mu.Lock()
+            defer s.mu.Unlock()
+            cur, ok := s.carts[id]
+            if !ok || in.UpdatedAt.After(cur.UpdatedAt) {
+                s.carts[id] = in // theirs is newer
+            }
+            // else: ours is newer, keep it
+        }
+      roles: { client: [8, 8], context: [8, 16], replace: [12, 13], keep: [15, 15] }
+      change:
+        - { line: 4, replace: '    Lamport   uint64 // replaces wall-clock time: no more skew' }
+        - { line: 12, replace: '    if !ok || in.Lamport > cur.Lamport {' }
+    after:
+      file: cart.go
+      source: |
+        // cart.go
+        type VV map[string]uint64 // one counter per replica that wrote
+
+        type Version struct {
+            Items map[string]int
+            VV    VV
+        }
+
+        // Add records a local write: tick this replica's own entry.
+        func (v *Version) Add(self, sku string) {
+            v.Items[sku]++
+            v.VV[self]++
+        }
+
+        // Compare says whether a happened before b, after it, or neither (concurrent).
+        func Compare(a, b VV) Order {
+            less, more := false, false
+            for k, x := range a {
+                if x > b[k] {
+                    more = true
+                }
+            }
+            for k, y := range b {
+                if y > a[k] {
+                    less = true
+                }
+            }
+            switch {
+            case less && more:
+                return Concurrent
+            case less:
+                return Before
+            case more:
+                return After
+            }
+            return Equal
+        }
+
+        // Receive keeps every version that no other version dominates.
+        func (s *Store) Receive(id string, in Version) {
+            s.mu.Lock()
+            defer s.mu.Unlock()
+            var keep []Version
+            for _, v := range s.carts[id] {
+                switch Compare(v.VV, in.VV) {
+                case Before, Equal:
+                    continue // in replaces v
+                case After:
+                    return // we already have something newer
+                }
+                keep = append(keep, v) // concurrent: a sibling
+            }
+            s.carts[id] = append(keep, in)
+        }
+      roles: { client: [40, 40], context: [39, 54], strategy: [15, 37], replace: [46, 47], keep: [48, 49], siblings: [51, 51], write: [9, 13], compare: [15, 37], sibling: [51, 53], dominate: [46, 47] }
+    again:
+      file: merge.go
+      source: |
+        // merge.go: the same request from a third device. Nothing above changes; its writes add a key to VV.
+        // Opening a cart with siblings merges them, and the result dominates every sibling.
+        func Merge(vs []Version, self string) Version {
+            out := Version{Items: map[string]int{}, VV: VV{}}
+            for _, v := range vs {
+                for sku, q := range v.Items {
+                    out.Items[sku] = max(out.Items[sku], q)
+                }
+                for k, c := range v.VV {
+                    out.VV[k] = max(out.VV[k], c)
+                }
+            }
+            out.VV[self]++
+            return out
+        }
+    cost:
+      before: { text: 1 item lost per concurrent edit · no error anywhere, value: 0.8 }
+      after: { text: 0 items lost · siblings merged on next open, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'A `map[string]uint64` is the natural vector: a missing key reads as 0, which is exactly the rule for a replica that never wrote. Go randomises map iteration, so sort the keys before you encode or hash a vector. `max` is a builtin since Go 1.21.'
+      seenIn: 'HashiCorp Serf''s `LamportClock` (a Lamport clock, not a vector). etcd needs neither: one Raft leader orders every write, so one revision number is enough.'
+
+  python:
+    before:
+      file: cart.py
+      source: |
+        # cart.py
+        @dataclass
+        class Cart:
+            items: dict[str, int]
+            updated_at: datetime
+
+
+        def receive(store: dict[str, Cart], cart_id: str, incoming: Cart) -> None:
+            """Apply a cart sent by another replica."""
+            current = store.get(cart_id)
+            if current is None or incoming.updated_at > current.updated_at:
+                store[cart_id] = incoming  # theirs is newer
+            # else: ours is newer, keep it
+      roles: { client: [8, 8], context: [8, 13], replace: [11, 12], keep: [13, 13] }
+      change:
+        - { line: 5, replace: '    lamport: int  # replaces wall-clock time: no more skew' }
+        - { line: 11, replace: '    if current is None or incoming.lamport > current.lamport:' }
+    after:
+      file: cart.py
+      source: |
+        # cart.py
+        VV = dict[str, int]  # one counter per replica that wrote
+
+
+        class Order(Enum):
+            BEFORE = "before"
+            AFTER = "after"
+            EQUAL = "equal"
+            CONCURRENT = "concurrent"
+
+
+        @dataclass
+        class Version:
+            items: dict[str, int]
+            vv: VV
+
+            def add(self, self_id: str, sku: str) -> None:
+                """A local write: tick this replica's own entry."""
+                self.items[sku] = self.items.get(sku, 0) + 1
+                self.vv[self_id] = self.vv.get(self_id, 0) + 1
+
+
+        def compare(a: VV, b: VV) -> Order:
+            keys = a.keys() | b.keys()
+            less = any(a.get(k, 0) < b.get(k, 0) for k in keys)
+            more = any(a.get(k, 0) > b.get(k, 0) for k in keys)
+            if less and more:
+                return Order.CONCURRENT
+            if less:
+                return Order.BEFORE
+            return Order.AFTER if more else Order.EQUAL
+
+
+        def receive(store: dict[str, list[Version]], cart_id: str, incoming: Version) -> None:
+            """Keep every version that no other version dominates."""
+            keep = []
+            for v in store.get(cart_id, []):
+                order = compare(v.vv, incoming.vv)
+                if order in (Order.BEFORE, Order.EQUAL):
+                    continue  # incoming replaces v
+                if order is Order.AFTER:
+                    return  # we already have something newer
+                keep.append(v)  # concurrent: a sibling
+            store[cart_id] = [*keep, incoming]
+      roles: { client: [34, 34], context: [34, 44], strategy: [23, 31], replace: [39, 40], keep: [41, 42], siblings: [43, 43], write: [17, 20], compare: [23, 31], sibling: [43, 44], dominate: [39, 40] }
+    again:
+      file: merge.py
+      source: |
+        # merge.py: the same request from a third device. Nothing above changes; its writes add a key to vv.
+        def merge(versions: list[Version], self_id: str) -> Version:
+            """Opening a cart with siblings merges them, and the result dominates every sibling."""
+            items: dict[str, int] = {}
+            vv: VV = {}
+            for v in versions:
+                for sku, q in v.items.items():
+                    items[sku] = max(items.get(sku, 0), q)
+                for k, c in v.vv.items():
+                    vv[k] = max(vv.get(k, 0), c)
+            vv[self_id] = vv.get(self_id, 0) + 1
+            return Version(items, vv)
+    cost:
+      before: { text: 1 item lost per concurrent edit · no error anywhere, value: 0.8 }
+      after: { text: 0 items lost · siblings merged on next open, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'A `dict[str, int]` with `.get(k, 0)` reads a missing replica as 0. `a.keys() | b.keys()` gives the union of replicas in one expression. Dicts keep insertion order, not sorted order, so sort the items before you serialise a vector for hashing or comparison on the wire.'
+      seenIn: 'Riak''s Python client, which hands siblings to a resolver function you supply. `pycrdt`, the Python binding of Yjs, which syncs documents by exchanging per-client counters.'
+
+  typescript:
+    before:
+      file: cart.ts
+      source: |
+        // cart.ts
+        interface Cart {
+          items: Record<string, number>;
+          updatedAt: number; // ms since epoch, from the writer's clock
+        }
+
+        // Apply a cart sent by another replica.
+        export function receive(store: Map<string, Cart>, id: string, incoming: Cart): void {
+          const current = store.get(id);
+          if (!current || incoming.updatedAt > current.updatedAt) {
+            store.set(id, incoming); // theirs is newer
+          }
+          // else: ours is newer, keep it
+        }
+      roles: { client: [8, 8], context: [8, 14], replace: [10, 11], keep: [13, 13] }
+      change:
+        - { line: 4, replace: '  lamport: number; // replaces wall-clock time: no more skew' }
+        - { line: 10, replace: '  if (!current || incoming.lamport > current.lamport) {' }
+    after:
+      file: cart.ts
+      source: |
+        // cart.ts
+        type VV = Record<string, number>; // one counter per replica that wrote
+        type Order = "before" | "after" | "equal" | "concurrent";
+
+        interface Version {
+          items: Record<string, number>;
+          vv: VV;
+        }
+
+        // A local write: tick this replica's own entry.
+        export function add(v: Version, self: string, sku: string): void {
+          v.items[sku] = (v.items[sku] ?? 0) + 1;
+          v.vv[self] = (v.vv[self] ?? 0) + 1;
+        }
+
+        export function compare(a: VV, b: VV): Order {
+          const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+          let less = false, more = false;
+          for (const k of keys) {
+            if ((a[k] ?? 0) < (b[k] ?? 0)) less = true;
+            if ((a[k] ?? 0) > (b[k] ?? 0)) more = true;
+          }
+          if (less && more) return "concurrent";
+          return less ? "before" : more ? "after" : "equal";
+        }
+
+        // Keep every version that no other version dominates.
+        export function receive(store: Map<string, Version[]>, id: string, incoming: Version): void {
+          const keep: Version[] = [];
+          for (const v of store.get(id) ?? []) {
+            const order = compare(v.vv, incoming.vv);
+            if (order === "before" || order === "equal") continue; // incoming replaces v
+            if (order === "after") return; // we already have something newer
+            keep.push(v); // concurrent: a sibling
+          }
+          store.set(id, [...keep, incoming]);
+        }
+      roles: { client: [28, 28], context: [27, 37], strategy: [16, 25], replace: [32, 32], keep: [33, 33], siblings: [34, 34], write: [10, 14], compare: [16, 25], sibling: [34, 36], dominate: [32, 32] }
+    again:
+      file: merge.ts
+      source: |
+        // merge.ts: the same request from a third device. Nothing above changes; its writes add a key to vv.
+        // Opening a cart with siblings merges them, and the result dominates every sibling.
+        export function merge(versions: Version[], self: string): Version {
+          const out: Version = { items: {}, vv: {} };
+          for (const v of versions) {
+            for (const [sku, q] of Object.entries(v.items)) out.items[sku] = Math.max(out.items[sku] ?? 0, q);
+            for (const [k, c] of Object.entries(v.vv)) out.vv[k] = Math.max(out.vv[k] ?? 0, c);
+          }
+          out.vv[self] = (out.vv[self] ?? 0) + 1;
+          return out;
+        }
+    cost:
+      before: { text: 1 item lost per concurrent edit · no error anywhere, value: 0.8 }
+      after: { text: 0 items lost · siblings merged on next open, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'A `Record<string, number>` serialises straight to JSON, which is how a vector travels with the data over HTTP. Read missing entries with `?? 0`. JSON numbers are doubles, exact up to 2^53, which is far more writes than one replica will make.'
+      seenIn: 'Yjs: `Y.encodeStateVector(doc)` sends one counter per client so a peer can reply with only the updates you are missing. Automerge tracks changes per actor in the same spirit.'
+
+  rust:
+    before:
+      file: cart.rs
+      source: |
+        // cart.rs
+        #[derive(Clone)]
+        pub struct Cart {
+            pub items: HashMap<String, u32>,
+            pub updated_at: SystemTime,
+        }
+
+        /// Apply a cart sent by another replica.
+        pub fn receive(store: &mut HashMap<String, Cart>, id: &str, incoming: Cart) {
+            let newer = match store.get(id) {
+                None => true,
+                Some(cur) => incoming.updated_at > cur.updated_at,
+            };
+            if newer {
+                store.insert(id.to_string(), incoming); // theirs is newer
+            }
+            // else: ours is newer, keep it
+        }
+      roles: { client: [9, 9], context: [9, 18], replace: [12, 15], keep: [17, 17] }
+      change:
+        - { line: 5, replace: '    pub lamport: u64, // replaces wall-clock time: no more skew' }
+        - { line: 12, replace: '        Some(cur) => incoming.lamport > cur.lamport,' }
+    after:
+      file: cart.rs
+      source: |
+        // cart.rs
+        use std::cmp::Ordering;
+        use std::collections::{BTreeMap, HashMap};
+
+        /// One counter per replica that wrote. BTreeMap keeps a stable order for hashing and logs.
+        pub type VV = BTreeMap<String, u64>;
+
+        #[derive(Clone)]
+        pub struct Version {
+            pub items: BTreeMap<String, u32>,
+            pub vv: VV,
+        }
+
+        impl Version {
+            /// A local write: tick this replica's own entry.
+            pub fn add(&mut self, me: &str, sku: &str) {
+                *self.items.entry(sku.to_string()).or_default() += 1;
+                *self.vv.entry(me.to_string()).or_default() += 1;
+            }
+        }
+
+        /// `Some(order)` if one happened before the other, `None` if they are concurrent.
+        pub fn compare(a: &VV, b: &VV) -> Option<Ordering> {
+            let (mut less, mut more) = (false, false);
+            for k in a.keys().chain(b.keys()) {
+                let (x, y) = (a.get(k).copied().unwrap_or(0), b.get(k).copied().unwrap_or(0));
+                less |= x < y;
+                more |= x > y;
+            }
+            match (less, more) {
+                (true, true) => None,
+                (true, false) => Some(Ordering::Less),
+                (false, true) => Some(Ordering::Greater),
+                (false, false) => Some(Ordering::Equal),
+            }
+        }
+
+        /// Keep every version that no other version dominates.
+        pub fn receive(store: &mut HashMap<String, Vec<Version>>, id: &str, incoming: Version) {
+            let current = store.entry(id.to_string()).or_default();
+            let mut keep = Vec::new();
+            for v in current.iter() {
+                match compare(&v.vv, &incoming.vv) {
+                    Some(Ordering::Less | Ordering::Equal) => continue, // incoming replaces v
+                    Some(Ordering::Greater) => return, // we already have something newer
+                    None => keep.push(v.clone()), // concurrent: a sibling
+                }
+            }
+            keep.push(incoming);
+            *current = keep;
+        }
+      roles: { client: [39, 39], context: [38, 51], strategy: [22, 36], replace: [44, 44], keep: [45, 45], siblings: [46, 46], write: [14, 19], compare: [22, 36], sibling: [46, 50], dominate: [44, 44] }
+    again:
+      file: merge.rs
+      source: |
+        // merge.rs: the same request from a third device. Nothing above changes; its writes add a key to vv.
+        /// Opening a cart with siblings merges them, and the result dominates every sibling.
+        pub fn merge(versions: &[Version], me: &str) -> Version {
+            let mut out = Version { items: BTreeMap::new(), vv: VV::new() };
+            for v in versions {
+                for (sku, &q) in &v.items {
+                    let e = out.items.entry(sku.clone()).or_default();
+                    *e = (*e).max(q);
+                }
+                for (k, &c) in &v.vv {
+                    let e = out.vv.entry(k.clone()).or_default();
+                    *e = (*e).max(c);
+                }
+            }
+            *out.vv.entry(me.to_string()).or_default() += 1;
+            out
+        }
+    cost:
+      before: { text: 1 item lost per concurrent edit · no error anywhere, value: 0.8 }
+      after: { text: 0 items lost · siblings merged on next open, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'Version vectors are a textbook partial order, and Rust has a trait for exactly that: `PartialOrd::partial_cmp` returns `None` for "neither", as `compare` does here. Wrap `VV` in a newtype and implement `PartialOrd` to get `a < b` for free. `BTreeMap` gives a deterministic key order for encoding.'
+      seenIn: 'The `crdts` crate''s `VClock`, which implements `PartialOrd`. Riak used version vectors on every object, and dotted version vectors from Riak 2.0.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Offline, the laptop adds a book and the phone adds a lamp. Each ticks only its own entry, so the laptop's cart is {laptop 1} and the phone's is {phone 1}.
+    nodes: [client]
+    edges: []
+    role: write
+  - text: The phone's cart reaches the store, which holds the laptop's. Compare finds an entry where the phone is ahead and one where the laptop is ahead.
+    nodes: [context, strategy]
+    edges: [client>context, context>strategy]
+    role: compare
+  - text: Ahead in both directions means concurrent. Neither cart saw the other, so the store keeps both as siblings. No item is lost.
+    nodes: [strategy, siblings]
+    edges: [strategy>siblings]
+    role: sibling
+  - text: The next time the cart is opened, the app merges the siblings and writes the result. Its vector is ahead of both, so every replica that receives it replaces what it had.
+    nodes: [strategy, replace]
+    edges: [strategy>replace]
+    role: dominate
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: What can a vector clock tell you that a Lamport timestamp cannot?
+    options:
+      - text: Whether two events were concurrent, meaning neither could have known about the other.
+        correct: true
+        why: Right. Lamport times put all events in one line, so any two compare as smaller or larger. Vectors can say neither.
+      - text: The real time at which each event happened.
+        why: Neither clock measures time. Both count events. That is why they keep working when wall clocks are wrong.
+      - text: Which of two concurrent updates is the correct one.
+        why: No clock can tell you that. A vector only detects the conflict. Your code, or the user, decides how to merge.
+  engineer:
+    question: Two versions of a cart carry the vectors [2,1,0] and [1,2,0]. What is their relation?
+    options:
+      - text: Concurrent. Each is ahead of the other in one entry.
+        correct: true
+        why: Right. The first is ahead in A's entry, the second in B's. Neither saw all of the other's writes, so a store must keep both or merge them.
+      - text: The first happened before the second, because its first entry is larger.
+        why: Happened-before needs every entry to be smaller or equal, with at least one smaller. One larger entry is not enough.
+      - text: They are equal, because the entries add up to the same total.
+        why: Totals mean nothing. [2,1,0] and [1,2,0] record different writes on different replicas.
+  deep:
+    question: Dynamo kept a timestamp with each (node, counter) pair and dropped the oldest pair once a vector reached about ten entries. What can go wrong?
+    options:
+      - text: After truncation the store may not see that one version descends from another, and reports a conflict that is not real.
+        correct: true
+        why: Right. A dropped entry looks like a 0, so a descendant can seem to be missing a write. The result is a false conflict, extra siblings for the app to merge, and no data loss. The Dynamo paper notes this risk and that it had not surfaced in production.
+      - text: Concurrent versions may be treated as ordered, so one is silently lost.
+        why: Dropping an entry can only make vectors look less ordered, not more. A missing entry never makes one vector dominate another that it did not dominate before.
+      - text: The clocks drift, because the timestamps are used to order versions.
+        why: The timestamps only pick which pair to drop. Ordering still comes from the counters.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Replica (or device)
+      example: the laptop, the phone, a store node
+      job: Owns one entry in every vector and ticks it on each local write.
+    - role: Version vector
+      example: "{laptop: 2, phone: 1}"
+      job: Travels with the data and records which writes it includes.
+    - role: Compare
+      example: { go: "Compare(a, b VV) Order", python: "compare(a, b) -> Order", typescript: "compare(a, b): Order", rust: "compare(&a, &b) -> Option<Ordering>" }
+      job: Says before, after, equal or concurrent, entry by entry.
+    - role: Merge
+      example: union of items, max of vectors, plus one tick
+      job: Resolves siblings into one version that dominates them all.
+  useWhen:
+    - Several replicas or devices accept writes for the same data without a leader, and losing a write silently is not acceptable.
+    - You need to know whether a message or update could have caused another, for debugging, tracing or causal delivery.
+    - Syncing peers that should exchange only what the other is missing.
+  avoidWhen:
+    - A single leader orders all writes. One sequence number (an LSN or a revision) already gives a total order.
+    - Thousands of writers per item. Vectors grow with the number of writers; use per-replica entries or dotted version vectors.
+    - The data has a merge that needs no history, such as a counter or a set designed as a CRDT.
+  tradeoffs:
+    - One entry per writer travels with every version, so size grows with the number of replicas that ever wrote.
+    - Detecting a conflict is not resolving it. Someone must write the merge, and a union can bring deleted items back.
+    - Pruning old entries keeps vectors small and can turn ordered versions into false conflicts.
+  lookalikes:
+    - name: Lamport clock
+      how: One counter for everyone. Consistent with causality, so a cause always has the smaller number, but it cannot detect concurrency.
+    - name: Last-write-wins timestamp
+      how: Picks one version by time and drops the other. Simple and lossy when writes are concurrent.
+    - name: Hybrid logical clock
+      how: A physical timestamp plus a counter. It orders events close to real time and respects causality, but it is still one number and cannot detect concurrency.
+    - name: CRDT
+      how: Builds the merge into the data type so concurrent versions always combine without conflicts. Many CRDTs use version vectors inside.
+---
+
+## [concept] Vector clocks and version vectors
+
+**Keep one counter per node instead of one per system. Comparing two vectors entry by entry tells you whether one event saw the other, or whether they were concurrent.**
+
+A <Term id="lamport-clock">Lamport clock</Term> gives every event one number. If one event caused another, the cause has the smaller number. The reverse does not hold, so a smaller number tells you nothing about cause. A <Term id="vector-clock">vector clock</Term> fixes that by keeping a separate counter for each node.
+
+<Depth level={2}>
+The rules are short. On every local event, a node ticks its own entry. A message carries the sender's vector, and the receiver takes the entry-wise maximum with its own before ticking. To compare two vectors: if every entry of a is ≤ the matching entry of b, and one is smaller, then a <Term id="happened-before">happened before</Term> b. If each is ahead somewhere, they are <Term id="concurrent-events">concurrent</Term>. A <Term id="version-vector">version vector</Term> applies the same idea to data: it is attached to a version of a key and ticks only on writes.
+</Depth>
+
+<Depth level={3}>
+Lamport defined happened-before and the scalar clock in 1978, and proved the clock condition: if a happened before b, then C(a) < C(b). Vector clocks came a decade later, from Fidge and from Mattern independently, around 1988. With vectors the relation is exact in both directions: a happened before b if and only if V(a) < V(b). Version vectors for replicated files are older still (Parker and others, 1983), designed to detect conflicting copies in a partitioned file system.
+</Depth>
+
+## [problem] Keep the newer cart
+
+A shop's cart syncs between replicas: a phone app that works offline, a laptop, and a store node. When one replica receives another's cart, it keeps whichever has the later `updated_at`. It is the obvious rule, and it works whenever one device is used at a time.
+
+Read it once. The rule assumes one of the two carts is newer.
+
+<Depth level={2}>
+"Newer" here means "has a later wall-clock timestamp". Two devices can each change the cart while offline. When they sync, one of them has the later clock, and its cart replaces the other completely, including items the other added.
+</Depth>
+
+<Depth level={3}>
+Wall clocks make it worse: phones drift and get corrected by NTP, so the device that wrote later can carry the earlier timestamp. But the bug is not the clock. Even with perfect clocks, two independent edits have no "newer" one.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** carts edited on two devices while offline must keep every item.
+
+Support has tickets about items vanishing from carts after a phone comes back online. Someone reads that wall clocks skew and swaps the timestamp for a Lamport counter, the marked lines. Clock skew is gone. Items still vanish.
+
+<Depth level={2}>
+The Lamport counter does give an order consistent with causality: if the phone saw the laptop's cart before editing, the phone's counter is larger. But when neither saw the other, the counters still compare as smaller or larger, and the "smaller" cart is dropped. The code cannot tell "this replaced that" from "these happened apart".
+</Depth>
+
+<Depth level={3}>
+Every last-write-wins rule has this shape, whatever it compares: wall time, Lamport time, or a hybrid logical clock. It turns a partial order into a total one by inventing a winner, and the loser's write disappears without an error.
+</Depth>
+
+## [morph] Give every replica its own counter
+
+Drag the slider. A version vector appears between the store and its decision, and a third outcome appears: siblings.
+
+Each version now carries one counter per replica. Comparing two vectors gives one of three answers. Theirs saw ours, so replace. Ours saw theirs, so ignore. Neither saw the other, so keep both as <Term id="siblings">siblings</Term> and merge them later.
+
+<Depth level={2}>
+The vector ticks only on writes, not on every message. That is the difference between a version vector and a vector clock: two replicas that exchange the same cart end up with the same vector, so the second sync compares as equal and does nothing.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Maps make the vector sparse: a replica that never wrote has no key, and reading it gives 0. That also means a new device needs no schema change.</Lang>
+<Lang only="python">A dict makes the vector sparse: a replica that never wrote has no key, and `.get(k, 0)` reads it as 0. A new device needs no schema change.</Lang>
+<Lang only="typescript">A record makes the vector sparse: a replica that never wrote has no key, and `?? 0` reads it as 0. A new device needs no schema change, and the vector is plain JSON.</Lang>
+<Lang only="rust">`compare` returns `Option<Ordering>`, the same shape as `PartialOrd::partial_cmp`. That is the honest type: version vectors are partially ordered, and `None` is the concurrent case the old code could not express.</Lang>
+</Depth>
+
+## [walk] Follow two offline edits to one cart
+
+Two devices, one cart, no connection between them for a while. Step through what happens when they sync. Use the numbered buttons.
+
+<Depth level={2}>
+Siblings move the conflict to the place that knows how to resolve it. For a cart, take the union of items. For a document, show both and ask. The store's job is to never pick for you.
+</Depth>
+
+<Depth level={3}>
+Union has a known cost. An item removed on one device and untouched on the other comes back after the merge, because the union cannot tell "removed" from "never added". The Dynamo paper reports exactly this for Amazon's cart: an add is never lost, and a removed item can reappear. To fix it, record removals too, which is what CRDT sets such as an observed-remove set do.
+</Depth>
+
+## [again] The same request, from a third device
+
+The same request comes from a customer with a tablet as well. No code above changes. The tablet's writes appear as a new key in the vector, Compare already treats a missing key as 0, and the merge function in the new file handles any number of siblings.
+
+<Depth level={2}>
+The merged vector is the entry-wise maximum of the siblings, plus one tick for the replica doing the merge. It is therefore ahead of every sibling, so the merge replaces them everywhere it goes.
+</Depth>
+
+<Depth level={3}>
+Vectors grow with every replica that ever wrote. Riak first gave each client an entry, and vectors grew with every client. Per-replica entries keep them small, but then the store cannot tell apart the writes of many clients going through one replica, and siblings pile up. Riak's users called it sibling explosion. <Term id="dotted-version-vector">Dotted version vectors</Term>, used by Riak from 2.0, add one extra pair naming the exact write, which keeps vectors small and conflicts real.
+</Depth>
+
+## [play] Send messages and compare the vectors
+
+Three cart replicas on a space-time diagram. Each event shows its Lamport time inside the dot and its vector beside it. Press two events to see how they relate.
+
+Make a conflict, merge it, and find two events where the Lamport time points the wrong way.
+
+## [lens] How each language holds a vector
+
+Every language can implement this in a page of code, as above. The differences are in how a missing entry reads, and in whether the map iterates in a stable order, which matters as soon as you hash a vector or send it over the wire.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Most databases that use version vectors hide them behind an opaque context. Riak returned a vector clock with each read and expected it back on the next write, so the server could tell whether the write had seen the siblings. Treat such a context as an opaque token, and always send back the one you read.
+</Depth>
+
+<Depth level={3}>
+Collaborative editors use the same idea for sync. A Yjs peer sends its state vector, one counter per client, and the other peer replies with only the updates that vector has not seen. The vector is not deciding conflicts there; the CRDT does. It is answering "what are you missing?" exactly.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="vector-clocks" />
+
+### Vector clock or version vector
+
+They look the same and answer different questions. A vector clock ticks on every event, including sends and receives, and orders events in a run. A version vector ticks only when data changes, and orders versions of that data. Use a vector clock to reason about messages, for example in a trace or a debugger like ShiViz. Use a version vector to decide whether a replica's copy replaces, ignores or conflicts with another.
