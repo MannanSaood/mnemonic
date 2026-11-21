@@ -1,0 +1,692 @@
+---
+title: Hash tables
+track: algorithms
+group: Data structures
+order: 7
+summary: A hash table turns a key into a slot index. A lookup reads one or two slots while the hash spreads the keys and resizing keeps the table from filling up. Break either condition and the same lookup scans the whole table.
+intent: Know what a map lookup really costs, so you can spot the key type, the hash or the load factor that quietly turns O(1) into O(n).
+changeRequest: Move the largest customer, 50,000 storefront pages, onto the shared render cache.
+languages: [go, python, typescript, rust]
+glossary: [hash-table, hash-function, load-factor, separate-chaining, open-addressing, linear-probing, tombstone, swiss-table, hash-flooding]
+
+prerequisites: [algorithms/arrays-and-linked-lists, algorithms/amortized-analysis]
+skills: [hashing, data-structures]
+depths: [overview, engineer, deep]
+
+playground:
+  model: hash-tables
+  scenarios:
+    - try: "Press +10 three times with the default settings, then click a slot and press Find on its key."
+      notice: "The table doubles from 8 to 64 slots as you go. Almost every key is found on the first slot read, a few on the second."
+    - try: "Set the hash to Tenant only and the traffic to One big tenant, then insert 32 keys."
+      notice: "All 32 keys share one home slot. A hit reads about 16 slots, although the table is half empty."
+    - try: "With linear probing, set the load cap to 0.9, insert 120 keys, switch to Never resize and insert until the table is 90% full."
+      notice: "Misses jump from about 2 slots to about 30. Switch to Chaining and the same keys cost about one comparison."
+    - try: "Choose Empty the slot under Delete, then click a slot in a long run and delete its key."
+      notice: "A key further along the same run becomes unreachable: its lookup stops at the hole you made."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 104, h: 48, title: render svc, sub: "get(acme, path)" }
+      after:  { x: 12, y: 111, w: 104, h: 48, title: render svc, sub: "get(acme, path)" }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 260, h: 236, title: page cache, sub: "pictured as: O(1)" }
+      after:  { x: 140, y: 20, w: 120, h: 48, title: hash table, sub: get / put }
+    - id: hash
+      kind: concrete
+      before: { x: 160, y: 72, w: 220, h: 32, title: hash(tenant) }
+      after:  { x: 140, y: 111, w: 120, h: 48, title: hash(key), sub: tenant + path }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 290, y: 111, w: 120, h: 48, title: "" }
+      after:  { x: 290, y: 111, w: 120, h: 48, title: slot array, sub: load ≤ 7/8 }
+    - id: slot
+      kind: concrete
+      before: { x: 160, y: 120, w: 220, h: 32, title: scan the tenant }
+      after:  { x: 430, y: 111, w: 118, h: 48, title: home slot, sub: 1-2 probes }
+    - id: resize
+      kind: concrete
+      before: { x: 160, y: 168, w: 220, h: 32, title: grows by itself }
+      after:  { x: 290, y: 202, w: 120, h: 44, title: resize, sub: 2× and rehash }
+    - id: tenant
+      kind: concrete
+      appears: change
+      before: { x: 424, y: 202, w: 124, h: 44, title: acme, sub: 50k pages }
+      after:  { x: 430, y: 202, w: 118, h: 44, title: acme, sub: spread out }
+  edges:
+    - { from: client, to: context, label: get }
+    - { from: context, to: hash, label: key }
+    - { from: hash, to: strategy, label: "h & (m-1)" }
+    - { from: strategy, to: slot, label: probe }
+    - { from: strategy, to: resize, label: too full }
+    - { from: tenant, to: strategy, label: put }
+
+code:
+  go:
+    before:
+      file: render_cache.go
+      source: |
+        // render_cache.go
+        type Entry struct {
+            Path string
+            HTML []byte
+        }
+
+        // RenderCache keeps each tenant's pages together so Purge can drop them in one go.
+        type RenderCache struct {
+            mu       sync.RWMutex
+            byTenant map[string][]Entry // tenant -> its pages
+        }
+
+        func (c *RenderCache) Get(tenant, path string) ([]byte, bool) {
+            c.mu.RLock()
+            defer c.mu.RUnlock()
+            for _, e := range c.byTenant[tenant] { // the map finds the tenant; the path is a scan
+                if e.Path == path {
+                    return e.HTML, true
+                }
+            }
+            return nil, false
+        }
+
+        func (c *RenderCache) Put(tenant string, e Entry) {
+            c.mu.Lock()
+            defer c.mu.Unlock()
+            pages := c.byTenant[tenant]
+            for i := range pages {
+                if pages[i].Path == e.Path {
+                    pages[i] = e
+                    return
+                }
+            }
+            c.byTenant[tenant] = append(pages, e)
+        }
+
+        func (c *RenderCache) Purge(tenant string) {
+            c.mu.Lock()
+            defer c.mu.Unlock()
+            delete(c.byTenant, tenant)
+        }
+      roles: { client: [13, 22], context: [8, 11], hash: [10, 10], slot: [16, 20], resize: [34, 34] }
+      change:
+        - after: 41
+          add:
+            - ""
+            - "// Warm loads a tenant's pages at deploy time: 50,000 for the new customer."
+            - "func (c *RenderCache) Warm(tenant string, pages []Entry) {"
+            - "    for _, e := range pages {"
+            - "        c.Put(tenant, e)"
+            - "    }"
+            - "}"
+    after:
+      file: render_cache.go
+      source: |
+        // render_cache.go: one map entry per page, keyed by tenant and path together
+        type pageKey struct {
+            tenant, path string // the map hashes every field of a comparable key
+        }
+
+        type RenderCache struct {
+            mu      sync.RWMutex
+            pages   map[pageKey][]byte
+            tenants map[string]map[pageKey]struct{} // for Purge
+        }
+
+        func NewRenderCache(expected int) *RenderCache {
+            return &RenderCache{
+                pages:   make(map[pageKey][]byte, expected), // sized up front: no growth while warming
+                tenants: make(map[string]map[pageKey]struct{}),
+            }
+        }
+
+        func (c *RenderCache) Get(tenant, path string) ([]byte, bool) {
+            c.mu.RLock()
+            defer c.mu.RUnlock()
+            html, ok := c.pages[pageKey{tenant, path}] // hash, pick a group, match 7-bit tags
+            return html, ok
+        }
+
+        func (c *RenderCache) Put(tenant, path string, html []byte) {
+            k := pageKey{tenant, path}
+            c.mu.Lock()
+            defer c.mu.Unlock()
+            c.pages[k] = html // a full table splits in two; the rest of the map is untouched
+            if c.tenants[tenant] == nil {
+                c.tenants[tenant] = make(map[pageKey]struct{})
+            }
+            c.tenants[tenant][k] = struct{}{}
+        }
+
+        func (c *RenderCache) Warm(tenant string, pages map[string][]byte) {
+            for path, html := range pages { // 50,000 keys spread over the whole map
+                c.Put(tenant, path, html)
+            }
+        }
+
+        func (c *RenderCache) Purge(tenant string) {
+            c.mu.Lock()
+            defer c.mu.Unlock()
+            for k := range c.tenants[tenant] {
+                delete(c.pages, k)
+            }
+            delete(c.tenants, tenant)
+        }
+      roles: { hash: [2, 4], context: [6, 17], strategy: [8, 8], client: [19, 24], index: [22, 22], probe: [22, 23], slot: [22, 22], resize: [30, 30], spread: [37, 41], tenant: [37, 41] }
+    again:
+      file: render_cache_test.go
+      source: |
+        // render_cache_test.go: 50,000 pages of one tenant, each found in one map lookup
+        func BenchmarkGetBigTenant(b *testing.B) {
+            c := NewRenderCache(50_000)
+            for i := range 50_000 {
+                c.Put("acme", "/p/"+strconv.Itoa(i), nil)
+            }
+            for i := 0; b.Loop(); i++ {
+                c.Get("acme", "/p/"+strconv.Itoa(i%50_000))
+            }
+        }
+    cost:
+      before: { text: "one tenant, one list · ~25,000 compares per hit", value: 0.9 }
+      after: { text: one or two slot reads per lookup at any size, value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: 'Since Go 1.24 a map is a set of Swiss tables. Slots come in groups of 8 with a 64-bit control word holding a 7-bit hash tag per slot, so one comparison checks eight slots. Each table holds at most 1,024 slots and grows or splits on its own, so a single insert never rehashes the whole map. The hash is seeded per map, iteration order is randomised on purpose, and concurrent writes are a fatal error.'
+      seenIn: '`map[K]V` with `make(map[K]V, hint)`. `maps.Keys`, `clear`. `hash/maphash` (with `maphash.Comparable` since 1.24) for tables you build yourself. `sync.Map` for read-mostly concurrent caches.'
+
+  python:
+    before:
+      file: render_cache.py
+      source: |
+        # render_cache.py
+        from dataclasses import dataclass
+
+
+        @dataclass(eq=True)
+        class PageKey:
+            tenant: str
+            path: str
+
+            def __hash__(self) -> int:
+                return hash(self.tenant)  # written when keys were per tenant; path came later
+
+
+        class RenderCache:
+            def __init__(self) -> None:
+                self._pages: dict[PageKey, bytes] = {}
+
+            def get(self, tenant: str, path: str) -> bytes | None:
+                return self._pages.get(PageKey(tenant, path))
+
+            def put(self, tenant: str, path: str, html: bytes) -> None:
+                self._pages[PageKey(tenant, path)] = html
+      roles: { client: [18, 19], context: [14, 16], hash: [10, 11], slot: [19, 19], resize: [22, 22] }
+      change:
+        - after: 22
+          add:
+            - ""
+            - "    def warm(self, tenant: str, pages: dict[str, bytes]) -> None:"
+            - "        for path, html in pages.items():  # 50,000 pages for the new customer"
+            - "            self.put(tenant, path, html)"
+    after:
+      file: render_cache.py
+      source: |
+        # render_cache.py: the key hashes every field that equality compares
+        from dataclasses import dataclass
+
+
+        @dataclass(frozen=True)  # generates __eq__ and __hash__ over (tenant, path)
+        class PageKey:
+            tenant: str
+            path: str
+
+
+        class RenderCache:
+            def __init__(self) -> None:
+                self._pages: dict[PageKey, bytes] = {}
+
+            def get(self, tenant: str, path: str) -> bytes | None:
+                # hash((tenant, path)) picks a slot; the probe sequence reads one or two
+                return self._pages.get(PageKey(tenant, path))
+
+            def put(self, tenant: str, path: str, html: bytes) -> None:
+                self._pages[PageKey(tenant, path)] = html  # past 2/3 full, the dict resizes
+
+            def warm(self, tenant: str, pages: dict[str, bytes]) -> None:
+                for path, html in pages.items():  # 50,000 keys spread over the whole table
+                    self.put(tenant, path, html)
+      roles: { hash: [5, 8], context: [11, 13], strategy: [13, 13], client: [15, 17], index: [16, 17], probe: [16, 17], slot: [17, 17], resize: [19, 20], spread: [22, 24], tenant: [22, 24] }
+    again:
+      file: test_render_cache.py
+      source: |
+        # test_render_cache.py: keys that differ only in path must not share a hash
+        def test_page_keys_spread():
+            keys = [PageKey("acme", f"/p/{i}") for i in range(50_000)]
+            assert len({hash(k) for k in keys}) > 49_000
+    cost:
+      before: { text: "one hash for the whole tenant · ~25,000 compares per hit", value: 0.9 }
+      after: { text: one or two slot reads per lookup at any size, value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: 'A dict is a compact open-addressing table: a sparse array of small indices points into a dense array of entries kept in insertion order (guaranteed since 3.7). Collisions follow a perturbed probe sequence that mixes in more hash bits each step. The dict resizes when it is two thirds full. `str` and `bytes` hashes are SipHash with a per-process random key; `PYTHONHASHSEED` pins it.'
+      seenIn: '`dict`, `set`, `collections.Counter`, `defaultdict`. `@dataclass(frozen=True)` or a `NamedTuple` for composite keys. Equal objects must hash equal: define `__eq__` and `__hash__` on the same fields.'
+
+  typescript:
+    before:
+      file: render-cache.ts
+      source: |
+        // render-cache.ts
+        interface Entry {
+          path: string;
+          html: string;
+        }
+
+        // Pages grouped by tenant, so purge(tenant) is one delete.
+        export class RenderCache {
+          private byTenant = new Map<string, Entry[]>();
+
+          get(tenant: string, path: string): string | undefined {
+            // the Map finds the tenant; the path is a linear scan
+            return this.byTenant.get(tenant)?.find((e) => e.path === path)?.html;
+          }
+
+          put(tenant: string, entry: Entry): void {
+            const pages = this.byTenant.get(tenant) ?? [];
+            const i = pages.findIndex((e) => e.path === entry.path);
+            if (i >= 0) pages[i] = entry;
+            else pages.push(entry);
+            this.byTenant.set(tenant, pages);
+          }
+
+          purge(tenant: string): void {
+            this.byTenant.delete(tenant);
+          }
+        }
+      roles: { client: [11, 14], context: [8, 9], hash: [9, 9], slot: [12, 13], resize: [20, 20] }
+      change:
+        - after: 26
+          add:
+            - ""
+            - "  warm(tenant: string, pages: Entry[]): void {"
+            - "    for (const e of pages) this.put(tenant, e); // 50,000 pages for the new customer"
+            - "  }"
+    after:
+      file: render-cache.ts
+      source: |
+        // render-cache.ts: one Map entry per page; the string key covers tenant and path
+        const keyOf = (tenant: string, path: string) => `${tenant}\u0000${path}`;
+
+        export class RenderCache {
+          private pages = new Map<string, string>();
+          private tenants = new Map<string, Set<string>>(); // for purge
+
+          get(tenant: string, path: string): string | undefined {
+            return this.pages.get(keyOf(tenant, path)); // hash the string, one bucket, a short chain
+          }
+
+          put(tenant: string, path: string, html: string): void {
+            const k = keyOf(tenant, path);
+            this.pages.set(k, html); // when the table fills, V8 rebuilds it at twice the size
+            let keys = this.tenants.get(tenant);
+            if (!keys) this.tenants.set(tenant, (keys = new Set()));
+            keys.add(k);
+          }
+
+          purge(tenant: string): void {
+            for (const k of this.tenants.get(tenant) ?? []) this.pages.delete(k);
+            this.tenants.delete(tenant);
+          }
+
+          warm(tenant: string, pages: Map<string, string>): void {
+            for (const [path, html] of pages) this.put(tenant, path, html); // spread over every bucket
+          }
+        }
+      roles: { hash: [2, 2], context: [4, 6], strategy: [5, 5], client: [8, 10], index: [9, 9], probe: [9, 9], slot: [9, 9], resize: [14, 14], spread: [25, 27], tenant: [25, 27] }
+    again:
+      file: render-cache.test.ts
+      source: |
+        // render-cache.test.ts: 50,000 pages of one tenant load in well under a second
+        test("warming a big tenant is linear", () => {
+          const cache = new RenderCache();
+          const pages = new Map(Array.from({ length: 50_000 }, (_, i) => [`/p/${i}`, "<html>"]));
+          const t0 = performance.now();
+          cache.warm("acme", pages);
+          assert.ok(performance.now() - t0 < 500);
+          assert.equal(cache.get("acme", "/p/49999"), "<html>");
+        });
+    cost:
+      before: { text: "one array per tenant · ~25,000 compares per hit", value: 0.9 }
+      after: { text: one or two slot reads per lookup at any size, value: 0.1 }
+    lens:
+      need: 2
+      needLabel: A key string
+      note: '`Map` and `Set` compare object keys by identity, so a composite key has to become a string (or nested maps). V8 builds them as deterministic hash tables: a bucket array of chain heads plus an entries array in insertion order, which is why iteration follows insertion. Objects get a random hash code the first time they are used as a key; strings hash their content. Avoid plain objects as maps: inherited names such as `constructor` and `__proto__` are already there.'
+      seenIn: '`Map`, `Set`, `WeakMap`. `Object.create(null)` when an object must be a map. `Object.groupBy` and `Map.groupBy` (ES2024) build the grouped form in one call.'
+
+  rust:
+    before:
+      file: render_cache.rs
+      source: |
+        // render_cache.rs
+        use std::collections::HashMap;
+        use std::hash::{Hash, Hasher};
+
+        #[derive(PartialEq, Eq)]
+        pub struct PageKey {
+            pub tenant: String,
+            pub path: String,
+        }
+
+        impl Hash for PageKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.tenant.hash(state); // written when keys were per tenant; path came later
+            }
+        }
+
+        #[derive(Default)]
+        pub struct RenderCache {
+            pages: HashMap<PageKey, Vec<u8>>,
+        }
+
+        impl RenderCache {
+            pub fn get(&self, tenant: &str, path: &str) -> Option<&Vec<u8>> {
+                self.pages.get(&PageKey { tenant: tenant.into(), path: path.into() })
+            }
+
+            pub fn put(&mut self, tenant: &str, path: &str, html: Vec<u8>) {
+                self.pages.insert(PageKey { tenant: tenant.into(), path: path.into() }, html);
+            }
+        }
+      roles: { client: [23, 25], context: [17, 20], hash: [11, 15], slot: [24, 24], resize: [28, 28] }
+      change:
+        - after: 29
+          add:
+            - ""
+            - "    pub fn warm(&mut self, tenant: &str, pages: Vec<(String, Vec<u8>)>) {"
+            - "        for (path, html) in pages {"
+            - "            self.put(tenant, &path, html); // 50,000 pages for the new customer"
+            - "        }"
+            - "    }"
+    after:
+      file: render_cache.rs
+      source: |
+        // render_cache.rs: derive Hash, so it covers the same fields as Eq
+        use std::collections::HashMap;
+
+        #[derive(PartialEq, Eq, Hash)]
+        pub struct PageKey {
+            pub tenant: String,
+            pub path: String,
+        }
+
+        pub struct RenderCache {
+            pages: HashMap<PageKey, Vec<u8>>, // hashbrown inside, seeded SipHash-1-3 by default
+        }
+
+        impl RenderCache {
+            pub fn with_capacity(expected: usize) -> Self {
+                Self { pages: HashMap::with_capacity(expected) } // no rehash while warming
+            }
+
+            pub fn get(&self, tenant: &str, path: &str) -> Option<&Vec<u8>> {
+                // hash both fields, check a group of control bytes at once, compare the key
+                self.pages.get(&PageKey { tenant: tenant.into(), path: path.into() })
+            }
+
+            pub fn put(&mut self, tenant: &str, path: &str, html: Vec<u8>) {
+                // past 7/8 full: allocate twice the buckets and move every entry
+                self.pages.insert(PageKey { tenant: tenant.into(), path: path.into() }, html);
+            }
+
+            pub fn warm(&mut self, tenant: &str, pages: Vec<(String, Vec<u8>)>) {
+                for (path, html) in pages {
+                    self.put(tenant, &path, html); // 50,000 keys spread over the whole table
+                }
+            }
+        }
+      roles: { hash: [4, 8], context: [10, 17], strategy: [11, 11], client: [19, 22], index: [20, 21], probe: [20, 21], slot: [21, 21], resize: [24, 27], spread: [29, 33], tenant: [29, 33] }
+    again:
+      file: tests/render_cache.rs
+      source: |
+        // tests/render_cache.rs: keys that differ only in path must hash differently
+        #[test]
+        fn page_keys_spread() {
+            let s = std::hash::RandomState::new();
+            let hashes: std::collections::HashSet<u64> = (0..50_000)
+                .map(|i| s.hash_one(PageKey { tenant: "acme".into(), path: format!("/p/{i}") }))
+                .collect();
+            assert!(hashes.len() > 49_000);
+        }
+    cost:
+      before: { text: "one hash for the whole tenant · ~25,000 compares per hit", value: 0.9 }
+      after: { text: one or two slot reads per lookup at any size, value: 0.1 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: '`HashMap` is the hashbrown crate, a port of the Swiss table: a control byte per slot holding 7 bits of the hash, checked 16 at a time with SSE2 (8 at a time without it), and a maximum load of 7/8. The default `RandomState` is SipHash-1-3 with a random key per map, chosen to resist hash flooding. For trusted keys on a hot path, swap in a faster hasher such as `foldhash` or `rustc-hash`.'
+      seenIn: '`HashMap::with_capacity`, the `entry` API, `HashSet`. `#[derive(Hash, PartialEq, Eq)]` together. `BuildHasher::hash_one` to test a hash. `BTreeMap` when you need order instead.'
+
+walk:
+  - text: get(acme, /products/1042) builds the key and hashes all of it, tenant and path, to a 64-bit number. Equal keys always give equal numbers; different keys almost never share one.
+    nodes: [client, context, hash]
+    edges: [client>context, context>hash]
+    role: hash
+  - text: The low bits of the hash pick a slot (h & (m − 1) for a power-of-two size m). A Swiss table also keeps 7 more bits of the hash per slot, so it can rule out a whole group of slots with one comparison.
+    nodes: [hash, strategy]
+    edges: [hash>strategy]
+    role: index
+  - text: The table reads that slot. Usually the key is there; on a collision it reads the next candidate. Because the table stays at most 7/8 full and the hash is good, that is one or two reads.
+    nodes: [strategy, slot]
+    edges: [strategy>slot]
+    role: probe
+  - text: A put that would pass the load cap first allocates a table twice the size and reinserts every key. That one put is slow, but each key is moved a constant number of times on average, so inserts stay O(1) amortised.
+    nodes: [strategy, resize]
+    edges: [strategy>resize]
+    role: resize
+  - text: Warming the big tenant's 50,000 pages spreads them over every slot, because each key's hash includes its path. Each put and each get still reads one or two slots.
+    nodes: [tenant, strategy]
+    edges: [tenant>strategy]
+    role: spread
+
+checks:
+  overview:
+    question: A map lookup is described as O(1). What does that depend on?
+    options:
+      - text: A hash that spreads the keys evenly, and a table that resizes before it gets too full
+        correct: true
+        why: Right. Cost is the number of slots read. With a good hash and a capped load factor that is one or two; if the keys pile into one slot it is proportional to the number of keys.
+      - text: The keys being small, such as integers
+        why: Hashing a long string takes longer, but that is per key. The number of slots read does not depend on key size.
+      - text: Nothing. Every hash map lookup is one memory read
+        why: Collisions mean some lookups read more than one slot, and a bad hash can make every lookup read all of them.
+  engineer:
+    question: A key type compares two fields for equality but its hash uses only the first. What happens when one value of the first field covers most keys?
+    options:
+      - text: Lookups still return correct results, but those keys share one hash and every lookup scans them
+        correct: true
+        why: Right. Equal keys still hash equal, so the map is correct. It just puts every key with that first field in one collision chain, so the cost grows with their number.
+      - text: The map returns the wrong value for some keys
+        why: The map always confirms with equality after the hash matches, so it finds the right key. It only finds it slowly.
+      - text: The map detects the collisions and resizes until they go away
+        why: Resizing changes which slot a hash maps to, but keys with the same hash stay together at any size.
+  deep:
+    question: In an open-addressing table, why does deleting a key leave a tombstone instead of marking the slot empty?
+    options:
+      - text: An empty slot ends a lookup, so keys placed after it in the same probe run would become unreachable
+        correct: true
+        why: Right. A lookup walks the probe sequence until it finds the key or an empty slot. A tombstone says keep walking; inserts can reuse it, and a later resize drops it.
+      - text: To keep the keys in insertion order
+        why: Order is kept separately where it is kept at all (CPython's entries array). Tombstones exist for probe correctness.
+      - text: So the table never has to shrink
+        why: Tombstones do occupy space until the next rebuild, but that is a cost, not the reason for them.
+
+reference:
+  roles:
+    - role: Hash function
+      example: { go: "the runtime's seeded hash", python: "__hash__ and SipHash for str", typescript: "V8's string hash, random ids for objects", rust: "RandomState (SipHash-1-3)" }
+      job: Turns a key into a number. Must agree with equality and spread different keys evenly.
+    - role: Slot array
+      example: a power-of-two array of buckets or groups
+      job: Holds the keys. The hash's low bits pick a home slot.
+    - role: Collision handling
+      example: chaining, linear probing, Swiss-table groups
+      job: Decides where a key goes when its home slot is taken, and so how many slots a lookup reads.
+    - role: Resize policy
+      example: grow at 2/3 (CPython) or 7/8 (Swiss tables)
+      job: Keeps the load factor bounded by doubling and rehashing, which keeps the average cost constant.
+  useWhen:
+    - Lookup, insert and delete by exact key, where order does not matter. Caches, indexes, counters, dedupe sets, joins in memory.
+    - Grouping or counting by a key in one pass over the data.
+  avoidWhen:
+    - You need keys in order, ranges or the nearest key. Use an ordered map (a B-tree or balanced tree) or a sorted array.
+    - Keys come from untrusted input and your hash is fixed and public. Use a seeded hash and cap the input size.
+    - Tiny collections that are scanned a few times; a short array is often faster.
+  tradeoffs:
+    - A lower load cap means fewer probes and more memory.
+    - Resizing keeps the average constant but makes some inserts slow; pre-size when you know the count.
+    - Open addressing is compact and cache friendly but needs tombstones and degrades sharply near full; chaining degrades gently and costs a pointer per entry.
+  lookalikes:
+    - name: Ordered map (B-tree, red-black tree)
+      how: O(log n) instead of O(1), but keeps keys sorted for ranges and iteration.
+    - name: Bloom filter
+      how: Hashes keys into bits to answer "maybe present" or "definitely absent" without storing the keys.
+    - name: Consistent hashing
+      how: Hashes keys to servers instead of slots, and moves few keys when the set of servers changes.
+---
+
+## [concept] Hash tables
+
+**A hash table turns a key into a slot index. A lookup costs one hash plus the slots it reads, and that stays at one or two while the hash spreads the keys and the table never gets too full.**
+
+A <Term id="hash-table">hash table</Term> is an array of slots and a <Term id="hash-function">hash function</Term>. To find a key, hash it, take the hash modulo the array size, and look in that slot. Two keys can land in the same slot, a collision, so the table needs a rule for where the second one goes, and a lookup may read a few slots before it finds the key or proves it absent.
+
+<Depth level={2}>
+The number that predicts the cost is the <Term id="load-factor">load factor</Term>, keys divided by slots. With <Term id="separate-chaining">separate chaining</Term>, each slot holds a list, and an average list has load-factor many keys. With <Term id="open-addressing">open addressing</Term>, keys live in the array itself and a collision moves on to another slot. Either way, a table that doubles its size whenever the load factor passes a cap keeps the average lookup at a small constant, whatever the number of keys.
+</Depth>
+
+<Depth level={3}>
+The textbook analysis (CLRS chapter 11) assumes simple uniform hashing: each key is equally likely to land in any slot, independently of the others. Under that assumption a miss in a chained table compares α keys on average and a hit about 1 + α/2, for load factor α. For <Term id="linear-probing">linear probing</Term>, Knuth's result is about ½(1 + 1/(1 − α)) slots for a hit and ½(1 + 1/(1 − α)²) for a miss. At α = 0.5 a miss reads 2.5 slots; at 0.9 it reads about 50.
+</Depth>
+
+## [problem] A render cache keyed by tenant
+
+A storefront platform renders product pages and caches the HTML in memory. The cache keeps each tenant's pages together, so purging a tenant after a theme change is one delete. A lookup asks the map for the tenant and then finds the page by path.
+
+Read the code once. It looks like O(1): there is a map right there. Each tenant has a few hundred pages, so the scan never shows up in a profile.
+
+<Depth level={2}>
+The map only sees the tenant. In Go and TypeScript the page is found by scanning the tenant's list; in Python and Rust the key type's hash covers only the tenant field, so every page of a tenant collides into one chain inside the map. Either way, the work per lookup grows with the number of pages per tenant, and nothing in the API shows it.
+</Depth>
+
+<Depth level={3}>
+The Python and Rust versions are legal. A hash only has to give equal keys equal hashes, and two keys with the same tenant still hash the same. The map stays correct: after a hash match it compares the full key. It is just slow, which is the worst kind of bug, because no test fails.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** move the largest customer, 50,000 storefront pages, onto the shared render cache.
+
+The marked lines warm the new tenant's pages at deploy time. Each put scans every page already stored for that tenant, so warming 50,000 pages costs about 1.25 billion comparisons, and the deploy hangs. Once it is warm, every page view for that tenant scans 25,000 entries on average. Other tenants stay fast, which makes the slowdown look like it is about that customer's traffic.
+
+<Depth level={2}>
+Profiles point at the map lookup itself (in Python and Rust) or at the list scan (in Go and TypeScript). Adding servers does not help: every replica has the same table shape. Pre-sizing the map does not help either: a bigger table gives the tenant's pages more empty slots, but they all still hash to one of them.
+</Depth>
+
+<Depth level={3}>
+This is the same shape as <Term id="hash-flooding">hash flooding</Term>. In 2011 researchers showed that the request parsers of several web platforms put untrusted parameter names into tables with a fixed, public hash, so one request full of crafted names could tie up a CPU core for a long time. Here no one is attacking; the key design produced the collisions on its own.
+</Depth>
+
+## [morph] Hash the whole key
+
+Drag the slider. The magic O(1) box becomes the real mechanism: a hash of the whole key, a slot array that stays partly empty, and a resize when it fills up.
+
+The fix is the key, not the map. Hash every field that equality compares, so pages of one tenant land all over the table. Purging a tenant then needs its own index from tenant to keys, a second map that is cheap to keep.
+
+<Depth level={2}>
+Know the count? Pre-size the table: `make(map[K]V, n)` in Go, `HashMap::with_capacity(n)` in Rust. Warming then never resizes, which removes the slow inserts from deploys. Python's `dict` and JavaScript's `Map` have no capacity argument; they grow as you insert, which is still O(1) per insert on average.
+</Depth>
+
+<Depth level={3}>
+Production tables differ from the textbook mostly in collision handling. A <Term id="swiss-table">Swiss table</Term> (Go since 1.24, Rust's hashbrown) splits the hash: the high bits pick a group of 8 or 16 slots, and the low 7 bits are stored in one control byte per slot. A lookup compares its 7 bits against a whole group at once with one wide comparison and only checks the keys whose bytes match. That makes a load factor of 7/8 cheap. CPython uses open addressing with a perturbed probe sequence and resizes at 2/3. V8 chains through an entries array kept in insertion order.
+</Depth>
+
+## [walk] Follow one lookup
+
+One get, then one resize, then the big tenant's pages. Use the numbered buttons.
+
+<Depth level={2}>
+Resizing is why "O(1) amortised" carries the word amortised. A doubling table moves n keys when it grows from n to 2n slots, so the total moving work over n inserts is at most n + n/2 + n/4 … < 2n. The average per insert is constant, but one insert in the sequence pays for all of it. Latency-sensitive code pre-sizes, or uses a design that grows in pieces: Go splits one 1,024-slot table at a time.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go map iteration starts at a random position and the hash is seeded per map, so two runs never agree on order. Code that sorts keys before printing or hashing a map is not being fussy.</Lang>
+<Lang only="python">A dict lookup hashes the key once and caches it in the entry, so a resize reinserts entries without calling `__hash__` again. Strings also cache their hash on the object.</Lang>
+<Lang only="typescript">A string key is hashed once and the hash is cached on the string, so the cost of `keyOf` is building the string, not hashing it repeatedly.</Lang>
+<Lang only="rust">hashbrown stores no hash per entry; a resize recomputes each key's hash. A slow hasher makes resizes slow too, which is another reason to `with_capacity` when you can.</Lang>
+</Depth>
+
+## [again] The same request, with the whole key hashed
+
+Warming 50,000 pages is now 50,000 puts of one or two slot reads each, a few milliseconds in total. A page view for the big tenant costs the same as for a small one. The test pins the property that matters: keys that differ only in path must not share a hash.
+
+<Depth level={2}>
+The tenant index costs one extra set entry per page. That is the price of a cheap purge, and it is paid in memory, not in lookup time. If purges are rare, scanning all keys once on purge is a reasonable alternative.
+</Depth>
+
+<Depth level={3}>
+A seeded hash also protects this cache from crafted paths. If page paths come from user input and the hash were fixed and public, an attacker could still pick paths that collide. Go, Python, V8 and Rust all seed their default hashes for that reason; a custom hash you write yourself should take a seed too.
+</Depth>
+
+## [play] Fill a table and break it
+
+One table of cache keys. Insert keys, change the collision strategy and the load cap, and watch how many slots a lookup reads. Then break it three ways: a hash that ignores the path, keys crafted against a weak hash, and a delete that leaves a hole.
+
+Click any slot to look up or delete the key in it.
+
+## [lens] The map in each language
+
+All four languages ship a hash table, and since Go 1.24 two of them are Swiss tables. What differs is how you make a composite key, how the hash is seeded, and whether you can pre-size.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+The rule that holds everywhere: keys that compare equal must hash equal, and a key must not change while it is in a map. Change a field that the hash uses and the entry is stranded in a slot no lookup will ever visit.
+</Depth>
+
+<Depth level={3}>
+| | Go | Python | TypeScript (V8) | Rust |
+|---|---|---|---|---|
+| Structure | Swiss tables, groups of 8 | compact dict, open addressing | ordered chaining | Swiss table (hashbrown) |
+| Grows at | 7/8 full, one table at a time | 2/3 full | when the entries array fills | 7/8 full |
+| Default hash | seeded per map | SipHash, seeded per process | seeded string hash, random object ids | SipHash-1-3, seeded per map |
+| Iteration order | randomised | insertion | insertion | arbitrary |
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="hash-tables" />
+
+### What a lookup costs
+
+Expected slots read under uniform hashing, for load factor α:
+
+| α | Chaining, hit | Chaining, miss | Linear probing, hit | Linear probing, miss |
+|---|---|---|---|---|
+| 0.5 | 1.25 | 0.5 | 1.5 | 2.5 |
+| 0.75 | 1.4 | 0.75 | 2.5 | 8.5 |
+| 0.9 | 1.45 | 0.9 | 5.5 | 50.5 |
+
+These hold only when the hash spreads the keys. If many keys share one hash, every one of them costs a scan of the others, at any load factor.

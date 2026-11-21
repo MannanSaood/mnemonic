@@ -1,0 +1,28 @@
+# Terms introduced by algorithms/hash-tables.
+- id: hash-table
+  term: Hash table
+  short: An array of slots plus a hash function that turns a key into a slot index, so insert, lookup and delete read only a slot or two on average.
+- id: hash-function
+  term: Hash function
+  short: A function from a key to a fixed-size number. Equal keys must give equal hashes; a good one spreads different keys evenly over the output.
+- id: load-factor
+  term: Load factor
+  short: Stored keys divided by slots. It sets the expected cost of a lookup, so tables resize when it passes a cap such as 2/3 or 7/8.
+- id: separate-chaining
+  term: Separate chaining
+  short: Collision handling where each slot holds a list of the keys that hash to it. A lookup scans one list.
+- id: open-addressing
+  term: Open addressing
+  short: Collision handling where every key lives in the slot array itself; a key whose slot is taken goes to the next slot its probe sequence names.
+- id: linear-probing
+  term: Linear probing
+  short: Open addressing that tries the next slot, then the one after, until it finds the key or an empty slot. Fast on caches, but filled runs merge into long clusters.
+- id: tombstone
+  term: Tombstone
+  short: A marker left in a deleted open-addressing slot. Lookups walk past it and inserts may reuse it, so probe runs through the slot stay connected.
+- id: swiss-table
+  term: Swiss table
+  short: An open-addressing hash table design from Google's Abseil that stores a byte of each key's hash in a control array and checks a whole group of slots at once.
+- id: hash-flooding
+  term: Hash flooding
+  short: A denial-of-service attack that sends keys chosen to collide in a server's hash tables, turning each insert into a scan. Seeded hashes defend against it.
