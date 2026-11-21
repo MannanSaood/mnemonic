@@ -1,0 +1,498 @@
+---
+title: Tuning the GC
+track: go-internals
+group: Memory
+order: 20
+summary: GOGC trades memory for GC CPU everywhere. GOMEMLIMIT tells the GC how much memory it really has, so it works harder only when memory is short.
+intent: Know what GOGC and GOMEMLIMIT do to heap size and GC CPU, how to set them for a container, and why no setting saves a live heap that does not fit.
+changeRequest: Fetch batches of 50,000 records instead of 10,000, to cut queue round trips.
+languages: [go, python, typescript, rust]
+glossary: [gogc, gomemlimit, gc-pacer, gc-death-spiral, memory-cgroup, oom-killer]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [go-internals/gc-tricolor]
+skills: [memory-management, performance]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: gc-tuning
+  scenarios:
+    - try: "Make a prediction, then run the 300 MiB burst with GOGC 100 and no limit."
+      notice: "The heap target follows the live heap to about 600 MiB. Memory crosses the container's 512 MiB at 2.84 s and the pod is killed, with GC CPU never above 8%."
+    - try: "Set GOMEMLIMIT to 460 MiB and run the same burst."
+      notice: "Memory stops at about 462 MiB. The GC runs 23 times instead of 10 and takes up to 17% of CPU in the worst second. Outside the burst nothing changes."
+    - try: "Remove the limit and lower GOGC to 50 instead."
+      notice: "It survives too, at 490 MiB, but the GC runs 39 times and costs more CPU even while the service is quiet."
+    - try: "Set the limit back to 460 MiB and raise the burst to 380 MiB, then to 440 MiB."
+      notice: "At 380 MiB the GC runs almost back to back and takes 47% of CPU: the program runs at half speed. At 440 MiB the limiter holds the GC back, memory passes the limit, and the pod dies anyway."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: worker
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: ingest worker, sub: { go: "batchSize", python: batch_size, typescript: batchSize, rust: batch_size } }
+      after:  { x: 12, y: 24, w: 112, h: 48, title: ingest worker, sub: { go: "50,000 per batch", python: "chunks of 5,000", typescript: "chunks of 5,000", rust: "chunks of 5,000" } }
+    - id: runtime
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: Go GC, sub: "frees memory when needed?" }
+      after:  { x: 150, y: 24, w: 150, h: 48, title: GC pacer, sub: sets the target }
+    - id: limit
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 100, w: 110, h: 48, title: "" }
+      after:  { x: 330, y: 24, w: 220, h: 48, title: GOMEMLIMIT, sub: "90% of the container" }
+    - id: live
+      kind: concrete
+      before: { x: 170, y: 56, w: 230, h: 30, title: "GC keeps memory low" }
+      after:  { x: 12, y: 190, w: 96, h: 48, title: live heap, sub: "300 MiB" }
+    - id: goal
+      kind: concrete
+      before: { x: 170, y: 98, w: 230, h: 30, title: "heap = live data" }
+      after:  { x: 120, y: 190, w: 100, h: 48, title: heap target, sub: "live × 2" }
+    - id: cpu
+      kind: concrete
+      before: { x: 170, y: 140, w: 230, h: 30, title: "512 MiB is plenty" }
+      after:  { x: 232, y: 190, w: 96, h: 48, title: GC CPU, sub: more cycles }
+    - id: oom
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 200, w: 230, h: 30, title: "50,000-record batches" }
+      after:  { x: 340, y: 190, w: 210, h: 48, title: OOM killer, sub: "container: 512 MiB" }
+  edges:
+    - { from: worker, to: live, label: keeps }
+    - { from: runtime, to: goal, label: sets }
+    - { from: limit, to: goal, label: caps }
+    - { from: goal, to: cpu, label: lower = more }
+    - { from: oom, to: goal, label: kills above }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: ingest.go · main.go
+      source: |
+        // ingest.go
+        func (w *Worker) Run(ctx context.Context) error {
+            for {
+                batch, err := w.queue.Fetch(ctx, w.batchSize)
+                if err != nil {
+                    return err
+                }
+                recs := make([]Record, 0, len(batch))
+                for _, msg := range batch {
+                    var r Record
+                    if err := json.Unmarshal(msg.Body, &r); err != nil {
+                        continue
+                    }
+                    recs = append(recs, r)
+                }
+                if err := w.store.InsertMany(ctx, recs); err != nil {
+                    return err
+                }
+            }
+        }
+
+        // main.go (deployment: memory limit 512Mi, no GOGC or GOMEMLIMIT)
+        w := &Worker{queue: q, store: db, batchSize: 10_000}
+      roles: { worker: [2, 20], live: [8, 14], goal: [22, 22], oom: [23, 23] }
+      change:
+        - { line: 23, replace: "w := &Worker{queue: q, store: db, batchSize: 50_000} // live heap peaks near 300 MiB" }
+    after:
+      file: main.go
+      source: |
+        // main.go: tell the GC how much memory the container really has.
+        func main() {
+            // memory.max of the container's cgroup: 512 MiB here
+            if limit, ok := cgroupMemoryMax(); ok {
+                // leave 10% for memory the runtime does not manage (cgo, the binary)
+                debug.SetMemoryLimit(limit * 9 / 10)
+            }
+            // GOGC stays at 100: the limit only works harder during bursts
+            w := &Worker{queue: q, store: db, batchSize: 50_000}
+            log.Fatal(w.Run(context.Background()))
+        }
+      roles: { limit: [4, 7], runtime: [6, 6], goal: [6, 6], oom: [3, 4], worker: [9, 10], live: [9, 9], cpu: [8, 8], target: [8, 8], trigger: [8, 8], cap: [4, 7], spiral: [9, 9], soft: [5, 6] }
+    again:
+      file: main.go
+      source: |
+        // the same 50,000-record burst with the limit at 460 MiB:
+        // the target stops at the limit, cycles come about twice as often
+        // during the burst, and memory peaks near 460 MiB instead of 600.
+        // Between bursts the GC runs exactly as before.
+    cost:
+      before: { text: "target ~600 MiB · OOMKilled", value: 0.95 }
+      after: { text: "peak ~460 MiB · GC ≤ 17% CPU", value: 0.3 }
+    lens:
+      need: 3
+      needLabel: Two knobs
+      note: 'GOGC sets the heap target as a multiple of the live heap, everywhere and always. GOMEMLIMIT caps that target, so the GC runs more often only when memory is short. In a container, set the limit about 10% under the container limit and leave GOGC alone unless a profile says otherwise.'
+      seenIn: '`debug.SetGCPercent`, `debug.SetMemoryLimit`, `/gc/heap/goal:bytes` and `/gc/gomemlimit:bytes` in `runtime/metrics`. The automemlimit package sets the limit from the cgroup. Before Go 1.19, teams used a memory ballast or Uber''s GOGCTuner to the same end.'
+
+  python:
+    before:
+      file: ingest.py · main.py
+      source: |
+        # ingest.py
+        def run(queue: Queue, db: Db, batch_size: int) -> None:
+            while True:
+                batch = queue.fetch(batch_size)
+                recs = []
+                for msg in batch:
+                    try:
+                        recs.append(json.loads(msg.body))
+                    except json.JSONDecodeError:
+                        continue
+                db.insert_many(recs)
+
+        # main.py (container memory limit 512Mi)
+        run(queue, db, batch_size=10_000)
+      roles: { worker: [2, 11], live: [5, 8], goal: [13, 13], oom: [14, 14] }
+      change:
+        - { line: 14, replace: "run(queue, db, batch_size=50_000)  # live data peaks near 300 MiB" }
+    after:
+      file: ingest.py
+      source: |
+        def run(queue: Queue, db: Db, batch_size: int) -> None:
+            while True:
+                batch = queue.fetch(batch_size)
+                for chunk in itertools.batched(batch, 5_000):
+                    recs = []
+                    for msg in chunk:
+                        try:
+                            recs.append(json.loads(msg.body))
+                        except json.JSONDecodeError:
+                            continue
+                    db.insert_many(recs)
+                    # rebinding recs drops these 5,000 dicts at once:
+                    # reference counting frees them without any collection
+      roles: { limit: [4, 4], runtime: [12, 13], goal: [4, 4], oom: [4, 4], worker: [1, 11], live: [5, 8], cpu: [12, 13], target: [12, 13], trigger: [12, 13], cap: [4, 4], spiral: [5, 8], soft: [12, 13] }
+    again:
+      file: ingest.py
+      source: |
+        # the same 50,000-record batches, decoded 5,000 at a time:
+        # only one chunk of dicts is alive at once, so peak memory
+        # is the raw batch plus one chunk, far under 512 MiB.
+    cost:
+      before: { text: "300 MiB live · close to the limit", value: 0.8 }
+      after: { text: "one chunk live · low peak", value: 0.25 }
+    lens:
+      need: 2
+      needLabel: Shape the live data
+      note: 'CPython frees each object when its last reference goes, so memory tracks live data closely and there is no heap target to tune. Peak memory is what you hold at once. `gc.set_threshold` only changes how often the cycle collector runs, not how much memory is kept.'
+      seenIn: '`gc.set_threshold`, `gc.freeze`, `tracemalloc` to find what is holding memory, `itertools.batched` (3.12).'
+
+  typescript:
+    before:
+      file: ingest.ts · main.ts
+      source: |
+        // ingest.ts
+        export async function run(queue: Queue, db: Db, batchSize: number) {
+          for (;;) {
+            const batch = await queue.fetch(batchSize);
+            const recs: Rec[] = [];
+            for (const msg of batch) {
+              try { recs.push(JSON.parse(msg.body)); } catch { /* skip bad record */ }
+            }
+            await db.insertMany(recs);
+          }
+        }
+
+        // main.ts (container memory limit 512Mi)
+        await run(queue, db, 10_000);
+      roles: { worker: [2, 11], live: [5, 8], goal: [13, 13], oom: [14, 14] }
+      change:
+        - { line: 14, replace: "await run(queue, db, 50_000); // live heap peaks near 300 MiB" }
+    after:
+      file: ingest.ts
+      source: |
+        // Started with: node --max-old-space-size=384 dist/main.js
+        // V8 collects harder as old space nears 384 MiB, under the 512Mi limit.
+        export async function run(queue: Queue, db: Db, batchSize: number) {
+          for (;;) {
+            const batch = await queue.fetch(batchSize);
+            for (let i = 0; i < batch.length; i += 5_000) {
+              const recs: Rec[] = [];
+              for (const msg of batch.slice(i, i + 5_000)) {
+                try { recs.push(JSON.parse(msg.body)); } catch { /* skip bad record */ }
+              }
+              await db.insertMany(recs); // only 5,000 parsed records alive at once
+            }
+          }
+        }
+      roles: { limit: [1, 2], runtime: [1, 2], goal: [1, 2], oom: [2, 2], worker: [3, 14], live: [7, 11], cpu: [1, 2], target: [1, 2], trigger: [1, 2], cap: [1, 2], spiral: [6, 11], soft: [11, 11] }
+    again:
+      file: ingest.ts
+      source: |
+        // the same 50,000-record batches, parsed 5,000 at a time:
+        // old space stays far under 384 MiB, and if it ever nears it,
+        // V8 fails with "heap out of memory" instead of a silent OOM kill.
+    cost:
+      before: { text: "heap grows past 512Mi · OOMKilled", value: 0.9 }
+      after: { text: "one chunk live · bounded heap", value: 0.25 }
+    lens:
+      need: 2
+      needLabel: One knob, plus shape
+      note: 'V8 has a heap limit, set with `--max-old-space-size`. Set it below the container limit so V8, not the kernel, decides when memory is short. Near its limit V8 also spirals: back-to-back full GCs, then "Ineffective mark-compacts near heap limit" and a crash.'
+      seenIn: '`--max-old-space-size`, `v8.getHeapStatistics().heap_size_limit`, `--trace-gc`, `NODE_OPTIONS`.'
+
+  rust:
+    before:
+      file: ingest.rs · main.rs
+      source: |
+        // ingest.rs
+        async fn run(queue: Queue, db: Db, batch_size: usize) -> anyhow::Result<()> {
+            loop {
+                let batch = queue.fetch(batch_size).await?;
+                let recs: Vec<Record> = batch
+                    .iter()
+                    .filter_map(|m| serde_json::from_slice(&m.body).ok())
+                    .collect();
+                db.insert_many(&recs).await?;
+            }
+        }
+
+        // main.rs (container memory limit 512Mi)
+        run(queue, db, 10_000).await?;
+      roles: { worker: [2, 11], live: [5, 8], goal: [13, 13], oom: [14, 14] }
+      change:
+        - { line: 14, replace: "run(queue, db, 50_000).await?; // live data peaks near 300 MiB" }
+    after:
+      file: ingest.rs
+      source: |
+        async fn run(queue: Queue, db: Db, batch_size: usize) -> anyhow::Result<()> {
+            loop {
+                let batch = queue.fetch(batch_size).await?;
+                for chunk in batch.chunks(5_000) {
+                    let recs: Vec<Record> = chunk
+                        .iter()
+                        .filter_map(|m| serde_json::from_slice(&m.body).ok())
+                        .collect();
+                    db.insert_many(&recs).await?;
+                } // each chunk's records are dropped here: peak is one chunk
+            }
+        }
+      roles: { limit: [4, 4], runtime: [10, 10], goal: [4, 4], oom: [4, 4], worker: [1, 12], live: [5, 8], cpu: [10, 10], target: [10, 10], trigger: [10, 10], cap: [4, 4], spiral: [5, 8], soft: [10, 10] }
+    again:
+      file: ingest.rs
+      source: |
+        // the same 50,000-record batches, decoded 5,000 at a time:
+        // records are freed at the end of each chunk, with no collector,
+        // so memory is the raw batch plus one chunk.
+    cost:
+      before: { text: "300 MiB live · no headroom", value: 0.7 }
+      after: { text: "one chunk live · predictable", value: 0.2 }
+    lens:
+      need: 1
+      needLabel: Not needed
+      note: 'No garbage collector, so no heap target and no GC CPU. Memory is live data plus what the allocator keeps for reuse. Peak memory is set by what you hold at once, which makes it predictable and entirely your design.'
+      seenIn: '`Vec::chunks`, `with_capacity` and `shrink_to_fit`. jemalloc and mimalloc both have settings for how quickly freed memory goes back to the OS.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: At the end of each cycle the pacer sets the next heap target, the live heap it just marked times 1 + GOGC/100, plus a share for stacks and globals. With 300 MiB live and GOGC 100, that is about 600 MiB.
+    nodes: [runtime, goal, live]
+    edges: [runtime>goal]
+    role: target
+  - text: It starts the next cycle early enough that marking, at about a quarter of the CPU, finishes as the heap reaches the target. Nothing in that sum knows about the container's 512 MiB.
+    nodes: [goal, oom]
+    edges: [oom>goal]
+    role: trigger
+  - text: GOMEMLIMIT caps the target at the limit, minus the runtime's other memory. In a burst, cycles come more often and memory stops near 460 MiB.
+    nodes: [limit, goal]
+    edges: [limit>goal]
+    role: cap
+  - text: If the live heap itself nears the limit, each cycle frees almost nothing and the next is due at once. GC CPU climbs toward all of it. That is the death spiral.
+    nodes: [goal, cpu]
+    edges: [goal>cpu]
+    role: spiral
+  - text: The limit is soft. The GC holds itself to about half the CPU and lets memory pass the limit instead. The program runs at about half speed, and if the live heap keeps growing, the kernel kills it anyway.
+    nodes: [cpu, oom, worker]
+    edges: []
+    role: soft
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: What does raising GOGC from 100 to 200 do?
+    options:
+      - text: The GC runs about half as often, and the heap may grow to about three times the live heap.
+        correct: true
+        why: Right. The target is the live heap times 1 + GOGC/100. Less GC CPU, more memory.
+      - text: The GC runs twice as often and memory use drops.
+        why: That is lowering GOGC. A higher value lets the heap grow further before each cycle.
+      - text: It sets the memory limit to 200 MiB.
+        why: GOGC is a percentage of the live heap. The memory limit is GOMEMLIMIT, a separate setting.
+  engineer:
+    question: An ingest service's live heap peaks at 300 MiB in a 512 MiB container with default GC settings, and the pod is OOM-killed. What is the best first change?
+    options:
+      - text: Set GOMEMLIMIT to about 460 MiB and keep GOGC at 100.
+        correct: true
+        why: Right. The GC now works harder only when memory nears the limit, and the burst fits. Between bursts nothing changes.
+      - text: Set GOGC=off so the GC stops wasting CPU.
+        why: With no limit that grows the heap until the pod dies sooner. GOGC=off only makes sense together with a memory limit, in a process that owns its container.
+      - text: Raise GOGC to 200 so the GC has more room.
+        why: That raises the target to three times the live heap, about 900 MiB. The pod dies earlier.
+  deep:
+    question: GOMEMLIMIT is 460 MiB and the live heap grows to 440 MiB. What does the runtime do?
+    options:
+      - text: The GC runs nearly back to back until it hits its CPU cap of about 50%, then lets memory exceed the limit.
+        correct: true
+        why: Right. The limit is soft. The GC CPU limiter keeps the program running at about half speed instead of stalling it, and the container may still kill the process if memory keeps growing.
+      - text: Allocations start failing with an out-of-memory error the program can handle.
+        why: Go has no recoverable allocation failure. The limit only changes when the GC runs.
+      - text: The runtime stops all goroutines until memory falls below the limit.
+        why: Nothing is stopped. The GC runs more, within its CPU cap, and memory may go over the limit.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: GOGC
+      example: "GOGC=100, debug.SetGCPercent"
+      job: Sets the heap target as live heap × (1 + GOGC/100). Off disables it.
+    - role: GOMEMLIMIT
+      example: "GOMEMLIMIT=460MiB, debug.SetMemoryLimit"
+      job: Caps the target so total runtime memory stays under the limit, softly.
+    - role: Pacer
+      example: runtime/mgcpacer.go
+      job: Computes the target and starts each cycle so marking ends near it.
+    - role: GC CPU limiter
+      example: about 50% over a short window
+      job: Stops the GC from taking more, letting memory exceed the limit instead.
+  useWhen:
+    - A Go service runs in a container with a memory limit (set GOMEMLIMIT a little under it).
+    - GC CPU is high and memory is plentiful (raise GOGC, or GOGC=off with a limit if the process owns its container).
+    - A profile shows the live heap itself is near the limit (cut what you hold; no knob will help).
+  avoidWhen:
+    - The program shares memory with other processes it does not control, such as a CLI tool or a desktop app. A limit there can push the GC into thrashing.
+    - You have not profiled allocations yet. Fewer allocations beat any setting.
+  tradeoffs:
+    - Higher GOGC means less GC CPU and more memory, all the time.
+    - A memory limit costs nothing until memory is short, then costs GC CPU, up to about half of it.
+    - GOGC=off with a limit gives the fewest cycles, but a growing live heap goes straight into the death spiral.
+  lookalikes:
+    - name: "Node's --max-old-space-size"
+      how: A hard heap limit for V8. Near it V8 runs full GCs back to back, then crashes with a heap-out-of-memory error.
+    - name: "JVM -Xmx and GC ergonomics"
+      how: A hard heap maximum; the JVM throws OutOfMemoryError rather than exceeding it.
+    - name: "CPython gc.set_threshold"
+      how: Changes how often the cycle collector runs. Memory is mostly freed by reference counting, so it rarely matters for peak memory.
+---
+
+## [concept] Tuning the GC
+
+**<Term id="gogc">GOGC</Term> decides how big the heap may grow between cycles, as a multiple of the live heap. <Term id="gomemlimit">GOMEMLIMIT</Term> caps that size, so the GC runs more often only when memory is short.**
+
+More memory means fewer cycles and less GC CPU. Less memory means the reverse. The two knobs choose where on that line you sit.
+
+<Depth level={2}>
+The <Term id="gc-pacer">pacer</Term> sets the target at the end of each cycle: live heap plus (live heap plus roots) times GOGC/100. With the default of 100 the heap may double. GOMEMLIMIT, added in Go 1.19, is a soft cap on all memory the runtime manages. Most services in containers should set the limit a little under the container's and leave GOGC alone.
+</Depth>
+
+<Depth level={3}>
+The GC's CPU cost per cycle depends mostly on the live heap it must mark. Its frequency depends on how fast you allocate and how much room the target leaves. Double GOGC and you roughly halve the cycles, and so the GC CPU, at the price of more memory. A memory limit shrinks the room only when total memory approaches it.
+</Depth>
+
+## [problem] An ingest worker in a container
+
+A worker pulls records from a queue in batches, decodes them, and inserts them into a database. It runs on Kubernetes with a 512 MiB memory limit and no GC settings. With 10,000-record batches its live heap peaks around 60 MiB, and memory never comes near the limit.
+
+The model behind it: the GC frees memory, so the process uses about as much as it holds.
+
+<Depth level={2}>
+At that size the default target of twice the live heap is far below 512 MiB. Nobody had a reason to think about GOGC.
+</Depth>
+
+<Depth level={3}>
+The Go runtime does not read the container's memory limit. Unless told, the GC sizes the heap only from the live heap and GOGC.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** fetch batches of 50,000 records instead of 10,000, to cut queue round trips.
+
+The marked line is the only change. Now the live heap peaks near 300 MiB during a burst. The pacer sets the next target at about 600 MiB, plus stacks and runtime memory, and the heap grows toward it. At 512 MiB the kernel's <Term id="oom-killer">OOM killer</Term> ends the process. The pod restarts with `OOMKilled`, picks up the same batch, and dies again.
+
+<Depth level={2}>
+The confusing part: GC CPU was low the whole time, and the live heap was only 300 MiB. The GC did exactly what GOGC told it to. It had no idea the <Term id="memory-cgroup">memory cgroup</Term> would kill it first.
+</Depth>
+
+<Depth level={3}>
+Lowering GOGC to 50 also fits the burst, but it makes every cycle come sooner all the time, quiet periods included. Setting GOMEMLIMIT changes nothing until memory is actually short.
+</Depth>
+
+## [morph] From "the GC keeps memory low" to "the GC grows to a target"
+
+Drag the slider. The picture of a GC that keeps memory close to live data becomes the pacer: it lets the heap grow to a target set from the live heap and GOGC, and only a memory limit makes that target notice the container.
+
+The code sets the limit from the container's cgroup at 90%, and keeps GOGC at its default.
+
+<Depth level={2}>
+Leave headroom. The limit counts memory the Go runtime manages: heap, stacks, runtime structures. It does not count memory used by C libraries through cgo, or the parts of the binary mapped from disk. The GC guide suggests 5 to 10% headroom.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`GOMEMLIMIT=460MiB` in the environment does the same as `debug.SetMemoryLimit`. Setting it from code lets you read the cgroup's `memory.max` at startup, so one image works with any container size.</Lang>
+<Lang only="python">There is no heap target to cap. The fix is to hold less at once: decode and insert in chunks, and let reference counting free each chunk as soon as it is replaced.</Lang>
+<Lang only="typescript">`--max-old-space-size` is in MiB. It limits V8's old space only; buffers, new space and native memory come on top, which is why 384 leaves room under a 512Mi container.</Lang>
+<Lang only="rust">There is nothing to configure. Memory is set by what the code holds, so the fix is the same as in Python: process in chunks.</Lang>
+</Depth>
+
+## [walk] Follow the heap through a burst
+
+One burst, from the pacer setting a target to the limit stepping in, and what happens if the live heap keeps climbing. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The target formula and the minimum heap of 4 MiB are in the GC guide; the code is `runtime/mgcpacer.go`. When the memory limit is lower than the GOGC target, the pacer uses the limit minus memory it cannot free. The CPU limiter, `gcCPULimiter`, caps GC CPU at about 50% over a window of 2 × GOMAXPROCS CPU-seconds, so a bad limit slows a program by about 2× at most.</Lang>
+<Lang only="python">CPython's cycle collector triggers on allocation counts, not on memory size: the youngest generation is collected when allocations minus deallocations of tracked objects pass its threshold, which `gc.get_threshold()` shows.</Lang>
+<Lang only="typescript">As old space nears `--max-old-space-size`, V8 runs full mark-compacts more and more often, then gives up with "Ineffective mark-compacts near heap limit".</Lang>
+<Lang only="rust">The global allocator (the system malloc, jemalloc or mimalloc) may keep freed pages for reuse, so RSS can stay above live data after a burst. That is a fragmentation and return-to-OS question, not a GC one.</Lang>
+</Depth>
+
+## [again] The 50,000-record batch, the second time
+
+The same burst with GOMEMLIMIT at 460 MiB. The heap target stops at the limit, so cycles come about twice as often during the burst. Memory peaks near 460 MiB, GC CPU stays under a fifth, and the pod survives. Between bursts, the GC runs exactly as it did before.
+
+<Depth level={2}>
+Watch `/gc/heap/goal:bytes` and `/gc/gomemlimit:bytes` from `runtime/metrics`. If the goal sits at the limit for long stretches, the live heap is too close to it, and the next step is to hold less, not to tune more.
+</Depth>
+
+<Depth level={3}>
+If the live heap rises to the limit, the GC enters the <Term id="gc-death-spiral">death spiral</Term>: every cycle frees almost nothing and the next is due at once. The CPU limiter keeps the program alive at about half speed and lets memory exceed the limit. Alert on GC CPU, not only on memory.
+</Depth>
+
+## [play] Run the burst
+
+A service in a 512 MiB container goes through a burst of live data. Set GOGC and GOMEMLIMIT and watch the heap sawtooth, how often the GC runs, how much CPU it takes, and whether the pod survives.
+
+## [lens] How each language handles memory pressure
+
+Go gives you a heap target and a soft limit. Node gives you a hard heap limit. Python and Rust have no heap target at all: memory follows what you hold.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+In all four, the most effective fix for a memory spike is to hold less at once. The knobs decide what happens at the edge.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="gc-tuning" />
+
+### Which knob for which problem
+
+| Symptom | Setting |
+|---|---|
+| OOM-killed in a container, live heap well under the limit | GOMEMLIMIT about 10% under the container limit |
+| GC CPU high, plenty of spare memory | Raise GOGC, or GOGC=off with GOMEMLIMIT if the process owns its container |
+| Memory too high, CPU to spare, no container limit | Lower GOGC |
+| Live heap close to the limit, GC CPU near 50% | No knob helps: hold less, or give the container more memory |

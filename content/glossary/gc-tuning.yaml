@@ -1,0 +1,13 @@
+# Terms introduced by the Go GC tuning lesson.
+- id: gogc
+  term: GOGC
+  short: Go's GC setting for how far the heap may grow past the live heap before the next cycle, as a percentage. The default, 100, lets it double. Higher means fewer cycles and more memory; off disables the GC unless a memory limit applies.
+- id: gomemlimit
+  term: GOMEMLIMIT
+  short: A soft limit on the Go runtime's total memory, added in Go 1.19. As memory nears it, the GC runs more often. It is soft, so the runtime exceeds it rather than spend more than about half the CPU on GC.
+- id: gc-pacer
+  term: GC pacer
+  short: The part of the Go runtime that sets the heap target and decides when to start each cycle, so marking finishes about when the heap reaches the target.
+- id: gc-death-spiral
+  term: GC death spiral
+  short: The live heap sits so close to the memory limit that each cycle frees almost nothing, and the GC runs back to back, eating the CPU the program needs. Also called GC thrashing.
