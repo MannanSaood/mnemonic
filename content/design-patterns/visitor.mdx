@@ -1,0 +1,610 @@
+---
+title: Visitor
+track: design-patterns
+group: Behavioral
+order: 50
+summary: Put each operation over a set of types in its own object, with one method per type, so new operations need no edits to the types.
+intent: Adding an operation over a stable set of types should mean writing one new unit, not editing every type.
+changeRequest: Finance wants a monthly cost estimate for every stack before it deploys.
+languages: [go, python, typescript, rust]
+glossary: [double-dispatch, expression-problem, exhaustive-match, open-closed, dynamic-dispatch]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/composite]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: visitor
+  scenarios:
+    - try: "Request 1: write Cost for every resource type in both designs, and watch the file names."
+      notice: "Methods on resources edits all four resource files. Visitor edits none and adds one file, CostVisitor."
+    - try: "Request 2: add Queue in both designs."
+      notice: "Now it flips. Methods on resources adds one new file. Visitor edits its interface and every visitor."
+    - try: "In request 2, declare VisitQueue, turn on empty default visits, and write nothing else in the Visitor design."
+      notice: "The build passes and the estimate is wrong: the queue costs $0 and is left out of the plan. Defaults hide the work the compiler was pointing at."
+    - try: "Click a resource under Trace and compare the two rows."
+      notice: "A method call dispatches once, on the resource. A visitor call dispatches twice: Accept picks by the resource's type, Visit by the visitor's."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: plan CLI, sub: calls methods }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: plan CLI, sub: picks a visitor }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 398, h: 244, title: resource types, sub: each type has every operation }
+      after:  { x: 140, y: 24, w: 170, h: 60, title: { go: Resource, python: Visitor.visit, typescript: Resource, rust: trait Resource }, sub: { go: "Accept(v) only", python: finds visit_<type>, typescript: "accept(v) only", rust: "accept(v) only" } }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 24, w: 180, h: 60, title: "" }
+      after:  { x: 370, y: 24, w: 180, h: 60, title: { go: Visitor, python: visit_<type>, typescript: Visitor, rust: trait Visitor }, sub: one method per type }
+    - id: validate
+      kind: concrete
+      before: { x: 166, y: 70, w: 366, h: 40, title: validate × 3 types, sub: one method in each type }
+      after:  { x: 300, y: 196, w: 76, h: 40, title: Validate }
+    - id: render
+      kind: concrete
+      before: { x: 166, y: 120, w: 366, h: 40, title: render × 3 types, sub: one method in each type }
+      after:  { x: 386, y: 196, w: 76, h: 40, title: Render }
+    - id: cost
+      kind: concrete
+      appears: change
+      before: { x: 166, y: 176, w: 366, h: 40, title: cost × 3 types, sub: plus the interface }
+      after:  { x: 472, y: 196, w: 76, h: 40, title: Cost }
+  edges:
+    - { from: client, to: context, label: walks }
+    - { from: context, to: strategy, label: calls back }
+    - { from: validate, to: strategy, kind: implements }
+    - { from: render, to: strategy, kind: implements, label: implements }
+    - { from: cost, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: resource.go · bucket.go · database.go · network.go
+      source: |
+        type Resource interface {
+            Validate() error
+            Render() map[string]any
+        }
+
+        // bucket.go
+        func (b *Bucket) Validate() error { return checkName(b.Name) }
+        func (b *Bucket) Render() map[string]any {
+            return map[string]any{"aws_s3_bucket": b.Name}
+        }
+
+        // database.go
+        func (d *Database) Validate() error { return checkSize(d.Class) }
+        func (d *Database) Render() map[string]any {
+            return map[string]any{"aws_db_instance": d.Name, "instance_class": d.Class}
+        }
+
+        // network.go: holds the other resources
+        func (n *Network) Validate() error {
+            for _, c := range n.Children {
+                if err := c.Validate(); err != nil {
+                    return err
+                }
+            }
+            return checkCIDR(n.CIDR)
+        }
+        func (n *Network) Render() map[string]any { /* n, then each child */ }
+      roles: { context: [1, 27], validate: [7, 7], render: [8, 10] }
+      change:
+        - { after: 3, add: ['    MonthlyCost() float64'] }
+        - { after: 10, add: ['func (b *Bucket) MonthlyCost() float64 { return b.GB * 0.023 }'] }
+        - { after: 16, add: ['func (d *Database) MonthlyCost() float64 { return hourly[d.Class] * 730 }'] }
+        - { after: 27, add: ['func (n *Network) MonthlyCost() float64 { /* NAT gateway + each child */ }'] }
+    after:
+      file: visitor.go · validate.go · plan.go
+      source: |
+        type Visitor interface {
+            VisitBucket(b *Bucket)
+            VisitDatabase(d *Database)
+            VisitNetwork(n *Network)
+        }
+
+        type Resource interface{ Accept(v Visitor) }
+
+        func (b *Bucket) Accept(v Visitor)   { v.VisitBucket(b) }
+        func (d *Database) Accept(v Visitor) { v.VisitDatabase(d) }
+        func (n *Network) Accept(v Visitor) {
+            v.VisitNetwork(n)
+            for _, c := range n.Children {
+                c.Accept(v)
+            }
+        }
+
+        // validate.go: one operation, every type, in one place
+        type Validate struct{ Errs []error }
+
+        func (x *Validate) VisitBucket(b *Bucket)     { x.add(checkName(b.Name)) }
+        func (x *Validate) VisitDatabase(d *Database) { x.add(checkSize(d.Class)) }
+        func (x *Validate) VisitNetwork(n *Network)   { x.add(checkCIDR(n.CIDR)) }
+
+        // plan.go: the caller picks the operation
+        v := &Validate{}
+        stack.Accept(v)
+      roles: { strategy: [1, 5], context: [7, 16], validate: [18, 23], client: [26, 27], traverse: [11, 16], accept: [10, 10], visit: [22, 22] }
+    again:
+      file: cost.go
+      source: |
+        // cost.go: a new file; no resource type changes
+        type Cost struct{ Monthly float64 }
+
+        func (x *Cost) VisitBucket(b *Bucket)     { x.Monthly += b.GB * 0.023 }
+        func (x *Cost) VisitDatabase(d *Database) { x.Monthly += hourly[d.Class] * 730 }
+        func (x *Cost) VisitNetwork(n *Network)   { x.Monthly += natGatewayMonthly }
+    cost:
+      before: { text: 4 lines · 4 files, value: 0.8 }
+      after: { text: 1 new file · 0 edits, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Go has no overloading, so each visit method has its own name, as here. Much Go code uses a type switch instead: `switch r := r.(type) { case *Bucket: … }`. It is shorter, but the compiler does not tell you when a new type is missing from a switch. A Visitor interface does.'
+      seenIn: '`go/ast.Walk(v, node)` walks a syntax tree and calls `v.Visit(node)` on each node; visitors then type-switch on the node. `ast.Inspect` is the same walk with a function.'
+
+  python:
+    before:
+      file: bucket.py · database.py · network.py
+      source: |
+        class Bucket:
+            def validate(self) -> list[str]:
+                return check_name(self.name)
+
+            def render(self) -> dict:
+                return {"aws_s3_bucket": self.name}
+
+        class Database:
+            def validate(self) -> list[str]:
+                return check_size(self.instance_class)
+
+            def render(self) -> dict:
+                return {"aws_db_instance": self.name, "instance_class": self.instance_class}
+
+        class Network:
+            def validate(self) -> list[str]:
+                return [e for c in self.children for e in c.validate()] + check_cidr(self.cidr)
+
+            def render(self) -> dict:
+                return merge(c.render() for c in self.children)
+      roles: { context: [1, 20], validate: [2, 3], render: [5, 6] }
+      change:
+        - { after: 6, add: ['', '    def monthly_cost(self) -> float:', '        return self.gb * 0.023'] }
+        - { after: 13, add: ['', '    def monthly_cost(self) -> float:', '        return HOURLY[self.instance_class] * 730'] }
+        - { after: 20, add: ['', '    def monthly_cost(self) -> float:', '        return NAT_GATEWAY + sum(c.monthly_cost() for c in self.children)'] }
+    after:
+      file: visitor.py · validate.py · plan.py
+      source: |
+        class Visitor:
+            def visit(self, r: Resource) -> None:
+                method = getattr(self, f"visit_{type(r).__name__.lower()}")
+                method(r)
+                for child in getattr(r, "children", []):
+                    self.visit(child)
+
+        # validate.py: one operation, every type, in one place
+        class Validate(Visitor):
+            def __init__(self) -> None:
+                self.errors: list[str] = []
+
+            def visit_bucket(self, b: Bucket) -> None:
+                self.errors += check_name(b.name)
+
+            def visit_database(self, d: Database) -> None:
+                self.errors += check_size(d.instance_class)
+
+            def visit_network(self, n: Network) -> None:
+                self.errors += check_cidr(n.cidr)
+
+        # plan.py: the caller picks the operation
+        v = Validate()
+        v.visit(stack)
+      roles: { strategy: [1, 4], context: [1, 6], validate: [8, 20], client: [23, 24], traverse: [5, 6], accept: [3, 3], visit: [16, 17] }
+    again:
+      file: cost.py
+      source: |
+        # cost.py: a new file; no resource class changes
+        class Cost(Visitor):
+            def __init__(self) -> None:
+                self.monthly = 0.0
+
+            def visit_bucket(self, b: Bucket) -> None:
+                self.monthly += b.gb * 0.023
+
+            def visit_database(self, d: Database) -> None:
+                self.monthly += HOURLY[d.instance_class] * 730
+
+            def visit_network(self, n: Network) -> None:
+                self.monthly += NAT_GATEWAY
+    cost:
+      before: { text: 9 lines · 3 files, value: 0.8 }
+      after: { text: 1 new file · 0 edits, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Python looks the method up by name, so there is no `accept`: the base finds `visit_<type>` from the class name, as `ast.NodeVisitor` does. A missing method fails only when that type is visited. `functools.singledispatchmethod` and `match` with class patterns are other ways to pick by type.'
+      seenIn: '`ast.NodeVisitor` and `ast.NodeTransformer` call `visit_<ClassName>`. A missing one falls back to `generic_visit`, which visits the children and does nothing else: an empty default.'
+
+  typescript:
+    before:
+      file: resource.ts · bucket.ts · database.ts · network.ts
+      source: |
+        interface Resource {
+          validate(): string[];
+          render(): Record<string, unknown>;
+        }
+
+        class Bucket implements Resource {
+          validate() { return checkName(this.name); }
+          render() { return { aws_s3_bucket: this.name }; }
+        }
+
+        class Database implements Resource {
+          validate() { return checkSize(this.instanceClass); }
+          render() { return { aws_db_instance: this.name, instance_class: this.instanceClass }; }
+        }
+
+        class Network implements Resource {
+          validate() { return [...this.children.flatMap((c) => c.validate()), ...checkCidr(this.cidr)]; }
+          render() { return merge(this.children.map((c) => c.render())); }
+        }
+      roles: { context: [1, 19], validate: [7, 7], render: [8, 8] }
+      change:
+        - { after: 3, add: ['  monthlyCost(): number;'] }
+        - { after: 8, add: ['  monthlyCost() { return this.gb * 0.023; }'] }
+        - { after: 13, add: ['  monthlyCost() { return HOURLY[this.instanceClass] * 730; }'] }
+        - { after: 18, add: ['  monthlyCost() { return NAT_GATEWAY + sum(this.children.map((c) => c.monthlyCost())); }'] }
+    after:
+      file: visitor.ts · validate.ts · plan.ts
+      source: |
+        interface Visitor {
+          visitBucket(b: Bucket): void;
+          visitDatabase(d: Database): void;
+          visitNetwork(n: Network): void;
+        }
+
+        interface Resource { accept(v: Visitor): void }
+
+        class Database implements Resource {
+          accept(v: Visitor) { v.visitDatabase(this); }
+        }
+        class Network implements Resource {
+          accept(v: Visitor) {
+            v.visitNetwork(this);
+            for (const c of this.children) c.accept(v);
+          }
+        }
+
+        // validate.ts: one operation, every type, in one place
+        class Validate implements Visitor {
+          errors: string[] = [];
+          visitBucket(b: Bucket) { this.errors.push(...checkName(b.name)); }
+          visitDatabase(d: Database) { this.errors.push(...checkSize(d.instanceClass)); }
+          visitNetwork(n: Network) { this.errors.push(...checkCidr(n.cidr)); }
+        }
+
+        // plan.ts: the caller picks the operation
+        stack.accept(new Validate());
+      roles: { strategy: [1, 5], context: [7, 17], validate: [19, 25], client: [28, 28], traverse: [12, 17], accept: [10, 10], visit: [23, 23] }
+    again:
+      file: cost.ts
+      source: |
+        // cost.ts: a new file; no resource class changes
+        class Cost implements Visitor {
+          monthly = 0;
+          visitBucket(b: Bucket) { this.monthly += b.gb * 0.023; }
+          visitDatabase(d: Database) { this.monthly += HOURLY[d.instanceClass] * 730; }
+          visitNetwork(_n: Network) { this.monthly += NAT_GATEWAY; }
+        }
+    cost:
+      before: { text: 4 lines · 4 files, value: 0.8 }
+      after: { text: 1 new file · 0 edits, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'With plain data, a discriminated union often replaces Visitor: `switch (r.kind)` with a `never` check in the default branch puts one operation in one function, and the compiler flags every switch when a kind is added. Class visitors fit when the nodes are already classes.'
+      seenIn: 'Babel plugins export a visitor object keyed by node type, such as `{ Identifier(path) { … } }`. The TypeScript compiler API rewrites trees with `ts.visitEachChild`.'
+
+  rust:
+    before:
+      file: resource.rs · bucket.rs · database.rs · network.rs
+      source: |
+        trait Resource {
+            fn validate(&self) -> Vec<String>;
+            fn render(&self) -> Value;
+        }
+
+        impl Resource for Bucket {
+            fn validate(&self) -> Vec<String> { check_name(&self.name) }
+            fn render(&self) -> Value { json!({ "aws_s3_bucket": self.name }) }
+        }
+
+        impl Resource for Database {
+            fn validate(&self) -> Vec<String> { check_size(&self.class) }
+            fn render(&self) -> Value { json!({ "aws_db_instance": self.name, "instance_class": self.class }) }
+        }
+
+        impl Resource for Network {
+            fn validate(&self) -> Vec<String> { self.children.iter().flat_map(|c| c.validate()).collect() }
+            fn render(&self) -> Value { merge(self.children.iter().map(|c| c.render())) }
+        }
+      roles: { context: [1, 19], validate: [7, 7], render: [8, 8] }
+      change:
+        - { after: 3, add: ['    fn monthly_cost(&self) -> f64;'] }
+        - { after: 8, add: ['    fn monthly_cost(&self) -> f64 { self.gb * 0.023 }'] }
+        - { after: 13, add: ['    fn monthly_cost(&self) -> f64 { hourly(&self.class) * 730.0 }'] }
+        - { after: 18, add: ['    fn monthly_cost(&self) -> f64 { NAT_GATEWAY + self.children.iter().map(|c| c.monthly_cost()).sum::<f64>() }'] }
+    after:
+      file: visitor.rs · validate.rs · plan.rs
+      source: |
+        trait Visitor {
+            fn visit_bucket(&mut self, b: &Bucket);
+            fn visit_database(&mut self, d: &Database);
+            fn visit_network(&mut self, n: &Network);
+        }
+
+        trait Resource {
+            fn accept(&self, v: &mut dyn Visitor);
+        }
+
+        impl Resource for Database {
+            fn accept(&self, v: &mut dyn Visitor) { v.visit_database(self) }
+        }
+
+        impl Resource for Network {
+            fn accept(&self, v: &mut dyn Visitor) {
+                v.visit_network(self);
+                for c in &self.children { c.accept(v); }
+            }
+        }
+
+        // validate.rs: one operation, every type, in one place
+        #[derive(Default)]
+        struct Validate { errors: Vec<String> }
+
+        impl Visitor for Validate {
+            fn visit_bucket(&mut self, b: &Bucket) { self.errors.extend(check_name(&b.name)) }
+            fn visit_database(&mut self, d: &Database) { self.errors.extend(check_size(&d.class)) }
+            fn visit_network(&mut self, n: &Network) { self.errors.extend(check_cidr(&n.cidr)) }
+        }
+
+        // plan.rs: the caller picks the operation
+        let mut v = Validate::default();
+        stack.accept(&mut v);
+      roles: { strategy: [1, 5], context: [7, 20], validate: [22, 30], client: [33, 34], traverse: [15, 20], accept: [12, 12], visit: [28, 28] }
+    again:
+      file: cost.rs
+      source: |
+        // cost.rs: a new file; no resource type changes
+        #[derive(Default)]
+        struct Cost { monthly: f64 }
+
+        impl Visitor for Cost {
+            fn visit_bucket(&mut self, b: &Bucket) { self.monthly += b.gb * 0.023 }
+            fn visit_database(&mut self, d: &Database) { self.monthly += hourly(&d.class) * 730.0 }
+            fn visit_network(&mut self, _n: &Network) { self.monthly += NAT_GATEWAY }
+        }
+    cost:
+      before: { text: 4 lines · 4 files, value: 0.8 }
+      after: { text: 1 new file · 0 edits, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'For a closed set of types, an `enum Resource { Bucket(…), Database(…), Network(…) }` with one function per operation and a `match` inside is the usual Rust form. The match is exhaustive, so a new variant flags every operation at compile time: the same trade-off as Visitor, with less code. Visitor traits pay off on large trees.'
+      seenIn: '`syn::visit::Visit` has a default method per syntax node that walks the children; you override the few you care about. `serde::de::Visitor` is called back by a deserializer with `visit_str`, `visit_u64` and so on.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'The plan command builds a `Validate` visitor and hands it to the root: `stack.Accept(v)`.', python: 'The plan command builds a `Validate` visitor and calls `v.visit(stack)`.', typescript: 'The plan command builds a `Validate` visitor and hands it to the root: `stack.accept(new Validate())`.', rust: 'The plan command builds a `Validate` visitor and hands it to the root: `stack.accept(&mut v)`.' }
+    nodes: [client]
+    edges: [client>context]
+    role: client
+  - text: { go: 'The network visits itself, then calls `Accept` on each child. The structure owns the traversal, as in Composite.', python: 'The base `visit` handles the network, then visits each child. Here the visitor base owns the traversal.', typescript: 'The network visits itself, then calls `accept` on each child. The structure owns the traversal, as in Composite.', rust: 'The network visits itself, then calls `accept` on each child. The structure owns the traversal, as in Composite.' }
+    nodes: [context]
+    edges: []
+    role: traverse
+  - text: { go: 'First dispatch: the child is a `*Database`, so `Database.Accept` runs. It knows its own type and calls `v.VisitDatabase(d)`.', python: 'First dispatch: `getattr` builds `visit_database` from the resource''s class name. No `accept` is needed in Python.', typescript: 'First dispatch: the child is a `Database`, so `Database.accept` runs. It knows its own type and calls `v.visitDatabase(this)`.', rust: 'First dispatch: the child is a `Database`, so its `accept` runs through the `dyn Resource` vtable and calls `v.visit_database(self)`.' }
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: accept
+  - text: Second dispatch. The visitor is a Validate, so Validate's database method runs. The code that ran depended on two types, the resource's and the visitor's.
+    nodes: [strategy, validate]
+    edges: [validate>strategy]
+    role: visit
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: Which of these situations suits Visitor?
+    options:
+      - text: "An infrastructure tool has a fixed set of resource types and keeps gaining operations: cost estimates, validation, rendering, drift checks."
+        correct: true
+        why: Right. The types are stable and the operations keep coming. Each new operation is one new visitor, and no resource type changes.
+      - text: A plugin system where third parties add new resource types every month.
+        why: That is the case Visitor handles worst. Every new type edits the Visitor interface and every visitor, and plugin authors cannot edit your visitors.
+      - text: A checkout must pay through one of three providers, chosen from config.
+        why: That is Strategy. One step varies and the caller picks the implementation. There is no set of types for operations to run over.
+  engineer:
+    question: Your team adds a new resource type every sprint and a new operation about once a year. How should the operations be laid out?
+    options:
+      - text: As methods on each resource type, behind an interface every type implements.
+        correct: true
+        why: Right. A new type is then one new file. The rare new operation costs an edit to every type, which you pay once a year instead of every sprint.
+      - text: As visitors, one per operation.
+        why: Each sprint's new type would edit the Visitor interface and every visitor. Visitor optimises the change you rarely make.
+      - text: As visitors with empty default methods, so new types do not break the build.
+        why: The build stays green while the operations silently skip the new type. A cost estimate that leaves out a resource is worse than a compile error.
+  deep:
+    question: In Java or C#, why does Visitor use accept instead of overloads visit(Bucket), visit(Database) called as v.visit(r) on a Resource r?
+    options:
+      - text: Overloads are chosen at compile time from the static type, which is Resource. Inside Bucket's accept, this has the static type Bucket, so the right overload is picked.
+        correct: true
+        why: Right. accept is chosen at runtime by the resource's type (first dispatch), and visit at runtime by the visitor's type (second dispatch). Languages with multiple dispatch, such as CLOS or Julia, need no accept. Go has no overloading, so each visit method gets its own name.
+      - text: accept is needed so the structure can traverse its children.
+        why: No. Traversal can live in the structure, in the visitor or in an iterator. accept exists to recover the concrete type.
+      - text: accept avoids a virtual call, so visiting is faster.
+        why: No. It adds one. Visitor costs two indirect calls per node; it buys a place to put operations, not speed.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Visitor
+      example: { go: "Visitor (interface)", python: "Visitor (base class)", typescript: "Visitor (interface)", rust: "Visitor (trait)" }
+      job: Declares one visit method per element type.
+    - role: Concrete visitor
+      example: "Validate, Render, Cost"
+      job: One operation over every element type, in one place. Can keep state, such as a running total.
+    - role: Element
+      example: { go: "Resource (Accept)", python: "Resource (no accept needed)", typescript: "Resource (accept)", rust: "Resource (accept)" }
+      job: Calls the visit method for its own type. That call is the first dispatch.
+    - role: Object structure
+      example: the stack, a Network of resources
+      job: Holds the elements and usually walks them, as a Composite.
+    - role: Client
+      example: the plan command
+      job: Picks a visitor and runs it over the structure.
+  useWhen:
+    - The set of types is stable and new operations keep arriving, as in compilers, linters and plan tools.
+    - Operations would otherwise mix unrelated concerns, such as cost, rendering and validation, inside every type.
+    - An operation needs to gather state across the whole structure, such as a total or a list of errors.
+  avoidWhen:
+    - New types arrive more often than new operations. Every new type edits every visitor.
+    - The types are owned by other teams or plugins that cannot edit your visitors.
+    - Your language has closed sums with exhaustive matching (Rust enums, TypeScript unions). A match per operation does the same job with less code.
+  tradeoffs:
+    - Adding an element type is expensive. The Visitor interface and every visitor change.
+    - Visitors often need access to element internals, which weakens encapsulation.
+    - Each node costs two indirect calls, and the flow is harder to follow in a debugger.
+    - Empty default visit methods keep the build green when a type is missing, and hide the work the compiler was pointing at.
+  lookalikes:
+    - name: Composite
+      how: Composite builds the tree. Visitor runs operations over it, and a composite's accept often does the traversal.
+    - name: Iterator
+      how: An iterator walks a structure of one element type. A visitor can visit unrelated types and picks code by each one.
+    - name: Interpreter
+      how: An interpreter evaluates a grammar's syntax tree. Evaluation, pretty-printing and type checking are often written as visitors over that tree.
+    - name: Strategy
+      how: Swaps one step behind an interface. Visitor varies the operation and also picks code by the element's type.
+---
+
+## [concept] Visitor
+
+**Put each operation over a set of types in its own object, with one method per type, so new operations need no edits to the types.**
+
+A stack of infrastructure resources needs many operations: validate, render, estimate cost. With Visitor, each operation lives in one place, and the resource types stay small and stable.
+
+<Depth level={2}>
+The pattern trades one kind of change for another. A new operation is one new visitor. A new type edits every visitor. With a table of types against operations, a design can make adding columns or adding rows cheap, not both: the <Term id="expression-problem">expression problem</Term>. Visitor picks rows (operations), so use it where the types are stable.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Visitor as an object behavioral pattern for operations over an object structure, often a Composite. It names the mechanism <Term id="double-dispatch">double dispatch</Term>: the code that runs depends on two runtime types, the element's and the visitor's. Languages that only dispatch on the receiver get it from two calls, `accept` and then `visit`. The catalogue notes that languages with multiple dispatch, such as CLOS, need the pattern less, and that it can force elements to expose state the visitor reads.
+</Depth>
+
+## [problem] Every resource knows every operation
+
+A deployment tool models infrastructure as typed resources: buckets, databases and networks that contain the others. Each type validates itself and renders itself into the plan the cloud provider receives.
+
+Read it once. Every operation is spread across every type. Validation rules live in three files, and so does rendering.
+
+<Depth level={2}>
+Each resource type mixes concerns that change for different reasons. The database file holds naming rules, plan output and soon pricing, owned by three different people. The <Term id="open-closed">open/closed principle</Term> holds for new types here, not for new operations.
+</Depth>
+
+<Depth level={3}>
+The network is a composite: its methods loop over the children. Every new operation repeats that loop, once per operation, in the network type.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** Finance wants a monthly cost estimate for every stack before it deploys.
+
+The marked lines add a cost method to the interface and to every resource type. Pricing is one concern, yet it ends up in four files, next to validation and rendering code it has nothing to do with.
+
+<Depth level={2}>
+Each edited file is owned and reviewed by someone else, and each change re-runs those types' tests. Next quarter brings a drift check and a security scan, and the same four files change again.
+</Depth>
+
+<Depth level={3}>
+In Go, TypeScript and Rust, the build fails until every type implements the new method. That is helpful, but it means the cost feature cannot land in pieces: all four files ship together.
+</Depth>
+
+## [morph] Move each operation into a visitor
+
+Drag the slider. Each operation leaves the resource types and becomes a visitor with one method per type. Each resource type keeps one small method that hands itself to the visitor.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Decide who walks the tree. Here the network's accept visits its children, so every visitor gets the traversal for free. Put the walk in the visitor instead when the order depends on results, such as skipping a subtree that failed validation.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go has no overloading, so the methods are `VisitBucket`, `VisitDatabase` and `VisitNetwork`. Adding `VisitQueue` to the interface makes every visitor that lacks it fail to compile where it is passed as a `Visitor`.</Lang>
+<Lang only="python">Python skips `accept`. The base class builds the method name from the resource's class, `visit_database`, and looks it up with `getattr`. It is less code, and a missing method shows up only at runtime.</Lang>
+<Lang only="typescript">`Validate implements Visitor` makes the compiler check all three methods. Because types are structural, any object with those three methods is a visitor, with or without `implements`.</Lang>
+<Lang only="rust">`accept` takes `&mut dyn Visitor`, so visitors can keep state, such as a list of errors, while the tree is walked by shared reference.</Lang>
+</Depth>
+
+## [walk] Follow one validation through the stack
+
+One validation, from the plan command down to the database. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Each dispatch is an interface call through an <Term id="itab">itab</Term>: one on `Resource` to reach `Accept`, one on `Visitor` to reach `VisitDatabase`. Two indirect calls per node.</Lang>
+<Lang only="python">`getattr` with a built string runs on every node. It is a dictionary lookup on the class, cheap next to the work a real check does, and easy to break with a typo in a method name.</Lang>
+<Lang only="typescript">Both calls are property lookups on objects. While one call site only sees a few classes, V8's inline caches keep them fast.</Lang>
+<Lang only="rust">Both calls go through vtables: `&dyn Resource` to reach `accept`, `&mut dyn Visitor` to reach `visit_database`. With an enum and `match`, there is no vtable at all: the compiler branches on the tag.</Lang>
+</Depth>
+
+## [again] The cost estimate, the second time
+
+The same request after the refactor. Cost is one new visitor. No resource type changes, so nothing that validates or renders today can break.
+
+<Depth level={2}>
+The visitor keeps its own state, the running total, so the estimate needs no extra arguments threaded through every type.
+</Depth>
+
+<Depth level={3}>
+Test each visitor on a small hand-built stack. The resource types' tests never change when an operation is added.
+</Depth>
+
+## [play] Grow the table both ways
+
+The same code cells, one per operation and resource type, laid out two ways: grouped by resource type, or grouped by operation. Add an operation, then add a resource type, and watch which existing files each design edits.
+
+Then trace one call through the stack and count the dispatches.
+
+## [lens] How each language writes it
+
+Go, TypeScript and Rust can write the classic form with `accept`. Python looks visit methods up by name. In Rust and TypeScript, an <Term id="exhaustive-match">exhaustive match</Term> over an enum or a union often replaces the pattern entirely.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="visitor" />
+
+### When a match is the visitor
+
+If the language has closed sum types, write the types as one enum or union and each operation as one function with a match: `fn cost(r: &Resource) -> f64 { match r { … } }` in Rust, or `switch (r.kind)` with a `never` check in TypeScript. Each operation still lives in one place, a new operation is still one new function, and a new type still flags every operation at compile time. That is Visitor's trade-off without `accept`, interfaces or <Term id="dynamic-dispatch">dynamic dispatch</Term>. Reach for a visitor trait or interface when the tree is large and most visitors only care about a few node types, as in `syn`.

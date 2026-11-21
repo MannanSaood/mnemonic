@@ -1,0 +1,10 @@
+# Terms introduced by design-patterns/visitor.
+- id: double-dispatch
+  term: Double dispatch
+  short: Choosing which code runs from the runtime types of two objects, here the node and the visitor. Visitor builds it from two ordinary single-dispatch calls.
+- id: expression-problem
+  term: Expression problem
+  short: With a set of types and a set of operations, a design makes it easy to add one kind without editing existing code, but not both.
+- id: exhaustive-match
+  term: Exhaustive match
+  short: A match or switch over every case of a closed type, checked by the compiler, so adding a case flags every match that misses it.
