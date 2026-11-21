@@ -1,0 +1,28 @@
+# Terms introduced by the page faults lesson.
+- id: page-fault
+  term: Page fault
+  short: A trap into the kernel when the CPU cannot use a page-table entry for an access, because the page is not mapped yet or the access is not allowed. The kernel fixes the mapping and the instruction runs again, or the process gets SIGSEGV.
+- id: minor-fault
+  term: Minor fault
+  short: A page fault the kernel resolves without I/O, by mapping a page already in RAM (in the page cache, the zero page, a fresh zeroed page, or a copy). It costs around a microsecond.
+- id: major-fault
+  term: Major fault
+  short: A page fault that needs I/O, usually reading the page from a file or from swap. The task sleeps until the disk answers, which takes from about 100 µs to milliseconds.
+- id: copy-on-write
+  term: Copy-on-write
+  short: Sharing a page read-only between processes (after fork) or mappings (MAP_PRIVATE) and copying it only when one of them writes. The write faults, the kernel copies 4 KiB, and the writer gets its own page.
+- id: zero-page
+  term: Zero page
+  short: One page of zeros the kernel maps read-only wherever untouched anonymous memory is read. A write replaces it with a real zeroed page.
+- id: page-table
+  term: Page table
+  short: The per-process tree that maps virtual pages to physical frames, with permission bits. The MMU walks it in hardware on every access the TLB does not already cover.
+- id: vma
+  term: VMA
+  short: Virtual memory area. The kernel's record of one mapping in a process (start, end, permissions, backing file or anonymous). A fault outside every VMA is SIGSEGV.
+- id: rss
+  term: RSS
+  short: Resident set size. The memory of a process that is actually in RAM right now, counted in pages it has mapped, including pages it shares with others.
+- id: page-cache
+  term: Page cache
+  short: The kernel's cache of file contents in RAM, in 4 KiB pages. read() and write() go through it, and a cached page costs a memory copy instead of a disk wait.

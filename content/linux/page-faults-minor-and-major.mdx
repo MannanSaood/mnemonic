@@ -1,0 +1,501 @@
+---
+title: "Page faults: minor, major and copy-on-write"
+track: linux
+group: Processes and memory
+order: 11
+summary: mmap and malloc only promise memory. The first touch of each page traps into the kernel, and whether that costs a microsecond or a disk read depends on where the page is.
+intent: A page fault is cheap when the page is already in RAM and slow when it must come from disk, so pay for the disk before you take traffic.
+changeRequest: For the first minutes after every deploy, search p99 jumps from 2 ms to 60 ms.
+languages: [go, python, typescript, rust]
+glossary: [page-fault, minor-fault, major-fault, copy-on-write, zero-page, page-table, vma, rss, page-cache]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [linux/process-address-space-and-vmas]
+skills: [linux, memory, debugging]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: page-faults-minor-and-major
+  scenarios:
+    - try: "Predict, then serve a request right after start, and serve another."
+      notice: "The first request takes three major faults, about 3 ms, waiting on the disk. The second takes no faults at all: every page it needs is mapped now."
+    - try: "Press Memory pressure, then serve a request again."
+      notice: "The kernel dropped the clean index pages, so the next request goes back to the disk, even for page 2, which the backup had cached."
+    - try: "Reset, prefault the index, then serve a request."
+      notice: "The disk reads move to startup. The first request only takes one minor fault, for the heap page it writes."
+    - try: "Write a heap page, fork, and write the same page in the child, then in the parent."
+      notice: "The child's write copies the page. The parent's write still faults, but it is the last user of the old page, so the kernel hands it over without copying."
+
+# ---------------------------------------------------------------- diagram
+# before: "mmap loaded the file". after: the MMU, the fault handler, the page cache and the disk.
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 8, y: 60, w: 120, h: 56, title: Lookup, sub: "index[off]" }
+      after:  { x: 8, y: 40, w: 110, h: 50, title: Lookup, sub: "index[off]" }
+    - id: pte
+      kind: strategy
+      appears: after
+      before: { x: 150, y: 40, w: 110, h: 50, title: "" }
+      after:  { x: 150, y: 40, w: 110, h: 50, title: Page table, sub: MMU walk }
+    - id: handler
+      kind: context
+      before: { x: 150, y: 18, w: 400, h: 236, title: The index in memory, sub: { go: "syscall.Mmap loaded it", python: "mmap.mmap loaded it", typescript: "it is on disk; we read it", rust: "Mmap::map loaded it" } }
+      after:  { x: 280, y: 160, w: 110, h: 50, title: Fault handler, sub: find VMA · resolve }
+    - id: cache
+      kind: concrete
+      before: { x: 170, y: 84, w: 360, h: 44, title: index pages, sub: in RAM }
+      after:  { x: 410, y: 160, w: 78, h: 50, title: Page cache, sub: minor }
+    - id: disk
+      kind: concrete
+      before: { x: 170, y: 144, w: 360, h: 44, title: index.bin on disk, sub: read once }
+      after:  { x: 498, y: 160, w: 56, h: 50, title: Disk, sub: major }
+    - id: warm
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 202, w: 360, h: 40, title: + warm-up before ready }
+      after:  { x: 8, y: 190, w: 120, h: 50, title: Prefault, sub: at startup }
+  edges:
+    - { from: app, to: pte }
+    - { from: pte, to: handler, label: not present }
+    - { from: handler, to: cache }
+    - { from: cache, to: disk }
+    - { from: warm, to: handler }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: index.go · main.go
+      source: |
+        // index.go: open the search index, then start serving
+        func OpenIndex(path string) ([]byte, error) {
+            f, err := os.Open(path)
+            if err != nil {
+                return nil, err
+            }
+            defer f.Close()
+            st, err := f.Stat()
+            if err != nil {
+                return nil, err
+            }
+            return syscall.Mmap(int(f.Fd()), 0, int(st.Size()),
+                syscall.PROT_READ, syscall.MAP_SHARED)
+        }
+
+        func lookup(index []byte, off int) []byte {
+            return index[off : off+64]
+        }
+
+        // main.go
+        index, err := OpenIndex("/data/index.bin")
+        if err != nil {
+            log.Fatal(err)
+        }
+        ready.Store(true) // the load balancer starts sending traffic
+      roles: { app: [16, 18], handler: [12, 13], cache: [17, 17], disk: [3, 3], warm: [25, 25] }
+      change:
+        - { after: 17, add: ['    // first touch of each page: a fault, often a disk read'] }
+        - { after: 25, add: ['// first minutes after deploy: p99 60 ms, maj_flt climbing'] }
+    after:
+      file: index.go · main.go
+      source: |
+        func OpenIndex(path string) ([]byte, error) {
+            f, err := os.Open(path)
+            if err != nil {
+                return nil, err
+            }
+            defer f.Close()
+            st, err := f.Stat()
+            if err != nil {
+                return nil, err
+            }
+            // MAP_POPULATE: read the file and fill the page table now
+            return syscall.Mmap(int(f.Fd()), 0, int(st.Size()),
+                syscall.PROT_READ, syscall.MAP_SHARED|syscall.MAP_POPULATE)
+        }
+
+        func lookup(index []byte, off int) []byte {
+            return index[off : off+64] // an MMU walk; no syscall
+        }
+
+        // main.go: ready only after the index is resident
+        index, err := OpenIndex("/data/index.bin")
+        if err != nil {
+            log.Fatal(err)
+        }
+        ready.Store(true)
+      roles: { app: [16, 18], pte: [17, 17], handler: [11, 13], cache: [12, 13], disk: [2, 2], warm: [11, 13], populate: [11, 13], fill: [12, 13], ready: [25, 25], lookup: [17, 17], evict: [12, 13] }
+    again:
+      file: shell
+      source: |
+        // $ ps -o maj_flt= -p "$(pidof search)"   # sampled a minute apart while serving
+        // no new major faults; p99 2 ms from the first request
+    cost:
+      before: { text: "p99 60 ms after deploy · major faults", value: 0.85 }
+      after: { text: "p99 2 ms · 0 major faults serving", value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Go exposes `syscall.Mmap` and `golang.org/x/sys/unix.Mmap`, with `MAP_POPULATE`, `unix.Madvise` and `unix.Mlock`, but most Go services read files into the heap instead. Heap memory faults too: a large `make([]byte, n)` gets fresh zeroed pages from the OS, so RSS grows as you write, not as you allocate.'
+      seenIn: '`bbolt` maps its database file and lets you pass `MAP_POPULATE` in `Options.MmapFlags`. `unix.Madvise(b, unix.MADV_WILLNEED)`. `ps -o min_flt,maj_flt` and `perf stat -e major-faults` to count.'
+
+  python:
+    before:
+      file: index.py · main.py
+      source: |
+        # index.py: open the search index, then start serving
+        def open_index(path: str) -> mmap.mmap:
+            with open(path, "rb") as f:
+                return mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+
+        def lookup(index: mmap.mmap, off: int) -> bytes:
+            return index[off:off + 64]
+
+        # main.py
+        index = open_index("/data/index.bin")
+        ready.set()  # the load balancer starts sending traffic
+      roles: { app: [6, 7], handler: [4, 4], cache: [7, 7], disk: [3, 3], warm: [11, 11] }
+      change:
+        - { after: 7, add: ['    # first touch of each page: a fault, often a disk read'] }
+        - { after: 11, add: ['# first minutes after deploy: p99 60 ms, maj_flt climbing'] }
+    after:
+      file: index.py · main.py
+      source: |
+        def open_index(path: str) -> mmap.mmap:
+            with open(path, "rb") as f:
+                # MAP_POPULATE: read the file and fill the page table now
+                return mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ,
+                                 flags=mmap.MAP_SHARED | mmap.MAP_POPULATE)
+
+        def lookup(index: mmap.mmap, off: int) -> bytes:
+            return index[off:off + 64]  # an MMU walk; no syscall
+
+        # main.py: ready only after the index is resident
+        index = open_index("/data/index.bin")
+        ready.set()
+      roles: { app: [7, 8], pte: [8, 8], handler: [3, 5], cache: [4, 5], disk: [2, 2], warm: [3, 5], populate: [3, 5], fill: [4, 5], ready: [12, 12], lookup: [8, 8], evict: [4, 5] }
+    again:
+      file: shell
+      source: |
+        # $ ps -o maj_flt= -p "$(pidof search)"   # sampled a minute apart while serving
+        # no new major faults; p99 2 ms from the first request
+    cost:
+      before: { text: "p99 60 ms after deploy · major faults", value: 0.85 }
+      after: { text: "p99 2 ms · 0 major faults serving", value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`mmap.mmap` takes `flags=mmap.MAP_POPULATE` on Linux (Python 3.10 and later), and `m.madvise(mmap.MADV_WILLNEED)` (3.8 and later) starts the reads in the background. NumPy''s `np.memmap` and `np.load(path, mmap_mode="r")` fault pages in lazily in exactly the same way.'
+      seenIn: '`resource.getrusage(resource.RUSAGE_SELF).ru_majflt` and `ru_minflt` count faults from inside the process. `np.memmap`. `mmap.madvise`.'
+
+  typescript:
+    before:
+      file: index.ts
+      source: |
+        // index.ts: open the search index, then start serving
+        import { openSync, readSync } from "node:fs";
+
+        const fd = openSync("/data/index.bin", "r");
+
+        // each lookup reads its 64-byte entry when asked
+        export function lookup(off: number): Buffer {
+          const buf = Buffer.alloc(64);
+          readSync(fd, buf, 0, 64, off);
+          return buf;
+        }
+
+        ready = true; // the load balancer starts sending traffic
+      roles: { app: [7, 11], handler: [9, 9], cache: [9, 9], disk: [4, 4], warm: [13, 13] }
+      change:
+        - { after: 9, add: ['  // a page not in the page cache: read() waits on the disk'] }
+        - { after: 13, add: ['// first minutes after deploy: p99 60 ms, disk reads on every request'] }
+    after:
+      file: index.ts
+      source: |
+        import { readFileSync } from "node:fs";
+
+        // Load the whole index at startup: one sequential read,
+        // then lookups are plain memory reads.
+        const index = readFileSync("/data/index.bin");
+
+        export function lookup(off: number): Buffer {
+          return index.subarray(off, off + 64); // no syscall
+        }
+
+        ready = true; // only after the index is in memory
+      roles: { app: [7, 9], pte: [8, 8], handler: [3, 5], cache: [5, 5], disk: [5, 5], warm: [3, 5], populate: [3, 5], fill: [5, 5], ready: [11, 11], lookup: [8, 8], evict: [5, 5] }
+    again:
+      file: shell
+      source: |
+        // $ ps -o maj_flt= -p "$(pidof node)"   # sampled a minute apart while serving
+        // no new major faults; p99 2 ms from the first request
+    cost:
+      before: { text: "p99 60 ms after deploy · disk reads", value: 0.85 }
+      after: { text: "p99 2 ms · 0 disk reads serving", value: 0.08 }
+    lens:
+      need: 1
+      needLabel: Rare
+      note: 'Node has no `mmap` in core, so Node code meets cold pages inside `read()` instead: the same page-cache miss, the same wait on the disk, counted as I/O rather than as a major fault. The fix has the same shape: read at startup, before you report ready. `readFileSync` refuses files over 2 GiB; stream bigger ones into several Buffers.'
+      seenIn: '`fs.readFileSync` at startup. Large `Buffer.alloc` and V8 heap growth fault in fresh pages as they are first written. `process.resourceUsage().majorPageFault` and `minorPageFault`.'
+
+  rust:
+    before:
+      file: index.rs · main.rs
+      source: |
+        // index.rs: open the search index, then start serving
+        fn open_index(path: &Path) -> io::Result<Mmap> {
+            let file = File::open(path)?;
+            unsafe { Mmap::map(&file) } // memmap2
+        }
+
+        fn lookup(index: &Mmap, off: usize) -> &[u8] {
+            &index[off..off + 64]
+        }
+
+        // main.rs
+        let index = open_index(Path::new("/data/index.bin"))?;
+        ready.store(true, Ordering::Release); // the load balancer starts sending traffic
+      roles: { app: [7, 9], handler: [4, 4], cache: [8, 8], disk: [3, 3], warm: [13, 13] }
+      change:
+        - { after: 8, add: ['    // first touch of each page: a fault, often a disk read'] }
+        - { after: 13, add: ['// first minutes after deploy: p99 60 ms, maj_flt climbing'] }
+    after:
+      file: index.rs · main.rs
+      source: |
+        fn open_index(path: &Path) -> io::Result<Mmap> {
+            let file = File::open(path)?;
+            // MAP_POPULATE: read the file and fill the page table now
+            unsafe { MmapOptions::new().populate().map(&file) }
+        }
+
+        fn lookup(index: &Mmap, off: usize) -> &[u8] {
+            &index[off..off + 64] // an MMU walk; no syscall
+        }
+
+        // main.rs: ready only after the index is resident
+        let index = open_index(Path::new("/data/index.bin"))?;
+        ready.store(true, Ordering::Release);
+      roles: { app: [7, 9], pte: [8, 8], handler: [3, 4], cache: [4, 4], disk: [2, 2], warm: [3, 4], populate: [3, 4], fill: [4, 4], ready: [13, 13], lookup: [8, 8], evict: [4, 4] }
+    again:
+      file: shell
+      source: |
+        // $ ps -o maj_flt= -p "$(pidof search)"   # sampled a minute apart while serving
+        // no new major faults; p99 2 ms from the first request
+    cost:
+      before: { text: "p99 60 ms after deploy · major faults", value: 0.85 }
+      after: { text: "p99 2 ms · 0 major faults serving", value: 0.08 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Mapping files is common in Rust through the `memmap2` crate. `MmapOptions::populate()` sets `MAP_POPULATE`, and the map is `unsafe` because another process could change the file under you. Heap memory is lazy too: `vec![0u8; n]` asks the allocator for zeroed memory, which for large sizes is fresh pages that fault in on first write.'
+      seenIn: '`memmap2::MmapOptions::populate`. Search and storage engines such as tantivy map their index files. `perf stat -e minor-faults,major-faults` to count.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'At startup, `syscall.Mmap` with `MAP_POPULATE` creates the mapping, a VMA, and then faults in every page of it now, before anything else runs.', python: 'At startup, `mmap.mmap` with `MAP_POPULATE` creates the mapping, a VMA, and then faults in every page of it now, before anything else runs.', typescript: 'At startup, `readFileSync` reads the whole file into a Buffer: one sequential pass through the page cache, before anything else runs.', rust: 'At startup, `MmapOptions::populate()` creates the mapping, a VMA, with `MAP_POPULATE`, and the kernel faults in every page of it now, before anything else runs.' }
+    nodes: [warm, handler]
+    edges: [warm>handler]
+    role: populate
+  - text: For each page the kernel looks in the page cache. A miss reads the page from disk, with readahead pulling in its neighbours, and the page-table entry is filled in.
+    nodes: [handler, cache, disk]
+    edges: [handler>cache, cache>disk]
+    role: fill
+  - text: Only now does the service report ready. The disk time was spent before any request arrived.
+    nodes: [app]
+    edges: []
+    role: ready
+  - text: { go: 'A lookup slices `index[off:off+64]`. The MMU walks the page table, finds a present entry and loads the bytes. No fault, no kernel.', python: 'A lookup slices `index[off:off + 64]`. The MMU walks the page table, finds a present entry and loads the bytes. No fault, no kernel.', typescript: 'A lookup takes a `subarray` of the Buffer: ordinary heap memory, already written, so its pages are present. No fault, no syscall.', rust: 'A lookup slices `&index[off..off + 64]`. The MMU walks the page table, finds a present entry and loads the bytes. No fault, no kernel.' }
+    nodes: [app, pte]
+    edges: [app>pte]
+    role: lookup
+  - text: If memory pressure later reclaims a clean index page, its entry is cleared. The next touch faults again, minor if the page is still in the page cache, major if it is gone.
+    nodes: [pte, handler, cache]
+    edges: [pte>handler, handler>cache]
+    role: evict
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A process maps a 1 GB file with mmap and immediately reads one byte at the start. What happens?
+    options:
+      - text: The read faults. The kernel maps that one page, reading it from disk first if it is not in the page cache.
+        correct: true
+        why: Right. mmap only records the mapping. Pages arrive one fault at a time as they are touched.
+      - text: mmap already read the whole file, so the byte comes straight from RAM.
+        why: No. Without MAP_POPULATE, mmap reads nothing. That is why mapping a huge file is instant.
+      - text: The read fails, because the file has not been loaded yet.
+        why: No. A fault inside a valid mapping is normal and invisible to the program. It only fails outside any mapping, or for a write to a read-only one.
+  engineer:
+    question: After a deploy, ps -o min_flt,maj_flt shows maj_flt rising fast for a few minutes and then flat. p99 is high in the same window. What is the best fix?
+    options:
+      - text: Prefault or read the data at startup (MAP_POPULATE, MADV_WILLNEED, or a warm-up pass) and report ready only after it finishes.
+        correct: true
+        why: Right. The major faults are first touches of cold pages. Doing them before taking traffic moves the disk time out of the requests.
+      - text: Add more RAM to the host.
+        why: RAM does not help a page that was never read. The first touch still goes to disk. More RAM only helps if the pages are being evicted.
+      - text: Lower the request timeout so slow requests fail fast.
+        why: That turns slow requests into failed ones. The faults still happen, and retries add load at the worst moment.
+  deep:
+    question: A preforking Python server loads a large read-only config in the parent, then forks 16 workers. Memory use grows towards 16 copies within an hour, although no worker changes the config. Why?
+    options:
+      - text: CPython writes reference counts (and GC bookkeeping) into every object it touches, so reading an object writes its page, and each write to a shared page triggers a copy-on-write copy.
+        correct: true
+        why: Right. Reading an object in CPython writes to it. gc.freeze() before fork keeps the collector off those objects, but reference counts still change on use.
+      - text: fork() copies the whole address space up front, so 16 copies exist from the start.
+        why: No. fork shares pages copy-on-write. Memory grows only as pages are written, which is why it grows over an hour.
+      - text: The kernel periodically unshares pages so that each process has its own copy.
+        why: No. The kernel copies a shared page only when a process writes to it.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: MMU and page table
+      example: the CPU's page-table walk
+      job: Translates each access in hardware. Traps to the kernel when the entry is missing or forbids the access.
+    - role: Fault handler
+      example: "handle_mm_fault"
+      job: Finds the VMA, checks permissions, and resolves the fault or sends SIGSEGV.
+    - role: Page cache
+      example: file pages in RAM
+      job: Serves file pages without I/O. A hit makes the fault minor.
+    - role: Disk or swap
+      example: index.bin, swap
+      job: Source of a major fault. The task sleeps until the read completes.
+    - role: Zero page and copy-on-write
+      example: fresh heap, pages shared after fork
+      job: Share a page read-only until the first write, then give the writer its own copy.
+  useWhen:
+    - Latency-critical services that map files or allocate large buffers. Prefault at startup and report ready after.
+    - Diagnosing slow first requests, slow first runs of a batch job, or RSS that grows after fork.
+    - Choosing between read() into the heap and mmap. Both pay for cold pages; mmap pays in faults.
+  avoidWhen:
+    - Prefaulting data larger than RAM. It evicts other pages and the early ones get dropped again.
+    - Prefaulting with mlock without a memory limit plan. Locked pages can never be reclaimed.
+  tradeoffs:
+    - Prefaulting makes startup slower and uses RAM for pages that may never be read.
+    - mmap avoids a copy into the heap, but turns I/O errors into SIGBUS and I/O waits into page faults you cannot see in strace.
+    - Copy-on-write makes fork cheap, but every write after fork can cost a copy, and the RSS of parent and child can double.
+    - Transparent huge pages cut the number of faults, but a copy-on-write fault on a huge page copies 2 MiB.
+  lookalikes:
+    - name: Swapping
+      how: One cause of major faults, for anonymous memory. File-backed pages fault from their file, with no swap involved.
+    - name: TLB miss
+      how: The page is mapped, but its translation is not cached. The MMU walks the page table in hardware; there is no fault and no kernel.
+    - name: SIGSEGV
+      how: A fault the kernel cannot resolve, because no mapping covers the address or it forbids the access.
+---
+
+## [concept] Page faults: minor, major and copy-on-write
+
+**`mmap` and `malloc` only promise memory. The first touch of each page traps into the kernel, a <Term id="page-fault">page fault</Term>, and the kernel maps a page then.**
+
+How long that takes depends on where the page is. Already in RAM: about a microsecond, a <Term id="minor-fault">minor fault</Term>. On disk: the time of a disk read, a <Term id="major-fault">major fault</Term>.
+
+<Depth level={2}>
+Four parts are involved. The MMU walks the process's <Term id="page-table">page table</Term> on every access. When an entry is missing or forbids the access, it traps to the kernel's fault handler. The handler finds the mapping (the <Term id="vma">VMA</Term>), and resolves the fault from the <Term id="page-cache">page cache</Term>, the <Term id="zero-page">zero page</Term>, a fresh page, a copy, or the disk. Then the instruction runs again.
+</Depth>
+
+<Depth level={3}>
+Minor faults come in several kinds: a file page found in the page cache, a read of untouched heap (mapped to the shared zero page), a first write to heap (a fresh zeroed page), and a write to a page shared after fork, which is <Term id="copy-on-write">copy-on-write</Term>. Major faults read from a file or from swap. The kernel counts both per task, which is what `ps -o min_flt,maj_flt` and `getrusage` report.
+</Depth>
+
+## [problem] A search service that maps its index
+
+A search service maps its 1.5 GB index file and answers lookups by slicing into the mapping. Startup is instant, and lookups are memory reads.
+
+It passes every test and load test, which all run on a machine where the index was read a minute earlier.
+
+<Depth level={2}>
+The author's picture: mmap loads the file into memory, so once it returns, the index is in RAM. That picture explains why the code is fast in tests, and nothing in the code contradicts it.
+</Depth>
+
+<Depth level={3}>
+<Lang only="typescript">Node has no mmap in core, so the Node version reads each entry with `readSync` at a file offset. It has the same hidden assumption in a different form: that the page cache already holds the index.</Lang>
+<Lang only="go">`syscall.Mmap` returns a `[]byte` backed by the mapping. Slicing it allocates nothing and makes no syscall, which is the attraction.</Lang>
+<Lang only="python">`mmap.mmap` returns an object you can slice like `bytes`. Each slice copies out of the mapping, which is still only memory access.</Lang>
+<Lang only="rust">`Mmap` derefs to `&[u8]`, so the index looks like any other slice to the rest of the program.</Lang>
+</Depth>
+
+## [pain] Slow minutes after every deploy
+
+After each deploy, p99 latency jumps from 2 ms to 60 ms, then settles over a few minutes. CPU is low. `ps -o maj_flt` for the process climbs fast in exactly that window, then stops.
+
+The marked lines are where it happens. mmap read nothing. Every lookup that touches a page for the first time waits for the disk, and on a new host or after a reboot, no page is in the page cache.
+
+<Depth level={2}>
+The disk is a cloud volume, so each read takes around a millisecond, and a lookup that touches 50 cold pages spends 50 ms waiting. Load tests missed it because they ran right after the index was built, with every page cached.
+</Depth>
+
+<Depth level={3}>
+Faults are invisible to strace, because no syscall happens. They show up as major-fault counters, as time in the D state, and in `perf trace -F maj` or a page-fault tracepoint. Readahead helps a little: the kernel reads neighbouring pages on a fault in a file mapping, but random lookups defeat it.
+</Depth>
+
+## [morph] From "it is in memory" to the fault path
+
+Drag the slider. The block labelled "the index in memory" splits into what actually happens: the MMU and page table, the fault handler, the page cache, and the disk.
+
+Hover a box to see its code.
+
+<Depth level={2}>
+The change is to take the faults on purpose, at startup. `MAP_POPULATE` (or `MADV_WILLNEED`, or a pass that touches every page) does the disk reads before the service reports ready. The load balancer only sends traffic to a process whose pages are in RAM.
+</Depth>
+
+<Depth level={3}>
+Pages stay mapped only while the kernel keeps them. Under memory pressure, clean file pages are the first to go: the kernel can drop them because the file still has the data. If the index does not fit comfortably in RAM next to everything else, prefaulting only delays the problem; size the host, or `mlock` the hot part.
+</Depth>
+
+## [walk] Follow one lookup
+
+One startup and one lookup through the corrected code. Step through it with the numbered buttons.
+
+<Depth level={3}>
+The fault handler is `handle_mm_fault`. For a file page it looks the page up in the page cache, maps it on a hit, and on a miss starts a read and sleeps. For a file mapping it also maps neighbouring pages that are already cached in one go ("fault-around"), so sequential access takes fewer minor faults than pages. A page-table walk on a TLB miss is not a fault at all: the MMU does it in hardware.
+</Depth>
+
+## [again] The same deploy, prefaulted
+
+The same deploy with the prefault. Startup takes a few seconds longer while the index is read. From the first request, p99 is 2 ms and the major-fault counter does not move while serving.
+
+<Depth level={2}>
+Pair it with a readiness check. If the process reports ready before the prefault finishes, the load balancer sends traffic to it anyway and you are back to the pain.
+</Depth>
+
+<Depth level={3}>
+Copy-on-write is the third kind of fault worth knowing. After fork, parent and child share every private page read-only. The first write by either one faults, and the kernel copies the page (or, if the other side already took its copy, just makes it writable). This is how Redis snapshots a live dataset, and why its memory can nearly double during a busy save.
+</Depth>
+
+## [play] Touch pages and watch them fault
+
+Touch pages of the service's memory directly, serve requests, put the host under memory pressure, prefault, and fork. Watch the page-table lines, the frames and the fault counters.
+
+## [lens] How each language meets page faults
+
+Every runtime's heap is mapped memory, so every language takes minor faults as its heap grows. File mappings, prefaulting and fork vary.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={3}>
+<Lang only="go">The Go runtime gets heap memory with `mmap` and returns it with `madvise`, so a Go process faults in pages as the heap grows and can fault again after the scavenger releases them. `GODEBUG=madvdontneed=1` changes how memory is returned, not whether it faults.</Lang>
+<Lang only="python">CPython's reference counts are writes. In a forked worker, reading a shared object writes its page and triggers a copy. `gc.freeze()` before fork keeps the collector from touching those objects, which helps, but reference counting still unshares the pages you use.</Lang>
+<Lang only="typescript">V8 reserves its heap with mmap and commits pages as it grows, so a growing Node heap takes minor faults. `--max-old-space-size` limits growth, not faulting.</Lang>
+<Lang only="rust">Rust has no runtime between you and the allocator. `Vec::with_capacity` reserves address space; the pages fault in as you push. Allocators such as jemalloc and mimalloc return memory with `madvise`, so a freed and reused region can fault again.</Lang>
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="page-faults-minor-and-major" />
+
+### Counting faults
+
+`ps -o min_flt,maj_flt -p PID` shows the totals since the process started; sample it twice to get a rate. `perf stat -e minor-faults,major-faults -p PID` counts over an interval. `/usr/bin/time -v cmd` prints both for a whole run. A high minor rate is usually harmless (heap growth); a major rate on a latency-critical service is worth a look every time.
