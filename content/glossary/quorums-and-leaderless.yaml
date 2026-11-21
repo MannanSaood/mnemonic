@@ -1,0 +1,22 @@
+# Terms introduced by distributed-systems/quorums-and-leaderless.
+- id: replication-factor
+  term: Replication factor (N)
+  short: How many replicas hold each key. In Cassandra it is set per keyspace (and per datacenter).
+- id: quorum
+  term: Quorum
+  short: The number of replicas that must answer before a read or write counts. A majority quorum is floor(N / 2) + 1.
+- id: sloppy-quorum
+  term: Sloppy quorum
+  short: A write or read that counts answers from any N healthy nodes, not only the key's home replicas, so it succeeds during outages.
+- id: hinted-handoff
+  term: Hinted handoff
+  short: A stand-in node keeps a write meant for a down replica, with a note naming that replica, and delivers it when the replica returns.
+- id: read-repair
+  term: Read repair
+  short: When a read sees replicas disagree, the coordinator writes the newest version back to the replicas that were behind.
+- id: last-write-wins
+  term: Last-write-wins (LWW)
+  short: Resolving concurrent versions by keeping the one with the highest timestamp. The other is dropped without an error.
+- id: coordinator
+  term: Coordinator
+  short: In a leaderless store, the node that receives a client request, forwards it to the replicas and counts their answers.

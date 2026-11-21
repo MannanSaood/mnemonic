@@ -1,0 +1,532 @@
+---
+title: Quorums and leaderless replication
+track: distributed-systems
+group: Replication
+order: 12
+summary: Write each key to N replicas and wait for W of them, read from R of them. If R + W > N, every read set shares a replica with every write set.
+intent: Pick R and W so reads see the latest successful write without making every replica a single point of failure, and know the cases where the overlap does not save you.
+changeRequest: Checkout must show every item the customer added to the cart, even while a node is down.
+languages: [go, python, typescript, rust]
+glossary: [replication-factor, quorum, coordinator, sloppy-quorum, hinted-handoff, read-repair, last-write-wins]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [distributed-systems/vector-clocks, distributed-systems/replication-lag-and-session-guarantees]
+skills: [replication]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: quorums-and-leaderless
+  scenarios:
+    - try: "With N = 3, W = 2, R = 2: take replica 3 down, add an item, bring it back, take replica 1 down, then read."
+      notice: "The read is fresh. Replica 2 took the write and answered the read: that shared replica is the overlap, and it exists for any 2 and any 2 out of 3."
+    - try: "Drag W and R to 1, take two replicas down, add an item, bring them back and read."
+      notice: "Stale. With R + W ≤ N the read can land entirely on replicas the write never reached."
+    - try: "Back at W = R = 2, tick Sloppy quorum. Take replicas 1 and 2 down, add an item, bring them back, and read before handing off hints."
+      notice: "R + W > N and still stale. The write landed on spares outside the home set, which the overlap argument never counted."
+    - try: "Press Laptop and phone add at once, first with Last write wins, then with Keep siblings."
+      notice: "Last-write-wins keeps the higher timestamp and silently drops the phone's item. Siblings keep both, and the app merges them."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 98, h: 48, title: Cart service, sub: driver }
+      after:  { x: 12, y: 111, w: 98, h: 48, title: Cart service, sub: CL QUORUM }
+    - id: context
+      kind: context
+      before: { x: 130, y: 18, w: 260, h: 236, title: Cassandra · RF 3, sub: "ONE: the first reply wins" }
+      after:  { x: 130, y: 111, w: 112, h: 48, title: Coordinator, sub: any node }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 262, y: 104, w: 132, h: 62, title: "" }
+      after:  { x: 262, y: 104, w: 132, h: 62, title: Quorum, sub: "W 2 · R 2 · 2+2>3" }
+    - id: r1
+      kind: concrete
+      before: { x: 420, y: 20, w: 128, h: 48, title: Replica 1, sub: has v2 }
+      after:  { x: 420, y: 20, w: 128, h: 48, title: Replica 1, sub: has v2 }
+    - id: r2
+      kind: concrete
+      before: { x: 420, y: 111, w: 128, h: 48, title: Replica 2, sub: has v2 }
+      after:  { x: 420, y: 111, w: 128, h: 48, title: Replica 2, sub: has v2 }
+    - id: r3
+      kind: concrete
+      before: { x: 420, y: 202, w: 128, h: 48, title: Replica 3, sub: was down · v1 }
+      after:  { x: 420, y: 202, w: 128, h: 48, title: Replica 3, sub: was down · v1 }
+  edges:
+    - { from: client, to: context, label: query }
+    - { from: context, to: strategy, label: fan out }
+    - { from: strategy, to: r1 }
+    - { from: strategy, to: r2, label: wait for 2 }
+    - { from: strategy, to: r3 }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: cart.go
+      source: |
+        // cart.go
+        func (s *CartStore) Add(ctx context.Context, userID gocql.UUID, sku string, qty int) error {
+            return s.session.Query(
+                `INSERT INTO cart_items (user_id, sku, qty) VALUES (?, ?, ?)`, userID, sku, qty,
+            ).WithContext(ctx).Consistency(gocql.One).Exec()
+        }
+
+        func (s *CartStore) Items(ctx context.Context, userID gocql.UUID) (map[string]int, error) {
+            items := map[string]int{}
+            iter := s.session.Query(
+                `SELECT sku, qty FROM cart_items WHERE user_id = ?`, userID,
+            ).WithContext(ctx).Consistency(gocql.One).Iter()
+            var sku string
+            var qty int
+            for iter.Scan(&sku, &qty) {
+                items[sku] = qty
+            }
+            return items, iter.Close()
+        }
+      roles: { client: [2, 6], context: [8, 19], r1: [5, 5], r2: [12, 12], r3: [12, 12] }
+      change:
+        - { line: 12, replace: '    ).WithContext(ctx).Consistency(gocql.All).Iter()' }
+    after:
+      file: cart.go
+      source: |
+        // cart.go: writes and reads both wait for a majority of the 3 replicas
+        const cl = gocql.Quorum // W = 2, R = 2, RF = 3: 2 + 2 > 3
+
+        func (s *CartStore) Add(ctx context.Context, userID gocql.UUID, sku string, qty int) error {
+            return s.session.Query(
+                `INSERT INTO cart_items (user_id, sku, qty) VALUES (?, ?, ?)`, userID, sku, qty,
+            ).WithContext(ctx).Consistency(cl).Exec()
+        }
+
+        func (s *CartStore) Items(ctx context.Context, userID gocql.UUID) (map[string]int, error) {
+            items := map[string]int{}
+            iter := s.session.Query(
+                `SELECT sku, qty FROM cart_items WHERE user_id = ?`, userID,
+            ).WithContext(ctx).Consistency(cl).Iter()
+            var sku string
+            var qty int
+            for iter.Scan(&sku, &qty) {
+                items[sku] = qty
+            }
+            return items, iter.Close()
+        }
+      roles: { client: [4, 8], context: [10, 21], strategy: [2, 2], r1: [7, 7], r2: [7, 7], r3: [14, 14], write: [5, 7], ack: [2, 2], read: [12, 14], merge: [17, 20] }
+    again:
+      file: cluster.go
+      source: |
+        // cluster.go: the same request in a second datacenter. Count the quorum inside the local DC.
+        cluster.Consistency = gocql.LocalQuorum
+        cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy("eu-west"))
+    cost:
+      before: { text: checkout fails whenever 1 of 3 replicas is down, value: 0.85 }
+      after: { text: 1 replica down · 0 errors · 0 missing items, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: One setting
+      note: 'gocql sets the level per query with `.Consistency(gocql.Quorum)` or for the whole session with `cluster.Consistency`. Do not trust a default you have not read: set it explicitly for every read and write path that must overlap. Rows from a multi-row read come back through an `Iter`, so check `iter.Close()` for the error.'
+      seenIn: '`gocql.Quorum`, `gocql.LocalQuorum`, `gocql.One`. `gocql.DCAwareRoundRobinPolicy` for multi-datacenter clusters.'
+
+  python:
+    before:
+      file: cart.py
+      source: |
+        # cart.py
+        from cassandra import ConsistencyLevel
+        from cassandra.query import SimpleStatement
+
+        ADD = SimpleStatement(
+            "INSERT INTO cart_items (user_id, sku, qty) VALUES (%s, %s, %s)",
+            consistency_level=ConsistencyLevel.ONE,
+        )
+        ITEMS = SimpleStatement(
+            "SELECT sku, qty FROM cart_items WHERE user_id = %s",
+            consistency_level=ConsistencyLevel.ONE,
+        )
+
+
+        def add(session, user_id, sku: str, qty: int) -> None:
+            session.execute(ADD, (user_id, sku, qty))
+
+
+        def items(session, user_id) -> dict[str, int]:
+            return {row.sku: row.qty for row in session.execute(ITEMS, (user_id,))}
+      roles: { client: [15, 16], context: [19, 20], r1: [7, 7], r2: [11, 11], r3: [11, 11] }
+      change:
+        - { line: 11, replace: '    consistency_level=ConsistencyLevel.ALL,' }
+    after:
+      file: cart.py
+      source: |
+        # cart.py: writes and reads both wait for a majority of the 3 replicas
+        from cassandra import ConsistencyLevel
+        from cassandra.query import SimpleStatement
+
+        CL = ConsistencyLevel.QUORUM  # W = 2, R = 2, RF = 3: 2 + 2 > 3
+
+        ADD = SimpleStatement(
+            "INSERT INTO cart_items (user_id, sku, qty) VALUES (%s, %s, %s)",
+            consistency_level=CL,
+        )
+        ITEMS = SimpleStatement(
+            "SELECT sku, qty FROM cart_items WHERE user_id = %s",
+            consistency_level=CL,
+        )
+
+
+        def add(session, user_id, sku: str, qty: int) -> None:
+            session.execute(ADD, (user_id, sku, qty))
+
+
+        def items(session, user_id) -> dict[str, int]:
+            return {row.sku: row.qty for row in session.execute(ITEMS, (user_id,))}
+      roles: { client: [17, 18], context: [21, 22], strategy: [5, 5], r1: [9, 9], r2: [9, 9], r3: [13, 13], write: [17, 18], ack: [5, 5], read: [11, 14], merge: [22, 22] }
+    again:
+      file: cluster.py
+      source: |
+        # cluster.py: the same request in a second datacenter. Count the quorum inside the local DC.
+        CL = ConsistencyLevel.LOCAL_QUORUM
+        policy = TokenAwarePolicy(DCAwareRoundRobinPolicy(local_dc="eu-west"))
+        cluster = Cluster(execution_profiles={EXEC_PROFILE_DEFAULT: ExecutionProfile(load_balancing_policy=policy)})
+    cost:
+      before: { text: checkout fails whenever 1 of 3 replicas is down, value: 0.85 }
+      after: { text: 1 replica down · 0 errors · 0 missing items, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: One setting
+      note: 'The DataStax `cassandra-driver` defaults to `LOCAL_ONE`, which is R = W = 1 inside one datacenter. Set the level on each statement (`consistency_level=`) or in an `ExecutionProfile`. A level on the statement wins over the profile.'
+      seenIn: '`ConsistencyLevel.QUORUM`, `LOCAL_QUORUM`, `ONE`, `ALL`. `ExecutionProfile` and `DCAwareRoundRobinPolicy`.'
+
+  typescript:
+    before:
+      file: cart.ts
+      source: |
+        // cart.ts
+        import { Client, types } from "cassandra-driver";
+
+        const ONE = { prepare: true, consistency: types.consistencies.one };
+
+        export async function add(db: Client, userId: string, sku: string, qty: number) {
+          await db.execute(
+            "INSERT INTO cart_items (user_id, sku, qty) VALUES (?, ?, ?)",
+            [userId, sku, qty], ONE,
+          );
+        }
+
+        export async function items(db: Client, userId: string): Promise<Map<string, number>> {
+          const rs = await db.execute(
+            "SELECT sku, qty FROM cart_items WHERE user_id = ?", [userId], ONE,
+          );
+          return new Map(rs.rows.map((r) => [r.sku, r.qty]));
+        }
+      roles: { client: [6, 11], context: [13, 18], r1: [9, 9], r2: [15, 15], r3: [15, 15] }
+      change:
+        - { line: 15, replace: '    "SELECT sku, qty FROM cart_items WHERE user_id = ?", [userId], { prepare: true, consistency: types.consistencies.all },' }
+    after:
+      file: cart.ts
+      source: |
+        // cart.ts: writes and reads both wait for a majority of the 3 replicas
+        import { Client, types } from "cassandra-driver";
+
+        // W = 2, R = 2, RF = 3: 2 + 2 > 3
+        const QUORUM = { prepare: true, consistency: types.consistencies.quorum };
+
+        export async function add(db: Client, userId: string, sku: string, qty: number) {
+          await db.execute(
+            "INSERT INTO cart_items (user_id, sku, qty) VALUES (?, ?, ?)",
+            [userId, sku, qty], QUORUM,
+          );
+        }
+
+        export async function items(db: Client, userId: string): Promise<Map<string, number>> {
+          const rs = await db.execute(
+            "SELECT sku, qty FROM cart_items WHERE user_id = ?", [userId], QUORUM,
+          );
+          return new Map(rs.rows.map((r) => [r.sku, r.qty]));
+        }
+      roles: { client: [7, 12], context: [14, 19], strategy: [4, 5], r1: [10, 10], r2: [10, 10], r3: [16, 16], write: [8, 11], ack: [5, 5], read: [15, 17], merge: [18, 18] }
+    again:
+      file: client.ts
+      source: |
+        // client.ts: the same request in a second datacenter. Count the quorum inside the local DC.
+        const db = new Client({
+          contactPoints: ["10.1.0.10"],
+          localDataCenter: "eu-west",
+          queryOptions: { consistency: types.consistencies.localQuorum },
+        });
+    cost:
+      before: { text: checkout fails whenever 1 of 3 replicas is down, value: 0.85 }
+      after: { text: 1 replica down · 0 errors · 0 missing items, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: One setting
+      note: 'The DataStax Node.js `cassandra-driver` defaults to `localOne`. Pass `consistency` in the per-call options, or once in `queryOptions` on the `Client`. The values are plain numbers in `types.consistencies`, so a typo in a name is a compile error only if you go through that object.'
+      seenIn: '`types.consistencies.quorum`, `localQuorum`, `one`, `all`. `localDataCenter`, which the driver requires.'
+
+  rust:
+    before:
+      file: cart.rs
+      source: |
+        // cart.rs
+        use scylla::client::session::Session;
+        use scylla::statement::{unprepared::Statement, Consistency};
+
+        pub async fn add(db: &Session, user_id: Uuid, sku: &str, qty: i32) -> anyhow::Result<()> {
+            let mut q = Statement::new("INSERT INTO cart_items (user_id, sku, qty) VALUES (?, ?, ?)");
+            q.set_consistency(Consistency::One);
+            db.query_unpaged(q, (user_id, sku, qty)).await?;
+            Ok(())
+        }
+
+        pub async fn items(db: &Session, user_id: Uuid) -> anyhow::Result<HashMap<String, i32>> {
+            let mut q = Statement::new("SELECT sku, qty FROM cart_items WHERE user_id = ?");
+            q.set_consistency(Consistency::One);
+            let rows = db.query_unpaged(q, (user_id,)).await?.into_rows_result()?;
+            Ok(rows.rows::<(String, i32)>()?.collect::<Result<_, _>>()?)
+        }
+      roles: { client: [5, 10], context: [12, 17], r1: [7, 7], r2: [14, 14], r3: [14, 14] }
+      change:
+        - { line: 14, replace: '    q.set_consistency(Consistency::All);' }
+    after:
+      file: cart.rs
+      source: |
+        // cart.rs: writes and reads both wait for a majority of the 3 replicas
+        use scylla::client::session::Session;
+        use scylla::statement::{unprepared::Statement, Consistency};
+
+        const CL: Consistency = Consistency::Quorum; // W = 2, R = 2, RF = 3: 2 + 2 > 3
+
+        pub async fn add(db: &Session, user_id: Uuid, sku: &str, qty: i32) -> anyhow::Result<()> {
+            let mut q = Statement::new("INSERT INTO cart_items (user_id, sku, qty) VALUES (?, ?, ?)");
+            q.set_consistency(CL);
+            db.query_unpaged(q, (user_id, sku, qty)).await?;
+            Ok(())
+        }
+
+        pub async fn items(db: &Session, user_id: Uuid) -> anyhow::Result<HashMap<String, i32>> {
+            let mut q = Statement::new("SELECT sku, qty FROM cart_items WHERE user_id = ?");
+            q.set_consistency(CL);
+            let rows = db.query_unpaged(q, (user_id,)).await?.into_rows_result()?;
+            Ok(rows.rows::<(String, i32)>()?.collect::<Result<_, _>>()?)
+        }
+      roles: { client: [7, 12], context: [14, 19], strategy: [5, 5], r1: [9, 9], r2: [9, 9], r3: [16, 16], write: [8, 10], ack: [5, 5], read: [15, 17], merge: [18, 18] }
+    again:
+      file: cluster.rs
+      source: |
+        // cluster.rs: the same request in a second datacenter. Count the quorum inside the local DC.
+        const CL: Consistency = Consistency::LocalQuorum;
+        let policy = DefaultPolicy::builder().prefer_datacenter("eu-west".to_string()).token_aware(true).build();
+    cost:
+      before: { text: checkout fails whenever 1 of 3 replicas is down, value: 0.85 }
+      after: { text: 1 replica down · 0 errors · 0 missing items, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: One setting
+      note: 'The `scylla` crate (it also speaks to Cassandra) sets the level on a `Statement` or a `PreparedStatement` with `set_consistency`, or for every statement through an `ExecutionProfile`. `Consistency` is an enum, so a level that does not exist will not compile. Rows decode into typed tuples, and a type mismatch is an error, not a panic.'
+      seenIn: '`scylla::statement::Consistency::{Quorum, LocalQuorum, One, All}`. `ExecutionProfile` and `DefaultPolicy` with `prefer_datacenter`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The cart service sends the INSERT at QUORUM to any node. That node becomes the coordinator and forwards the write to all three replicas of the key.
+    nodes: [client, context, strategy]
+    edges: [client>context, context>strategy]
+    role: write
+  - text: Replicas 1 and 2 acknowledge. Replica 3 is down. Two acks meet W = 2, so the write succeeds, and the coordinator keeps a hint for replica 3.
+    nodes: [strategy, r1, r2]
+    edges: [strategy>r1, strategy>r2]
+    role: ack
+  - text: Replica 3 comes back without the item. Checkout reads at QUORUM, and replicas 2 and 3 answer first.
+    nodes: [context, strategy, r2, r3]
+    edges: [context>strategy, strategy>r2, strategy>r3]
+    role: read
+  - text: Replica 2 has the new row and replica 3 does not. The coordinator keeps the newest value per cell and returns the full cart. Any two of three replicas share one, and here it is replica 2.
+    nodes: [strategy, r2]
+    edges: [strategy>r2]
+    role: merge
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A key has N = 5 replicas. Which choice of W and R makes every read set share at least one replica with every write set?
+    options:
+      - text: W = 3 and R = 3
+        correct: true
+        why: Right. 3 + 3 = 6 > 5, so any 3 replicas and any other 3 out of 5 must share at least one.
+      - text: W = 2 and R = 3
+        why: 2 + 3 = 5 is not more than 5. The write can land on replicas 1 and 2 and the read can ask 3, 4 and 5.
+      - text: W = 1 and R = 4
+        why: 1 + 4 = 5 is not more than 5. The single replica that took the write can be the one replica the read skipped.
+  engineer:
+    question: N = 3, W = 2, R = 2 with a sloppy quorum. Two home replicas are down during a write, so the write lands on two stand-in nodes. What can a reader see once the home replicas are back?
+    options:
+      - text: A quorum read of the home replicas can miss the write until hinted handoff delivers it.
+        correct: true
+        why: Right. The overlap argument counts the N home replicas. The write went to nodes outside that set, so a read of the home replicas has nothing to overlap with.
+      - text: The new value, because R + W > N holds.
+        why: R + W > N only works when both sets come from the same N replicas. A sloppy quorum breaks that assumption on purpose, to stay available.
+      - text: An error, because the write did not reach its home replicas.
+        why: The read succeeds. Two home replicas answer, and both are behind. Nothing tells the reader the newest version is elsewhere.
+  deep:
+    question: A QUORUM write reaches one replica of three, then times out, and the client is told it failed. What can later QUORUM reads return?
+    options:
+      - text: Sometimes the old value and sometimes the new one, until read repair or anti-entropy copies the new one everywhere and makes it stick.
+        correct: true
+        why: Right. Nothing rolls back the replica that took the write. A read that includes it returns the newer value; one that does not returns the older one. Repair then spreads the failed write.
+      - text: Always the old value, because failed writes are rolled back.
+        why: Leaderless stores do not roll back. A timeout means unknown, not undone, and the one replica that took the write keeps it.
+      - text: An error until an operator repairs the key.
+        why: Reads still succeed with two replies. Which version they return depends on which replicas answer.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Coordinator
+      example: whichever node the driver picked
+      job: Forwards the request to the N replicas of the key and counts the answers.
+    - role: Replica
+      example: the 3 nodes that own the cart's partition
+      job: Stores the key and answers reads with its newest version.
+    - role: Quorum
+      example: W = 2, R = 2 for N = 3
+      job: How many answers make a write succeed or a read complete.
+    - role: Stand-in node
+      example: the next healthy node on the ring
+      job: Holds a hinted write for a down replica in a sloppy quorum.
+  useWhen:
+    - Writes must keep working while any one node is down, without a leader election.
+    - Data partitioned across many nodes, where per-key replication is cheaper than one leader per partition.
+    - Reads that must see recent writes, but can tolerate an occasional stale answer during failures.
+  avoidWhen:
+    - Operations that need a single winner, like a unique username or a balance check. Use a lightweight transaction (Paxos) or a store with a leader.
+    - Data that is updated concurrently in place and cannot be merged. Last-write-wins will drop updates silently.
+  tradeoffs:
+    - A higher W makes writes slower and less available; a higher R does the same for reads. W = N or R = N fails whenever one replica is down.
+    - Quorum reads cost R round trips worth of load and wait for the slowest of the first R replies.
+    - Sloppy quorums keep writes available during outages and give up the overlap guarantee until hints are delivered.
+    - Failed writes are not rolled back. A timeout means the write may or may not be there.
+  lookalikes:
+    - name: Leader-follower replication
+      how: One node orders all writes. Reads from the leader see everything; reads from followers lag. No quorum math, but a failover when the leader dies.
+    - name: Raft and Paxos
+      how: Also use majorities, but to agree on one order of operations. That gives linearizable reads; quorum reads alone do not.
+    - name: Read repair and anti-entropy
+      how: How the replicas converge after a quorum write missed some of them. They make the system eventually consistent; the quorum only makes single reads fresher.
+---
+
+## [concept] Quorums and leaderless replication
+
+**Write each key to N replicas and wait for W of them. Read from R of them. If R + W > N, every read set shares a replica with every write set.**
+
+There is no leader. Any node can take a request and act as the <Term id="coordinator">coordinator</Term>. It forwards the request to the key's N replicas (the <Term id="replication-factor">replication factor</Term>) and counts the answers. The read keeps the newest version it sees, so if one replica in the read set took the latest write, the read returns it.
+
+<Depth level={2}>
+The numbers are a trade. With N = 3, W = 2 and R = 2 (a majority <Term id="quorum">quorum</Term> on both sides), writes and reads keep working with one replica down. W = 1 makes writes fast and reads risky; R = 1 does the opposite. W = N or R = N makes every replica a single point of failure for that operation. The overlap only holds when R + W > N, and only for the N home replicas of the key.
+</Depth>
+
+<Depth level={3}>
+Amazon's Dynamo paper (2007) made this design popular. Its services typically ran with N, R, W = 3, 2, 2. Cassandra, Riak and ScyllaDB follow the same model. Dynamo also used a <Term id="sloppy-quorum">sloppy quorum</Term>: requests go to the first N healthy nodes on the key's preference list, which may not be the home replicas, so writes stay available during failures. Those stand-ins keep the write with a hint and return it later through <Term id="hinted-handoff">hinted handoff</Term>.
+</Depth>
+
+## [problem] A cart written and read at ONE
+
+A shop keeps carts in Cassandra with a replication factor of 3. The cart service writes and reads at consistency level ONE: the first replica to answer wins. It is fast, and in testing every replica was always up.
+
+Read it once. The write succeeds as soon as one replica has it, and the read is satisfied by any one replica.
+
+<Depth level={2}>
+ONE for both means W = 1 and R = 1, so R + W = 2, which is not more than 3. A write can land only on replica 1, and the next read can be answered only by replica 3. Normally the other replicas catch up within milliseconds, so the window is small. When a replica is down or overloaded, the window is as long as the outage.
+</Depth>
+
+<Depth level={3}>
+The DataStax drivers for Python and Node.js default to LOCAL_ONE, so many services run at R = W = 1 without anyone choosing it. Rows written in one place and read from another (a cart, a session, a draft) are exactly the data that shows the gap.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** checkout must show every item the customer added to the cart, even while a node is down.
+
+A node was restarted for a kernel patch. For the few minutes it was down, customers added items, went to checkout, and some items were missing. The obvious fix is the marked line: read at ALL.
+
+<Depth level={2}>
+ALL is R = N, so the read now sees every replica, and every write. It also needs every replica to answer. The next time one node of three is down, every checkout fails. The fix traded stale carts for an outage.
+</Depth>
+
+<Depth level={3}>
+ALL also waits for the slowest replica. One replica in a long garbage collection pause sets the latency of every checkout, which is the opposite of why the cluster has three replicas.
+</Depth>
+
+## [morph] Make the read set and the write set overlap
+
+Drag the slider. A quorum appears between the coordinator and the replicas.
+
+Both the write and the read now use QUORUM, which is 2 of 3. Two plus two is more than three, so the two replicas that took the write and the two that answer the read share at least one. One replica can be down and both still work.
+
+<Depth level={2}>
+The change is one constant per language, and both paths must use it. Raising only the reads to QUORUM while writes stay at ONE gives R + W = 3, no overlap, and the same missing items. Treat the read and write levels as one setting.
+</Depth>
+
+<Depth level={3}>
+Majority quorums are not the only overlapping pair. Any read and write quorums that must intersect work, which is why some systems make writes cheap (W = 1) and reads expensive (R = N), or the reverse. Flexible Paxos uses the same observation for consensus. What matters is that the sets come from the same N nodes.
+</Depth>
+
+## [walk] Follow one item into the cart and out again
+
+One write and one read, with replica 3 down for the write and back for the read. Use the numbered buttons.
+
+<Depth level={2}>
+When the read sees replicas disagree, Cassandra can write the newer value back to the replica that was behind. That is <Term id="read-repair">read repair</Term>. It makes the next read cheaper, and it is how the overlap slowly turns into all three replicas agreeing.
+</Depth>
+
+<Depth level={3}>
+Cassandra decides "newest" per cell, by the write timestamp the coordinator or client attached. That is <Term id="last-write-wins">last-write-wins</Term>. Two writes to the same cell at about the same time keep only the higher timestamp, even if its clock was wrong. Different cart items are different rows here, so adding two items at once is safe; changing the same item's quantity from two devices at once is not.
+</Depth>
+
+## [again] The same request, in a second region
+
+The shop opens a second datacenter. QUORUM would now count replicas in both regions, and every checkout would wait on a cross-region round trip. The change is one setting: LOCAL_QUORUM, a majority of the replicas in the local datacenter, plus a driver policy that prefers local nodes.
+
+<Depth level={2}>
+LOCAL_QUORUM gives the overlap inside each region. A cart written in Europe and read in America straight after can still be stale, because the two regions' quorums do not overlap. Route a customer's requests to one home region, or accept the cross-region wait with QUORUM or EACH_QUORUM for that path.
+</Depth>
+
+<Depth level={3}>
+Quorum arithmetic is per datacenter for LOCAL_QUORUM: with 3 replicas in each of two regions, a local quorum is 2 of the local 3. The global QUORUM would be 4 of 6.
+</Depth>
+
+## [play] Take nodes down and count the overlap
+
+Replicas you can take down, spare nodes for a sloppy quorum, and sliders for N, R and W. Every read shows which replicas answered, which took the last write, and whether they overlapped.
+
+First prove the overlap works, then break it three ways while R + W > N still holds.
+
+## [lens] How each driver sets R and W
+
+In Cassandra-style stores you never set R and W as numbers. You pick a consistency level per request, and the driver sends it to the coordinator. The coordinator turns it into a count. ONE, QUORUM, LOCAL_QUORUM and ALL exist in every driver; what differs is where you set them and what the default is.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Make the level visible in code review. A named constant used by both the read and the write path, as in the code above, prevents the most common bug: someone tunes one side and silently breaks the overlap.
+</Depth>
+
+<Depth level={3}>
+Siblings are the other answer to concurrent writes. Riak, like Dynamo, can keep every concurrent version and hand all of them to the reader, which merges them. To know which versions are concurrent and which simply replaced older ones, those stores tag each version with a version vector. That is the lesson on vector clocks.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="quorums-and-leaderless" />
+
+### What R + W > N does not give you
+
+It is not linearizability. A sloppy quorum can put the write outside the N replicas. A write that fails partway leaves its value on some replicas, where later reads may or may not find it. Two concurrent writes are resolved by timestamp, and one of them is lost. Two readers racing a write can see the new value and then the old one. For a single winner (a username, a seat, a balance), use a lightweight transaction or a store built on consensus.
