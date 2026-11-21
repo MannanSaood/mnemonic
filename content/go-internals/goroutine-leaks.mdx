@@ -1,0 +1,490 @@
+---
+title: Goroutine leaks
+track: go-internals
+group: Channels and goroutines
+order: 11
+summary: A goroutine that waits for something that can no longer happen never exits. It keeps its stack and everything it points to, and the count only goes up.
+intent: Be able to say, for every go statement, how that goroutine ends, and find the ones that never do.
+changeRequest: The profile service's memory climbs all day, and the pods are OOM-killed every few hours.
+languages: [go, python, typescript, rust]
+glossary: [goroutine-leak, goroutine-profile, partial-deadlock, goroutine-park]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [go-internals/channels-hchan]
+skills: [concurrency, debugging]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: goroutine-leaks
+  scenarios:
+    - try: "Predict, then send 1,000 requests through the handler as written."
+      notice: "About 1,900 goroutines stay parked on ch <- p: the two losers of almost every request, and all three when a request times out."
+    - try: "Keep sending until the pod dies."
+      notice: "Memory only rises. Around the third thousand the pod hits its limit and is OOM-killed, and the count starts again."
+    - try: "Set the buffer to 1, then 2, then 3, sending 1,000 requests each time."
+      notice: "1 still leaks about one goroutine per request; 2 leaks only on timeouts; 3, one slot per sender, leaks nothing. The losers still finish their backend calls, though."
+    - try: "Turn on ctx with an unbuffered channel, then add the buffer too."
+      notice: "ctx stops the in-flight calls, but a few goroutines that got their answer at the same moment as the winner still park. ctx plus a buffer of 3 leaves nothing and wastes nothing."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 230
+  nodes:
+    - id: handler
+      kind: client
+      before: { x: 12, y: 90, w: 110, h: 52, title: Profile, sub: reads once }
+      after:  { x: 12, y: 90, w: 110, h: 52, title: Profile, sub: reads once }
+    - id: g1
+      kind: concrete
+      before: { x: 170, y: 18, w: 160, h: 48, title: primary, sub: answered first }
+      after:  { x: 170, y: 18, w: 160, h: 48, title: primary, sub: answered first }
+    - id: g2
+      kind: concrete
+      before: { x: 170, y: 90, w: 160, h: 48, title: replica-a, sub: parked forever }
+      after:  { x: 170, y: 90, w: 160, h: 48, title: replica-a, sub: "sent to a slot, exited" }
+    - id: g3
+      kind: concrete
+      before: { x: 170, y: 162, w: 160, h: 48, title: replica-b, sub: parked forever }
+      after:  { x: 170, y: 162, w: 160, h: 48, title: replica-b, sub: "cancelled, exited" }
+    - id: ch
+      kind: context
+      before: { x: 380, y: 40, w: 168, h: 150, title: ch, sub: "unbuffered, read once" }
+      after:  { x: 380, y: 82, w: 168, h: 68, title: ch, sub: one slot per sender }
+    - id: ctx
+      kind: strategy
+      appears: after
+      before: { x: 12, y: 172, w: 110, h: 44, title: "" }
+      after:  { x: 12, y: 172, w: 110, h: 44, title: ctx, sub: "defer cancel()" }
+  edges:
+    - { from: handler, to: g1 }
+    - { from: handler, to: g2, label: go }
+    - { from: handler, to: g3 }
+    - { from: g1, to: ch, label: send }
+    - { from: g2, to: ch }
+    - { from: g3, to: ch }
+    - { from: ctx, to: g2 }
+    - { from: ctx, to: g3, label: Done }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: profile.go
+      source: |
+        // profile.go
+        func (s *Server) Profile(ctx context.Context, id string) (*Profile, error) {
+            ch := make(chan *Profile)
+            for _, b := range s.backends { // primary, replica-a, replica-b
+                go func() {
+                    p, err := b.Get(id)
+                    if err == nil {
+                        ch <- p
+                    }
+                }()
+            }
+            select {
+            case p := <-ch:
+                return p, nil
+            case <-time.After(100 * time.Millisecond):
+                return nil, ErrTimeout
+            }
+        }
+      roles: { handler: [2, 18], ch: [3, 3], g1: [5, 10], g2: [5, 10], g3: [5, 10] }
+      change:
+        - { line: 8, replace: '                ch <- p // the losers park here forever' }
+        - { line: 14, replace: '        return p, nil // reads one value, then nobody reads again' }
+    after:
+      file: profile.go
+      source: |
+        // profile.go
+        func (s *Server) Profile(ctx context.Context, id string) (*Profile, error) {
+            ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+            defer cancel() // tells the losers to stop
+            ch := make(chan *Profile, len(s.backends)) // a slot for every sender
+            for _, b := range s.backends {
+                go func() {
+                    p, err := b.Get(ctx, id)
+                    if err == nil {
+                        ch <- p // never parks: there is a slot for it
+                    }
+                }()
+            }
+            select {
+            case p := <-ch:
+                return p, nil
+            case <-ctx.Done():
+                return nil, ctx.Err()
+            }
+        }
+      roles: { handler: [2, 20], ctx: [3, 4], cancel: [4, 4], ch: [5, 5], buffer: [5, 5], fanout: [6, 13], g1: [7, 12], g2: [7, 12], g3: [7, 12], send: [10, 10], first: [15, 16] }
+    again:
+      file: the same 1,000 requests
+      source: |
+        // same traffic, same backend latencies
+        // before: 1,875 goroutines parked on ch <- p, +15 MiB, still rising
+        // after:  0 parked; in-flight losers stop when Profile returns
+        // runtime.NumGoroutine() after the burst: back to the idle count
+    cost:
+      before: { text: "1,875 parked per 1,000 requests · memory only grows", value: 0.9 }
+      after: { text: "0 parked · losers stop at return", value: 0.08 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'A goroutine cannot be stopped from outside, so every `go` statement needs an answer to "how does this one end?". The runtime reports a deadlock only when every goroutine is blocked. A leak in a busy server never trips it.'
+      seenIn: '`go.uber.org/goleak` fails a test that leaves goroutines behind. `/debug/pprof/goroutine?debug=1` groups live goroutines by stack. The `goroutineleak` profile in `runtime/pprof` (an experiment in Go 1.26, arriving in Go 1.27) finds goroutines blocked on channels or locks that no running goroutine can reach.'
+
+  python:
+    before:
+      file: profile.py
+      source: |
+        # profile.py
+        async def profile(user_id: str) -> Profile:
+            results: asyncio.Queue[Profile] = asyncio.Queue(maxsize=1)
+
+            async def ask(b: Backend) -> None:
+                await results.put(await b.get(user_id))
+
+            for b in backends:  # primary, replica-a, replica-b
+                asyncio.create_task(ask(b))
+            async with asyncio.timeout(0.1):
+                return await results.get()
+      roles: { handler: [2, 11], ch: [3, 3], g1: [5, 6], g2: [5, 6], g3: [5, 6] }
+      change:
+        - { line: 6, replace: '        await results.put(await b.get(user_id))  # the last loser waits here forever' }
+        - { line: 11, replace: '        return await results.get()  # reads one value, then nobody reads again' }
+    after:
+      file: profile.py
+      source: |
+        # profile.py
+        async def profile(user_id: str) -> Profile:
+            tasks = [asyncio.create_task(b.get(user_id)) for b in backends]
+            try:
+                async with asyncio.timeout(0.1):
+                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    return done.pop().result()
+            finally:
+                for t in tasks:
+                    t.cancel()  # the losers get CancelledError at their next await
+      roles: { handler: [2, 10], fanout: [3, 3], ch: [3, 3], buffer: [3, 3], g1: [3, 3], g2: [3, 3], g3: [3, 3], first: [6, 7], send: [6, 6], ctx: [8, 10], cancel: [8, 10] }
+    again:
+      file: the same 1,000 requests
+      source: |
+        # same traffic, same backend latencies
+        # before: one task stuck in put() per request, until the GC destroys it:
+        #         "Task was destroyed but it is pending!"
+        # after:  no pending tasks; losers cancelled when profile() returns
+    cost:
+      before: { text: "1 stuck task per request · destroyed later with a warning", value: 0.7 }
+      after: { text: "0 pending tasks · losers cancelled at return", value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'asyncio holds only weak references to tasks. A task stuck on a queue nobody reads becomes garbage once nothing else refers to it, and asyncio logs "Task was destroyed but it is pending!". Keep references to your tasks, and cancel the ones you no longer need.'
+      seenIn: '`asyncio.TaskGroup` cancels the remaining tasks when one fails. `asyncio.timeout()` cancels the current task when the deadline passes. The docs for `asyncio.create_task` tell you to keep a reference to the result.'
+
+  typescript:
+    before:
+      file: profile.ts
+      source: |
+        // profile.ts
+        export function profile(userId: string): Promise<Profile> {
+          const timeout = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("timeout")), 100));
+          const calls = backends.map((b) => b.get(userId)); // primary, replica-a, replica-b
+          return Promise.race([...calls, timeout]);
+        }
+      roles: { handler: [2, 7], ch: [6, 6], g1: [5, 5], g2: [5, 5], g3: [5, 5] }
+      change:
+        - { line: 5, replace: '  const calls = backends.map((b) => b.get(userId)); // the losers keep running' }
+        - { line: 6, replace: '  return Promise.race([...calls, timeout]); // settles once; nothing stops the rest' }
+    after:
+      file: profile.ts
+      source: |
+        // profile.ts
+        export async function profile(userId: string): Promise<Profile> {
+          const ac = new AbortController();
+          const signal = AbortSignal.any([ac.signal, AbortSignal.timeout(100)]);
+          try {
+            return await Promise.any(backends.map((b) => b.get(userId, { signal })));
+          } finally {
+            ac.abort(); // cancels the losers' requests
+          }
+        }
+      roles: { handler: [2, 10], ctx: [3, 4], fanout: [6, 6], ch: [6, 6], buffer: [6, 6], g1: [6, 6], g2: [6, 6], g3: [6, 6], first: [6, 6], send: [6, 6], cancel: [7, 9] }
+    again:
+      file: the same 1,000 requests
+      source: |
+        // same traffic, same backend latencies
+        // before: ~2,000 backend requests ran on after their answer was useless
+        // after:  the losers' sockets close when profile() returns
+    cost:
+      before: { text: "2 requests per call run on unread · sockets held", value: 0.6 }
+      after: { text: "losers aborted at return", value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A Promise cannot be cancelled, and no stack is parked, so the leak is work that keeps running: the losing requests, their sockets and their callbacks. A Promise that never settles keeps its closures alive. `AbortSignal` is how you tell the work to stop.'
+      seenIn: '`fetch(url, { signal })`. `AbortSignal.timeout(ms)` and `AbortSignal.any([...])`. Node''s `events.once(emitter, name, { signal })`.'
+
+  rust:
+    before:
+      file: profile.rs
+      source: |
+        // profile.rs
+        async fn profile(backends: &[Backend], id: &str) -> Result<Profile, Error> {
+            let (tx, mut rx) = mpsc::channel(1);
+            for b in backends.iter().cloned() {
+                let (tx, id) = (tx.clone(), id.to_owned());
+                tokio::spawn(async move {
+                    if let Ok(p) = b.get(&id).await {
+                        let _ = tx.send(p).await;
+                    }
+                });
+            }
+            match timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(p)) => Ok(p),
+                _ => Err(Error::Timeout),
+            }
+        }
+      roles: { handler: [2, 16], ch: [3, 3], g1: [6, 10], g2: [6, 10], g3: [6, 10] }
+      change:
+        - { line: 6, replace: '        tokio::spawn(async move { // detached: keeps running after we return' }
+        - { line: 8, replace: '                let _ = tx.send(p).await; // Err once rx is dropped, so it does exit' }
+    after:
+      file: profile.rs
+      source: |
+        // profile.rs
+        async fn profile(backends: &[Backend], id: &str) -> Result<Profile, Error> {
+            let mut set = JoinSet::new();
+            for b in backends.iter().cloned() {
+                let id = id.to_owned();
+                set.spawn(async move { b.get(&id).await });
+            }
+            let first = timeout(Duration::from_millis(100), async {
+                while let Some(res) = set.join_next().await {
+                    if let Ok(Ok(p)) = res {
+                        return Some(p);
+                    }
+                }
+                None
+            });
+            first.await.ok().flatten().ok_or(Error::Timeout)
+        } // `set` is dropped here: every task still running is aborted
+      roles: { handler: [2, 17], fanout: [3, 7], ch: [3, 3], buffer: [3, 3], g1: [6, 6], g2: [6, 6], g3: [6, 6], first: [9, 11], send: [9, 11], ctx: [17, 17], cancel: [17, 17] }
+    again:
+      file: the same 1,000 requests
+      source: |
+        // same traffic, same backend latencies
+        // before: nothing stuck forever, but ~2,000 backend calls ran on unread
+        // after:  JoinSet's drop aborts the losers at their next .await
+    cost:
+      before: { text: "0 stuck · 2 calls per request run on unread", value: 0.5 }
+      after: { text: "losers aborted at return", value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Dropping a future cancels it, but `tokio::spawn` detaches the task: dropping its `JoinHandle` does not stop it. A send on a channel whose receiver was dropped returns an error, so the stuck-forever leak is rarer than in Go. `JoinSet` aborts all of its tasks when it is dropped.'
+      seenIn: '`tokio::task::JoinSet`. `tokio::select!`, which drops the branches that lose. `tokio_util::sync::CancellationToken`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Profile starts one goroutine per backend. Each one gets the request's ctx and a channel with a slot for every backend.
+    nodes: [handler, g1, g2, g3]
+    edges: [handler>g1, handler>g2, handler>g3]
+    role: fanout
+  - text: primary answers first. Its value goes into the channel, the select takes it, and Profile returns.
+    nodes: [g1, ch, handler]
+    edges: [g1>ch]
+    role: first
+  - text: { go: 'Returning runs `defer cancel()`. `ctx.Done()` closes, and the replicas'' in-flight calls return `context.Canceled`. With nothing to send, they exit.', python: 'The `finally` block cancels every task. A task still waiting on its backend gets `CancelledError` at its next `await` and ends.', typescript: 'The `finally` block calls `ac.abort()`. The losers'' requests reject with an `AbortError` and their sockets close.', rust: 'Leaving the function drops the `JoinSet`, which aborts every task still running. Each one stops at its next `.await`.' }
+    nodes: [ctx, g2, g3]
+    edges: [ctx>g2, ctx>g3]
+    role: cancel
+  - text: { go: 'A replica that already had its answer when the cancel came still sends. The channel has a slot for it, so the send completes at once and the goroutine exits.', python: 'A task that finished before the cancel keeps its result. Nobody reads it, and the task is collected with the list.', typescript: 'A request that already finished resolves its Promise. Nobody awaits it, and it is collected.', rust: 'A task that already finished keeps its output in the set. Dropping the set drops the output too.' }
+    nodes: [g2, ch]
+    edges: [g2>ch]
+    role: send
+  - text: Nothing refers to the channel any more. The garbage collector frees it, with any unread answers inside. Nothing is left behind.
+    nodes: [ch]
+    edges: []
+    role: buffer
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A handler starts three goroutines that send their answers on an unbuffered channel, reads the first answer and returns. What happens to the two slower goroutines?
+    options:
+      - text: They park on the send forever, keeping their stacks and their answers in memory.
+        correct: true
+        why: Right. Nobody will ever receive again, so their sends can never finish. A goroutine that cannot finish is a leak.
+      - text: The garbage collector frees them once the handler has returned.
+        why: The garbage collector never frees a goroutine. A parked goroutine is a root, so its stack and everything it points to stay alive.
+      - text: They panic, because the channel's reader has gone.
+        why: Only a send on a closed channel panics. Nobody closed this one; the reader just stopped reading.
+  engineer:
+    question: That handler leaks. A colleague changes make(chan *Profile) to make(chan *Profile, 1). What happens now?
+    options:
+      - text: It still leaks. One loser fills the slot and the other parks; on a timeout, two park.
+        correct: true
+        why: Right. A buffer of 1 fixes a single sender. With three senders and at most one read, you need a slot for each sender, and a context to stop work nobody wants.
+      - text: The leak is gone, because no send can block on a buffered channel.
+        why: A send on a buffered channel blocks when the buffer is full. One slot fills after the first late send.
+      - text: The handler now blocks, because it has to drain the buffer before returning.
+        why: Nothing forces the handler to drain the channel. It returns after one read, and the channel is collected later.
+  deep:
+    question: A toy program that blocks every goroutine prints "all goroutines are asleep - deadlock!". Why does the leaking server never print it?
+    options:
+      - text: The runtime only reports a deadlock when no goroutine can run. In the server, others keep running and could in principle still wake the stuck ones.
+        correct: true
+        why: Right. This is a partial deadlock. Proving that nobody can ever wake a goroutine needs more work, which is what the newer goroutineleak profile does with the garbage collector's reachability pass.
+      - text: Deadlock detection is turned off in builds without the race detector.
+        why: The check is part of every Go runtime. It simply does not apply while some goroutines can still run.
+      - text: The garbage collector frees the stuck goroutines before the check runs.
+        why: Blocked goroutines are never freed. That is exactly why leaks grow memory.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Reader
+      example: Profile
+      job: Takes the first answer and returns. Owns the context and cancels it on the way out.
+    - role: Sender goroutine
+      example: one per backend
+      job: Must always have a way to finish, whether or not anyone reads its answer.
+    - role: Channel
+      example: { go: "make(chan *Profile, len(s.backends))", python: "the tasks list", typescript: "Promise.any", rust: "JoinSet" }
+      job: Holds answers that arrive after the reader left, so their senders can exit.
+    - role: Context
+      example: { go: "context.WithTimeout + defer cancel()", python: "task.cancel()", typescript: "AbortController", rust: "dropping the JoinSet" }
+      job: Tells work that nobody wants any more to stop.
+  useWhen:
+    - Fan-out that takes the first answer. Give the channel one slot per sender and cancel the rest.
+    - Any goroutine whose result may go unread. Give it a slot to send into or a context to watch.
+    - Long-lived workers and tickers. Give them a stop signal, and make sure something sends it.
+  avoidWhen:
+    - A goroutine that waits for a close that never comes, such as a range over a channel. A bigger buffer does not help; close the channel.
+    - Relying on the garbage collector or the runtime's deadlock check to find leaks. Neither will.
+  tradeoffs:
+    - A buffer as big as the number of senders holds unread answers until the channel is collected.
+    - Cancellation only works if every call on the path accepts the context and checks it.
+    - goleak catches leaks in tests, but only on the paths the tests run.
+    - The goroutine profile shows leaks in production only after they have happened.
+  lookalikes:
+    - name: Deadlock
+      how: Every goroutine is blocked and the runtime stops the program. A leak is a partial deadlock that the program survives, for a while.
+    - name: Memory leak
+      how: Heap objects that stay reachable. A goroutine leak is one cause, because a parked goroutine keeps everything it points to reachable.
+    - name: Forgotten asyncio task
+      how: A pending task nobody refers to. Python collects it with a warning; Go never collects a parked goroutine.
+---
+
+## [concept] Goroutine leaks
+
+**A goroutine that waits for something that can no longer happen never exits.** It keeps its stack and everything it points to, and the number of them only goes up.
+
+That is a <Term id="goroutine-leak">goroutine leak</Term>. It shows up as memory that climbs all day and a goroutine count that looks like a ramp.
+
+<Depth level={2}>
+The usual cause is a goroutine <Term id="goroutine-park">parked</Term> on a channel operation whose partner has gone: a send after the reader returned, a receive on a channel nobody will close, a worker with no stop signal. Every `go` statement needs an answer to one question: how does this goroutine end, in every case, including errors and timeouts?
+</Depth>
+
+<Depth level={3}>
+The runtime cannot help by itself. A parked goroutine is a garbage-collection root, so it is never collected, and the runtime only reports a deadlock when every goroutine is blocked. A leak in a running server is a <Term id="partial-deadlock">partial deadlock</Term>: some goroutines are stuck forever, others are serving traffic.
+</Depth>
+
+## [problem] Ask three, take the first
+
+The profile service reads from a primary and two replicas. To keep latency low, the handler asks all three at once and returns whichever answers first, or gives up after 100 ms.
+
+It is fast and it passes every test. Each test makes one request, checks the answer and exits.
+
+<Depth level={2}>
+The mental model is that the slower goroutines will just finish on their own after the handler returns. They do finish their backend calls. Then they reach `ch <- p`.
+</Depth>
+
+<Depth level={3}>
+The tests do not see the problem because the test process exits after each test, taking the stuck goroutines with it. A long-running server keeps every one of them.
+</Depth>
+
+## [pain] Memory that only goes up
+
+**What happened:** the profile service's memory climbs all day, and the pods are OOM-killed every few hours.
+
+The marked lines are the leak. The handler reads one value and returns. The two slower goroutines then run `ch <- p` on an unbuffered channel that nobody will ever read again, so they park forever. When a request times out, all three do.
+
+<Depth level={2}>
+At 50 requests a second, close to two leaked goroutines per request is about 95 a second, or 340,000 an hour. Each keeps at least a 2 KiB stack plus the profile it was trying to send. CPU stays flat, because parked goroutines do not run, so nothing looks wrong until memory runs out.
+</Depth>
+
+<Depth level={3}>
+The <Term id="goroutine-profile">goroutine profile</Term> gives it away. `curl /debug/pprof/goroutine?debug=1` groups goroutines by identical stack, and one group, parked in `chan send` at `profile.go:8`, holds almost all of them and grows between snapshots.
+</Depth>
+
+## [morph] Give every goroutine a way out
+
+Drag the slider. The unbuffered channel that is read once becomes a channel with one slot per sender, and a context appears that tells the losers to stop.
+
+Two changes, each closing one way out. The buffer means a late sender always has somewhere to put its answer. The context means a sender still waiting on its backend is told to give up.
+
+<Depth level={2}>
+Either change alone leaves a gap. A buffer of 3 stops the leak, but the losers still finish their backend calls, which is wasted load on the replicas. A context alone stops the calls in flight, but a goroutine that already has its answer when the cancel arrives still sends, and on an unbuffered channel it parks.
+</Depth>
+
+<Depth level={3}>
+`context.WithTimeout` also replaces `time.After`. Before Go 1.23, a `time.After` timer that had not fired stayed in memory until it did; since Go 1.23, timers that nothing refers to can be collected early. The context version is better for another reason: the same deadline travels into `b.Get`.
+</Depth>
+
+## [walk] Follow one request
+
+One request through the fixed handler, from fan-out to the last goroutine exiting. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Cancelling closes the context's Done channel, and every goroutine parked in a `select` on it wakes up. A call such as `http.NewRequestWithContext` or a database driver's `QueryContext` watches that channel and returns `context.Canceled`. Code that never looks at `ctx` keeps running; cancellation is a request, not a kill.</Lang>
+<Lang only="python">`task.cancel()` schedules a `CancelledError` to be thrown into the coroutine at its next `await`. A task that is in the middle of CPU work keeps running until it reaches one.</Lang>
+<Lang only="typescript">`ac.abort()` fires the signal's `abort` event. `fetch` listens for it, rejects with an `AbortError` and closes the connection. Code that ignores the signal keeps running.</Lang>
+<Lang only="rust">Aborting a tokio task marks it cancelled. The next time the scheduler would poll it, it drops the future instead, which runs the destructors of everything the future owned, such as open connections.</Lang>
+</Depth>
+
+## [again] The same traffic, again
+
+The same 1,000 requests, with the same backend latencies. This time nothing is left parked. The goroutine count after the burst is the same as before it, and memory stays flat.
+
+<Depth level={2}>
+Make it stay fixed. Add `goleak.VerifyNone(t)` to the handler's tests, or `goleak.VerifyTestMain(m)` for the whole package, so a test fails if it leaves a goroutine behind. In production, graph `runtime.NumGoroutine()` next to request rate: under steady load it should be flat.
+</Depth>
+
+<Depth level={3}>
+The Go team added a `goroutineleak` profile to `runtime/pprof`, experimental in Go 1.26 and, per the Go blog, arriving in Go 1.27. It runs a special garbage collection in which only runnable goroutines are roots. A blocked goroutine whose channel or lock is never reached from them can never be woken, so it is reported as leaked.
+</Depth>
+
+## [play] Run the leak lab
+
+The handler from this lesson runs in a pod with a 64 MiB memory limit. Send traffic and watch the parked goroutines pile up, then change the buffer size and the context handling until nothing is left behind.
+
+Each version of the handler you try gets its own row in the results, so you can compare them side by side.
+
+## [lens] How each language meets it
+
+Every language with background tasks can leak them. What differs is what a leak costs and who notices.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Go parks a whole goroutine and keeps it forever. Python keeps only weak references to tasks, so a stuck task is eventually destroyed with a warning. In Node a stuck Promise holds only its closures, but losing requests keep running. In Rust a dropped receiver turns a blocked send into an error, so tasks tend to exit, but a spawned task runs to completion unless something aborts it.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="goroutine-leaks" />
+
+### Finding leaks
+
+In tests, use `go.uber.org/goleak`. In production, watch `runtime.NumGoroutine()` over time and take the goroutine profile (`/debug/pprof/goroutine?debug=1`) twice, a few minutes apart: the group whose count grows, all parked on the same line, is the leak. Typical lines are `chan send`, `chan receive` on a channel nobody closes, and `select` with no case that can ever fire.

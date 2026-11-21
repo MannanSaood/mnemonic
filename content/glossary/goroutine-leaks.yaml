@@ -1,0 +1,10 @@
+# Terms introduced by the goroutine-leaks lesson.
+- id: goroutine-leak
+  term: Goroutine leak
+  short: A goroutine that is blocked on something that can never happen, such as a send nobody will receive. It never exits, and its stack and everything it references stay in memory.
+- id: goroutine-profile
+  term: Goroutine profile
+  short: A pprof snapshot of every live goroutine, grouped by identical stack. A leak shows up as one group with a large and growing count, all parked on the same line.
+- id: partial-deadlock
+  term: Partial deadlock
+  short: Some goroutines are blocked forever while others keep running. The Go runtime only reports a deadlock when every goroutine is blocked, so a partial deadlock goes unreported.
