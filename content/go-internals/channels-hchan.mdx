@@ -1,0 +1,525 @@
+---
+title: Inside a channel
+track: go-internals
+group: Channels and goroutines
+order: 7
+summary: A channel is a locked ring buffer plus two queues of parked goroutines. A send hands its value to a waiting receiver, drops it in a free slot, or parks.
+intent: For any send or receive, know whether your goroutine keeps running, parks or panics, and where the value goes.
+changeRequest: The analytics collector slowed down for a few seconds, and checkout latency went from 40 ms to several seconds.
+languages: [go, python, typescript, rust]
+glossary: [hchan, sudog, goroutine-park, direct-handoff, backpressure]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [concurrency, go-runtime]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: channels-hchan
+  scenarios:
+    - try: "R1 is parked on an unbuffered channel. Make S1 send."
+      notice: "The value goes straight onto R1's stack and S1 never waits. Nothing is stored in the channel."
+    - try: "Pick capacity 2 and send three times without receiving."
+      notice: "Two sends land in the ring buffer and return at once. The third parks on sendq, holding its value."
+    - try: "Now receive once."
+      notice: "The receiver takes the oldest value, and the parked sender's value drops into the slot just freed. Order is kept, and the sender wakes."
+    - try: "Park a receiver and a sender, then close the channel."
+      notice: "The receiver wakes with the zero value and ok == false. The sender wakes and panics."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 220
+  nodes:
+    - id: handler
+      kind: client
+      before: { x: 12, y: 84, w: 100, h: 52, title: handler, sub: { go: Checkout, python: checkout, typescript: checkout, rust: checkout } }
+      after:  { x: 12, y: 100, w: 100, h: 52, title: handler, sub: { go: Checkout, python: checkout, typescript: checkout, rust: checkout } }
+    - id: hchan
+      kind: context
+      before: { x: 150, y: 40, w: 260, h: 140, title: a queue, sub: "you think: drop in, return" }
+      after:  { x: 140, y: 14, w: 280, h: 40, title: { go: hchan, python: asyncio.Queue, typescript: queue + wake, rust: mpsc::channel }, sub: lock · count · closed }
+    - id: buf
+      kind: concrete
+      appears: after
+      before: { x: 140, y: 64, w: 280, h: 44, title: "" }
+      after:  { x: 140, y: 64, w: 280, h: 44, title: buf, sub: { go: "ring · sendx · recvx", python: "deque, maxsize slots", typescript: "array, MAX slots", rust: "slots, counted by a semaphore" } }
+    - id: sendq
+      kind: concrete
+      appears: after
+      before: { x: 140, y: 164, w: 134, h: 44, title: "" }
+      after:  { x: 140, y: 164, w: 134, h: 44, title: { go: sendq, python: _putters, typescript: full → drop, rust: tx waiters }, sub: parked senders }
+    - id: recvq
+      kind: concrete
+      appears: after
+      before: { x: 286, y: 164, w: 134, h: 44, title: "" }
+      after:  { x: 286, y: 164, w: 134, h: 44, title: { go: recvq, python: _getters, typescript: wake, rust: rx waker }, sub: parked receivers }
+    - id: shipper
+      kind: client
+      before: { x: 448, y: 84, w: 100, h: 52, title: shipper, sub: { go: shipEvents, python: ship_events, typescript: shipEvents, rust: ship_events } }
+      after:  { x: 448, y: 100, w: 100, h: 52, title: shipper, sub: { go: shipEvents, python: ship_events, typescript: shipEvents, rust: ship_events } }
+  edges:
+    - { from: handler, to: buf, label: copy in }
+    - { from: buf, to: shipper, label: copy out }
+    - { from: handler, to: shipper, label: direct copy }
+    - { from: handler, to: sendq }
+    - { from: recvq, to: shipper }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: handler.go
+      source: |
+        // handler.go
+        var events = make(chan Event) // shipEvents is always there to receive
+
+        func (h *Handler) Checkout(w http.ResponseWriter, r *http.Request) {
+            order, err := h.orders.Place(r.Context(), parseCart(r))
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusBadGateway)
+                return
+            }
+            events <- Event{Kind: "checkout", OrderID: order.ID}
+            writeJSON(w, order)
+        }
+
+        func shipEvents(in <-chan Event) {
+            for e := range in {
+                analytics.Send(e) // 3 ms
+            }
+        }
+      roles: { handler: [4, 12], hchan: [2, 2], shipper: [14, 18] }
+      change:
+        - { line: 10, replace: '    events <- Event{Kind: "checkout", OrderID: order.ID} // parks on sendq' }
+        - { line: 16, replace: '        analytics.Send(e) // 400 ms: the collector is slow' }
+    after:
+      file: handler.go
+      source: |
+        // handler.go
+        var (
+            events  = make(chan Event, 4096) // about 20 s of a slow collector at 200 checkouts/s
+            dropped atomic.Int64
+        )
+
+        func (h *Handler) Checkout(w http.ResponseWriter, r *http.Request) {
+            order, err := h.orders.Place(r.Context(), parseCart(r))
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusBadGateway)
+                return
+            }
+            select {
+            case events <- Event{Kind: "checkout", OrderID: order.ID}:
+            default:
+                dropped.Add(1) // analytics may lose an event; checkout may not wait
+            }
+            writeJSON(w, order)
+        }
+
+        func shipEvents(in <-chan Event) {
+            for e := range in {
+                analytics.Send(e)
+            }
+        }
+      roles: { hchan: [3, 3], buf: [3, 3], handler: [7, 19], send: [13, 14], buffer: [3, 3], full: [15, 16], sendq: [15, 16], shipper: [21, 25], recv: [22, 22], recvq: [22, 22] }
+    again:
+      file: the same slow minute
+      source: |
+        // 200 checkouts/s; the collector takes 400 ms per event for 8 s
+        // t = 0 s   collector slows      Checkout adds 0 ms
+        // t = 5 s   len(events) = 988    every send still finds a free slot
+        // t = 8 s   collector recovers   1,580 queued; drained in about 12 s
+        // p99 checkout latency: unchanged. dropped: 0
+    cost:
+      before: { text: "+400 ms and climbing · checkouts queue on sendq", value: 0.9 }
+      after: { text: "0 ms added · 1,580 of 4,096 slots used", value: 0.12 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'A channel is a runtime object: a lock, an optional ring buffer and two queues of parked goroutines. `make(chan T)` has no buffer, so every send waits for a receiver. A `select` with a `default` case turns any send or receive into a try that never parks.'
+      seenIn: '`ctx.Done()` is a channel that is closed and never sent on. `time.After` and `time.Ticker.C` deliver on channels. `signal.Notify` will not block to deliver a signal, so its docs ask for a buffered channel.'
+
+  python:
+    before:
+      file: handler.py
+      source: |
+        # handler.py
+        events: asyncio.Queue[Event] = asyncio.Queue(maxsize=1)
+
+        async def checkout(request: Request) -> Response:
+            order = await orders.place(parse_cart(request))
+            await events.put(Event(kind="checkout", order_id=order.id))
+            return JSONResponse(order.as_dict())
+
+        async def ship_events() -> None:
+            while True:
+                e = await events.get()
+                await analytics.send(e)  # 3 ms
+      roles: { handler: [4, 7], hchan: [2, 2], shipper: [9, 12] }
+      change:
+        - { line: 6, replace: '    await events.put(Event(kind="checkout", order_id=order.id))  # waits for a slot' }
+        - { line: 12, replace: '        await analytics.send(e)  # 400 ms: the collector is slow' }
+    after:
+      file: handler.py
+      source: |
+        # handler.py
+        events: asyncio.Queue[Event] = asyncio.Queue(maxsize=4096)
+        dropped = 0
+
+        async def checkout(request: Request) -> Response:
+            global dropped
+            order = await orders.place(parse_cart(request))
+            try:
+                events.put_nowait(Event(kind="checkout", order_id=order.id))
+            except asyncio.QueueFull:
+                dropped += 1  # analytics may lose an event; checkout may not wait
+            return JSONResponse(order.as_dict())
+
+        async def ship_events() -> None:
+            while True:
+                e = await events.get()
+                await analytics.send(e)
+      roles: { hchan: [2, 2], buf: [2, 2], handler: [5, 12], send: [9, 9], buffer: [2, 2], full: [10, 11], sendq: [10, 11], shipper: [14, 17], recv: [16, 16], recvq: [16, 16] }
+    again:
+      file: the same slow minute
+      source: |
+        # 200 checkouts/s; the collector takes 400 ms per event for 8 s
+        # t = 0 s   collector slows       checkout adds 0 ms
+        # t = 5 s   events.qsize() = 988  put_nowait still succeeds
+        # t = 8 s   collector recovers    1,580 queued; drained in about 12 s
+        # p99 checkout latency: unchanged. dropped: 0
+    cost:
+      before: { text: "+400 ms and climbing · checkouts wait in put()", value: 0.9 }
+      after: { text: "0 ms added · 1,580 of 4,096 slots used", value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`asyncio.Queue()` with no `maxsize` is unbounded: `put` never waits, and a slow consumer shows up as memory growth instead of latency. There is no rendezvous queue; `maxsize=1` is the closest. Inside, the queue keeps deques of waiting getters and putters, the same idea as recvq and sendq.'
+      seenIn: '`asyncio.Queue` for coroutines, `queue.Queue` for threads (one lock and condition variables to wait on), `multiprocessing.Queue` between processes.'
+
+  typescript:
+    before:
+      file: handler.ts
+      source: |
+        // handler.ts
+        const events = new Channel<Event>(0); // in-house: put() resolves when a reader takes it
+
+        export async function checkout(req: Request): Promise<Response> {
+          const order = await orders.place(parseCart(req));
+          await events.put({ kind: "checkout", orderId: order.id });
+          return Response.json(order);
+        }
+
+        async function shipEvents(): Promise<void> {
+          for await (const e of events) {
+            await analytics.send(e); // 3 ms
+          }
+        }
+      roles: { handler: [4, 8], hchan: [2, 2], shipper: [10, 14] }
+      change:
+        - { line: 6, replace: '  await events.put({ kind: "checkout", orderId: order.id }); // waits for shipEvents' }
+        - { line: 12, replace: '    await analytics.send(e); // 400 ms: the collector is slow' }
+    after:
+      file: handler.ts
+      source: |
+        // handler.ts
+        const MAX = 4096;
+        const queue: Event[] = [];
+        let dropped = 0;
+        let wake: (() => void) | null = null;
+
+        export async function checkout(req: Request): Promise<Response> {
+          const order = await orders.place(parseCart(req));
+          if (queue.length < MAX) {
+            queue.push({ kind: "checkout", orderId: order.id });
+            wake?.();
+          } else {
+            dropped++; // analytics may lose an event; checkout may not wait
+          }
+          return Response.json(order);
+        }
+
+        async function shipEvents(): Promise<never> {
+          for (;;) {
+            while (queue.length === 0) await new Promise<void>((r) => (wake = r));
+            await analytics.send(queue.shift()!);
+          }
+        }
+      roles: { hchan: [2, 5], buf: [3, 3], handler: [7, 16], send: [9, 11], buffer: [2, 3], full: [12, 14], sendq: [12, 14], shipper: [18, 23], recv: [20, 21], recvq: [20, 20] }
+    again:
+      file: the same slow minute
+      source: |
+        // 200 checkouts/s; the collector takes 400 ms per event for 8 s
+        // t = 0 s   collector slows      checkout adds 0 ms
+        // t = 5 s   queue.length = 988   push still succeeds
+        // t = 8 s   collector recovers   1,580 queued; drained in about 12 s
+        // p99 checkout latency: unchanged. dropped: 0
+    cost:
+      before: { text: "+400 ms and climbing · checkouts wait in put()", value: 0.9 }
+      after: { text: "0 ms added · 1,580 of 4,096 slots used", value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: 'Node has no channel type. One thread runs your code, so a queue needs no lock, and a parked receiver is just a pending Promise whose `resolve` you keep (here, `wake`). Streams give you backpressure without writing it yourself.'
+      seenIn: '`ReadableStream` with a `highWaterMark`. Node''s `writable.write()` returning `false` until `''drain''`. `events.on(emitter, name)` as an async iterator.'
+
+  rust:
+    before:
+      file: main.rs · handler.rs
+      source: |
+        // main.rs and handler.rs
+        let (tx, rx) = mpsc::channel::<Event>(1); // tokio needs a capacity of at least 1
+        tokio::spawn(ship_events(rx));
+
+        async fn checkout(State(app): State<App>, Json(cart): Json<Cart>) -> Result<Json<Order>, AppError> {
+            let order = app.orders.place(cart).await?;
+            app.events.send(Event::checkout(order.id)).await?;
+            Ok(Json(order))
+        }
+
+        async fn ship_events(mut rx: mpsc::Receiver<Event>) {
+            while let Some(e) = rx.recv().await {
+                analytics::send(e).await; // 3 ms
+            }
+        }
+      roles: { handler: [5, 9], hchan: [2, 3], shipper: [11, 15] }
+      change:
+        - { line: 7, replace: '    app.events.send(Event::checkout(order.id)).await?; // waits for a free slot' }
+        - { line: 13, replace: '        analytics::send(e).await; // 400 ms: the collector is slow' }
+    after:
+      file: main.rs · handler.rs
+      source: |
+        // main.rs and handler.rs
+        let (tx, rx) = mpsc::channel::<Event>(4096);
+        tokio::spawn(ship_events(rx));
+
+        async fn checkout(State(app): State<App>, Json(cart): Json<Cart>) -> Result<Json<Order>, AppError> {
+            let order = app.orders.place(cart).await?;
+            match app.events.try_send(Event::checkout(order.id)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => { app.dropped.fetch_add(1, Ordering::Relaxed); }
+                Err(TrySendError::Closed(_)) => tracing::warn!("event shipper has stopped"),
+            }
+            Ok(Json(order))
+        }
+
+        async fn ship_events(mut rx: mpsc::Receiver<Event>) {
+            while let Some(e) = rx.recv().await {
+                analytics::send(e).await;
+            }
+        }
+      roles: { hchan: [2, 2], buf: [2, 2], handler: [5, 13], send: [7, 8], buffer: [2, 2], full: [9, 9], sendq: [9, 10], shipper: [15, 19], recv: [16, 16], recvq: [16, 16] }
+    again:
+      file: the same slow minute
+      source: |
+        // 200 checkouts/s; the collector takes 400 ms per event for 8 s
+        // t = 0 s   collector slows      checkout adds 0 ms
+        // t = 5 s   988 events queued    try_send still returns Ok
+        // t = 8 s   collector recovers   1,580 queued; drained in about 12 s
+        // p99 checkout latency: unchanged. dropped: 0
+    cost:
+      before: { text: "+400 ms and climbing · checkouts wait in send()", value: 0.9 }
+      after: { text: "0 ms added · 1,580 of 4,096 slots used", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`tokio::sync::mpsc::channel(n)` is bounded and panics if `n` is 0. `send().await` waits for a slot; `try_send` returns `Full` instead. The value moves into the channel, so the sender cannot use it again. When the receiver is dropped, `send` returns an error instead of waiting forever.'
+      seenIn: '`std::sync::mpsc::sync_channel(0)` is a true rendezvous, like an unbuffered Go channel. crossbeam''s `bounded(0)`. tokio''s `mpsc`, `oneshot`, `broadcast` and `watch`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'Checkout reaches the send. The runtime locks the channel and checks recvq first. If shipEvents were parked there, the event would be copied straight onto its stack and it would be woken: no buffer involved.', python: '`checkout` calls `put_nowait`. The queue first checks for a waiting getter, a parked `get()`. If `ship_events` were waiting, its future would get the event and be scheduled to resume.', typescript: '`checkout` pushes the event. If `shipEvents` is parked on its pending Promise, `wake()` resolves it so it resumes on the next turn of the event loop.', rust: '`try_send` asks the channel for a slot. If `ship_events` is parked in `recv().await`, the send wakes its task through the stored waker.' }
+    nodes: [handler, hchan, recvq, shipper]
+    edges: [handler>shipper]
+    role: send
+  - text: The shipper is busy sending the last event, so nobody is waiting. There is a free slot, so the event is copied into the buffer and the index moves on. Checkout carries on without waiting.
+    nodes: [handler, buf]
+    edges: [handler>buf]
+    role: buffer
+  - text: When the shipper comes back for the next event, it takes the oldest one from the buffer. With 4,096 slots it can fall about 20 seconds behind before anyone waits.
+    nodes: [buf, shipper]
+    edges: [buf>shipper]
+    role: recv
+  - text: { go: 'If the buffer ever fills, a plain send would park Checkout on sendq until a slot frees. The `select` with `default` never parks: it counts the drop and moves on.', python: 'If the queue ever fills, `await put()` would park the handler among the putters. `put_nowait` raises `QueueFull` instead, and the handler counts the drop.', typescript: 'If the array reaches MAX, the handler counts a drop instead of waiting. Nothing in the request path ever awaits the collector.', rust: 'If all 4,096 slots are taken, `send().await` would park the handler task. `try_send` returns `Full` at once, and the handler counts the drop.' }
+    nodes: [handler, sendq]
+    edges: [handler>sendq]
+    role: full
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A channel with capacity 8 is empty, and a receiver is already parked on it. A goroutine sends a value. What happens?
+    options:
+      - text: The value is copied straight to the waiting receiver, which is woken. The buffer is not used.
+        correct: true
+        why: Right. A send checks for a parked receiver before it looks at the buffer, so the value skips the buffer and the sender never waits.
+      - text: The value goes into the buffer at sendx, and the receiver takes it from there when it wakes.
+        why: That would mean two copies and a wake for nothing. The runtime checks recvq first and hands the value over directly.
+      - text: The sender parks until the receiver has been scheduled.
+        why: A send only parks when there is no waiting receiver and no free slot. Here there is a waiting receiver.
+  engineer:
+    question: An unbuffered channel feeds a writer that sometimes takes 2 seconds per item, and senders stall. What does raising the capacity to 1,000 buy you?
+    options:
+      - text: Senders stop waiting until 1,000 items are queued. If the writer stays slower than the senders, they park again, just later.
+        correct: true
+        why: Right. A buffer absorbs a burst of a known size. It does not make the consumer faster, so a sustained slowdown still ends in parked senders, or in drops if you send with select and default.
+      - text: Senders never wait again, because the buffer grows when it is full.
+        why: Go channel buffers have a fixed size set by make. A full buffer parks the sender.
+      - text: Each send becomes faster, because a buffered channel needs no lock.
+        why: Every channel operation takes the channel's lock, buffered or not. The buffer changes when a sender waits, not how much a send costs.
+  deep:
+    question: A receiver is parked on an unbuffered channel. How does the sender's value reach the receiver's variable?
+    options:
+      - text: The receiver's sudog records where the value must land, and the sender copies it there under the channel lock, then marks the receiver runnable.
+        correct: true
+        why: Right. This is one of the few places where one goroutine writes to another goroutine's stack. chan.go notes that it needs a write barrier for this reason.
+      - text: The runtime allocates a temporary buffer slot on the heap, and the receiver copies out of it when it wakes.
+        why: An unbuffered channel has no slots, and the runtime avoids the extra copy. The value goes straight from the sender's stack to the receiver's.
+      - text: The sender parks, and the receiver copies the value off the sender's stack when it runs.
+        why: That is what happens the other way round, when a sender is parked and a receiver arrives. Here the receiver was waiting, so the sender does the copy and keeps running.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: hchan
+      example: { go: "make(chan Event, 4096)", python: "asyncio.Queue(maxsize=4096)", typescript: "array + wake()", rust: "mpsc::channel(4096)" }
+      job: Holds the lock, the buffer, the closed flag and the two wait queues.
+    - role: Buffer
+      example: buf, sendx, recvx
+      job: A fixed ring of slots. Lets senders run ahead of receivers by exactly the capacity.
+    - role: recvq and sendq
+      example: parked shipEvents, parked Checkout
+      job: Lists of sudogs, one per goroutine parked on this channel.
+    - role: Sender and receiver
+      example: Checkout, shipEvents
+      job: Goroutines that run, park, or are handed a value directly.
+  useWhen:
+    - Handing ownership of a value from one goroutine to another.
+    - Signalling an event to many goroutines at once, by closing a channel.
+    - Bounding how far a producer can run ahead of a consumer.
+  avoidWhen:
+    - Protecting state that stays in one place, such as a counter or a map. A mutex is simpler and usually faster.
+    - Hoping a bigger buffer will fix a deadlock or a consumer that is too slow. It only delays the wait.
+  tradeoffs:
+    - Every send and receive takes the channel's lock. Channels are not lock-free.
+    - An unbuffered send couples the sender's latency to the receiver's speed.
+    - A buffered channel hides a slow consumer until the buffer is full, so watch len(ch).
+    - Sending on a closed channel panics, so exactly one goroutine, the last sender, should close it.
+  lookalikes:
+    - name: Mutex plus a slice
+      how: The same lock and storage, without the wait queues. You add sync.Cond or polling to wait.
+    - name: asyncio.Queue
+      how: A bounded or unbounded queue with waiting getters and putters, for coroutines on one thread.
+    - name: tokio mpsc
+      how: Bounded, capacity at least 1, and the value moves into the channel.
+---
+
+## [concept] Inside a channel
+
+**A channel is a locked ring buffer plus two queues of parked goroutines.** A send hands its value to a receiver that is already waiting, or drops it into a free slot, or parks the sender until there is room.
+
+That one rule tells you, for any line with `<-` in it, whether your goroutine keeps running.
+
+<Depth level={2}>
+The runtime object behind `make(chan T, n)` is an <Term id="hchan">hchan</Term>. It holds a lock, a buffer of `n` slots with a send index and a receive index, a `closed` flag, and two wait queues: `recvq` for goroutines parked in a receive and `sendq` for goroutines parked in a send. To <Term id="goroutine-park">park</Term> a goroutine means taking it off its thread until another goroutine wakes it. A parked goroutine uses no CPU, but it keeps its stack and holds up whoever is waiting for it.
+</Depth>
+
+<Depth level={3}>
+In `runtime/chan.go`, `chansend` checks in a fixed order. A nil channel blocks forever. A closed channel panics. A receiver on `recvq` gets the value copied straight onto its stack and is made runnable. A free slot takes a copy at `sendx`. Otherwise the sender wraps itself in a <Term id="sudog">sudog</Term>, joins `sendq` and calls `gopark`. `chanrecv` mirrors it, and `closechan` wakes every waiter at once.
+</Depth>
+
+## [problem] A send that looked free
+
+A checkout handler records an analytics event for every order. Shipping the event takes a network call, so the handler puts it on a channel and a background goroutine ships it. The handler should never wait on analytics.
+
+It works. In testing the collector answers in 3 ms, and nobody notices the send at all.
+
+<Depth level={2}>
+The mental model behind this code is that a channel is a mailbox: drop a letter in, walk away. On an unbuffered channel that is wrong. There is no slot to drop anything into. A send can only finish at the moment a receiver takes the value.
+</Depth>
+
+<Depth level={3}>
+The test hid it because `shipEvents` is almost always parked in its receive, waiting. Every send finds it on `recvq` and hands the value over in microseconds. The handler only waits when the shipper is busy, and in testing it is never busy for long.
+</Depth>
+
+## [pain] The collector has a slow minute
+
+**What happened:** the analytics collector slowed to 400 ms per event, and checkout latency went from 40 ms to several seconds.
+
+The marked lines are the whole story. While `shipEvents` is inside `analytics.Send`, nobody is waiting to receive. Each checkout reaches the send, finds no receiver and no buffer, and parks on `sendq`. They leave one at a time, each 400 ms after the last.
+
+<Depth level={2}>
+At 200 checkouts a second and 2.5 shipped events a second, the queue of parked handlers grows by almost 200 a second. Each new checkout waits for every one ahead of it, so latency climbs until load balancers time requests out. The payment went through, but the customer saw an error. The send that was meant to decouple checkout from analytics coupled them completely.
+</Depth>
+
+<Depth level={3}>
+A goroutine dump during the incident shows hundreds of goroutines in `chan send`, all on the same line. They are not using CPU, so CPU graphs look calm. The runtime does not report it: other goroutines are still running, so this is not the "all goroutines are asleep" deadlock it can detect.
+</Depth>
+
+## [morph] From mailbox to hchan
+
+Drag the slider. The mailbox you imagined becomes what the runtime has: a header with a lock, a ring buffer, and two queues of parked goroutines.
+
+The code changes in two ways. The channel gets a buffer sized for the slowdowns you expect, and the send becomes a try that never parks the handler. If the buffer is full, the event is dropped and counted.
+
+<Depth level={2}>
+Size the buffer from numbers: inflow per second times the longest slowdown you want to absorb. 200 events a second for 20 seconds is 4,096 slots, a few hundred kilobytes. Then decide what happens when it is full anyway. For analytics, dropping and counting is right. For a payment ledger it is not; there you want <Term id="backpressure">backpressure</Term> or a durable queue.
+</Depth>
+
+<Depth level={3}>
+A `select` with a `default` case compiles to a non-blocking channel operation. `chansend` is called with `block == false`, and if the channel is full it can even return without taking the lock, after a quick check of the count. The handler never reaches `gopark`.
+</Depth>
+
+## [walk] Follow one event
+
+One event from the handler to the shipper, through the real mechanism. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">When a receiver is parked, the send takes the receiver's sudog off `recvq`, copies the value to the address the sudog records (a variable on the receiver's stack), and calls `goready`. This <Term id="direct-handoff">direct handoff</Term> is why an unbuffered channel can be faster than a buffered one when a receiver is always waiting: one copy instead of two. When the buffer is full and a sender is parked, a receive takes the oldest value and puts the parked sender's value into the same slot, so order is kept.</Lang>
+<Lang only="python">An `asyncio.Queue` is not locked, because one thread runs the event loop. Waiting getters and putters are futures in two deques. `put_nowait` stores the item and wakes the first getter's future; the getter resumes on a later loop iteration and takes the item.</Lang>
+<Lang only="typescript">Resolving a Promise does not run the waiting code at once. The continuation after `await` is queued as a microtask and runs after the current function returns. Nothing here can run in parallel, so the array needs no lock.</Lang>
+<Lang only="rust">A tokio bounded channel counts free slots with a semaphore. `try_send` tries to take a permit and returns `Full` if there is none. A parked receiver is a task whose `Waker` the channel stored; sending wakes it, and the scheduler polls it again.</Lang>
+</Depth>
+
+## [again] The same slow minute, again
+
+The collector slows to 400 ms for eight seconds, exactly as before. This time every checkout finds a free slot and returns at once. The buffer reaches about 1,580 events and drains in about twelve seconds once the collector recovers. Nobody waits, and nothing is dropped.
+
+<Depth level={2}>
+Export `len(events)` and `dropped` as metrics. The buffer turns a latency incident into a number that grows quietly, so you need to see that number. An alert on the queue length warns you long before drops begin.
+</Depth>
+
+<Depth level={3}>
+`len(ch)` reads `qcount` without taking the lock. That is fine for a gauge, but never use it to decide whether a send will block; by the time you send, it may have changed. Use `select` with `default` for that decision.
+</Depth>
+
+## [play] Drive the channel yourself
+
+Five goroutines share one channel: three senders and two receivers. You decide who runs next. The middle of the playground is the hchan itself, with its counters, ring buffer and wait queues.
+
+Predict first, then make the senders and receivers act. Try each capacity, and try closing the channel while goroutines are parked on it.
+
+## [lens] How each language meets it
+
+Go builds channels into the language and the runtime. Python and Rust ship queues in the library. Node has no channel type at all, and rarely needs one.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+The question to ask in each language is the same: when this queue is full, what happens to the producer? It parks (Go, `await put()`, `send().await`), it fails fast (`select` with `default`, `put_nowait`, `try_send`), or memory grows (an unbounded `asyncio.Queue`, a plain array).
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="channels-hchan" />
+
+### Close, nil and the zero value
+
+Closing a channel wakes every parked receiver with the zero value and `ok == false`, and every parked sender with a panic. Values already in the buffer are still delivered first; only then do receives start returning the zero value. A nil channel is different: a send or receive on it blocks forever. That sounds useless, but inside a `select` it switches a case off, which is how you stop listening to a channel that has been drained.

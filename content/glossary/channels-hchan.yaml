@@ -1,0 +1,16 @@
+# Terms introduced by the channels-hchan lesson.
+- id: hchan
+  term: hchan
+  short: The Go runtime's channel object. It holds a lock, an optional ring buffer with send and receive indexes, a closed flag, and two queues of parked goroutines (recvq and sendq).
+- id: sudog
+  term: sudog
+  short: A runtime record for one goroutine waiting on a channel. It points at the goroutine and at the value being sent, or the variable a received value should land in.
+- id: goroutine-park
+  term: Park
+  short: The runtime takes a goroutine off its thread and stops scheduling it until another goroutine wakes it. A parked goroutine uses no CPU but keeps its stack.
+- id: direct-handoff
+  term: Direct handoff
+  short: When a receiver is already waiting, a Go channel send copies the value straight onto the receiver's stack and wakes it, without using the buffer.
+- id: backpressure
+  term: Backpressure
+  short: A full queue slowing or stopping the producer, so a slow consumer pushes its delay back upstream instead of letting work pile up without bound.
