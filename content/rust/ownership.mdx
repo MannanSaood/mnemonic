@@ -1,0 +1,538 @@
+---
+title: Ownership, moves and drop
+track: rust
+group: Ownership
+order: 1
+summary: Every value has exactly one owner. Assigning or passing it moves ownership, and when the owner goes out of scope the value is dropped, exactly once.
+intent: For any allocation in your code, name the one variable that owns it, and say at which line it will be freed.
+changeRequest: Audit entries started showing frames from other tenants once traffic passed 2,000 frames a second.
+languages: [go, python, typescript, rust]
+glossary: [ownership, move-semantics, raii, double-free, use-after-free, escape-analysis, reference-counting]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [rust, memory]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: ownership
+  scenarios:
+    - try: "In Rust mode, send buf to the audit task, then put buf back in the pool."
+      notice: "The send moves the buffer. buf is greyed out, and the second line is refused with E0382 before the program can run."
+    - try: "Switch to GC mode and do the same, then let the next request run and the audit task write."
+      notice: "Both the pool and the audit task point at one buffer. The next request overwrites it, and the audit log records globex's frame for acme."
+    - try: "Switch to manual free. Send buf to audit, end the ingest scope, then let the audit task write."
+      notice: "ingest frees the buffer at its closing brace while audit still points at it. The audit write reads freed memory, and its own free is a double free."
+    - try: "Back in Rust mode, make the audit log correct and still recycle a buffer."
+      notice: "Clone the frame for the pool, or let the audit task be the last owner. Each allocation is freed once, by its one owner."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: handler
+      kind: client
+      before: { x: 12, y: 24, w: 110, h: 52, title: ingest, sub: per frame }
+      after:  { x: 12, y: 24, w: 110, h: 52, title: ingest, sub: per frame }
+    - id: owner
+      kind: context
+      before: { x: 150, y: 16, w: 250, h: 238, title: the frame buffer, sub: "you think: whoever has it uses it" }
+      after:  { x: 150, y: 24, w: 170, h: 56, title: buf, sub: { go: "*bytes.Buffer", python: bytearray, typescript: Buffer, rust: "owner · ptr len cap" } }
+    - id: heap
+      kind: concrete
+      before: { x: 170, y: 110, w: 210, h: 44, title: 4 KiB, sub: frame bytes }
+      after:  { x: 150, y: 196, w: 170, h: 56, title: heap, sub: 4 KiB frame }
+    - id: drop
+      kind: strategy
+      appears: after
+      before: { x: 380, y: 110, w: 170, h: 56, title: "" }
+      after:  { x: 380, y: 110, w: 170, h: 56, title: { go: last owner, python: last owner, typescript: last owner, rust: Drop }, sub: { go: "puts it back, by hand", python: "releases it, by hand", typescript: "releases it, by hand", rust: "runs once, at scope end" } }
+    - id: audit
+      kind: concrete
+      before: { x: 430, y: 60, w: 120, h: 48, title: audit task }
+      after:  { x: 380, y: 24, w: 170, h: 56, title: audit task, sub: next owner }
+    - id: pool
+      kind: concrete
+      before: { x: 430, y: 170, w: 120, h: 48, title: pool }
+      after:  { x: 380, y: 196, w: 170, h: 56, title: pool, sub: reuses the bytes }
+  edges:
+    - { from: handler, to: owner, label: owns }
+    - { from: owner, to: heap, label: points to }
+    - { from: owner, to: audit, label: move }
+    - { from: audit, to: drop, label: scope end }
+    - { from: drop, to: pool, label: put back }
+
+# ---------------------------------------------------------------- code
+code:
+  rust:
+    before:
+      file: ingest.rs
+      source: |
+        // ingest.rs
+        async fn ingest(app: &App, conn: &mut Conn) -> Result<(), Error> {
+            let mut buf = app.pool.take(); // a Vec<u8> with 4 KiB capacity
+            conn.read_frame(&mut buf).await?;
+            app.accept(&buf).await?;
+            app.audit.send(buf).await?; // the audit task appends it to the log
+            app.pool.put(buf);
+            Ok(())
+        }
+      roles: { handler: [2, 9], owner: [3, 3], heap: [3, 4], audit: [6, 6], pool: [7, 7] }
+      change:
+        - { line: 7, replace: "    app.pool.put(buf); // error[E0382]: use of moved value: `buf`" }
+    after:
+      file: pool.rs · ingest.rs
+      source: |
+        // pool.rs
+        pub struct PooledBuf { bytes: Vec<u8>, pool: Arc<Pool> } // derefs to Vec<u8>
+
+        impl Drop for PooledBuf {
+            fn drop(&mut self) {
+                let mut bytes = std::mem::take(&mut self.bytes);
+                bytes.clear(); // keep the capacity, forget the old frame
+                self.pool.put(bytes);
+            }
+        }
+
+        // ingest.rs
+        async fn ingest(app: &App, conn: &mut Conn) -> Result<(), Error> {
+            let mut buf = app.pool.take(); // a PooledBuf: this frame owns it
+            conn.read_frame(&mut buf).await?; // an early return drops buf: back to the pool
+            app.accept(&buf).await?;
+            app.audit.send(buf).await?; // ownership moves to the audit task
+            Ok(()) // buf is not ours any more, so nothing is freed here
+        }
+
+        async fn audit_task(mut rx: mpsc::Receiver<PooledBuf>, log: AuditLog) {
+            while let Some(buf) = rx.recv().await {
+                log.append(&buf).await;
+            } // buf is dropped here, once, and goes back to the pool
+        }
+      roles: { drop: [4, 10], handler: [13, 19], owner: [14, 14], take: [14, 14], heap: [14, 15], move: [17, 17], audit: [21, 25], dropped: [24, 24], recycle: [6, 8], pool: [8, 8] }
+    again:
+      file: the same busy minute
+      source: |
+        // 2,000 frames/s for a minute; the audit log runs 30 ms behind
+        // frames read            120,000
+        // audit entries          120,000, each holding its own frame
+        // buffers in the pool    64 at peak, each reused about 1,900 times
+        // frees                  one per buffer, when its last owner drops it
+    cost:
+      before: { text: "1 compile error · 0 wrong entries shipped", value: 0.25 }
+      after: { text: "0 wrong entries · 64 pooled buffers", value: 0.08 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: "Every value has one owner. Assigning or passing a non-`Copy` value moves it, and the old name cannot be used again. When the owner goes out of scope, `drop` runs, so memory and other resources are released exactly once, at a line you can point to."
+      seenIn: "`MutexGuard` unlocks when dropped. `File` closes when dropped. `Vec::into_iter` moves the elements out. `std::mem::take` and `Option::take` move a value out and leave a default behind."
+
+  go:
+    before:
+      file: ingest.go
+      source: |
+        // ingest.go
+        var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+        func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
+            buf := bufPool.Get().(*bytes.Buffer)
+            buf.Reset()
+            defer bufPool.Put(buf)
+            if _, err := buf.ReadFrom(r.Body); err != nil {
+                http.Error(w, err.Error(), http.StatusBadRequest)
+                return
+            }
+            if err := h.accept(r.Context(), buf.Bytes()); err != nil {
+                http.Error(w, err.Error(), http.StatusBadRequest)
+                return
+            }
+            h.audit <- buf.Bytes() // the audit goroutine appends it to the log
+            w.WriteHeader(http.StatusAccepted)
+        }
+      roles: { handler: [4, 18], owner: [5, 6], heap: [5, 8], pool: [7, 7], audit: [16, 16] }
+      change:
+        - { line: 7, replace: "    defer bufPool.Put(buf) // runs on return: the next request reuses these bytes" }
+        - { line: 16, replace: "    h.audit <- buf.Bytes() // a slice of the pooled bytes, not a copy" }
+    after:
+      file: ingest.go
+      source: |
+        // ingest.go
+        var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+        func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
+            buf := bufPool.Get().(*bytes.Buffer) // this handler owns buf until it hands it on
+            buf.Reset()
+            if _, err := buf.ReadFrom(r.Body); err != nil {
+                bufPool.Put(buf)
+                http.Error(w, err.Error(), http.StatusBadRequest)
+                return
+            }
+            if err := h.accept(r.Context(), buf.Bytes()); err != nil {
+                bufPool.Put(buf)
+                http.Error(w, err.Error(), http.StatusBadRequest)
+                return
+            }
+            h.audit <- buf // ownership passes to the audit goroutine: do not touch buf again
+            w.WriteHeader(http.StatusAccepted)
+        }
+
+        func (h *Handler) auditLoop() {
+            for buf := range h.audit {
+                h.log.Append(buf.Bytes())
+                bufPool.Put(buf) // the last owner returns it
+            }
+        }
+      roles: { handler: [4, 19], owner: [5, 6], take: [5, 6], heap: [5, 7], move: [17, 17], audit: [21, 26], dropped: [24, 24], drop: [24, 24], recycle: [24, 24], pool: [2, 2] }
+    again:
+      file: the same busy minute
+      source: |
+        // 2,000 frames/s for a minute; the audit log runs 30 ms behind
+        // frames read            120,000
+        // audit entries          120,000, each holding its own frame
+        // buffers in the pool    grows to cover the 30 ms lag, then steady
+        // checked by             code review and a comment: nothing enforces it
+    cost:
+      before: { text: "41% of audit entries hold a later frame", value: 0.85 }
+      after: { text: "0 wrong entries · pool covers the lag", value: 0.1 }
+    lens:
+      need: 2
+      needLabel: By convention
+      note: "Go has a garbage collector, so a value lives as long as anything points at it. Escape analysis in the compiler decides whether a value can stay on the stack or must go to the heap; `go build -gcflags=-m` prints its decisions. Ownership comes back the moment you reuse memory yourself, with `sync.Pool` or a long-lived buffer, and then nothing checks it."
+      seenIn: "`bytes.Buffer.Bytes` is documented as valid only until the next change to the buffer. `bufio.Scanner.Bytes` may be overwritten by the next call to `Scan`. Both hand out views, and the caller must copy what it keeps."
+
+  python:
+    before:
+      file: ingest.py
+      source: |
+        # ingest.py
+        pool = BufferPool(size=4096)  # bytearrays reused across frames
+
+        async def ingest(reader: asyncio.StreamReader) -> None:
+            buf = pool.take()
+            try:
+                n = await read_frame(reader, buf)
+                frame = memoryview(buf)[:n]  # no copy
+                await accept(frame)
+                audit_queue.put_nowait(frame)  # the audit task appends it to the log
+            finally:
+                pool.release(buf)
+      roles: { handler: [4, 12], owner: [5, 5], heap: [5, 8], audit: [10, 10], pool: [12, 12] }
+      change:
+        - { line: 10, replace: "        audit_queue.put_nowait(frame)  # a view of the pooled bytes, not a copy" }
+        - { line: 12, replace: "        pool.release(buf)  # the next frame is written into these bytes" }
+    after:
+      file: ingest.py
+      source: |
+        # ingest.py
+        pool = BufferPool(size=4096)  # bytearrays reused across frames
+
+        async def ingest(reader: asyncio.StreamReader) -> None:
+            buf = pool.take()  # this coroutine owns buf until it hands it on
+            try:
+                n = await read_frame(reader, buf)
+                await accept(memoryview(buf)[:n])
+            except BaseException:
+                pool.release(buf)
+                raise
+            audit_queue.put_nowait((buf, n))  # ownership passes to the audit task
+
+        async def audit_task() -> None:
+            while True:
+                buf, n = await audit_queue.get()
+                await audit_log.append(memoryview(buf)[:n])
+                pool.release(buf)  # the last owner returns it
+      roles: { handler: [4, 12], owner: [5, 5], take: [5, 5], heap: [5, 8], move: [12, 12], audit: [14, 18], dropped: [18, 18], drop: [18, 18], recycle: [18, 18], pool: [2, 2] }
+    again:
+      file: the same busy minute
+      source: |
+        # 2,000 frames/s for a minute; the audit log runs 30 ms behind
+        # frames read            120,000
+        # audit entries          120,000, each holding its own frame
+        # buffers in the pool    grows to cover the 30 ms lag, then steady
+        # checked by             code review and a comment: nothing enforces it
+    cost:
+      before: { text: "41% of audit entries hold a later frame", value: 0.85 }
+      after: { text: "0 wrong entries · pool covers the lag", value: 0.1 }
+    lens:
+      need: 2
+      needLabel: By convention
+      note: "CPython frees most objects the moment their reference count drops to zero, and the cycle collector in the `gc` module finds groups of objects that only point at each other. A `memoryview` keeps its buffer alive, but it does not stop anyone writing new bytes into that buffer."
+      seenIn: "`with` blocks give deterministic cleanup for files, sockets and locks, the part of RAII Python has. A `bytearray` refuses to resize while a `memoryview` of it exists, raising `BufferError`."
+
+  typescript:
+    before:
+      file: ingest.ts
+      source: |
+        // ingest.ts
+        const pool = new BufferPool(4096); // Buffers reused across frames
+
+        export async function ingest(socket: FrameReader): Promise<void> {
+          const buf = pool.take();
+          try {
+            const n = await socket.readFrame(buf);
+            const frame = buf.subarray(0, n); // no copy
+            await accept(frame);
+            auditQueue.push(frame); // the audit task appends it to the log
+          } finally {
+            pool.release(buf);
+          }
+        }
+      roles: { handler: [4, 14], owner: [5, 5], heap: [5, 8], audit: [10, 10], pool: [12, 12] }
+      change:
+        - { line: 10, replace: "    auditQueue.push(frame); // a view of the pooled bytes, not a copy" }
+        - { line: 12, replace: "    pool.release(buf); // the next frame is written into these bytes" }
+    after:
+      file: ingest.ts
+      source: |
+        // ingest.ts
+        const pool = new BufferPool(4096); // Buffers reused across frames
+
+        export async function ingest(socket: FrameReader): Promise<void> {
+          const buf = pool.take(); // this function owns buf until it hands it on
+          let n: number;
+          try {
+            n = await socket.readFrame(buf);
+            await accept(buf.subarray(0, n));
+          } catch (err) {
+            pool.release(buf);
+            throw err;
+          }
+          auditQueue.push({ buf, n }); // ownership passes to the audit task
+        }
+
+        async function auditTask(): Promise<never> {
+          for (;;) {
+            const { buf, n } = await auditQueue.shift();
+            await auditLog.append(buf.subarray(0, n));
+            pool.release(buf); // the last owner returns it
+          }
+        }
+      roles: { handler: [4, 15], owner: [5, 5], take: [5, 5], heap: [5, 9], move: [14, 14], audit: [17, 23], dropped: [21, 21], drop: [21, 21], recycle: [21, 21], pool: [2, 2] }
+    again:
+      file: the same busy minute
+      source: |
+        // 2,000 frames/s for a minute; the audit log runs 30 ms behind
+        // frames read            120,000
+        // audit entries          120,000, each holding its own frame
+        // buffers in the pool    grows to cover the 30 ms lag, then steady
+        // checked by             code review and a comment: nothing enforces it
+    cost:
+      before: { text: "41% of audit entries hold a later frame", value: 0.85 }
+      after: { text: "0 wrong entries · pool covers the lag", value: 0.1 }
+    lens:
+      need: 2
+      needLabel: By convention
+      note: "JavaScript engines trace from the roots and free what is unreachable, at a time you do not choose. `Buffer.subarray` returns a view over the same memory, so a pooled Buffer handed out as a view is shared by everyone who holds one."
+      seenIn: "`Buffer.allocUnsafe` carves small Buffers out of a shared internal pool. TypeScript 5.2 `using` declarations call `[Symbol.dispose]()` when the scope ends, which is scope-based cleanup much like `Drop`."
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { rust: "`app.pool.take()` gives this call a `PooledBuf`. The stack slot `buf` holds a pointer, a length and a capacity; the 4 KiB live on the heap. `buf` is the only owner.", go: "`bufPool.Get()` gives the handler a buffer. Nothing in Go records who holds it. The comment and the shape of the code say the handler does.", python: "`pool.take()` gives the coroutine a bytearray. The variable `buf` is one reference to it, and the pool keeps no other.", typescript: "`pool.take()` gives the function a Buffer. The constant `buf` is one reference to it, and the pool keeps no other." }
+    nodes: [handler, owner, heap]
+    edges: [handler>owner, owner>heap]
+    role: take
+  - text: { rust: "`send(buf)` moves the `PooledBuf` into the channel. A few machine words are copied; the frame bytes stay where they are. From this line on, `ingest` cannot name `buf`, and the compiler checks that.", go: "`h.audit <- buf` passes the pointer. The handler still has `buf` and could still use it or put it back; the rule that it must not is only a convention.", python: "The tuple carries the same bytearray to the audit task. The coroutine still has `buf` in scope; the rule that it must not touch it is only a convention.", typescript: "The object carries the same Buffer to the audit task. `buf` is still in scope; the rule that it must not be touched is only a convention." }
+    nodes: [owner, audit]
+    edges: [owner>audit]
+    role: move
+  - text: { rust: "At the end of each loop iteration in `audit_task`, `buf` goes out of scope and the compiler calls `PooledBuf::drop`. It runs exactly once, because only the current owner is ever dropped.", go: "The audit goroutine is the last user, so it is the one that calls `bufPool.Put`. If any other path also called Put, the buffer would be in the pool twice.", python: "The audit task is the last user, so it releases the buffer. A second release elsewhere would put it in the pool twice.", typescript: "The audit task is the last user, so it releases the buffer. A second release elsewhere would put it in the pool twice." }
+    nodes: [audit, drop]
+    edges: [audit>drop]
+    role: dropped
+  - text: The bytes go back to the pool cleared, keeping their capacity. The next frame reuses them, and nobody can still be reading the old frame.
+    nodes: [drop, pool]
+    edges: [drop>pool]
+    role: recycle
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: "`let a = String::from(\"acme\"); let b = a;` What can you do with `a` afterwards?"
+    options:
+      - text: Nothing. The String moved to `b`, and using `a` is a compile error.
+        correct: true
+        why: Right. `String` is not `Copy`, so the assignment moves ownership. The compiler rejects any later use of `a` with E0382.
+      - text: Read it. Both names point at the same heap bytes until one is changed.
+        why: That is how a garbage-collected language behaves. In Rust it would mean two owners, and two frees when both go out of scope.
+      - text: Use it normally. The assignment copied the heap bytes.
+        why: A move copies only the pointer, length and capacity. Copying the heap bytes is what `clone()` does, and you have to ask for it.
+  engineer:
+    question: "`ingest` takes a `PooledBuf` from the pool, then `read_frame(..).await?` returns an error. What happens to the buffer?"
+    options:
+      - text: The early return ends `buf`'s scope, so its `Drop` runs and the buffer goes back to the pool.
+        correct: true
+        why: Right. The compiler inserts the drop on every path out of the scope, including `?` and panics that unwind. You do not write cleanup per error path.
+      - text: It leaks until the pool notices it is missing.
+        why: That is the Go or Python version without a `defer` or `finally`. In Rust the drop is inserted on every exit path.
+      - text: It is freed at the next garbage collection.
+        why: Rust has no garbage collector. Drops run at a known point, the end of the owner's scope.
+  deep:
+    question: "A `Vec<u8>` holding a 4 KiB frame is moved into a channel on a 64-bit target. What is copied?"
+    options:
+      - text: The 24-byte header (pointer, length, capacity). The heap bytes stay where they are, and the source is marked moved at compile time.
+        correct: true
+        why: Right. A move is a shallow copy of the value's own bytes plus a compile-time rule that the old place is now uninitialised, so its destructor never runs.
+      - text: All 4 KiB, so the receiver owns an independent copy.
+        why: That would be `clone()`. A move never touches the heap allocation.
+      - text: Nothing at runtime. The compiler renames the variable.
+        why: The value has to reach the channel's storage, so its header is copied there. Sometimes the optimiser removes copies, but a move is defined as a bitwise copy.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Owner
+      example: "buf in ingest, then buf in audit_task"
+      job: The one variable responsible for the value. When it goes out of scope, the value is dropped.
+    - role: Move
+      example: "app.audit.send(buf)"
+      job: Hands ownership to another variable, function or channel. The old name becomes unusable.
+    - role: Drop
+      example: "impl Drop for PooledBuf"
+      job: Code the compiler runs once, when the owner's scope ends, on every exit path.
+    - role: Clone
+      example: "buf.clone()"
+      job: An explicit copy of the heap data, with a new owner. You pay for it in the code you write.
+  useWhen:
+    - A resource must be released exactly once, such as memory, a pooled buffer, a file, a lock or a connection.
+    - Data is handed from one stage to the next, such as a parser to a handler to a writer.
+    - You want cleanup to happen at a known line, including on errors.
+  avoidWhen:
+    - Many parts of the program really do share one value for a long time. Use `Rc` or `Arc` and make the sharing explicit.
+    - The value is small and plain, such as an id or a timestamp. Derive `Copy` and pass it by value.
+  tradeoffs:
+    - The compiler rejects programs that a garbage collector would run, some of them correct. You restructure, clone, or share explicitly.
+    - Moves are cheap, but clones are easy to sprinkle to silence errors, and each one copies the heap data.
+    - Drop order is fixed (reverse order of declaration), which matters for guards and handles that depend on each other.
+  lookalikes:
+    - name: Garbage collection
+      how: Frees memory when nothing points at it, at a time the runtime chooses. Several names may share a value freely.
+    - name: Reference counting
+      how: Frees when the last reference goes away. Rust offers it explicitly as Rc and Arc; CPython uses it for every object.
+    - name: C++ unique_ptr
+      how: Single ownership with moves, but using a moved-from pointer compiles and is a null dereference at runtime.
+---
+
+## [concept] Ownership, moves and drop
+
+**Every value in Rust has exactly one owner. Assigning or passing the value moves ownership, and when the owner goes out of scope the value is dropped, once.**
+
+Rust frees memory without a garbage collector and without you calling `free`. It can do that because, at every line, the compiler knows which variable owns each allocation.
+
+<Depth level={2}>
+The Rust Book states <Term id="ownership">ownership</Term> as three rules: each value has an owner, there is one owner at a time, and the value is dropped when the owner goes out of scope. A `String` or `Vec<u8>` is a small header on the stack (pointer, length, capacity) pointing at bytes on the heap. `let b = a` copies the header and marks `a` as moved, a <Term id="move-semantics">move</Term>. If both stayed valid, both would free the same bytes at the end of the scope, a <Term id="double-free">double free</Term>. `clone()` copies the heap bytes when you really want two independent values.
+</Depth>
+
+<Depth level={3}>
+Ownership is tracked by the compiler, not at runtime. Borrow checking runs on MIR, the compiler's control-flow form of each function, and knows on every path whether a variable is initialised, moved, or partly moved. At each scope exit it inserts drop calls for what is still owned, in reverse order of declaration, and skips moved-from variables. A type that implements `Drop` cannot also be `Copy`, because a bitwise copy would give one resource two destructors.
+</Depth>
+
+## [problem] Recycle the frame buffer
+
+An event ingest service reads frames of up to 4 KiB from many tenants. To avoid allocating a buffer per frame, it takes one from a pool and returns it when the frame is handled. Every frame also goes to an audit log, written by a background task.
+
+The handler reads the frame, accepts it, sends it to the audit task and gives the buffer back. In testing the audit task writes each entry within microseconds, and every test passes.
+
+<Depth level={2}>
+The mental model behind the code is that a buffer is just a value: hand it to whoever needs it, and someone will clean up. Two parties now hold the same bytes, the audit task and the pool, and nothing says which of them is responsible for them.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`defer bufPool.Put(buf)` runs when the handler returns. `buf.Bytes()` is a slice of the buffer's internal array, so the channel carries a view of memory the pool is about to hand to someone else.</Lang>
+<Lang only="python">`memoryview(buf)[:n]` is a view into the bytearray, not a copy. The `finally` releases the bytearray to the pool while the view sits in the audit queue.</Lang>
+<Lang only="typescript">`buf.subarray(0, n)` shares memory with `buf`. The `finally` releases the Buffer to the pool while the view sits in the audit queue.</Lang>
+<Lang only="rust">The Rust version of this code never runs. `send(buf)` moves the buffer into the channel, and the next line tries to use it again. The compiler stops there.</Lang>
+</Depth>
+
+## [pain] The audit log under load
+
+**What happened:** audit entries started showing frames from other tenants once traffic passed 2,000 frames a second.
+
+The marked lines are the whole story. The handler returns the buffer to the pool while the audit task still points at its bytes. Under load the audit task falls 30 ms behind, the next frame lands in the recycled buffer first, and the audit task writes that frame instead.
+
+<Depth level={2}>
+Nothing crashed and nothing was freed twice. The garbage collector did its job: memory that is referenced stays alive. The bug is that the program reused live memory on purpose, through the pool, and two parties both believed they owned it. About 4 in 10 entries were wrong at peak, and the audit log is the record a customer's compliance team reads.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">The Rust compiler reports `error[E0382]: use of moved value: buf` on the `put` line. The same bug in C would be a <Term id="use-after-free">use after free</Term> or a double free, and in Go, Python or TypeScript it is the data mix-up above. In Rust it is a compile error, so the cost meter shows one error and nothing shipped.</Lang>
+<Lang only="go">The race detector does not flag this. The pool hands the buffer over through a synchronised path, so each access is ordered. It is a logic error about who owns the bytes, and Go has no way to state that.</Lang>
+<Lang only="python">No exception is raised. The `memoryview` keeps the bytearray alive, exactly as reference counting promises, and the pool writes new bytes into it, which is allowed.</Lang>
+<Lang only="typescript">No error is thrown. The view keeps the memory alive, as garbage collection promises, and the next frame is written into it, which is allowed.</Lang>
+</Depth>
+
+## [morph] From shared buffer to one owner
+
+Drag the slider. The buffer that everyone could touch becomes a value with one owner at a time: the handler, then the audit task. The last owner returns it to the pool.
+
+The code changes in one way. The buffer is handed on instead of shared, and whoever holds it last gives it back.
+
+<Depth level={2}>
+<Lang only="rust">Wrapping the `Vec` in `PooledBuf` with a `Drop` impl means you never write "give it back". Whoever owns the buffer last drops it, on the happy path, on `?`, and on a panic that unwinds. This is <Term id="raii">RAII</Term>, and the move rules make sure exactly one owner exists to do it.</Lang>
+<Lang only="go">Go cannot express the transfer, so the code does it by convention. The handler puts the buffer back only on its error paths, and the audit goroutine puts it back after writing. A comment on the channel says who owns what.</Lang>
+<Lang only="python">Python cannot express the transfer, so the code does it by convention. The coroutine releases the buffer only on its error path, and the audit task releases it after writing.</Lang>
+<Lang only="typescript">TypeScript cannot express the transfer, so the code does it by convention. The function releases the buffer only on its error path, and the audit task releases it after writing.</Lang>
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">`std::mem::take(&mut self.bytes)` moves the `Vec` out of the struct and leaves an empty `Vec` behind. `drop` only gets `&mut self`, so it cannot move fields out directly; `take`, `Option::take` and `mem::replace` are the standard ways to do it.</Lang>
+<Lang only="go">`sync.Pool` may drop pooled items at any garbage collection, so a pool is a cache, not a fixed set of buffers. That does not change the ownership rule: never use an item after Put.</Lang>
+<Lang only="python">A pool keyed by identity would catch a double release: check `buf` is not already in the free list before appending. It catches the symptom at runtime; it cannot stop the early release.</Lang>
+<Lang only="typescript">A dev-mode check helps: fill a released Buffer with a marker byte. A view that is still in use then shows the marker instead of plausible data, and tests fail loudly.</Lang>
+</Depth>
+
+## [walk] Follow one frame
+
+One frame from the pool to the audit log and back. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="rust">The compiler inserts the drop at each point where `buf` goes out of scope while still initialised. In `ingest`, every path either moves `buf` into the channel or returns early with `buf` still owned, so only the early returns get a drop. When it cannot know statically, after a conditional move, it adds a hidden drop flag on the stack and checks it at the end of the scope.</Lang>
+<Lang only="go">Escape analysis puts the `bytes.Buffer` on the heap, because a pointer to it leaves the function through the pool and the channel. The collector frees it only when no goroutine and no pool refers to it.</Lang>
+<Lang only="python">Each reference to the bytearray adds to its reference count: the variable, the tuple in the queue, the memoryview. It is freed when the count reaches zero, but the pool keeps one, so it is never freed while pooled.</Lang>
+<Lang only="typescript">The Buffer's memory lives outside the JavaScript heap, and the garbage collector frees it once the Buffer object is unreachable. The pool keeps it reachable, so it is reused instead.</Lang>
+</Depth>
+
+## [again] The same busy minute, again
+
+2,000 frames a second, the audit log 30 ms behind, exactly as before. Each buffer has one owner at a time, so the pool only ever holds buffers that nobody else can read. Every audit entry holds its own frame.
+
+<Depth level={2}>
+The pool grows a little to cover the lag: at 2,000 frames a second and 30 ms of lag, about 60 buffers are with the audit task at any moment. That is the honest cost of the frames being in flight, and it is visible in the pool's size instead of hidden in wrong entries.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">If you wanted the handler to keep the buffer and the audit task to have the bytes, you would clone. One `clone()` per frame copies 4 KiB, which the compiler makes you write down, so it shows up in review and in profiles.</Lang>
+<Lang only="go">A test can catch a regression: wrap the pool in a debug build that poisons buffers on Put, then assert audit entries never contain the poison byte.</Lang>
+<Lang only="python">A test can catch a regression: make the test pool zero the bytearray on release, then assert audit entries are never all zeros.</Lang>
+<Lang only="typescript">A test can catch a regression: make the test pool fill each Buffer with a marker on release, then assert audit entries never contain it.</Lang>
+</Depth>
+
+## [play] Own, move and drop a frame buffer
+
+The playground runs one frame through `ingest` with three memory models: Rust ownership, a garbage collector, and manual `free` as in C. The stack is on the left, the heap in the middle, and the audit task, the pool and the next request on the right.
+
+Predict first, then move, clone and drop the buffer yourself. Run the same steps in each mode and compare the numbers.
+
+## [lens] How each language meets it
+
+Rust checks ownership at compile time. Go, Python and TypeScript manage memory for you, so ownership only matters when you reuse memory or release a resource yourself, and then it is a convention you have to keep by hand.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+The question to ask in every language is the same: who releases this, and can anyone still be using it then? Rust answers it in the type system. Go answers it with <Term id="escape-analysis">escape analysis</Term> and a tracing collector, Python with <Term id="reference-counting">reference counting</Term> plus a cycle collector, and Node with a tracing collector. None of the three can tell you that a pooled buffer is still in use.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="ownership" />
+
+### Copy, Clone and moves
+
+Small plain types such as integers, `bool`, `char` and tuples of them implement `Copy`, so assignment duplicates them and the original stays usable. Everything that owns a heap allocation or another resource moves instead. `Clone` is the explicit, possibly expensive copy. A type can be `Copy` only if all its parts are, and never if it implements `Drop`. Passing a value to a function moves it, and returning a value moves it back out, which is how a function can take ownership and hand it back.

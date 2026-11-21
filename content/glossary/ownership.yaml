@@ -1,0 +1,22 @@
+# Terms introduced by the rust/ownership lesson.
+- id: ownership
+  term: Ownership
+  short: Rust's rule that every value has exactly one owner at a time, and is dropped when that owner goes out of scope.
+- id: move-semantics
+  term: Move
+  short: Handing a value's ownership to another variable, function or channel. The bytes of the value itself are copied, and the old name can no longer be used.
+- id: raii
+  term: RAII
+  short: Resource acquisition is initialisation. A resource is tied to a value, and released by that value's destructor when its owner's scope ends.
+- id: double-free
+  term: Double free
+  short: Freeing the same allocation twice. It corrupts the allocator's bookkeeping and is a classic memory-safety bug in C and C++.
+- id: use-after-free
+  term: Use after free
+  short: Reading or writing memory through a pointer after that memory has been freed, often after it was handed out again for something else.
+- id: escape-analysis
+  term: Escape analysis
+  short: A compiler pass that decides whether a value can live on the stack or must be allocated on the heap, because a reference to it outlives the function.
+- id: reference-counting
+  term: Reference counting
+  short: Each object counts the references to it and is freed when the count reaches zero. CPython does this for every object; Rust offers it as Rc and Arc.
