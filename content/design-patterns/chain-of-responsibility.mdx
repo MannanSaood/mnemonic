@@ -1,0 +1,561 @@
+---
+title: Chain of Responsibility
+track: design-patterns
+group: Behavioral
+order: 40
+summary: Pass a request along a line of handlers. Each one either handles it or passes it to the next, so the sender never has to know who will take it.
+intent: The code that raises a request should not decide which of several handlers deals with it, and the line of handlers should be easy to rearrange.
+changeRequest: Enterprise customers' tickets go to their account manager first, if the manager is on shift, and follow the normal route otherwise.
+languages: [go, python, typescript, rust]
+glossary: [cor-successor, catch-all-handler, middleware-onion, short-circuit-response, interface]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: chain-of-responsibility
+  scenarios:
+    - try: "Send all eight tickets through the starting chain."
+      notice: "The $2,400 dispute and the data-export request walk off the end. Nothing errors and nothing is logged; two customers simply never hear back."
+    - try: "Add the Support lead at the end and run again."
+      notice: "Nothing is lost. A catch-all at the end turns silence into a decision someone sees."
+    - try: "Move Tier 2 billing to the front."
+      notice: "Every desk still works, but the cost goes up: the first desk that can take a ticket does, so an expensive desk early takes cheap work."
+    - try: "Tick the bug on the Help bot so it forgets to pass on what it cannot handle."
+      notice: "Every ticket that is not a password reset stops at the bot. One broken link cuts off the whole chain behind it."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: intake, sub: new ticket }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: intake, sub: builds the chain }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: assign, sub: one switch for all }
+      after:  { x: 168, y: 30, w: 150, h: 56, title: Chain, sub: tries each in order }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 30, w: 180, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 180, h: 56, title: Handler, sub: { go: "Handle(t) (Desk, bool)", python: "(t) -> Desk | None", typescript: "(t) => Desk | undefined", rust: "handle(&t) -> Option" } }
+    - id: bot
+      kind: concrete
+      before: { x: 188, y: 70, w: 222, h: 30, title: password → bot }
+      after:  { x: 196, y: 204, w: 66, h: 40, title: Bot }
+    - id: tier1
+      kind: concrete
+      before: { x: 188, y: 106, w: 222, h: 30, title: "refund ≤ 100 → tier 1" }
+      after:  { x: 268, y: 204, w: 66, h: 40, title: Tier 1 }
+    - id: tier2
+      kind: concrete
+      before: { x: 188, y: 142, w: 222, h: 30, title: "≤ 1000 → tier 2" }
+      after:  { x: 340, y: 204, w: 66, h: 40, title: Tier 2 }
+    - id: eng
+      kind: concrete
+      before: { x: 188, y: 178, w: 222, h: 30, title: outage → on-call }
+      after:  { x: 412, y: 204, w: 66, h: 40, title: On-call }
+    - id: manager
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 222, w: 222, h: 30, title: enterprise → manager }
+      after:  { x: 484, y: 204, w: 70, h: 40, title: Manager }
+  edges:
+    - { from: client, to: context, label: asks }
+    - { from: context, to: strategy, label: tries each }
+    - { from: bot, to: strategy, kind: implements }
+    - { from: tier1, to: strategy, kind: implements }
+    - { from: tier2, to: strategy, kind: implements, label: implements }
+    - { from: eng, to: strategy, kind: implements }
+    - { from: manager, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: routing.go · intake.go
+      source: |
+        // routing.go
+        func (r *Router) Assign(t Ticket) (Desk, error) {
+            switch {
+            case t.Kind == Password:
+                return r.bot, nil
+            case t.Kind == Refund && t.Amount <= 100:
+                return r.tier1, nil
+            case (t.Kind == Refund || t.Kind == Dispute) && t.Amount <= 1000:
+                return r.tier2, nil
+            case t.Kind == Outage:
+                return r.oncall, nil
+            }
+            return nil, fmt.Errorf("no desk for ticket %d", t.ID)
+        }
+
+        // intake.go
+        desk, err := router.Assign(ticket)
+      roles: { context: [2, 14], bot: [4, 5], tier1: [6, 7], tier2: [8, 9], eng: [10, 11], client: [17, 17] }
+      change:
+        - { after: 3, add: ['    case t.Plan == Enterprise && r.managers[t.AccountID].OnShift():', '        return r.managers[t.AccountID], nil'] }
+        - { line: 8, replace: '    case (t.Kind == Refund || t.Kind == Dispute) && t.Amount <= r.limitFor(t.Plan):' }
+    after:
+      file: chain.go · intake.go
+      source: |
+        type Handler interface {
+            Handle(t Ticket) (Desk, bool)
+        }
+
+        type Chain []Handler
+
+        func (c Chain) Assign(t Ticket) (Desk, error) {
+            for _, h := range c {
+                if d, ok := h.Handle(t); ok {
+                    return d, nil
+                }
+            }
+            return nil, fmt.Errorf("ticket %d: %w", t.ID, ErrUnhandled)
+        }
+
+        type MoneyLimit struct {
+            Max  Money
+            Desk Desk
+        }
+
+        func (h MoneyLimit) Handle(t Ticket) (Desk, bool) {
+            ok := (t.Kind == Refund || t.Kind == Dispute) && t.Amount <= h.Max
+            return h.Desk, ok
+        }
+
+        // intake.go: the chain is configuration, and its last link takes anything
+        standard := Chain{HelpBot{bot}, MoneyLimit{100, tier1}, MoneyLimit{1000, tier2}, OnCall{oncall}, CatchAll{lead}}
+        desk, err := standard.Assign(ticket)
+      roles: { strategy: [1, 3], context: [5, 14], tier2: [16, 24], client: [26, 28], build: [27, 27], pass: [8, 11], handle: [21, 24], end: [13, 13] }
+    again:
+      file: manager.go
+      source: |
+        // manager.go: a new handler; no existing handler changes
+        type AccountManager struct{ managers map[AccountID]Desk }
+
+        func (h AccountManager) Handle(t Ticket) (Desk, bool) {
+            m, ok := h.managers[t.AccountID]
+            return m, ok && m.OnShift()
+        }
+
+        // intake.go: enterprise gets its own chain, built from the same parts
+        enterprise := append(Chain{AccountManager{managers}}, standard...)
+    cost:
+      before: { text: 3 lines · shared switch, value: 0.6 }
+      after: { text: 1 new handler · 1 new chain, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A slice of handlers and a loop is the plain Go chain. The other common form is HTTP middleware, `func(next http.Handler) http.Handler`: each layer either writes the response itself or calls `next.ServeHTTP`, so the links are the wrapped handlers.'
+      seenIn: 'HTTP middleware around `http.Handler`. gRPC''s `grpc.ChainUnaryInterceptor`, where each interceptor decides whether to call the next handler. `errors.As` walks an error''s `Unwrap` chain until one link matches.'
+
+  python:
+    before:
+      file: routing.py · intake.py
+      source: |
+        # routing.py
+        def assign(ticket: Ticket) -> Desk:
+            if ticket.kind == "password":
+                return bot
+            if ticket.kind == "refund" and ticket.amount <= 100:
+                return tier1
+            if ticket.kind in ("refund", "dispute") and ticket.amount <= 1000:
+                return tier2
+            if ticket.kind == "outage":
+                return oncall
+            raise NoDeskError(ticket.id)
+
+        # intake.py
+        desk = assign(ticket)
+      roles: { context: [2, 11], bot: [3, 4], tier1: [5, 6], tier2: [7, 8], eng: [9, 10], client: [14, 14] }
+      change:
+        - { after: 2, add: ['    if ticket.plan == "enterprise" and managers[ticket.account_id].on_shift():', '        return managers[ticket.account_id]'] }
+        - { line: 7, replace: '    if ticket.kind in ("refund", "dispute") and ticket.amount <= limit_for(ticket.plan):' }
+    after:
+      file: chain.py · intake.py
+      source: |
+        from typing import Callable, Iterable
+
+        Handler = Callable[[Ticket], Desk | None]
+
+        def assign(chain: Iterable[Handler], ticket: Ticket) -> Desk:
+            for handle in chain:
+                if (desk := handle(ticket)) is not None:
+                    return desk
+            raise UnhandledTicket(ticket.id)
+
+        def money_limit(limit: int, desk: Desk) -> Handler:
+            def handle(ticket: Ticket) -> Desk | None:
+                if ticket.kind in ("refund", "dispute") and ticket.amount <= limit:
+                    return desk
+                return None
+            return handle
+
+        # intake.py: the chain is configuration, and its last link takes anything
+        STANDARD = [help_bot, money_limit(100, tier1), money_limit(1000, tier2), on_call, catch_all(lead)]
+        desk = assign(STANDARD, ticket)
+      roles: { strategy: [3, 3], context: [5, 9], tier2: [11, 16], client: [18, 20], build: [19, 19], pass: [6, 8], handle: [12, 15], end: [9, 9] }
+    again:
+      file: manager.py
+      source: |
+        # manager.py: a new handler; no existing handler changes
+        def account_manager(ticket: Ticket) -> Desk | None:
+            manager = managers.get(ticket.account_id)
+            return manager if manager and manager.on_shift() else None
+
+        # intake.py: enterprise gets its own chain, built from the same parts
+        ENTERPRISE = [account_manager, *STANDARD]
+    cost:
+      before: { text: 3 lines · shared function, value: 0.6 }
+      after: { text: 1 new function · 1 new list, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A handler is a function that returns a result or `None`, and the chain is a list. The walrus operator keeps the loop short. Use a class only when a handler needs configuration you want to inspect or test, and a closure such as `money_limit(100, tier1)` usually covers that.'
+      seenIn: 'The import system asks each finder on `sys.meta_path` for a spec until one returns something other than `None`. Django middleware calls `get_response` to pass the request on. A `logging.Logger` passes records up to its parent''s handlers while `propagate` is true.'
+
+  typescript:
+    before:
+      file: routing.ts · intake.ts
+      source: |
+        // routing.ts
+        export function assign(t: Ticket): Desk {
+          if (t.kind === "password") return bot;
+          if (t.kind === "refund" && t.amount <= 100) return tier1;
+          if ((t.kind === "refund" || t.kind === "dispute") && t.amount <= 1000) return tier2;
+          if (t.kind === "outage") return onCall;
+          throw new Error(`no desk for ticket ${t.id}`);
+        }
+
+        // intake.ts
+        const desk = assign(ticket);
+      roles: { context: [2, 8], bot: [3, 3], tier1: [4, 4], tier2: [5, 5], eng: [6, 6], client: [11, 11] }
+      change:
+        - { after: 2, add: ['  if (t.plan === "enterprise" && managers.get(t.accountId)?.onShift()) return managers.get(t.accountId)!;'] }
+        - { line: 5, replace: '  if ((t.kind === "refund" || t.kind === "dispute") && t.amount <= limitFor(t.plan)) return tier2;' }
+    after:
+      file: chain.ts · intake.ts
+      source: |
+        export type Handler = (t: Ticket) => Desk | undefined;
+
+        export function assign(chain: readonly Handler[], t: Ticket): Desk {
+          for (const handle of chain) {
+            const desk = handle(t);
+            if (desk) return desk;
+          }
+          throw new UnhandledTicket(t.id);
+        }
+
+        export const moneyLimit = (limit: number, desk: Desk): Handler => (t) =>
+          (t.kind === "refund" || t.kind === "dispute") && t.amount <= limit ? desk : undefined;
+
+        // intake.ts: the chain is configuration, and its last link takes anything
+        const standard = [helpBot, moneyLimit(100, tier1), moneyLimit(1000, tier2), onCall, catchAll(lead)];
+        const desk = assign(standard, ticket);
+      roles: { strategy: [1, 1], context: [3, 9], tier2: [11, 12], client: [14, 16], build: [15, 15], pass: [4, 7], handle: [11, 12], end: [8, 8] }
+    again:
+      file: manager.ts
+      source: |
+        // manager.ts: a new handler; no existing handler changes
+        export const accountManager: Handler = (t) => {
+          const m = managers.get(t.accountId);
+          return m?.onShift() ? m : undefined;
+        };
+
+        // intake.ts: enterprise gets its own chain, built from the same parts
+        const enterprise = [accountManager, ...standard];
+    cost:
+      before: { text: 2 lines · shared function, value: 0.6 }
+      after: { text: 1 new function · 1 new array, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Functions and arrays are enough: a handler returns a value or `undefined`, and the chain is an array you can spread into a new one. The middleware form, `(req, res, next) => …`, is the same pattern with the links passed in as `next`.'
+      seenIn: 'Express and Koa middleware, where a layer either responds or calls `next()`. DOM events bubble from the target up through its ancestors until a listener calls `stopPropagation()`.'
+
+  rust:
+    before:
+      file: routing.rs · intake.rs
+      source: |
+        // routing.rs
+        pub fn assign(t: &Ticket) -> Result<Desk, Unhandled> {
+            match t.kind {
+                Kind::Password => Ok(Desk::Bot),
+                Kind::Refund if t.amount <= 100 => Ok(Desk::Tier1),
+                Kind::Refund | Kind::Dispute if t.amount <= 1000 => Ok(Desk::Tier2),
+                Kind::Outage => Ok(Desk::OnCall),
+                _ => Err(Unhandled(t.id)),
+            }
+        }
+
+        // intake.rs
+        let desk = assign(&ticket)?;
+      roles: { context: [2, 10], bot: [4, 4], tier1: [5, 5], tier2: [6, 6], eng: [7, 7], client: [13, 13] }
+      change:
+        - { after: 2, add: ['    if t.plan == Plan::Enterprise && managers.on_shift(t.account_id) {', '        return Ok(Desk::Manager(t.account_id));', '    }'] }
+        - { line: 6, replace: '        Kind::Refund | Kind::Dispute if t.amount <= limit_for(t.plan) => Ok(Desk::Tier2),' }
+    after:
+      file: chain.rs · intake.rs
+      source: |
+        pub trait Handler {
+            fn handle(&self, t: &Ticket) -> Option<Desk>;
+        }
+
+        pub struct Chain(pub Vec<Box<dyn Handler>>);
+
+        impl Chain {
+            pub fn assign(&self, t: &Ticket) -> Result<Desk, Unhandled> {
+                self.0.iter().find_map(|h| h.handle(t)).ok_or(Unhandled(t.id))
+            }
+        }
+
+        pub struct MoneyLimit { pub max: u64, pub desk: Desk }
+
+        impl Handler for MoneyLimit {
+            fn handle(&self, t: &Ticket) -> Option<Desk> {
+                let money = matches!(t.kind, Kind::Refund | Kind::Dispute);
+                (money && t.amount <= self.max).then(|| self.desk.clone())
+            }
+        }
+
+        // intake.rs: the chain is configuration, and its last link takes anything
+        let standard = Chain(vec![
+            Box::new(HelpBot),
+            Box::new(MoneyLimit { max: 100, desk: Desk::Tier1 }),
+            Box::new(MoneyLimit { max: 1000, desk: Desk::Tier2 }),
+            Box::new(OnCall),
+            Box::new(CatchAll(Desk::Lead)),
+        ]);
+        let desk = standard.assign(&ticket)?;
+      roles: { strategy: [1, 3], context: [5, 11], tier2: [13, 20], client: [22, 30], build: [23, 29], pass: [9, 9], handle: [16, 19], end: [9, 9] }
+    again:
+      file: manager.rs
+      source: |
+        // manager.rs: a new handler; no existing handler changes
+        pub struct AccountManager { managers: Arc<Managers> }
+
+        impl Handler for AccountManager {
+            fn handle(&self, t: &Ticket) -> Option<Desk> {
+                self.managers.on_shift(t.account_id).then(|| Desk::Manager(t.account_id))
+            }
+        }
+
+        // intake.rs: enterprise gets its own chain: the manager first, then the standard links
+        let enterprise = Chain(vec![Box::new(AccountManager { managers }), Box::new(HelpBot) /* , … */]);
+    cost:
+      before: { text: 4 lines · shared match, value: 0.6 }
+      after: { text: 1 new type · 1 new chain, value: 0.18 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`Iterator::find_map` is the chain loop in one line: it stops at the first handler that returns `Some`. Use `Box<dyn Handler>` when chains are built from config; when the chain is fixed at compile time, a plain `match` or a sequence of `or_else` calls is shorter and just as clear.'
+      seenIn: '`tower` layers wrap a `Service`, and each can answer or call the inner one. `axum::middleware::from_fn` hands each layer a `Next` to call. `Option::or_else` chains try one source after another.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Intake builds the chain once, from configuration, with a catch-all as the last link. The order in this list is the routing policy.
+    nodes: [client, context]
+    edges: [client>context]
+    role: build
+  - text: A $600 refund arrives. The chain offers it to each handler in turn. The bot and Tier 1 both decline, so it moves on.
+    nodes: [context, strategy, bot, tier1]
+    edges: [context>strategy, bot>strategy, tier1>strategy]
+    role: pass
+  - text: Tier 2's money limit accepts it. The loop stops there; the handlers after Tier 2 never see the ticket.
+    nodes: [strategy, tier2]
+    edges: [tier2>strategy]
+    role: handle
+  - text: If every handler declines, Assign returns an unhandled error instead of nothing. The end of the chain is a decision, made in one place.
+    nodes: [context]
+    edges: []
+    role: end
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these calls for Chain of Responsibility?
+    options:
+      - text: An expense claim goes to the team lead, then the director, then the CFO, and stops at the first one whose approval limit covers the amount.
+        correct: true
+        why: Right. Several handlers could take it, the request decides which one does, and each one either handles it or passes it up.
+      - text: When an order is placed, email, stock and analytics all need to react.
+        why: That is Observer. Every subscriber gets the event. In a chain, the request stops at the first handler that takes it.
+      - text: Support queues refunds for a worker that retries them and logs each one.
+        why: That is Command. The point is storing the request to run later, not choosing who handles it.
+  engineer:
+    question: Some tickets come back from the chain with no handler. What should the chain do about it?
+    options:
+      - text: End the chain on purpose, with a catch-all handler or an explicit unhandled error that is logged and alerted.
+        correct: true
+        why: Right. The pattern does not guarantee that anyone handles a request. Make the end of the chain a visible decision, so a lost request is noticed.
+      - text: Return an empty desk and let the caller deal with it.
+        why: Callers will treat it as a normal answer. That is how tickets vanish without anyone noticing.
+      - text: Sort the handlers alphabetically, so the order is predictable.
+        why: Predictable is not the problem. Order decides who handles what, so it must follow the policy, cheap and narrow handlers first.
+  deep:
+    question: An Express-style middleware neither sends a response nor calls next(). What happens to the request?
+    options:
+      - text: It hangs until the client or a proxy gives up. Nothing throws, so nothing is logged.
+        correct: true
+        why: Right. Express's own guide says the request is left hanging. A broken link in the middle of a chain looks exactly like a chain with no end.
+      - text: Express calls the next middleware automatically.
+        why: No. Passing on is the handler's job; the framework only moves forward when `next()` is called.
+      - text: Express sends a 404.
+        why: Express's 404 comes from the end of the stack, which this request never reaches.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Handler
+      example: { go: "Handler (interface)", python: "Handler (a Callable type)", typescript: "Handler (function type)", rust: "Handler (trait)" }
+      job: Takes the request, or says it does not.
+    - role: Concrete handler
+      example: "HelpBot, MoneyLimit, OnCall, CatchAll"
+      job: Knows one rule, and nothing about the other handlers.
+    - role: Chain
+      example: "Chain (a list), or each handler's successor"
+      job: Offers the request to each handler in order, and decides what happens when nobody takes it.
+    - role: Client
+      example: intake
+      job: Builds the chain and sends requests into it.
+  useWhen:
+    - Several objects could handle a request and the request itself decides which one does.
+    - The set or order of handlers differs by configuration, customer or environment.
+    - Each step of a pipeline may stop the request, as in HTTP middleware and validation.
+  avoidWhen:
+    - The rules are few, fixed and read best side by side. A switch or a decision table is clearer.
+    - Every handler must see every request. That is Observer, or a plain pipeline.
+    - Handlers depend on each other's decisions. A chain hides those dependencies in its order.
+  tradeoffs:
+    - Nothing guarantees a request is handled. You must design the end of the chain.
+    - The order is policy, and it is not visible inside any one handler.
+    - Finding out who handled a request takes logging; the code no longer says.
+    - A request may visit many handlers before one takes it.
+  lookalikes:
+    - name: Decorator
+      how: Wraps an object and always calls it, adding behaviour around it. A chain handler usually stops the request instead of passing it on.
+    - name: Observer
+      how: Every subscriber gets the event. In a chain, the first handler that takes the request ends it.
+    - name: Command
+      how: Makes the request an object. The thing travelling down a chain is often a command.
+---
+
+## [concept] Chain of Responsibility
+
+**Pass a request along a line of handlers. Each one either handles it or passes it to the next, so the sender never has to know who will take it.**
+
+Each handler knows one rule. The chain decides the order in which the rules are tried.
+
+<Depth level={2}>
+Three parts make a chain. The **handler** is a one-method <Term id="interface">interface</Term>: take this request, or say no. Each **concrete handler** knows one rule and nothing about the others. The **chain** offers the request to each handler in turn, or each handler holds a link to its <Term id="cor-successor">successor</Term>. The **client** builds the chain and sends requests into it.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files it under object behavioral patterns. Its benefits are reduced coupling, because the sender knows only the first link, and the freedom to add or rearrange handlers at runtime. Its main liability is that receipt is not guaranteed: a request can fall off the end of the chain without being handled, including when the chain is wired wrong. The book also notes that a chain can reuse links that already exist, such as each widget's parent in a UI tree.
+</Depth>
+
+## [problem] One function that routes every ticket
+
+A support system assigns each new ticket to a desk: the help bot, Tier 1, Tier 2 billing or the engineering on-call. One function holds every rule, in order.
+
+Read it once. It is short and clear, and for a single support team it is the right design.
+
+<Depth level={2}>
+The order of the checks matters. A $60 refund matches both the Tier 1 rule and the Tier 2 rule; it goes to Tier 1 only because that check comes first.
+</Depth>
+
+<Depth level={3}>
+The last line is easy to miss and important. A ticket that matches no rule gets an error. Without it, the function would fall through and return nothing, and the ticket would sit unassigned.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** enterprise customers' tickets go to their account manager first, if the manager is on shift, and follow the normal route otherwise.
+
+The marked lines add an enterprise rule at the top of a function every customer goes through, and change the refund limit for everyone to depend on the plan.
+
+<Depth level={2}>
+Each new kind of customer adds conditions to the same shared function, and each condition can change where other customers' tickets go. Testing the standard route now means setting up enterprise data to prove it is not used.
+</Depth>
+
+<Depth level={3}>
+Next quarter, the EU office wants its own route with a privacy desk first, and the night shift wants Tier 2 skipped. One function cannot hold three routes without becoming a tangle of flags.
+</Depth>
+
+## [morph] Turn each rule into a handler
+
+Drag the slider. Each branch of the switch becomes a small handler that knows one rule. The chain is a list of them, tried in order.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+A route is now configuration: a list of handlers. Different customers get different lists built from the same parts, and each handler is tested alone. The last link is a <Term id="catch-all-handler">catch-all handler</Term>, so the end of the chain is a decision you can see.
+</Depth>
+
+<Depth level={3}>
+This is the list form of the pattern: a loop owns the order. The catalogue's form links each handler to its successor and has it forward the request itself. HTTP <Term id="middleware-onion">middleware</Term> is that second form, with the successor passed in as `next`; a layer that answers without calling `next` is a <Term id="short-circuit-response">short-circuit</Term>. The list form makes the order visible in one place; the linked form lets a handler do work both before and after the rest of the chain.
+</Depth>
+
+## [walk] Follow one ticket
+
+One $600 refund through the chain, from intake to Tier 2. Step through it with the numbered buttons.
+
+<Depth level={2}>
+Log which handler took each request. With a switch, reading the code told you where a ticket would go. With a chain, the answer depends on configuration, and the log is how you find out.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`range` over a slice of interfaces calls each `Handle` through the interface's method table. A chain of five handlers is five indirect calls at most, nothing next to a database write. Wrapping `ErrUnhandled` with `%w` lets callers test for it with `errors.Is`.</Lang>
+<Lang only="python">The walrus operator `:=` assigns and tests in one expression. Compare with `is not None`, not truthiness, so a handler can return a falsy but valid result.</Lang>
+<Lang only="typescript">`if (desk)` treats every falsy value as no answer. That is fine for objects; if a handler could return `0` or an empty string, test `!== undefined` instead.</Lang>
+<Lang only="rust">`find_map` stops at the first `Some` and never calls the remaining handlers. `ok_or` turns the `None` at the end into the `Unhandled` error, so the type system makes the caller deal with an unhandled ticket.</Lang>
+</Depth>
+
+## [again] The account manager, the second time
+
+The same request after the refactor. The account manager is one new handler. Enterprise customers get a chain that starts with it and continues with the standard links. The standard chain does not change, so ordinary customers cannot be affected.
+
+<Depth level={2}>
+Where the new handler goes is the real decision. At the front, the manager sees every enterprise ticket first. After the help bot, password resets stay automatic. The handler code is the same either way; only the list changes.
+</Depth>
+
+<Depth level={3}>
+Chains built from configuration can be wrong in ways the compiler cannot see: a missing catch-all, a broad handler before a narrow one. Test each configured chain with one request of every kind, and assert that none comes back unhandled.
+</Depth>
+
+## [play] Route the tickets
+
+Eight real tickets and a chain of support desks. Reorder the desks, add or remove them, break one, and send the same eight tickets through again.
+
+Find which tickets get lost, why, and the cheapest chain that loses nothing.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. How much ceremony it needs is not.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="chain-of-responsibility" />
+
+### Design the end of the chain
+
+A chain answers "who handles this?" with "whoever comes first and says yes", and sometimes the answer is nobody. Decide what nobody means before you ship: a catch-all handler that sends the request to a person, or an unhandled error that is logged and alerted. A handler in the middle that neither handles nor passes on is the same failure in disguise. In Express, a middleware that neither responds nor calls `next()` leaves the request hanging until the client gives up.
