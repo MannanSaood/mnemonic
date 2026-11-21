@@ -1,0 +1,517 @@
+---
+title: Deadlock, livelock and starvation
+track: concurrency
+group: Foundations
+order: 15
+summary: Two transfers that lock the same two accounts in opposite orders can each hold one lock and wait forever for the other. One global lock order makes that cycle impossible.
+intent: Spot code that can take two locks in different orders, fix it with one lock order, and tell a deadlock from a livelock or starvation when something hangs.
+changeRequest: Customers can now send money to each other, and twice a day two transfers between the same pair of accounts hang until the service is restarted.
+languages: [go, python, typescript, rust]
+glossary: [deadlock, livelock, starvation, wait-for-graph, lock-ordering, coffman-conditions, try-lock, jitter, partial-deadlock]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [concurrency, debugging]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: deadlock-and-liveness
+  scenarios:
+    - try: "Step T1 once, then T2 once."
+      notice: "T1 holds A, T2 holds B, and each now waits for the other's lock. The arrows close into a cycle, and both step buttons go dead."
+    - try: "Start again and step T1 five times before touching T2."
+      notice: "The same code finishes. A deadlock needs one particular interleaving, which is why it shows up twice a day and never in tests."
+    - try: "Switch to lower id first and tick both cores."
+      notice: "T2 now also wants A first, so it waits while holding nothing. No cycle can form, and money keeps moving."
+    - try: "Switch to try-lock with a fixed 2-tick wait and run 40 ticks. Then pick random 1-4 ticks and run again."
+      notice: "With a fixed wait both threads collide, back off and collide again: 0 transfers, plenty of retries. Jitter breaks the lockstep and transfers go through."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: t1
+      kind: client
+      before: { x: 12, y: 36, w: 120, h: 52, title: thread 1, sub: "transfer A → B" }
+      after:  { x: 12, y: 36, w: 120, h: 52, title: thread 1, sub: "transfer A → B" }
+    - id: t2
+      kind: client
+      before: { x: 12, y: 182, w: 120, h: 52, title: thread 2, sub: "transfer B → A" }
+      after:  { x: 12, y: 182, w: 120, h: 52, title: thread 2, sub: "transfer B → A" }
+    - id: transfer
+      kind: context
+      before: { x: 170, y: 20, w: 220, h: 230, title: transfer, sub: "lock from, then to" }
+      after:  { x: 196, y: 24, w: 170, h: 48, title: transfer, sub: "sort the two accounts" }
+    - id: order
+      kind: strategy
+      appears: after
+      before: { x: 196, y: 110, w: 170, h: 52, title: "" }
+      after:  { x: 196, y: 110, w: 170, h: 52, title: lock order, sub: lower id first }
+    - id: locka
+      kind: concrete
+      before: { x: 428, y: 36, w: 120, h: 52, title: lock A, sub: "account id 1" }
+      after:  { x: 428, y: 36, w: 120, h: 52, title: lock A, sub: "id 1 · always first" }
+    - id: lockb
+      kind: concrete
+      before: { x: 428, y: 182, w: 120, h: 52, title: lock B, sub: "account id 2" }
+      after:  { x: 428, y: 182, w: 120, h: 52, title: lock B, sub: "id 2 · always second" }
+  edges:
+    - { from: t1, to: locka, label: holds }
+    - { from: t2, to: lockb, label: holds }
+    - { from: t1, to: lockb, label: waits }
+    - { from: t2, to: locka, label: waits }
+    - { from: t1, to: order }
+    - { from: t2, to: order }
+    - { from: transfer, to: order, label: picks }
+    - { from: order, to: locka, label: 1st }
+    - { from: order, to: lockb, label: 2nd }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: ledger.go
+      source: |
+        // ledger.go
+        type Account struct {
+            mu      sync.Mutex
+            ID      int64
+            Balance int64
+        }
+
+        func Transfer(from, to *Account, amount int64) error {
+            from.mu.Lock()
+            defer from.mu.Unlock()
+            to.mu.Lock()
+            defer to.mu.Unlock()
+
+            if from.Balance < amount {
+                return ErrInsufficientFunds
+            }
+            from.Balance -= amount
+            to.Balance += amount
+            return nil
+        }
+      roles: { transfer: [8, 20], locka: [9, 10], lockb: [11, 12], t1: [8, 8], t2: [8, 8] }
+      change:
+        - { line: 9, replace: "    from.mu.Lock() // goroutine 1 holds A here, goroutine 2 holds B" }
+        - { line: 11, replace: "    to.mu.Lock() // each waits for the lock the other holds: forever" }
+    after:
+      file: ledger.go
+      source: |
+        // ledger.go
+        type Account struct {
+            mu      sync.Mutex
+            ID      int64 // unique; fixes the lock order
+            Balance int64
+        }
+
+        func Transfer(from, to *Account, amount int64) error {
+            first, second := from, to
+            if to.ID < from.ID {
+                first, second = to, from // always lock the lower id first
+            }
+            first.mu.Lock()
+            defer first.mu.Unlock()
+            second.mu.Lock()
+            defer second.mu.Unlock()
+
+            if from.Balance < amount {
+                return ErrInsufficientFunds
+            }
+            from.Balance -= amount
+            to.Balance += amount
+            return nil
+        }
+      roles: { transfer: [8, 24], order: [9, 12], pick: [9, 12], locka: [13, 14], first: [13, 14], lockb: [15, 16], second: [15, 16], move: [18, 23], t1: [8, 8], t2: [8, 8] }
+    again:
+      file: the same busy day
+      source: |
+        // 2 goroutines, 100,000 transfers each, always between the same two accounts, in opposite directions
+        // hung requests: 0
+        // A + B before: 1,000   A + B after: 1,000
+    cost:
+      before: { text: "2 requests hung until restart · both accounts locked", value: 0.95 }
+      after: { text: "0 hangs · one id comparison per transfer", value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The runtime reports a deadlock only when every goroutine is blocked: "all goroutines are asleep". Two goroutines stuck on each other''s mutex while the HTTP server keeps running is a partial deadlock that nothing reports. A goroutine dump (SIGQUIT, or /debug/pprof/goroutine?debug=2) shows both waiting in `sync.(*Mutex).Lock`. `TryLock` exists since Go 1.18, and its docs warn that correct uses are rare.'
+      seenIn: 'PostgreSQL detects lock cycles between transactions and aborts one with SQLSTATE 40P01, so database code retries instead of hanging. `sync.Mutex` switches to a starvation mode when a waiter has waited over 1 ms.'
+
+  python:
+    before:
+      file: ledger.py
+      source: |
+        # ledger.py
+        @dataclass
+        class Account:
+            id: int
+            balance: int
+            lock: threading.Lock = field(default_factory=threading.Lock)
+
+        def transfer(src: Account, dst: Account, amount: int) -> None:
+            with src.lock:
+                with dst.lock:
+                    if src.balance < amount:
+                        raise InsufficientFunds(src.id)
+                    src.balance -= amount
+                    dst.balance += amount
+      roles: { transfer: [8, 14], locka: [9, 9], lockb: [10, 10], t1: [8, 8], t2: [8, 8] }
+      change:
+        - { line: 9, replace: "    with src.lock:  # thread 1 holds A here, thread 2 holds B" }
+        - { line: 10, replace: "        with dst.lock:  # each waits for the lock the other holds: forever" }
+    after:
+      file: ledger.py
+      source: |
+        # ledger.py
+        @dataclass
+        class Account:
+            id: int  # unique; fixes the lock order
+            balance: int
+            lock: threading.Lock = field(default_factory=threading.Lock)
+
+        def transfer(src: Account, dst: Account, amount: int) -> None:
+            first, second = sorted((src, dst), key=lambda a: a.id)  # lower id first
+            with first.lock, second.lock:
+                if src.balance < amount:
+                    raise InsufficientFunds(src.id)
+                src.balance -= amount
+                dst.balance += amount
+      roles: { transfer: [8, 14], order: [9, 9], pick: [9, 9], locka: [10, 10], first: [10, 10], lockb: [10, 10], second: [10, 10], move: [11, 14], t1: [8, 8], t2: [8, 8] }
+    again:
+      file: the same busy day
+      source: |
+        # 2 threads, 100,000 transfers each, always between the same two accounts, in opposite directions
+        # hung requests: 0
+        # A + B before: 1,000   A + B after: 1,000
+    cost:
+      before: { text: "2 worker threads hung until restart", value: 0.95 }
+      after: { text: "0 hangs · one sort of two items per transfer", value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`threading.Lock` has no deadlock detection, and the GIL does not help: a thread blocked in `acquire` waits forever. `lock.acquire(timeout=0.05)` returns `False` instead of waiting, the building block for try-lock with backoff. `py-spy dump --pid` or `faulthandler.dump_traceback` prints where every thread is stuck.'
+      seenIn: '`threading.RLock` lets one thread re-enter a lock it already holds, which avoids self-deadlock but not cycles. psycopg raises `DeadlockDetected` when PostgreSQL breaks a cycle between transactions.'
+
+  typescript:
+    before:
+      file: ledger.ts
+      source: |
+        // ledger.ts
+        interface Account { id: number; mutex: Mutex } // Mutex: an in-house promise-based lock
+
+        export async function transfer(from: Account, to: Account, amount: number): Promise<void> {
+          const releaseFrom = await from.mutex.lock();
+          const releaseTo = await to.mutex.lock();
+          try {
+            const balance = await store.balance(from.id); // an await: other transfers run here
+            if (balance < amount) throw new InsufficientFunds(from.id);
+            await store.move(from.id, to.id, amount);
+          } finally {
+            releaseTo();
+            releaseFrom();
+          }
+        }
+      roles: { transfer: [4, 15], locka: [5, 5], lockb: [6, 6], t1: [4, 4], t2: [4, 4] }
+      change:
+        - { line: 5, replace: "  const releaseFrom = await from.mutex.lock(); // request 1 holds A, request 2 holds B" }
+        - { line: 6, replace: "  const releaseTo = await to.mutex.lock(); // each awaits a lock the other holds: never settles" }
+    after:
+      file: ledger.ts
+      source: |
+        // ledger.ts
+        interface Account { id: number; mutex: Mutex } // id is unique and fixes the lock order
+
+        export async function transfer(from: Account, to: Account, amount: number): Promise<void> {
+          const [first, second] = from.id < to.id ? [from, to] : [to, from]; // lower id first
+          const releaseFirst = await first.mutex.lock();
+          const releaseSecond = await second.mutex.lock();
+          try {
+            const balance = await store.balance(from.id);
+            if (balance < amount) throw new InsufficientFunds(from.id);
+            await store.move(from.id, to.id, amount);
+          } finally {
+            releaseSecond();
+            releaseFirst();
+          }
+        }
+      roles: { transfer: [4, 16], order: [5, 5], pick: [5, 5], locka: [6, 6], first: [6, 6], lockb: [7, 7], second: [7, 7], move: [8, 12], t1: [4, 4], t2: [4, 4] }
+    again:
+      file: the same busy day
+      source: |
+        // 100,000 transfers each way between the same two accounts, all in flight at once
+        // promises that never settled: 0
+        // A + B before: 1,000   A + B after: 1,000
+    cost:
+      before: { text: "2 requests never answer · every later transfer on A or B queues behind them", value: 0.95 }
+      after: { text: "0 stuck requests · one id comparison per transfer", value: 0.05 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Node runs your code on one thread and has no mutex in the standard library, yet async locks deadlock the same way. Two promises each waiting for a lock the other holds never settle. The event loop keeps serving other requests, so it looks like a few requests that time out, with no error anywhere. Use one lock order, or a timeout on acquiring the lock.'
+      seenIn: 'The async-mutex package. The Web Locks API in browsers, whose `ifAvailable` option is a try-lock. `Atomics.wait` between worker_threads can deadlock like threads do.'
+
+  rust:
+    before:
+      file: ledger.rs
+      source: |
+        // ledger.rs
+        pub struct Account {
+            pub id: u64,
+            pub balance: Mutex<i64>,
+        }
+
+        pub fn transfer(from: &Account, to: &Account, amount: i64) -> Result<(), LedgerError> {
+            let mut src = from.balance.lock().unwrap();
+            let mut dst = to.balance.lock().unwrap();
+            if *src < amount {
+                return Err(LedgerError::InsufficientFunds(from.id));
+            }
+            *src -= amount;
+            *dst += amount;
+            Ok(())
+        }
+      roles: { transfer: [7, 16], locka: [8, 8], lockb: [9, 9], t1: [7, 7], t2: [7, 7] }
+      change:
+        - { line: 8, replace: "    let mut src = from.balance.lock().unwrap(); // thread 1 holds A, thread 2 holds B" }
+        - { line: 9, replace: "    let mut dst = to.balance.lock().unwrap(); // each waits for the other: forever, and it compiled" }
+    after:
+      file: ledger.rs
+      source: |
+        // ledger.rs
+        pub struct Account {
+            pub id: u64, // unique; fixes the lock order
+            pub balance: Mutex<i64>,
+        }
+
+        pub fn transfer(from: &Account, to: &Account, amount: i64) -> Result<(), LedgerError> {
+            let (mut src, mut dst) = if from.id < to.id {
+                let src = from.balance.lock().unwrap(); // lower id first
+                (src, to.balance.lock().unwrap())
+            } else {
+                let dst = to.balance.lock().unwrap(); // lower id first
+                (from.balance.lock().unwrap(), dst)
+            };
+            if *src < amount {
+                return Err(LedgerError::InsufficientFunds(from.id));
+            }
+            *src -= amount;
+            *dst += amount;
+            Ok(())
+        }
+      roles: { transfer: [7, 21], order: [8, 14], pick: [8, 8], locka: [9, 10], first: [9, 9], lockb: [12, 13], second: [10, 10], move: [15, 20], t1: [7, 7], t2: [7, 7] }
+    again:
+      file: the same busy day
+      source: |
+        // 2 threads, 100,000 transfers each, always between the same two accounts, in opposite directions
+        // hung threads: 0
+        // A + B before: 1,000   A + B after: 1,000
+    cost:
+      before: { text: "2 threads hung until restart · it compiled without a warning", value: 0.95 }
+      after: { text: "0 hangs · one id comparison per transfer", value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The type system prevents data races, not deadlocks: both versions compile. Locking a `Mutex` again on the thread that already holds it never returns; the docs say it may deadlock or panic. `try_lock` returns `Err(TryLockError::WouldBlock)` instead of waiting. The parking_lot crate has an optional `deadlock_detection` feature that finds cycles at run time.'
+      seenIn: '`parking_lot::deadlock::check_deadlock()`. `tokio::sync::Mutex` held across an `.await` deadlocks the same way between tasks.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Thread 1 runs transfer(A → B). Before it locks anything, it sorts the two accounts by id. A has id 1, so A comes first.
+    nodes: [t1, transfer, order]
+    edges: [t1>order, transfer>order]
+    role: pick
+  - text: Thread 1 locks A. At the same moment thread 2 runs transfer(B → A), sorts the same two accounts, and also wants A first. A is taken, so thread 2 waits, holding nothing.
+    nodes: [t1, t2, order, locka]
+    edges: [order>locka, t1>order, t2>order]
+    role: first
+  - text: Thread 1 locks B. Nobody can be holding B while waiting for A, because everyone takes A first. The arrows can only point one way, from lower id to higher, so they can never close into a loop.
+    nodes: [order, lockb]
+    edges: [order>lockb]
+    role: second
+  - text: Thread 1 moves the money and releases both locks. Thread 2 gets A, then B, and makes its transfer. Both finished, one after the other.
+    nodes: [t1, t2, locka, lockb]
+    edges: [order>locka, order>lockb]
+    role: move
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: What is a deadlock?
+    options:
+      - text: Threads that each wait for a lock another of them holds, so none of them can ever continue.
+        correct: true
+        why: Right. The waiting forms a cycle. No thread in it will release anything, because each is stuck waiting.
+      - text: A thread that runs slowly because many others want the same lock.
+        why: That is contention. The thread still gets the lock eventually. In a deadlock it never does.
+      - text: A crash that happens when two threads take the same lock at once.
+        why: A lock exists so that two threads can ask for it at once; one waits. A deadlock produces no crash and no error, only threads that never wake.
+  engineer:
+    question: transfer(A, B) and transfer(B, A) sometimes hang under load. Which change removes the hang for good?
+    options:
+      - text: Lock the two accounts in one global order, such as lower account id first.
+        correct: true
+        why: Right. With one order, a thread holding the second lock never waits for the first, so the circular wait the deadlock needs cannot form.
+      - text: Make the locks fair, so waiters are served first come, first served.
+        why: Fairness decides who gets a free lock next. It does nothing for two threads each holding the lock the other needs.
+      - text: Add a timeout to the HTTP request so the client gives up.
+        why: The client stops waiting, but the two threads still hold their locks, and every later transfer touching A or B now queues behind them.
+  deep:
+    question: Both threads use try-lock and, on failure, release and sleep exactly 10 ms. Under load, CPU is busy but transfers stop. What is happening, and what fixes it?
+    options:
+      - text: Livelock. They collide, back off for the same time and collide again. Random jitter in the sleep breaks the lockstep.
+        correct: true
+        why: Right. No thread is blocked, so there is no cycle in the wait-for graph, but the retries stay synchronised. Randomness, or one lock order, ends it.
+      - text: A deadlock, because try-lock still waits for the second lock.
+        why: Try-lock returns at once when the lock is taken, and the thread gives back what it holds. That removes hold-and-wait, so a deadlock cannot form.
+      - text: Starvation of the thread with the higher id. Give it a higher priority.
+        why: Neither thread is making progress, not just one. Priorities would not desynchronise the retries.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Resource
+      example: { go: "Account.mu", python: "Account.lock", typescript: "Account.mutex", rust: "Mutex<i64>" }
+      job: Something one thread holds at a time, usually a lock.
+    - role: Lock order
+      example: lower account id first
+      job: One rule every thread follows, so waiting can only point in one direction.
+    - role: Wait-for graph
+      example: thread 1 → B → thread 2 → A → thread 1
+      job: Who waits for whom. A cycle in it is a deadlock.
+    - role: Back off
+      example: try-lock, release, sleep with jitter, retry
+      job: Breaks a cycle at run time by giving a lock back, when no global order is possible.
+  useWhen:
+    - A global lock order whenever code takes more than one lock. Order by a stable id, never by the order the arguments arrive in.
+    - Open calls, releasing your lock before calling code you do not own, such as a callback or another service.
+    - Try-lock with jittered backoff only when the set of locks is not known in advance.
+  avoidWhen:
+    - Do not rely on a request timeout to clear a hang. The threads keep their locks after the client gives up.
+    - Do not use a fixed backoff for many retrying threads. They retry in step and livelock.
+  tradeoffs:
+    - Lock ordering is free at run time, but every code path must follow it, which is hard to see in review.
+    - Try-lock tolerates any order, but costs retries under contention and can starve an unlucky thread.
+    - One big lock cannot deadlock with itself, but serialises everything it guards.
+  lookalikes:
+    - name: Livelock
+      how: Threads are running, not blocked, and still make no progress.
+    - name: Starvation
+      how: Others progress, one thread never gets its turn.
+    - name: Database deadlock
+      how: The same cycle between transactions' row locks. Databases detect it and abort one transaction, which the caller must retry.
+---
+
+## [concept] Two locks, opposite orders
+
+**A deadlock is a loop of waiting: each thread holds a lock and waits for one that another thread in the loop holds.** Nothing inside the program will ever break it.
+
+Two transfers between the same two accounts are enough. One locks A and wants B. The other locks B and wants A. Neither gives anything back.
+
+<Depth level={2}>
+A <Term id="deadlock">deadlock</Term> is one of three liveness failures, where the program stops making progress without crashing. In a <Term id="livelock">livelock</Term>, threads keep running and reacting to each other but nothing gets done. In <Term id="starvation">starvation</Term>, the program as a whole progresses but one thread never gets its turn. All three look the same from outside: requests that never finish.
+
+The tool for reasoning about deadlock is the <Term id="wait-for-graph">wait-for graph</Term>: an arrow from each blocked thread to the thread holding what it wants. A deadlock is a cycle in that graph. Prevent the cycle and you prevent the deadlock.
+</Depth>
+
+<Depth level={3}>
+A deadlock needs all four <Term id="coffman-conditions">Coffman conditions</Term> at once. Mutual exclusion: a lock has one holder. Hold and wait: a thread holds one lock while waiting for another. No preemption: nobody can take a lock away from its holder. Circular wait: the waiting forms a cycle. Every practical fix removes one. <Term id="lock-ordering">Lock ordering</Term> removes circular wait. <Term id="try-lock">Try-lock</Term> with release removes hold and wait. Database deadlock detectors preempt, by aborting one transaction.
+</Depth>
+
+## [problem] A transfer between two accounts
+
+A ledger keeps each account's balance in memory, guarded by a lock per account, so transfers between unrelated accounts can run in parallel. A transfer locks the account it takes money from, then the one it pays into, then moves the money.
+
+The code is short and obviously correct. Each account is protected, the check and the move happen under both locks, and no money can be created or lost. In testing, every transfer goes through.
+
+<Depth level={2}>
+The mental model is that a lock is a short wait: if the account is busy, you wait a moment and then carry on. That holds for one lock. With two, the order you take them in matters, and here the order depends on which way the money goes.
+</Depth>
+
+<Depth level={3}>
+Tests rarely run two transfers in opposite directions between the same two accounts at the same instant. When they do, one thread usually gets both locks before the other starts. The deadlock needs a narrow interleaving: each thread past its first lock before either reaches its second.
+</Depth>
+
+## [pain] Two transfers hang
+
+**What happened:** customers started sending money to each other. Twice a day, two transfers between the same pair of accounts hang until the service is restarted, and every later transfer touching those accounts queues behind them.
+
+The marked lines are the whole story. Thread 1 sends A to B and locks A. Thread 2 sends B to A and locks B. Now thread 1 waits for B and thread 2 waits for A. Both wait forever.
+
+<Depth level={2}>
+Nothing reports it. CPU is idle, logs are quiet, and the rest of the service runs normally, so it is a <Term id="partial-deadlock">partial deadlock</Term>. The only symptoms are timeouts on the two requests and a growing queue of transfers waiting on A or B. A client-side timeout does not help: the client stops waiting, but the threads keep their locks.
+</Depth>
+
+<Depth level={3}>
+The diagnosis tool is a thread dump: every thread's stack at one moment. It shows two threads parked in a lock call, each at the second lock line of `transfer`, and a lock-aware tool shows which thread owns which lock. Draw the arrows and the cycle is there.
+</Depth>
+
+## [morph] From a short wait to a cycle
+
+Drag the slider. The picture you had, two threads briefly queueing for a lock, becomes the wait-for graph: thread 1 holds A and waits for B, thread 2 holds B and waits for A.
+
+The fix adds one rule. Every transfer sorts its two accounts by id and locks the lower id first, whichever way the money flows. The money still moves from `from` to `to`; only the order of the locks changes.
+
+<Depth level={2}>
+With one global order, any thread waiting for a lock holds only locks earlier in the order. Arrows in the wait-for graph always point from lower to higher, so they cannot close into a loop. Order by something stable and unique, such as a database id. Do not order by memory address in languages where objects can move, and do not order by argument position, which is exactly what went wrong here.
+</Depth>
+
+<Depth level={3}>
+When there is no natural order, or the set of locks is only known as you go, the alternative is to give up hold and wait: take the first lock, try the second, and if it is taken release the first and retry later. That trades deadlock for retries, and two threads that back off for exactly the same time can retry in step forever. Adding random <Term id="jitter">jitter</Term> to the wait breaks the lockstep.
+</Depth>
+
+## [walk] Follow two transfers
+
+Two transfers in opposite directions start together on two cores. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`sync.Mutex` is not fair by default: a goroutine that has just unlocked can lock again before a woken waiter runs. To stop a waiter starving, a mutex switches to starvation mode when a waiter has waited more than 1 ms, and then hands the lock directly to the oldest waiter.</Lang>
+<Lang only="python">`with first.lock, second.lock:` acquires left to right and releases in reverse, exactly like two nested `with` blocks. If acquiring the second lock raises, the first is released.</Lang>
+<Lang only="typescript">An async lock is a queue of promises. `lock()` resolves at once if the lock is free; otherwise its `resolve` waits in the queue until the holder calls its release function. A deadlock leaves two of those promises pending forever, which uses no CPU and never throws.</Lang>
+<Lang only="rust">The `if` returns both guards, so both locks stay held until `src` and `dst` go out of scope at the end of the function. The order of unlocking does not matter for deadlock; only the order of locking does.</Lang>
+</Depth>
+
+## [again] The same busy day, again
+
+The same pair of accounts, the same transfers in both directions at once. Both threads now want A first. The one that loses waits while holding nothing, so it blocks nobody, and it gets both locks as soon as the winner is done. Nothing hangs.
+
+<Depth level={2}>
+The order has to hold on every path that takes two account locks: refunds, fee collection, account merges, admin tools. Put it in one helper that locks a pair of accounts, and make that the only way to get two at once.
+</Depth>
+
+<Depth level={3}>
+A transfer from an account to itself locks the same lock twice. Go's `sync.Mutex`, Python's `threading.Lock` and Rust's `std::sync::Mutex` are not reentrant, so the thread deadlocks with itself. Reject same-account transfers before taking any lock.
+</Depth>
+
+## [play] Make it hang, then fix it
+
+Two threads keep transferring between A and B in opposite directions. Step one thread at a time, or tick both cores at once, and watch the wait-for graph in the middle.
+
+Predict first. Then create the cycle, fix it with a lock order, and try the other fix, try-lock with backoff, with and without jitter.
+
+## [lens] How each language meets it
+
+Every language with locks can deadlock, including Rust, whose type system stops data races but not this. Node has no threads by default, but async locks deadlock in the same way.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+What differs is how you find out. Go reports a deadlock only when every goroutine is blocked. Python and Rust report nothing. In Node the stuck work is a pending promise, invisible until a request times out. In all four, a dump of what every thread or task is waiting on is the diagnosis.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="deadlock-and-liveness" />
+
+### Deadlocks without two locks
+
+The same cycle forms with any resource that one party holds while waiting for another. A worker in a fixed-size pool that submits a subtask to the same pool and waits for it can deadlock when every worker is doing the same: all workers wait for subtasks that no free worker can run. A goroutine that sends on an unbuffered channel while holding a mutex that the receiver needs is a cycle between a lock and a channel. The fix is the same idea: find the cycle in what waits for what, and remove one edge.

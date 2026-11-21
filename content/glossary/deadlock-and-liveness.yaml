@@ -1,0 +1,22 @@
+# Terms introduced by the deadlock-and-liveness lesson.
+- id: deadlock
+  term: Deadlock
+  short: A set of threads each waiting for something, usually a lock, that another thread in the set holds. None can continue, and nothing inside the program will ever release them.
+- id: livelock
+  term: Livelock
+  short: Threads keep running and reacting to each other, such as releasing and retrying a lock in step, but none makes progress.
+- id: starvation
+  term: Starvation
+  short: One thread waits indefinitely while others keep making progress, because it keeps losing the race for a lock or other resource.
+- id: wait-for-graph
+  term: Wait-for graph
+  short: A graph with an edge from each blocked thread to the thread holding what it waits for. A cycle in it is a deadlock.
+- id: lock-ordering
+  term: Lock ordering
+  short: A rule that every thread takes locks in the same global order, for example by account id. With one order, a cycle of waiting threads cannot form.
+- id: coffman-conditions
+  term: Coffman conditions
+  short: "The four conditions a deadlock needs: mutual exclusion, hold and wait, no preemption, and circular wait. Removing any one prevents it."
+- id: try-lock
+  term: Try-lock
+  short: Taking a lock only if it is free right now, and returning failure instead of waiting. The caller decides what to do next, such as release what it holds and retry.
