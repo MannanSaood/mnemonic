@@ -1,0 +1,515 @@
+---
+title: TCP handshake and teardown
+track: networking
+group: TCP
+order: 14
+summary: Three segments open a TCP connection and four close it. The connection is nothing but state in the two endpoints, and silence is the failure that costs the most.
+intent: Know what each end believes at every step, so you can read refused, reset and timed out for what they are, and bound the wait yourself.
+changeRequest: Security puts the orders database behind a firewall that silently drops anything not on its allow list.
+languages: [go, python, typescript, rust]
+glossary: [three-way-handshake, initial-sequence-number, rst-segment, time-wait, connect-timeout, tcp-keepalive, sequence-number, retransmission]
+
+prerequisites: [networking/reliable-transfer-principles]
+skills: [networking]
+depths: [overview, engineer, deep]
+
+playground:
+  model: tcp-connection-lifecycle
+  scenarios:
+    - try: "Press Play with the database listening and nothing lost."
+      notice: "SYN, SYN-ACK, ACK, then the query, the rows and four segments to close. The client, which closed first, ends in TIME-WAIT for 60 s."
+    - try: "Set the host to Port closed, then to Firewall drops SYNs."
+      notice: "Closed fails in one round trip with ECONNREFUSED. The firewall gives no answer at all, and connect() waits 127 s while the SYN is resent six times."
+    - try: "Keep the firewall and set the connect timeout to 3 s."
+      notice: "Same silence, but the application gives up after 3 s and can answer its own caller."
+    - try: "Click the handshake ACK to lose it."
+      notice: "Nothing is resent. The query carries the same acknowledgement number, and the server becomes ESTABLISHED when it arrives."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 12, y: 30, w: 120, h: 52, title: orders service, sub: dial · no deadline }
+      after:  { x: 12, y: 30, w: 120, h: 52, title: orders service, sub: dial · 3 s deadline }
+    - id: kernel
+      kind: context
+      before: { x: 160, y: 14, w: 250, h: 246, title: connect(), sub: "thought: works or fails fast" }
+      after:  { x: 160, y: 30, w: 190, h: 56, title: client socket, sub: SYN-SENT → ESTABLISHED }
+    - id: deadline
+      kind: strategy
+      appears: after
+      before: { x: 12, y: 150, w: 130, h: 60, title: "" }
+      after:  { x: 12, y: 150, w: 130, h: 60, title: connect deadline, sub: error after 3 s }
+    - id: syn
+      kind: concrete
+      before: { x: 180, y: 70, w: 210, h: 34, title: SYN · SYN-ACK · ACK }
+      after:  { x: 160, y: 150, w: 190, h: 60, title: SYN retries, sub: 1 s · 2 s · 4 s … }
+    - id: server
+      kind: concrete
+      before: { x: 180, y: 116, w: 210, h: 34, title: no listener → refused }
+      after:  { x: 380, y: 30, w: 168, h: 56, title: db socket, sub: LISTEN → ESTABLISHED }
+    - id: firewall
+      kind: concrete
+      appears: change
+      before: { x: 180, y: 206, w: 210, h: 34, title: firewall drops SYNs }
+      after:  { x: 380, y: 150, w: 168, h: 60, title: firewall, sub: drops SYNs silently }
+  edges:
+    - { from: app, to: kernel, label: connect }
+    - { from: kernel, to: server, label: SYN }
+    - { from: kernel, to: syn, label: no answer }
+    - { from: syn, to: firewall, label: resends }
+    - { from: deadline, to: kernel, label: closes }
+
+code:
+  go:
+    before:
+      file: db.go · handler.go
+      source: |
+        // db.go: open a connection to the orders database
+        func connect(addr string) (net.Conn, error) {
+            conn, err := net.Dial("tcp", addr)
+            if err != nil {
+                return nil, err // "connection refused" comes back at once
+            }
+            return conn, nil
+        }
+
+        func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+            conn, err := connect(h.dbAddr)
+            if err != nil {
+                http.Error(w, "db unavailable", http.StatusServiceUnavailable)
+                return
+            }
+            defer conn.Close()
+            h.query(conn, w, r)
+        }
+      roles: { app: [10, 18], kernel: [2, 8], server: [4, 6] }
+      change:
+        - { after: 3, add: ['    // SYNs silently dropped: Dial blocks until the kernel gives up, about 2 minutes'] }
+        - { after: 11, add: ['    // every request now waits here; goroutines and DB slots pile up'] }
+    after:
+      file: db.go · handler.go
+      source: |
+        var dialer = &net.Dialer{
+            Timeout:   3 * time.Second,  // give up on a silent SYN after 3 s
+            KeepAlive: 30 * time.Second, // probe idle connections so dead peers are noticed
+        }
+
+        func connect(ctx context.Context, addr string) (net.Conn, error) {
+            conn, err := dialer.DialContext(ctx, "tcp", addr)
+            if err != nil {
+                return nil, err // refused at once, or timed out after 3 s
+            }
+            conn.SetDeadline(time.Now().Add(5 * time.Second)) // bound the query too
+            return conn, nil
+        }
+
+        func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+            conn, err := connect(r.Context(), h.dbAddr)
+            if err != nil {
+                http.Error(w, "db unavailable", http.StatusServiceUnavailable)
+                return
+            }
+            defer conn.Close()
+            h.query(conn, w, r)
+        }
+      roles: { deadline: [1, 4], kernel: [6, 13], app: [15, 23], server: [8, 10], syn: [2, 2], dial: [16, 16], handshake: [7, 7], retry: [2, 2], fail: [8, 10] }
+    again:
+      file: handler.go
+      source: |
+        // Same firewall mistake. Each dial now fails after 3 s; the handler answers 503 and moves on.
+        var ne net.Error
+        if errors.As(err, &ne) && ne.Timeout() {
+            dialTimeouts.Inc() // the alert names the cause: silence, not refusal
+        }
+    cost:
+      before: { text: 127 s per request · pool exhausted, value: 0.95 }
+      after: { text: 3 s, then a 503, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Easy to forget
+      note: '`net.Dial` has no timeout of its own, so the kernel''s SYN retries decide. `net.Dialer{Timeout}` or a context deadline bounds the connect. A zero `KeepAlive` means probes every 15 s; Go 1.23 added `KeepAliveConfig` for idle time, interval and count. `SetDeadline` then bounds every read and write.'
+      seenIn: '`http.DefaultTransport` dials with a `net.Dialer` whose `Timeout` and `KeepAlive` are both 30 s. pgx accepts `connect_timeout` in its connection string.'
+
+  python:
+    before:
+      file: db.py · handler.py
+      source: |
+        # db.py: open a connection to the orders database
+        def connect(addr: tuple[str, int]) -> socket.socket:
+            return socket.create_connection(addr)  # "refused" raises at once
+
+        def handle(request: Request) -> Response:
+            try:
+                conn = connect(DB_ADDR)
+            except OSError:
+                return Response("db unavailable", status=503)
+            with conn:
+                return query(conn, request)
+      roles: { app: [5, 11], kernel: [2, 3], server: [8, 9] }
+      change:
+        - { after: 3, add: ['    # SYNs silently dropped: blocks until the kernel gives up, about 2 minutes'] }
+        - { after: 7, add: ['        # every worker thread now waits here'] }
+    after:
+      file: db.py · handler.py
+      source: |
+        CONNECT_TIMEOUT = 3.0  # give up on a silent SYN after 3 s
+        QUERY_TIMEOUT = 5.0
+
+        def connect(addr: tuple[str, int]) -> socket.socket:
+            conn = socket.create_connection(addr, timeout=CONNECT_TIMEOUT)
+            conn.settimeout(QUERY_TIMEOUT)  # bound every later recv and send
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            return conn
+
+        def handle(request: Request) -> Response:
+            try:
+                conn = connect(DB_ADDR)
+            except OSError:  # ConnectionRefusedError at once, TimeoutError after 3 s
+                return Response("db unavailable", status=503)
+            with conn:
+                return query(conn, request)
+      roles: { deadline: [1, 2], kernel: [4, 8], app: [10, 16], server: [13, 14], syn: [1, 1], dial: [12, 12], handshake: [5, 5], retry: [1, 1], fail: [13, 14] }
+    again:
+      file: handler.py
+      source: |
+        # Same firewall mistake. Each connect now fails after 3 s.
+        try:
+            conn = connect(DB_ADDR)
+        except TimeoutError:
+            DIAL_TIMEOUTS.inc()  # the alert names the cause: silence, not refusal
+            raise
+    cost:
+      before: { text: 127 s per request · workers exhausted, value: 0.95 }
+      after: { text: 3 s, then a 503, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Easy to forget
+      note: '`socket.create_connection(addr, timeout=3)` bounds the connect, and the same timeout then applies to every `recv` and `send` until you call `settimeout` again. With no timeout the call blocks until the kernel gives up. Keepalive is `SO_KEEPALIVE`, tuned on Linux with `TCP_KEEPIDLE`, `TCP_KEEPINTVL` and `TCP_KEEPCNT`.'
+      seenIn: '`requests.get(url, timeout=(3.05, 27))` takes a connect and a read timeout, and has none by default. `asyncio.open_connection` is usually wrapped in `asyncio.timeout()`.'
+
+  typescript:
+    before:
+      file: db.ts · routes.ts
+      source: |
+        // db.ts: open a connection to the orders database
+        function connect(port: number, host: string): Promise<net.Socket> {
+          return new Promise((resolve, reject) => {
+            const sock = net.connect(port, host, () => resolve(sock));
+            sock.once("error", reject); // ECONNREFUSED arrives at once
+          });
+        }
+
+        app.get("/orders/:id", async (req, res) => {
+          try {
+            const db = await connect(DB_PORT, DB_HOST);
+            res.json(await query(db, req.params.id));
+          } catch {
+            res.status(503).send("db unavailable");
+          }
+        });
+      roles: { app: [9, 16], kernel: [2, 7], server: [5, 5] }
+      change:
+        - { after: 4, add: ['    // SYNs silently dropped: no event fires until the kernel gives up, about 2 minutes'] }
+        - { after: 11, add: ['    // every request now waits here; sockets and memory pile up'] }
+    after:
+      file: db.ts · routes.ts
+      source: |
+        const CONNECT_TIMEOUT_MS = 3_000; // give up on a silent SYN after 3 s
+
+        function connect(port: number, host: string): Promise<net.Socket> {
+          return new Promise((resolve, reject) => {
+            const sock = net.connect({ port, host, keepAlive: true, timeout: CONNECT_TIMEOUT_MS });
+            sock.on("timeout", () => sock.destroy(new Error("socket timeout"))); // only an event: we must destroy
+            sock.once("error", reject); // ECONNREFUSED at once, or our timeout after 3 s
+            sock.once("connect", () => {
+              sock.setTimeout(5_000); // from now on, an idle limit for the query
+              resolve(sock);
+            });
+          });
+        }
+
+        app.get("/orders/:id", async (req, res) => {
+          try {
+            const db = await connect(DB_PORT, DB_HOST);
+            res.json(await query(db, req.params.id));
+          } catch {
+            res.status(503).send("db unavailable");
+          }
+        });
+      roles: { deadline: [6, 7], kernel: [3, 13], app: [15, 22], server: [7, 7], syn: [1, 1], dial: [17, 17], handshake: [8, 11], retry: [1, 1], fail: [6, 7] }
+    again:
+      file: db.ts
+      source: |
+        // Same firewall mistake. Each connect now fails after 3 s; the route answers 503 and moves on.
+        sock.on("timeout", () => {
+          dialTimeouts.inc(); // the alert names the cause: silence, not refusal
+          sock.destroy(new Error("socket timeout"));
+        });
+    cost:
+      before: { text: 127 s per request · sockets pile up, value: 0.95 }
+      after: { text: 3 s, then a 503, value: 0.2 }
+    lens:
+      need: 4
+      needLabel: Easy to get wrong
+      note: '`socket.setTimeout(ms)`, and the `timeout` option of `net.connect`, only emit a `timeout` event after that much inactivity. The socket stays open until you call `destroy()`. `keepAlive: true` with `keepAliveInitialDelay` turns on TCP keepalive.'
+      seenIn: '`fetch(url, { signal: AbortSignal.timeout(3000) })` bounds a whole request, connect included. The `pg` client takes `connectionTimeoutMillis`, which defaults to no timeout.'
+
+  rust:
+    before:
+      file: db.rs · handler.rs
+      source: |
+        // db.rs: open a connection to the orders database
+        async fn connect(addr: &str) -> io::Result<TcpStream> {
+            TcpStream::connect(addr).await // "refused" returns at once
+        }
+
+        async fn get_order(State(app): State<App>, Path(id): Path<u64>) -> Result<Json<Order>, StatusCode> {
+            let conn = connect(&app.db_addr)
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            query(conn, id).await.map(Json)
+        }
+      roles: { app: [6, 11], kernel: [2, 4], server: [9, 9] }
+      change:
+        - { after: 3, add: ['    // SYNs silently dropped: the future stays pending about 2 minutes'] }
+        - { after: 7, add: ['        // every request now waits here; tasks and DB slots pile up'] }
+    after:
+      file: db.rs · handler.rs
+      source: |
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(3); // give up on a silent SYN
+
+        async fn connect(addr: &str) -> io::Result<TcpStream> {
+            let conn = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))??;
+            let keepalive = TcpKeepalive::new().with_time(Duration::from_secs(30));
+            SockRef::from(&conn).set_tcp_keepalive(&keepalive)?; // socket2: probe idle peers
+            Ok(conn)
+        }
+
+        async fn get_order(State(app): State<App>, Path(id): Path<u64>) -> Result<Json<Order>, StatusCode> {
+            let conn = connect(&app.db_addr)
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            timeout(Duration::from_secs(5), query(conn, id)) // bound the query too
+                .await
+                .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+                .map(Json)
+        }
+      roles: { deadline: [1, 1], kernel: [3, 10], app: [12, 20], server: [15, 15], syn: [1, 1], dial: [13, 13], handshake: [4, 4], retry: [1, 1], fail: [5, 6] }
+    again:
+      file: handler.rs
+      source: |
+        // Same firewall mistake. Each connect now fails after 3 s; the handler answers 503 and moves on.
+        if let Err(e) = &result {
+            if e.kind() == io::ErrorKind::TimedOut {
+                metrics::counter!("dial_timeouts").increment(1); // silence, not refusal
+            }
+        }
+    cost:
+      before: { text: 127 s per request · tasks pile up, value: 0.95 }
+      after: { text: 3 s, then a 503, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Easy to forget
+      note: 'tokio''s `TcpStream::connect` has no timeout. Wrap it in `tokio::time::timeout`; dropping the connect future closes the half-open socket. Blocking code has `std::net::TcpStream::connect_timeout`. tokio''s `TcpStream` has no keepalive setter, so use `socket2::SockRef`.'
+      seenIn: '`reqwest::ClientBuilder` has `connect_timeout` and `tcp_keepalive`. A `tonic` `Endpoint` takes `connect_timeout` for gRPC channels.'
+
+walk:
+  - text: { go: 'The handler calls `connect` with the request''s context. The kernel sends a SYN and the socket enters SYN-SENT.', python: 'The handler calls `connect`. The kernel sends a SYN and the socket enters SYN-SENT; the call blocks for at most 3 s.', typescript: 'The route calls `connect`. The kernel sends a SYN and the socket enters SYN-SENT; the event loop carries on.', rust: 'The handler awaits `connect`. The kernel sends a SYN and the socket enters SYN-SENT; the task yields.' }
+    nodes: [app, kernel]
+    edges: [app>kernel]
+    role: dial
+  - text: Normally the SYN-ACK comes back within one round trip. The kernel answers with an ACK, the socket is ESTABLISHED, and connect returns to the application.
+    nodes: [kernel, server]
+    edges: [kernel>server]
+    role: handshake
+  - text: If nothing comes back, the kernel resends the SYN after 1 s, then 2 s, then 4 s. The application sees none of this; it is still waiting.
+    nodes: [kernel, syn, firewall]
+    edges: [kernel>syn, syn>firewall]
+    role: retry
+  - text: At 3 s the deadline fires. The half-open socket is closed, connect returns a timeout error, and the handler is free to answer 503.
+    nodes: [deadline, kernel]
+    edges: [deadline>kernel]
+    role: fail
+
+checks:
+  overview:
+    question: Your client gets "connection refused". What happened on the network?
+    options:
+      - text: The server host answered the SYN with a RST, because nothing listens on that port.
+        correct: true
+        why: Right. Refused means an answer came back. That takes one round trip, so it is fast.
+      - text: The SYN was lost several times and the client gave up.
+        why: That is a timeout, and it takes much longer. Refused needs a reply from the host.
+      - text: The database accepted the connection and rejected the password.
+        why: A login failure happens after the handshake, inside the database's own protocol. TCP connected fine.
+  engineer:
+    question: Connections to a database sometimes fail at once with ECONNREFUSED and sometimes hang for two minutes, then fail with ETIMEDOUT. What does the hang tell you?
+    options:
+      - text: Something on the path silently drops the SYNs, such as a firewall or security group, or packets cannot reach the host.
+        correct: true
+        why: Right. With no answer at all, the kernel resends the SYN with backoff until it gives up. A connect timeout bounds the wait; the fix is on the path.
+      - text: The database is running but rejects the client's login slowly.
+        why: Login happens after connect succeeds. ETIMEDOUT from connect means the handshake never finished.
+      - text: The client's DNS lookup is slow.
+        why: A slow lookup delays the connect but fails with a resolver error, not ETIMEDOUT from connect. And ECONNREFUSED on other attempts shows the address resolves.
+  deep:
+    question: The final ACK of the handshake is lost, and the client sends its request at once. What happens on the server?
+    options:
+      - text: The request carries the same acknowledgement number, so the server moves from SYN-RECEIVED to ESTABLISHED when it arrives, and nothing is resent.
+        correct: true
+        why: Right. In SYN-RECEIVED, any acceptable ACK completes the handshake (RFC 9293), and data segments carry one. Only if the client stayed silent would the server's SYN-ACK timer fire.
+      - text: The server stays in SYN-RECEIVED and drops the request until it has resent its SYN-ACK.
+        why: The server processes the ACK field of every segment. The request's ACK is enough to complete the handshake, and its data is kept.
+      - text: The client notices the lost ACK after 1 s and sends it again.
+        why: Pure ACKs are never retransmitted, because nothing acknowledges them. The client cannot know it was lost.
+
+reference:
+  roles:
+    - role: SYN
+      example: client → server, seq = ISN
+      job: Asks to open a connection and carries the client's starting number and options.
+    - role: SYN-ACK
+      example: server → client, ack = ISN + 1
+      job: Accepts, and carries the server's own starting number.
+    - role: FIN
+      example: either side, on close()
+      job: Says "I have nothing more to send". Each direction closes on its own.
+    - role: RST
+      example: closed port, or a crashed process
+      job: Ends the connection at once. No TIME-WAIT, no FIN exchange.
+    - role: Connect deadline
+      example: { go: "net.Dialer{Timeout: 3 * time.Second}", python: "create_connection(addr, timeout=3)", typescript: "net.connect({ timeout: 3000 }) + destroy()", rust: "tokio::time::timeout(..., TcpStream::connect(addr))" }
+      job: The application's own limit on how long the handshake may take.
+  useWhen:
+    - Set a connect timeout on every outbound connection, a little above the worst round trip you accept times a couple of SYN retries.
+    - Set a read or idle timeout as well. A connect timeout does nothing once the connection is up.
+    - Turn on keepalive with a short idle time for long-lived connections through NATs and load balancers that drop idle state.
+  avoidWhen:
+    - Do not set the connect timeout below a round trip or two. A single lost SYN costs a full second, and a tight timeout turns that into an error.
+    - Do not treat ECONNRESET after a request as "the request did not run". The server may have done the work before it died.
+  tradeoffs:
+    - A short connect timeout fails fast but gives up on paths that are only slow.
+    - Keepalive probes cost a few packets and can wake idle mobile radios.
+    - The side that closes first holds a TIME-WAIT entry for 60 s on Linux; many short connections can use up local ports.
+  lookalikes:
+    - name: Read timeout
+      how: Bounds how long a read waits for data on an open connection. It does not cover the handshake.
+    - name: TCP Fast Open
+      how: Lets data ride on the SYN of a repeat connection. Rarely deployed; most connections still pay the full handshake.
+    - name: TLS handshake
+      how: Runs after TCP's handshake, on the open connection, and adds at least one more round trip.
+---
+
+## [concept] TCP handshake and teardown
+
+**TCP opens a connection with a <Term id="three-way-handshake">three-way handshake</Term> (SYN, SYN-ACK, ACK) and closes it with a FIN from each side. The connection is nothing but state kept in the two endpoints.**
+
+No router on the path knows the connection exists. Each end knows only what segments it has seen, so when a segment is lost, each end believes something different until a timer or a later segment fixes it.
+
+<Depth level={2}>
+The handshake does two jobs. Each side tells the other its <Term id="initial-sequence-number">initial sequence number</Term>, and the SYNs carry options that last for the whole connection: maximum segment size, window scaling, permission to use selective acknowledgements, and timestamps. Closing is two one-way closes, because each direction of the byte stream ends on its own. A <Term id="rst-segment">RST</Term> skips all of that and ends the connection at once.
+</Depth>
+
+<Depth level={3}>
+RFC 9293 names eleven states, from LISTEN and SYN-SENT through ESTABLISHED to FIN-WAIT-1, FIN-WAIT-2, CLOSE-WAIT, CLOSING, LAST-ACK and TIME-WAIT, plus CLOSED, which means "no record at all". It asks for initial sequence numbers built from a clock plus a keyed hash of the addresses and ports, so an attacker who is not on the path cannot guess them and old segments do not land inside a new connection's numbers.
+</Depth>
+
+## [problem] A database client with no deadline
+
+The orders service opens a connection to its database for each request, runs a query and closes it. Errors become a 503. In testing the database is either up, so the handshake takes a millisecond, or down, so the host answers at once with "connection refused".
+
+Both cases fail fast, so nobody sets a connect timeout. The defaults look fine.
+
+<Depth level={2}>
+"Refused" is fast because something answered: the database host's kernel saw a SYN for a port with no listener and sent a RST. The code has only ever met failures that come with an answer.
+</Depth>
+
+<Depth level={3}>
+None of the four default APIs bounds the handshake: Go's `net.Dial`, Python's `socket.create_connection`, Node's `net.connect` and tokio's `TcpStream::connect` all wait as long as the kernel keeps trying.
+</Depth>
+
+## [pain] A firewall that never answers
+
+**Change request:** security puts the orders database behind a firewall that silently drops anything not on its allow list.
+
+A rule change leaves the orders service off the list. Its SYNs now vanish. Nothing comes back, not even a RST, so the kernel cannot tell a firewall from a slow network. It resends the SYN after 1, 2, 4, 8, 16 and 32 seconds, waits 64 more, and gives up: about two minutes per request. Every request piles up behind its own connect, and the service runs out of workers long before the first error appears.
+
+<Depth level={2}>
+Refused and timed out are different answers. Refused means a host replied and nothing listens. Timed out means silence: a firewall, a wrong route, a dead host, or a full SYN queue on the server.
+</Depth>
+
+<Depth level={3}>
+The retry count is `net.ipv4.tcp_syn_retries`, 6 by default. With exponential backoff from a 1 s initial timeout that gives 127 s. The newest kernels add `tcp_syn_linear_timeouts`, which resends the first few SYNs at a steady 1 s before backing off, and documents a final timeout of 131 s. Either way it is minutes, not seconds.
+</Depth>
+
+## [morph] Give the handshake a deadline
+
+Drag the slider. The single connect call opens up into the client socket's states and the SYN retries hidden inside it, and a deadline appears that the application owns.
+
+Hover a box to see its code.
+
+<Depth level={2}>
+The connect timeout should be the application's decision, because only the application knows how long its caller will wait. Pick it from the path: a few round trips plus room for one lost SYN, so 1 to 3 seconds inside a data center. Add a read deadline too; the connect timeout ends when the handshake does.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`DialContext` honours both `Dialer.Timeout` and the context's deadline, and uses whichever is sooner. When it fires, Go closes the socket, and the kernel discards the half-open connection.</Lang>
+<Lang only="python">`create_connection` puts the socket in timeout mode before connecting, so `connect` itself raises `TimeoutError` at the limit. The same value then applies to every later operation on the socket.</Lang>
+<Lang only="typescript">`net.connect`'s `timeout` option calls `setTimeout` before connecting. When it fires you get an event, not an error; the `destroy` call is what closes the socket and rejects the promise.</Lang>
+<Lang only="rust">`tokio::time::timeout` returns `Err(Elapsed)` and drops the connect future. Dropping it closes the socket, which is why the half-open connection disappears with no extra code.</Lang>
+</Depth>
+
+## [walk] Follow one connect
+
+One connect, through the socket's states, with and without an answer. Step through it with the numbered buttons.
+
+<Depth level={3}>
+Each SYN is the same segment with the same initial sequence number. If an early one was only delayed and a later one also arrives, the server sees a duplicate SYN for a connection it already has in SYN-RECEIVED and answers with the same SYN-ACK.
+</Depth>
+
+## [again] The same firewall mistake, with a deadline
+
+The rule change happens again. Each request now fails after 3 seconds with a timeout error and answers 503. Workers are freed, the error rate shows the problem within a minute, and the alert says "connect timeout", which points at the path rather than at the database.
+
+<Depth level={2}>
+Count timeouts and refusals separately. A spike of refusals means the database is down or restarting. A spike of timeouts means something between you and it is dropping packets.
+</Depth>
+
+<Depth level={3}>
+<Term id="tcp-keepalive">Keepalive</Term> covers the other silent failure: a connection that was established, then went quiet because a NAT or load balancer forgot it. RFC 9293 says keepalive must default to off, with an idle time of at least two hours, so set a shorter one yourself for long-lived connections.
+</Depth>
+
+## [play] Open, break and close a connection
+
+One connection from the orders service to its database: the handshake, a query, the rows, and the close. Each end's state is written beside every segment.
+
+Lose any segment on its first trip, close the port, put a firewall in the way, or crash the database mid-query. Then set a connect timeout and compare.
+
+## [lens] How each language bounds a connect
+
+All four languages hand the handshake to the kernel. What differs is how you say "stop waiting" and how you turn on keepalive.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Each language also has one trap. Go and Python block until the kernel gives up. Node's timeout is only an event. tokio's connect future never completes on its own.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="tcp-connection-lifecycle" />
+
+### Who ends up in TIME-WAIT
+
+The side that sends the first FIN goes through FIN-WAIT-1 and FIN-WAIT-2 and ends in <Term id="time-wait">TIME-WAIT</Term>. The other side goes through CLOSE-WAIT and LAST-ACK and is gone as soon as its FIN is acknowledged. If the last ACK is lost, the other side resends its FIN, and TIME-WAIT is what lets the closer answer it. A connection ended by a RST skips all of this.

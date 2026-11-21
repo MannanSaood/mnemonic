@@ -1,0 +1,19 @@
+# Terms introduced by the TCP handshake and teardown lesson.
+- id: three-way-handshake
+  term: Three-way handshake
+  short: How TCP opens a connection. The client sends SYN, the server answers SYN-ACK, the client sends ACK. Each side learns the other's starting sequence number.
+- id: initial-sequence-number
+  term: Initial sequence number (ISN)
+  short: The first sequence number a side picks for a connection, carried in its SYN. It is randomised so that old packets and off-path attackers cannot guess where the numbers are.
+- id: rst-segment
+  term: RST (reset)
+  short: A segment that ends a connection at once. A host sends it when a SYN reaches a port nothing listens on ("connection refused") or when it has no record of the connection.
+- id: time-wait
+  term: TIME-WAIT
+  short: The state the side that closes first stays in after the last ACK, so a resent FIN can still be answered and stray old packets die out. RFC 9293 says 2 × MSL; Linux uses 60 s.
+- id: connect-timeout
+  term: Connect timeout
+  short: How long the application lets connect() wait for the handshake. Without one, the kernel's SYN retries decide, about two minutes on Linux.
+- id: tcp-keepalive
+  term: TCP keepalive
+  short: Optional empty probes sent on an idle connection to find out whether the peer is still there. Off by default in the RFC, with a default idle time of two hours on Linux; most languages let you shorten it.
