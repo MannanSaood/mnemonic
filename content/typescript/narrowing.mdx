@@ -1,0 +1,561 @@
+---
+title: Control-flow narrowing
+track: typescript
+group: Types
+order: 5
+summary: The checker follows your if statements. After typeof, in, instanceof, an equality test or a type guard, a variable's type is the subset that can still reach that line.
+intent: A cast tells the compiler what a value is without checking, so the first payload that does not match crashes in production.
+changeRequest: Email the customer when a payment fails. Guest checkouts send the event with customer set to null.
+languages: [go, python, typescript, rust]
+glossary: [control-flow-narrowing, type-predicate, top-type, union-type, literal-type]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [types]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: narrowing
+  scenarios:
+    - try: Add the typeof check, then the in check. Read the type under each row.
+      notice: "body goes from unknown to object to object & Record<\"type\", unknown>. Each check removes values that cannot reach the next line. The email line still has an error: knowing there is a type field is not knowing the shape."
+    - try: Add the type guard, the equality check, the null check and instanceof until the compiler reports zero errors. Click every payload.
+      notice: Seven payloads, seven correct outcomes. Remove the equality check and run the succeeded payload; the compiler had flagged failureCode, and as plain JavaScript the paid customer gets a failure email.
+    - try: Install the GDPR plugin hook and click the payload of the customer who asked for erasure.
+      notice: Zero compile errors and a crash. The plugin set customer to null inside a callback. The compiler assumes calls keep narrowings intact, so it still believes Customer.
+    - try: Switch the guard's body to check only typeof type, then click the truncated event.
+      notice: The guard says x is PaymentEvent and the compiler takes its word. The truncated event gets through and crashes at the null check.
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 110, w: 100, h: 48, title: provider, sub: POST /webhooks }
+      after:  { x: 12, y: 110, w: 100, h: 48, title: provider, sub: POST /webhooks }
+    - id: context
+      kind: context
+      before: { x: 130, y: 18, w: 418, h: 240, title: as PaymentEvent, sub: a cast, trusted and never checked }
+      after:  { x: 128, y: 110, w: 106, h: 48, title: body, sub: unknown }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 252, y: 110, w: 126, h: 48, title: "" }
+      after:  { x: 252, y: 110, w: 126, h: 48, title: isPaymentEvent, sub: x is PaymentEvent }
+    - id: succeeded
+      kind: concrete
+      before: { x: 160, y: 80, w: 220, h: 32, title: '"payment.succeeded"' }
+      after:  { x: 400, y: 36, w: 148, h: 40, title: PaymentSucceeded }
+    - id: failed
+      kind: concrete
+      appears: change
+      before: { x: 160, y: 130, w: 220, h: 32, title: '"payment.failed"' }
+      after:  { x: 400, y: 112, w: 148, h: 40, title: PaymentFailed }
+    - id: rejected
+      kind: concrete
+      before: { x: 160, y: 180, w: 220, h: 32, title: anything else }
+      after:  { x: 400, y: 188, w: 148, h: 40, title: 400 bad request }
+  edges:
+    - { from: client, to: context, label: json }
+    - { from: context, to: strategy, label: guard }
+    - { from: strategy, to: succeeded, label: tag }
+    - { from: strategy, to: failed }
+    - { from: strategy, to: rejected, label: "false" }
+
+# ---------------------------------------------------------------- code
+code:
+  typescript:
+    before:
+      file: webhooks.ts
+      source: |
+        // webhooks.ts
+        type Customer = { id: string; email: string };
+        type PaymentEvent = {
+          type: string;
+          data: { invoiceId: string; customer: Customer; failureCode?: string };
+        };
+
+        export async function handleWebhook(req: Request): Promise<Response> {
+          const event = (await req.json()) as PaymentEvent;
+          if (event.type === "payment.succeeded") {
+            await invoices.markPaid(event.data.invoiceId);
+          }
+          return ok();
+        }
+      roles: { client: [8, 8], context: [9, 9], succeeded: [10, 12], rejected: [9, 9] }
+      change:
+        - { after: 12, add: ['  if (event.type === "payment.failed") {', '    await mailer.paymentFailed(event.data.customer.email, event.data.failureCode!);', '  }'] }
+    after:
+      file: webhooks.ts
+      source: |
+        type Customer = { id: string; email: string };
+        type PaymentSucceeded = { type: "payment.succeeded"; data: { invoiceId: string; customer: Customer | null } };
+        type PaymentFailed = { type: "payment.failed"; data: { invoiceId: string; customer: Customer | null; failureCode: string } };
+        type PaymentEvent = PaymentSucceeded | PaymentFailed;
+
+        function isPaymentEvent(x: unknown): x is PaymentEvent {
+          if (typeof x !== "object" || x === null || !("type" in x) || !("data" in x)) return false;
+          const { type, data } = x;
+          return (type === "payment.succeeded" || type === "payment.failed")
+            && typeof data === "object" && data !== null
+            && "invoiceId" in data && typeof data.invoiceId === "string"; // customer and failureCode: same idea, trimmed
+        }
+
+        export async function handleWebhook(req: Request): Promise<Response> {
+          let body: unknown;
+          try { body = await req.json(); }
+          catch (err) {
+            if (err instanceof SyntaxError) return badRequest(err.message);
+            throw err;
+          }
+          if (!isPaymentEvent(body)) return badRequest();
+          if (body.type === "payment.succeeded") {
+            await invoices.markPaid(body.data.invoiceId); // body: PaymentSucceeded
+          }
+          return ok();
+        }
+      roles: { strategy: [6, 12], context: [15, 16], client: [14, 14], succeeded: [22, 24], failed: [3, 3], rejected: [21, 21], parse: [15, 20], guard: [6, 12], tag: [22, 24], reject: [21, 21] }
+    again:
+      file: webhooks.ts
+      source: |
+        // after the succeeded branch, one new branch:
+          if (body.type === "payment.failed") {
+            // body: PaymentFailed, so failureCode is a string
+            if (body.data.customer === null) return ok(); // guest checkout: nobody to email
+            await mailer.paymentFailed(body.data.customer.email, body.data.failureCode);
+          }
+        // Leave out the null check and the compiler says:
+        //   'body.data.customer' is possibly 'null'.
+    cost:
+      before: { text: 0 compile errors · a 500 on every guest checkout, value: 0.85 }
+      after: { text: 1 compile error · points at the line, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Narrowing is how TypeScript code is written: `typeof`, `instanceof`, `in`, `===`, truthiness and `x is T` predicates. Since TypeScript 4.4 a condition stored in a `const` still narrows, since 5.4 narrowing survives into closures created after the last assignment, and since 5.5 a function like `x => x !== undefined` gets an inferred `x is T` return type.'
+      seenIn: 'lib.es5.d.ts gives `Array.prototype.filter` an overload whose callback returns `value is S`, so `items.filter(isInvoice)` returns `Invoice[]`. `Array.isArray(arg): arg is any[]` is a built-in predicate.'
+
+  go:
+    before:
+      file: webhooks.go
+      source: |
+        // webhooks.go
+        type PaymentEvent struct {
+        	Type string `json:"type"`
+        	Data struct {
+        		InvoiceID   string    `json:"invoiceId"`
+        		Customer    *Customer `json:"customer"`
+        		FailureCode string    `json:"failureCode"`
+        	} `json:"data"`
+        }
+
+        func HandleWebhook(w http.ResponseWriter, r *http.Request) {
+        	var event PaymentEvent
+        	json.NewDecoder(r.Body).Decode(&event) // error ignored
+        	if event.Type == "payment.succeeded" {
+        		invoices.MarkPaid(r.Context(), event.Data.InvoiceID)
+        	}
+        	w.WriteHeader(http.StatusOK)
+        }
+      roles: { client: [11, 11], context: [12, 13], succeeded: [14, 16], rejected: [13, 13] }
+      change:
+        - { after: 16, add: ['	if event.Type == "payment.failed" {', '		mailer.PaymentFailed(r.Context(), event.Data.Customer.Email, event.Data.FailureCode)', '	}'] }
+    after:
+      file: webhooks.go
+      source: |
+        type Event interface{ isEvent() } // implemented by *PaymentSucceeded and *PaymentFailed
+
+        type envelope struct {
+        	Type string          `json:"type"`
+        	Data json.RawMessage `json:"data"`
+        }
+
+        func decodeEvent(body io.Reader) (Event, error) {
+        	var env envelope
+        	if err := json.NewDecoder(body).Decode(&env); err != nil {
+        		return nil, err
+        	}
+        	switch env.Type {
+        	case "payment.succeeded":
+        		var e PaymentSucceeded
+        		return &e, json.Unmarshal(env.Data, &e)
+        	case "payment.failed":
+        		var e PaymentFailed
+        		return &e, json.Unmarshal(env.Data, &e)
+        	}
+        	return nil, fmt.Errorf("unknown event type %q", env.Type)
+        }
+
+        func HandleWebhook(w http.ResponseWriter, r *http.Request) {
+        	event, err := decodeEvent(r.Body)
+        	var syntaxErr *json.SyntaxError
+        	if errors.As(err, &syntaxErr) {
+        		http.Error(w, fmt.Sprintf("bad JSON at byte %d", syntaxErr.Offset), http.StatusBadRequest)
+        		return
+        	}
+        	if err != nil {
+        		http.Error(w, err.Error(), http.StatusBadRequest)
+        		return
+        	}
+        	switch e := event.(type) {
+        	case *PaymentSucceeded:
+        		invoices.MarkPaid(r.Context(), e.InvoiceID) // e is *PaymentSucceeded here
+        	}
+        	w.WriteHeader(http.StatusOK)
+        }
+      roles: { strategy: [8, 22], context: [25, 25], client: [24, 24], succeeded: [35, 38], failed: [17, 19], rejected: [31, 34], parse: [25, 30], guard: [8, 22], tag: [35, 38], reject: [31, 34] }
+    again:
+      file: webhooks.go
+      source: |
+        	// one more case in the type switch:
+        	case *PaymentFailed:
+        		if e.Customer == nil { // guest checkout; the compiler does not make you write this
+        			break
+        		}
+        		mailer.PaymentFailed(r.Context(), e.Customer.Email, e.FailureCode)
+    cost:
+      before: { text: 0 compile errors · a nil pointer panic on every guest checkout, value: 0.85 }
+      after: { text: 1 new case · the nil check is still on you, value: 0.45 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Go narrows only through explicit forms: a type switch, a comma-ok type assertion `v, ok := x.(T)`, and `errors.As` for error chains. There is no flow analysis for nil, so a `*Customer` can be dereferenced without a check and panics at runtime. Uber''s `nilaway` is a static analyser that adds that check.'
+      seenIn: '`errors.As` walks the wrap chain to find a `*json.SyntaxError` or `*fs.PathError`. `ast.Inspect` callbacks in `go/ast` tools are a long `switch n := n.(type)`.'
+
+  python:
+    before:
+      file: webhooks.py
+      source: |
+        # webhooks.py
+        class EventData(TypedDict):
+            invoiceId: str
+            customer: Customer
+            failureCode: NotRequired[str]
+
+        class PaymentEvent(TypedDict):
+            type: str
+            data: EventData
+
+        async def handle_webhook(request: Request) -> Response:
+            event = cast(PaymentEvent, await request.json())
+            if event["type"] == "payment.succeeded":
+                await invoices.mark_paid(event["data"]["invoiceId"])
+            return ok()
+      roles: { client: [11, 11], context: [12, 12], succeeded: [13, 14], rejected: [12, 12] }
+      change:
+        - { after: 14, add: ['    if event["type"] == "payment.failed":', '        await mailer.payment_failed(event["data"]["customer"]["email"], event["data"]["failureCode"])'] }
+    after:
+      file: webhooks.py
+      source: |
+        from typing import Literal, TypedDict, TypeIs
+
+        class PaymentSucceeded(TypedDict):
+            type: Literal["payment.succeeded"]
+            data: SucceededData   # invoiceId, customer: Customer | None
+
+        class PaymentFailed(TypedDict):
+            type: Literal["payment.failed"]
+            data: FailedData      # invoiceId, customer: Customer | None, failureCode
+
+        type PaymentEvent = PaymentSucceeded | PaymentFailed
+
+        def is_payment_event(x: object) -> TypeIs[PaymentEvent]:
+            return (isinstance(x, dict)
+                    and x.get("type") in ("payment.succeeded", "payment.failed")
+                    and isinstance(x.get("data"), dict))  # field checks trimmed
+
+        async def handle_webhook(request: Request) -> Response:
+            try:
+                body: object = await request.json()
+            except json.JSONDecodeError as err:
+                return bad_request(str(err))
+            if not is_payment_event(body):
+                return bad_request()
+            if body["type"] == "payment.succeeded":
+                await invoices.mark_paid(body["data"]["invoiceId"])  # body: PaymentSucceeded
+            return ok()
+      roles: { strategy: [13, 16], context: [19, 20], client: [18, 18], succeeded: [25, 26], failed: [7, 9], rejected: [23, 24], parse: [19, 22], guard: [13, 16], tag: [25, 26], reject: [23, 24] }
+    again:
+      file: webhooks.py
+      source: |
+        # one new branch:
+            if body["type"] == "payment.failed":
+                customer = body["data"]["customer"]
+                if customer is None:  # guest checkout
+                    return ok()
+                await mailer.payment_failed(customer["email"], body["data"]["failureCode"])
+        # Without the None check, mypy and pyright report the indexing of an optional value.
+    cost:
+      before: { text: 0 checker errors · a TypeError on every guest checkout, value: 0.85 }
+      after: { text: 1 checker error · points at the line, value: 0.2 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Checkers narrow on `isinstance`, `is None`, `==` against a `Literal`, `match` statements and user-defined guards. `TypeGuard` (3.10) narrows only the true branch; `TypeIs` (3.13, or `typing_extensions`) narrows both branches and must be a subset of the input type. Like TypeScript, a guard''s body is not checked against its claim. At runtime none of this exists.'
+      seenIn: 'typeshed annotates `inspect.isclass` and friends as type guards, so code after `if inspect.isclass(obj):` sees a class. `match event: case {"type": "payment.failed", **rest}:` is the structural form of the same check.'
+
+  rust:
+    before:
+      file: webhooks.rs
+      source: |
+        // webhooks.rs
+        async fn handle_webhook(body: Bytes) -> StatusCode {
+            let event: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if event["type"] == "payment.succeeded" {
+                let invoice_id = event["data"]["invoiceId"].as_str().unwrap();
+                invoices::mark_paid(invoice_id).await;
+            }
+            StatusCode::OK
+        }
+      roles: { client: [2, 2], context: [3, 3], succeeded: [4, 7], rejected: [3, 3] }
+      change:
+        - { after: 7, add: ['    if event["type"] == "payment.failed" {', '        let email = event["data"]["customer"]["email"].as_str().unwrap();', '        mailer::payment_failed(email, event["data"]["failureCode"].as_str().unwrap()).await;', '    }'] }
+    after:
+      file: webhooks.rs
+      source: |
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum PaymentEvent {
+            #[serde(rename = "payment.succeeded")]
+            Succeeded { data: SucceededData },
+            #[serde(rename = "payment.failed")]
+            Failed { data: FailedData }, // customer: Option<Customer>
+        }
+
+        async fn handle_webhook(body: Bytes) -> StatusCode {
+            let event: PaymentEvent = match serde_json::from_slice(&body) {
+                Ok(event) => event,
+                Err(_) => return StatusCode::BAD_REQUEST, // bad JSON or wrong shape
+            };
+            match event {
+                PaymentEvent::Succeeded { data } => invoices::mark_paid(&data.invoice_id).await,
+                PaymentEvent::Failed { .. } => {}
+            }
+            StatusCode::OK
+        }
+      roles: { strategy: [1, 8], context: [11, 14], client: [10, 10], succeeded: [16, 16], failed: [6, 7], rejected: [13, 13], parse: [11, 14], guard: [1, 8], tag: [15, 18], reject: [13, 13] }
+    again:
+      file: webhooks.rs
+      source: |
+        // the Failed arm, filled in:
+                PaymentEvent::Failed { data } => {
+                    if let Some(customer) = &data.customer {
+                        mailer::payment_failed(&customer.email, &data.failure_code).await;
+                    } // guest checkout: None, nothing to email
+                }
+        // data.customer.email does not compile: Option<Customer> has no field email.
+    cost:
+      before: { text: 0 compile errors · a panic on every guest checkout, value: 0.85 }
+      after: { text: 1 compile error · points at the line, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Rust narrows by destructuring: `match`, `if let` and `let … else` bind the inner value only on the branch where it exists. Parsing with serde does the checking once, so there is no unknown value to narrow afterwards. The callback trap cannot happen either: while you hold `&data.customer`, the borrow checker rejects any `&mut` access that could set it to `None`.'
+      seenIn: 'serde''s internally tagged enums, `#[serde(tag = "type")]`, are how many Rust webhook and event consumers decode tagged JSON. `std::any::Any::downcast_ref` is the runtime-type form, closest to `instanceof`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { typescript: '`req.json()` returns a value the compiler knows nothing about, so `body` is `unknown`. If parsing throws, the catch variable is `unknown` too; `instanceof SyntaxError` narrows it so `err.message` compiles.', go: '`decodeEvent` reads the body. A malformed body comes back as an error, and `errors.As` finds a `*json.SyntaxError` in it.', python: '`request.json()` returns a value annotated `object`, the type of everything. A malformed body raises `JSONDecodeError`, and the `except` clause narrows `err` to it.', rust: '`serde_json::from_slice` either returns a `PaymentEvent` or an error. Bad JSON and a wrong shape both end in the `Err` arm.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: parse
+  - text: { typescript: '`isPaymentEvent(body)` has the return type `x is PaymentEvent`. In the true branch the compiler narrows `body` to `PaymentEvent`; in the false branch the handler returns 400.', go: 'The envelope''s `type` field picks which struct to decode into. The function returns the `Event` interface, holding a `*PaymentSucceeded` or a `*PaymentFailed`.', python: '`is_payment_event` returns `TypeIs[PaymentEvent]`. After the `if not …: return`, the checker treats `body` as `PaymentEvent`.', rust: 'The derive generates the check: serde reads `type`, picks the variant and fills its fields, or fails. The enum is the guard.' }
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: guard
+  - text: { typescript: '`body.type === "payment.succeeded"` compares a literal tag. The compiler drops every union member with a different tag, so inside the branch `body` is `PaymentSucceeded`.', go: 'The type switch binds `e` to the concrete type in each case. In `case *PaymentSucceeded`, `e.InvoiceID` is a plain field access.', python: 'Comparing `body["type"]` to a `Literal` narrows a union of TypedDicts to the member with that tag.', rust: '`match event` destructures the variant. The `data` bound in the `Succeeded` arm is `SucceededData`; there is no other way to reach it.' }
+    nodes: [strategy, succeeded]
+    edges: [strategy>succeeded]
+    role: tag
+  - text: { typescript: 'Values that fail the guard leave through `return badRequest()`. After that line they cannot reach the code below, which is exactly why the compiler may narrow.', go: 'An unknown type, or any decode error, leaves through the 400 branch before the switch runs.', python: 'Values that fail the guard leave through `return bad_request()`, so the checker removes them from everything below.', rust: 'The `Err` arm returns early, so `event` below has only the two variants.' }
+    nodes: [strategy, rejected]
+    edges: [strategy>rejected]
+    role: reject
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: "value has type string | number. Inside if (typeof value === \"string\") { … }, what is its type?"
+    options:
+      - text: string
+        correct: true
+        why: Right. The typeof check removes number on this branch. In the else branch, value is number.
+      - text: string | number
+        why: That would make the check pointless. The compiler follows the condition and keeps only what can pass it.
+      - text: unknown
+        why: Narrowing only ever makes the type smaller than the declared one. It starts from string | number.
+  engineer:
+    question: "The handler checks body.data.customer !== null, then awaits audit.record(body), then reads body.data.customer.email. audit.record sets customer to null for erased users. What happens?"
+    options:
+      - text: It compiles, and crashes at runtime for erased users.
+        correct: true
+        why: Right. The compiler assumes a call does not undo a narrowing. Resetting after every call would flag huge amounts of correct code, so TypeScript chose this trade-off. Check again after code you do not control, or pass a readonly view.
+      - text: The compiler flags the email line as possibly null, because of the call in between.
+        why: It does not. Property narrowings survive function calls and awaits.
+      - text: The compiler re-checks the property after every await.
+        why: No such re-check exists. Types are erased; nothing is checked at runtime unless you write it.
+  deep:
+    question: "isPaymentEvent(x: unknown): x is PaymentEvent only checks typeof x.type === \"string\". What does the compiler do about it?"
+    options:
+      - text: Nothing. It checks that the body returns a boolean and trusts the x is PaymentEvent claim in every caller.
+        correct: true
+        why: Right. A type predicate is a promise you write. Since TypeScript 5.5 the compiler infers predicates for simple arrow functions, but an explicit one is never verified against its body.
+      - text: It reports that the body does not prove the predicate.
+        why: There is no such analysis. Proving arbitrary checks equal a type is beyond what the checker does.
+      - text: It emits a runtime check for the full PaymentEvent shape.
+        why: TypeScript emits no type checks. The predicate disappears at compile time like every other type.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Declared type
+      example: "body: unknown"
+      job: What the variable may ever hold. Narrowing never goes beyond it.
+    - role: Narrowing check
+      example: typeof, in, instanceof, ===, truthiness
+      job: A condition the compiler understands. On each branch it keeps only the members that can pass.
+    - role: Type predicate
+      example: "isPaymentEvent(x): x is PaymentEvent"
+      job: A function whose true result narrows its argument. Trusted, not verified.
+    - role: Exit
+      example: return badRequest()
+      job: Removes the rejected values from everything below it, which is what lets the code after a guard rely on it.
+  useWhen:
+    - A value comes in as unknown, from JSON, a message queue, a catch block or postMessage.
+    - A union needs different handling per member.
+    - A property may be null or undefined and some paths need it present.
+  avoidWhen:
+    - You are about to write `as T` on unvalidated data. That is a cast, not a narrowing; it checks nothing.
+    - The same narrowing appears in ten places. Parse once at the boundary into a precise type and pass that around.
+  tradeoffs:
+    - Narrowing follows one function body. Callbacks, other functions and plugins can change a property without the compiler noticing.
+    - Hand-written guards are fast to write and easy to get wrong. A schema library such as zod or valibot generates the check and the type together.
+    - Early returns keep the narrowed path flat but scatter the exits. Name the guard well so the reader sees what was ruled out.
+  lookalikes:
+    - name: Type assertion (as)
+      how: Changes the type without any check. Narrowing changes it because of a check the compiler saw.
+    - name: Assertion function
+      how: "asserts x is T: narrows the code after the call instead of a branch, and throws if the check fails."
+    - name: Pattern matching
+      how: Rust match, Python match and Go type switches narrow by destructuring. TypeScript narrows ordinary if and switch statements instead.
+---
+
+## [concept] Control-flow narrowing
+
+**The checker follows your if statements. After typeof, in, instanceof, an equality test or a type guard, a variable's type is the subset that can still reach that line.**
+
+A value typed `unknown` can be anything. Write `if (typeof body !== "object" || body === null) return;` and on the next line the compiler knows `body` is an object. You did not change the declared type; you changed which values can get there.
+
+<Depth level={2}>
+This is <Term id="control-flow-narrowing">control-flow narrowing</Term>. The compiler understands `typeof`, `instanceof`, the `in` operator, `===` and `!==` against literals and null, truthiness, and functions whose return type is a <Term id="type-predicate">type predicate</Term> such as `x is PaymentEvent`. Each one splits a type in two: the part that passes and the part that does not. Read it with the set picture from the previous lesson. A <Term id="union-type">union</Term> shrinks member by member, and the <Term id="top-type">top type</Term> `unknown` shrinks to `object`, then to an object with known properties.
+</Depth>
+
+<Depth level={3}>
+The checker builds a control-flow graph for each function. Every reference to a variable or property path such as `body.data.customer` looks back along the graph to the assignments and conditions that reach it, and computes its type there. Two rules limit how far that goes. A narrowing is dropped when the variable or property path is assigned. And the checker is optimistic about calls: it assumes a function call does not undo a narrowing, a deliberate trade-off recorded in TypeScript issue 9998. Closures are the other edge. Since TypeScript 5.4, a `let` variable or parameter keeps its narrowing inside a closure created after its last assignment, but not if any nested function assigns it.
+</Depth>
+
+## [problem] A webhook handler with a cast
+
+A payment provider posts JSON events to a handler. The handler parses the body, casts it to `PaymentEvent`, and marks the invoice paid when a payment succeeds.
+
+It works. The provider's sample events pass, and the dashboard shows paid invoices.
+
+<Depth level={2}>
+`as PaymentEvent` is not a check. It tells the compiler to treat the value as a `PaymentEvent` from now on, whatever arrived. The declared type says `customer: Customer`, because every sample event the team saw had one. Nothing in the program confirms that real events agree.
+</Depth>
+
+<Depth level={3}>
+`req.json()` is typed `Promise<any>` in lib.dom, so even the cast is optional; `any` flows into anything. Starting from `unknown` and narrowing is the only path where the compiler checks what you do.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** email the customer when a payment fails. Guest checkouts send the event with customer set to null.
+
+The new branch compiles. The type says `customer: Customer`, so `event.data.customer.email` looks safe. The first guest checkout that fails throws a TypeError, the handler answers 500, and the provider retries the event, which fails the same way.
+
+<Depth level={2}>
+The compiler was not wrong; it was told something false. Every line after the cast inherits the lie, and the non-null assertion on `failureCode!` adds a second one. Nothing marks either line as risky in review.
+</Depth>
+
+<Depth level={3}>
+Providers typically retry failed deliveries with backoff for hours or days. A handler that crashes on one shape of event turns into a queue of retries for every event of that shape.
+</Depth>
+
+## [morph] Start from unknown and narrow
+
+Drag the slider. The one big box, a cast, becomes a path: `unknown`, a guard, and a branch per event type. Anything that does not fit leaves with a 400.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The types now say what the provider actually sends: two event shapes with a literal `type`, and a customer that may be null. `isPaymentEvent` is the one place that checks the shape, and its return type tells the compiler what a true result means.
+</Depth>
+
+<Depth level={3}>
+<Lang only="typescript">Inside the guard, `"type" in x` narrows `x` to `object & Record<"type", unknown>`, which TypeScript 4.9 added for properties the type does not list. That is what makes `x.type` readable without a cast.</Lang>
+<Lang only="go">Go has no unknown-to-shape narrowing; `encoding/json` decodes straight into structs. The envelope with `json.RawMessage` reads the tag first, then decodes the data into the matching struct.</Lang>
+<Lang only="python">`TypeIs` (Python 3.13) narrows in both branches, so after `if not is_payment_event(body): return`, the checker knows `body` is a `PaymentEvent`. With the older `TypeGuard`, the negative branch would not narrow.</Lang>
+<Lang only="rust">The serde derive turns the enum into the parser. If the bytes do not match a variant, you get an `Err`; there is never a half-checked value to narrow.</Lang>
+</Depth>
+
+## [walk] Follow one event
+
+A succeeded event arrives. Step through it with the numbered buttons and watch the type of `body` change at each step.
+
+<Depth level={3}>
+<Lang only="typescript">The narrowing is per reference. `body` narrows at the guard, `body.type` decides the member, and `body.data.customer` would narrow separately at its own null check. Assigning to `body` anywhere resets all three.</Lang>
+<Lang only="go">A type switch compiles to a comparison of the interface's type word against each case's type descriptor. `e` is a new variable per case, which is why its type can differ between cases.</Lang>
+<Lang only="python">Nothing happens at runtime beyond the `isinstance` and `in` checks you wrote. The narrowed types exist only inside mypy or pyright.</Lang>
+<Lang only="rust">`match` on an enum compiles to a jump on its discriminant. Each arm's bindings point into the matched variant, so no field of another variant is reachable.</Lang>
+</Depth>
+
+## [again] Failed payments, the second time
+
+The same request, after the refactor. Inside `body.type === "payment.failed"`, `body` is `PaymentFailed`, so `failureCode` is a string without a `!`. Reading `customer.email` is a compile error until you check for null, which is exactly the guest checkout case.
+
+<Depth level={2}>
+The error appears at the line, before the deploy. The handler now answers 200 for guest checkouts, so the provider stops retrying.
+</Depth>
+
+<Depth level={3}>
+The guard is still a hand-written claim. If it skips a field the types promise, every line after it is as wrong as the cast was. Generate the guard and the type from one schema, or keep the guard small and test it against recorded payloads.
+</Depth>
+
+## [play] Narrow a webhook body
+
+Add checks into the gaps and watch the type of `body` after each row. Then run seven real payloads through the handler as plain JavaScript, and break it twice: once with a plugin that changes a property inside a callback, and once with a guard that checks less than it claims.
+
+## [lens] How each language writes it
+
+Every language here narrows, but in different places. TypeScript and Python follow ordinary if statements. Go narrows only in type switches and assertions. Rust narrows by destructuring, and its borrow rules close the callback hole.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="narrowing" />
+
+### What each check narrows
+
+| Check | Narrows | Watch out for |
+|---|---|---|
+| `typeof x === "string"` | primitives, `"object"`, `"function"` | `typeof null` is `"object"` |
+| `x instanceof SyntaxError` | class instances | fails across realms, such as iframes and some test runners |
+| `"type" in x` | unions by property; adds `Record<"type", unknown>` (4.9+) | the right side must be an object; optional properties stay on both branches |
+| `x.type === "payment.failed"` | unions with a literal tag | the tag must be a literal type, not `string` |
+| `x !== null`, `x != null` | removes null (and undefined with `!=`) | a call in between does not undo it |
+| `isT(x): x is T` | whatever the predicate claims | the body is never checked against the claim |

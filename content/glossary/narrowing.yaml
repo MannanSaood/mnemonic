@@ -1,0 +1,7 @@
+# Terms introduced by typescript/narrowing.
+- id: control-flow-narrowing
+  term: Control-flow narrowing
+  short: The checker follows conditions, returns and assignments, and gives a variable a smaller type on the paths where a check has ruled values out.
+- id: type-predicate
+  term: Type predicate
+  short: A return type such as x is PaymentEvent. When the function returns true, the caller's argument is narrowed to that type. The compiler trusts it and does not check the body.
