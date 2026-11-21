@@ -1,0 +1,102 @@
+# Lesson outline for the computer-architecture track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: computer-architecture/bits-bytes-and-hex
+    title: "Bits, bytes and hex"
+    prerequisites: []
+    skills: [architecture]
+  - id: computer-architecture/integers-and-twos-complement
+    title: "Integers and two's complement"
+    prerequisites: [computer-architecture/bits-bytes-and-hex]
+    skills: [architecture]
+  - id: computer-architecture/floating-point
+    title: "Floating point"
+    prerequisites: [computer-architecture/integers-and-twos-complement]
+    skills: [architecture]
+  - id: computer-architecture/data-layout-and-alignment
+    title: "Data layout and alignment"
+    prerequisites: [computer-architecture/bits-bytes-and-hex]
+    skills: [architecture, memory]
+  - id: computer-architecture/compilation-pipeline
+    title: "From source to running program"
+    prerequisites: [computer-architecture/bits-bytes-and-hex]
+    skills: [architecture, linking]
+  - id: computer-architecture/isa-and-assembly-basics
+    title: "The ISA and assembly basics"
+    prerequisites: [computer-architecture/integers-and-twos-complement, computer-architecture/compilation-pipeline]
+    skills: [architecture]
+  - id: computer-architecture/control-flow-in-machine-code
+    title: "Control flow in machine code"
+    prerequisites: [computer-architecture/isa-and-assembly-basics]
+    skills: [architecture]
+  - id: computer-architecture/procedures-and-the-stack
+    title: "Procedures and the stack"
+    prerequisites: [computer-architecture/control-flow-in-machine-code, computer-architecture/data-layout-and-alignment]
+    skills: [architecture, memory]
+  - id: computer-architecture/buffer-overflows-and-defences
+    title: "Buffer overflows and defences"
+    prerequisites: [computer-architecture/procedures-and-the-stack]
+    skills: [architecture, security]
+  - id: computer-architecture/logic-and-the-cpu-datapath
+    title: "Logic and the CPU datapath"
+    prerequisites: [computer-architecture/isa-and-assembly-basics]
+    skills: [architecture]
+  - id: computer-architecture/pipelining-and-hazards
+    title: "Pipelining and hazards"
+    prerequisites: [computer-architecture/logic-and-the-cpu-datapath]
+    skills: [architecture, performance]
+  - id: computer-architecture/branch-prediction-and-speculation
+    title: "Branch prediction and speculation"
+    prerequisites: [computer-architecture/pipelining-and-hazards, computer-architecture/control-flow-in-machine-code]
+    skills: [architecture, performance, security]
+  - id: computer-architecture/out-of-order-and-superscalar
+    title: "Out-of-order and superscalar execution"
+    prerequisites: [computer-architecture/branch-prediction-and-speculation]
+    skills: [architecture, performance]
+  - id: computer-architecture/optimising-for-the-cpu
+    title: "Optimising for the CPU"
+    prerequisites: [computer-architecture/out-of-order-and-superscalar]
+    skills: [performance]
+  - id: computer-architecture/memory-hierarchy-and-locality
+    title: "The memory hierarchy and locality"
+    prerequisites: [computer-architecture/bits-bytes-and-hex]
+    skills: [architecture, memory, performance]
+  - id: computer-architecture/cache-organisation
+    title: "Cache organisation"
+    prerequisites: [computer-architecture/memory-hierarchy-and-locality]
+    skills: [architecture, memory]
+  - id: computer-architecture/cache-misses-writes-and-amat
+    title: "Misses, writes and average access time"
+    prerequisites: [computer-architecture/cache-organisation]
+    skills: [architecture, performance]
+  - id: computer-architecture/cache-friendly-code
+    title: "Writing cache-friendly code"
+    prerequisites: [computer-architecture/cache-misses-writes-and-amat, computer-architecture/data-layout-and-alignment]
+    skills: [performance, memory]
+  - id: computer-architecture/virtual-memory-hardware
+    title: "Virtual memory: page tables, MMU and TLB"
+    prerequisites: [computer-architecture/cache-misses-writes-and-amat]
+    skills: [architecture, memory, os]
+  - id: computer-architecture/multicore-coherence-and-memory-models
+    title: "Multicore, coherence and memory models"
+    prerequisites: [computer-architecture/cache-misses-writes-and-amat]
+    skills: [architecture, concurrency]
+  - id: computer-architecture/exceptions-and-interrupts
+    title: "Exceptions, traps and interrupts"
+    prerequisites: [computer-architecture/procedures-and-the-stack, computer-architecture/logic-and-the-cpu-datapath]
+    skills: [architecture, os]
+  - id: computer-architecture/io-devices-dma-and-storage-hardware
+    title: "I/O devices, DMA and storage hardware"
+    prerequisites: [computer-architecture/exceptions-and-interrupts, computer-architecture/memory-hierarchy-and-locality]
+    skills: [architecture, os]
+  - id: computer-architecture/static-linking-and-elf
+    title: "Static linking and ELF"
+    prerequisites: [computer-architecture/compilation-pipeline, computer-architecture/isa-and-assembly-basics]
+    skills: [linking]
+  - id: computer-architecture/dynamic-linking-and-pic
+    title: "Dynamic linking and position-independent code"
+    prerequisites: [computer-architecture/static-linking-and-elf, computer-architecture/virtual-memory-hardware]
+    skills: [linking]
+  - id: computer-architecture/performance-and-amdahl
+    title: "Measuring performance and Amdahl's law"
+    prerequisites: [computer-architecture/optimising-for-the-cpu, computer-architecture/cache-friendly-code]
+    skills: [performance]

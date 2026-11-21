@@ -1,0 +1,110 @@
+# Lesson outline for the operating-systems track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: operating-systems/what-an-os-does
+    title: "What an operating system does"
+    prerequisites: []
+    skills: [os]
+  - id: operating-systems/kernel-boundary-and-system-calls
+    title: "The kernel boundary and system calls"
+    prerequisites: [operating-systems/what-an-os-does, (arch)]
+    skills: [os]
+  - id: operating-systems/os-structure-and-boot
+    title: "OS structure and boot"
+    prerequisites: [operating-systems/kernel-boundary-and-system-calls]
+    skills: [os]
+  - id: operating-systems/the-process-abstraction
+    title: "The process abstraction"
+    prerequisites: [operating-systems/kernel-boundary-and-system-calls, (arch)]
+    skills: [os]
+  - id: operating-systems/process-api-fork-exec-wait
+    title: "The process API: fork, exec, wait"
+    prerequisites: [operating-systems/the-process-abstraction]
+    skills: [os]
+  - id: operating-systems/limited-direct-execution-and-context-switch
+    title: "Limited direct execution and context switching"
+    prerequisites: [operating-systems/the-process-abstraction, operating-systems/kernel-boundary-and-system-calls]
+    skills: [os, scheduling]
+  - id: operating-systems/scheduling-basics
+    title: "Scheduling basics"
+    prerequisites: [operating-systems/limited-direct-execution-and-context-switch]
+    skills: [os, scheduling]
+  - id: operating-systems/mlfq-and-proportional-share
+    title: "MLFQ and proportional-share scheduling"
+    prerequisites: [operating-systems/scheduling-basics]
+    skills: [os, scheduling]
+  - id: operating-systems/multiprocessor-and-realtime-scheduling
+    title: "Multiprocessor and real-time scheduling"
+    prerequisites: [operating-systems/mlfq-and-proportional-share, (arch)]
+    skills: [os, scheduling]
+  - id: operating-systems/threads-and-concurrency-models
+    title: "Threads and concurrency models"
+    prerequisites: [operating-systems/process-api-fork-exec-wait]
+    skills: [os, concurrency]
+  - id: operating-systems/races-and-critical-sections
+    title: "Races and critical sections"
+    prerequisites: [operating-systems/threads-and-concurrency-models]
+    skills: [os, concurrency]
+  - id: operating-systems/locks-and-atomic-instructions
+    title: "Locks and atomic instructions"
+    prerequisites: [operating-systems/races-and-critical-sections, (arch)]
+    skills: [os, concurrency]
+  - id: operating-systems/condition-variables-semaphores-monitors
+    title: "Condition variables, semaphores and monitors"
+    prerequisites: [operating-systems/locks-and-atomic-instructions]
+    skills: [os, concurrency]
+  - id: operating-systems/classic-sync-problems-and-concurrency-bugs
+    title: "Classic problems and real concurrency bugs"
+    prerequisites: [operating-systems/condition-variables-semaphores-monitors]
+    skills: [os, concurrency, debugging]
+  - id: operating-systems/deadlock
+    title: "Deadlock"
+    prerequisites: [operating-systems/classic-sync-problems-and-concurrency-bugs]
+    skills: [os, concurrency]
+  - id: operating-systems/address-spaces-and-segmentation
+    title: "Address spaces, base and bounds, segmentation"
+    prerequisites: [operating-systems/the-process-abstraction]
+    skills: [os, memory]
+  - id: operating-systems/paging-and-tlbs
+    title: "Paging and TLBs"
+    prerequisites: [operating-systems/address-spaces-and-segmentation, (arch)]
+    skills: [os, memory]
+  - id: operating-systems/demand-paging-and-replacement
+    title: "Demand paging and page replacement"
+    prerequisites: [operating-systems/paging-and-tlbs]
+    skills: [os, memory]
+  - id: operating-systems/thrashing-and-working-sets
+    title: "Thrashing, working sets and frame allocation"
+    prerequisites: [operating-systems/demand-paging-and-replacement]
+    skills: [os, memory, performance]
+  - id: operating-systems/free-space-and-allocators
+    title: "Free-space management and allocators"
+    prerequisites: [operating-systems/address-spaces-and-segmentation]
+    skills: [os, memory]
+  - id: operating-systems/io-devices-and-drivers
+    title: "I/O devices and drivers"
+    prerequisites: [operating-systems/kernel-boundary-and-system-calls, (arch)]
+    skills: [os, storage]
+  - id: operating-systems/disks-ssds-and-raid
+    title: "Disks, SSDs, I/O scheduling and RAID"
+    prerequisites: [operating-systems/io-devices-and-drivers]
+    skills: [os, storage]
+  - id: operating-systems/files-and-directories
+    title: "Files and directories"
+    prerequisites: [operating-systems/process-api-fork-exec-wait]
+    skills: [os, storage]
+  - id: operating-systems/file-system-implementation
+    title: "File system implementation"
+    prerequisites: [operating-systems/files-and-directories, operating-systems/disks-ssds-and-raid]
+    skills: [os, storage]
+  - id: operating-systems/crash-consistency-and-journaling
+    title: "Crash consistency, journaling and log-structured FS"
+    prerequisites: [operating-systems/file-system-implementation]
+    skills: [os, storage]
+  - id: operating-systems/protection-and-security-models
+    title: "Protection and security models"
+    prerequisites: [operating-systems/kernel-boundary-and-system-calls]
+    skills: [os, security]
+  - id: operating-systems/virtual-machines-and-containers-concepts
+    title: "Virtual machines and containers: the concepts"
+    prerequisites: [operating-systems/paging-and-tlbs, operating-systems/protection-and-security-models]
+    skills: [os, virtualization]

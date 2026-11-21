@@ -1,0 +1,110 @@
+# Lesson outline for the rust track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: rust/ownership
+    title: "Ownership, moves and drop"
+    prerequisites: []
+    skills: [rust, memory]
+  - id: rust/borrowing
+    title: "References and the borrow checker"
+    prerequisites: []
+    skills: [rust, memory]
+  - id: rust/slices-and-strings
+    title: "Slices and UTF-8 strings"
+    prerequisites: []
+    skills: [rust, memory]
+  - id: rust/structs-and-enums
+    title: "Structs, methods, enums and Option"
+    prerequisites: []
+    skills: [rust, design]
+  - id: rust/pattern-matching
+    title: "match, if let and patterns"
+    prerequisites: []
+    skills: [rust]
+  - id: rust/error-handling
+    title: "Result, ? and panic"
+    prerequisites: []
+    skills: [rust, design]
+  - id: rust/collections
+    title: "Vec, String and HashMap"
+    prerequisites: []
+    skills: [rust]
+  - id: rust/modules-and-cargo
+    title: "Modules, privacy, crates and Cargo"
+    prerequisites: []
+    skills: [rust, tooling]
+  - id: rust/generics
+    title: "Generics and monomorphization"
+    prerequisites: []
+    skills: [rust, types]
+  - id: rust/traits
+    title: "Traits and bounds"
+    prerequisites: []
+    skills: [rust, design]
+  - id: rust/lifetimes
+    title: "Lifetimes"
+    prerequisites: []
+    skills: [rust, memory]
+  - id: rust/closures
+    title: "Closures and Fn traits"
+    prerequisites: []
+    skills: [rust]
+  - id: rust/iterators
+    title: "Iterators and zero-cost abstraction"
+    prerequisites: []
+    skills: [rust]
+  - id: rust/box-deref-drop
+    title: "Box, Deref and Drop"
+    prerequisites: []
+    skills: [rust, memory]
+  - id: rust/rc-and-refcell
+    title: "Rc, RefCell and interior mutability"
+    prerequisites: []
+    skills: [rust, memory]
+  - id: rust/trait-objects
+    title: "Trait objects and dynamic dispatch"
+    prerequisites: []
+    skills: [rust, design]
+  - id: rust/state-and-typestate
+    title: "State pattern versus typestate"
+    prerequisites: []
+    skills: [rust, design]
+  - id: rust/threads-and-channels
+    title: "Threads and message passing"
+    prerequisites: []
+    skills: [rust, concurrency]
+  - id: rust/mutex-arc-send-sync
+    title: "Shared state: Mutex, Arc, Send and Sync"
+    prerequisites: []
+    skills: [rust, concurrency]
+  - id: rust/unsafe
+    title: "Unsafe Rust"
+    prerequisites: []
+    skills: [rust, unsafe, memory]
+  - id: rust/macros
+    title: "Declarative and procedural macros"
+    prerequisites: []
+    skills: [rust, design]
+  - id: rust/advanced-traits-and-types
+    title: "Associated types, operators, newtype"
+    prerequisites: []
+    skills: [rust, types]
+  - id: rust/testing
+    title: "Tests in Rust"
+    prerequisites: []
+    skills: [rust, testing]
+  - id: rust/atomics
+    title: "Atomic types and memory model basics"
+    prerequisites: []
+    skills: [rust, concurrency, systems]
+  - id: rust/memory-ordering
+    title: "Memory ordering"
+    prerequisites: []
+    skills: [rust, concurrency, systems]
+  - id: rust/building-primitives
+    title: "Spin lock, channel and Arc from scratch"
+    prerequisites: []
+    skills: [rust, concurrency, systems]
+  - id: rust/processor-and-os-locks
+    title: "CPU caches, futexes and real locks"
+    prerequisites: []
+    skills: [os, concurrency, systems]

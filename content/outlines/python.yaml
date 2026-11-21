@@ -1,0 +1,98 @@
+# Lesson outline for the python track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: python/data-model
+    title: "The data model: special methods"
+    prerequisites: []
+    skills: [python, design]
+  - id: python/sequences
+    title: "Sequences, slicing and unpacking"
+    prerequisites: []
+    skills: [python]
+  - id: python/dicts-and-sets
+    title: "Dicts, sets and hashing"
+    prerequisites: []
+    skills: [python, memory]
+  - id: python/text-vs-bytes
+    title: "Text, bytes and encodings"
+    prerequisites: []
+    skills: [python]
+  - id: python/data-class-builders
+    title: "namedtuple, NamedTuple, dataclass"
+    prerequisites: []
+    skills: [python, design]
+  - id: python/references-and-gc
+    title: "Names, references, mutability, recycling"
+    prerequisites: []
+    skills: [python, memory]
+  - id: python/first-class-functions
+    title: "Functions as objects"
+    prerequisites: []
+    skills: [python]
+  - id: python/type-hints
+    title: "Gradual typing, Protocol, generics"
+    prerequisites: []
+    skills: [python, types]
+  - id: python/closures-and-decorators
+    title: "Closures and decorators"
+    prerequisites: []
+    skills: [python, metaprogramming]
+  - id: python/patterns-with-functions
+    title: "Strategy, Command and friends as functions"
+    prerequisites: []
+    skills: [design, python]
+  - id: python/pythonic-object
+    title: "A Pythonic class: repr, slots, classmethods"
+    prerequisites: []
+    skills: [python, design]
+  - id: python/sequence-protocol
+    title: "Building your own sequence"
+    prerequisites: []
+    skills: [python]
+  - id: python/protocols-and-abcs
+    title: "Duck typing, goose typing, protocols"
+    prerequisites: []
+    skills: [python, design, types]
+  - id: python/inheritance-and-mro
+    title: "Inheritance, super() and the MRO"
+    prerequisites: []
+    skills: [python, design]
+  - id: python/operator-overloading
+    title: "Operators and NotImplemented"
+    prerequisites: []
+    skills: [python]
+  - id: python/iterators-and-generators
+    title: "Iterators, generators, yield from"
+    prerequisites: []
+    skills: [python]
+  - id: python/context-managers-and-match
+    title: "with, try/else and match"
+    prerequisites: []
+    skills: [python]
+  - id: python/exceptions-and-eafp
+    title: "Exceptions and the EAFP style"
+    prerequisites: []
+    skills: [python, design]
+  - id: python/concurrency-and-the-gil
+    title: "Threads, processes, async and the GIL"
+    prerequisites: []
+    skills: [concurrency, os, python]
+  - id: python/executors
+    title: "concurrent.futures"
+    prerequisites: []
+    skills: [concurrency, python]
+  - id: python/asyncio
+    title: "Coroutines and the event loop"
+    prerequisites: []
+    skills: [concurrency, async]
+  - id: python/properties-and-dynamic-attributes
+    title: "Properties and __getattr__"
+    prerequisites: []
+    skills: [python]
+  - id: python/descriptors
+    title: "Attribute descriptors"
+    prerequisites: []
+    skills: [python, metaprogramming]
+  - id: python/class-metaprogramming
+    title: "__init_subclass__, class decorators, metaclasses"
+    prerequisites: []
+    skills: [python, metaprogramming]

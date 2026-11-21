@@ -1,0 +1,102 @@
+# Lesson outline for the reliability track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: reliability/sre-mindset-and-toil
+    title: "What SRE is, and what toil is"
+    prerequisites: []
+    skills: [sre, reliability]
+  - id: reliability/availability-math
+    title: "Availability, nines and the cost of reliability"
+    prerequisites: []
+    skills: [reliability]
+  - id: reliability/slis-and-slos
+    title: "SLIs and SLOs: measuring what users feel"
+    prerequisites: [reliability/availability-math]
+    skills: [sre, observability]
+  - id: reliability/error-budgets
+    title: "Error budgets and the policy that uses them"
+    prerequisites: [reliability/slis-and-slos]
+    skills: [sre, reliability]
+  - id: reliability/slo-alerting-burn-rate
+    title: "Alerting on SLOs: burn rate and multiple windows"
+    prerequisites: [reliability/slis-and-slos, reliability/error-budgets]
+    skills: [observability, sre]
+  - id: reliability/monitoring-golden-signals
+    title: "Monitoring: symptoms, causes and the four golden signals"
+    prerequisites: [reliability/slis-and-slos]
+    skills: [observability]
+  - id: reliability/timeseries-alert-rules
+    title: "From metrics to alerts: time series, rules and aggregation"
+    prerequisites: [reliability/monitoring-golden-signals]
+    skills: [observability]
+  - id: reliability/on-call-sustainability
+    title: "On-call: load, safety and the shape of a rota"
+    prerequisites: [reliability/sre-mindset-and-toil]
+    skills: [sre, incident-response]
+  - id: reliability/troubleshooting-method
+    title: "Troubleshooting as hypothesis testing"
+    prerequisites: [reliability/monitoring-golden-signals]
+    skills: [debugging, incident-response]
+  - id: reliability/incident-command
+    title: "Incident command and communication"
+    prerequisites: [reliability/on-call-sustainability, reliability/troubleshooting-method]
+    skills: [incident-response]
+  - id: reliability/blameless-postmortems
+    title: "Blameless postmortems"
+    prerequisites: [reliability/incident-command]
+    skills: [incident-response, sre]
+  - id: reliability/release-engineering-and-canarying
+    title: "Release engineering and canarying"
+    prerequisites: [reliability/error-budgets, reliability/monitoring-golden-signals]
+    skills: [release-engineering, reliability]
+  - id: reliability/configuration-safety
+    title: "Configuration as a source of outages"
+    prerequisites: [reliability/release-engineering-and-canarying]
+    skills: [release-engineering, reliability]
+  - id: reliability/load-balancing-policies
+    title: "Load balancing from the edge to the backend"
+    prerequisites: []
+    skills: [reliability, networking]
+  - id: reliability/handling-overload
+    title: "Handling overload: shedding, criticality, client throttling"
+    prerequisites: [reliability/load-balancing-policies]
+    skills: [resilience, reliability]
+  - id: reliability/cascading-failures
+    title: "Cascading failures"
+    prerequisites: [reliability/handling-overload]
+    skills: [resilience, reliability]
+  - id: reliability/retry-storms-and-backoff
+    title: "Retries, timeouts and backoff budgets"
+    prerequisites: [reliability/handling-overload]
+    skills: [resilience]
+  - id: reliability/autoscaling-and-load-management
+    title: "Autoscaling and managing load"
+    prerequisites: [reliability/handling-overload, reliability/cascading-failures]
+    skills: [capacity-planning, kubernetes]
+  - id: reliability/consensus-for-critical-state
+    title: "Consensus for critical state"
+    prerequisites: []
+    skills: [distributed-systems]
+  - id: reliability/distributed-cron-and-idempotency
+    title: "Distributed cron, idempotency and at-most-once"
+    prerequisites: [reliability/consensus-for-critical-state]
+    skills: [distributed-systems, automation]
+  - id: reliability/data-integrity
+    title: "Data integrity: what you read is what you wrote"
+    prerequisites: [reliability/consensus-for-critical-state]
+    skills: [reliability]
+  - id: reliability/testing-and-chaos
+    title: "Testing for reliability and chaos experiments"
+    prerequisites: [reliability/release-engineering-and-canarying]
+    skills: [testing, resilience]
+  - id: reliability/production-readiness-and-launches
+    title: "Production readiness reviews and launches"
+    prerequisites: [reliability/slis-and-slos, reliability/error-budgets, reliability/release-engineering-and-canarying]
+    skills: [sre, reliability]
+  - id: reliability/capacity-design-nalsd
+    title: "Non-abstract large system design"
+    prerequisites: [reliability/availability-math, reliability/handling-overload]
+    skills: [capacity-planning, design]
+  - id: reliability/automation-and-reconciliation
+    title: "Automation: from scripts to reconciling systems"
+    prerequisites: [reliability/sre-mindset-and-toil]
+    skills: [automation, kubernetes]

@@ -1,0 +1,58 @@
+# Lesson outline for the software-architecture track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: software-architecture/what-is-architecture
+    title: "What architecture is: boundaries, policy and details"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/dependency-rule
+    title: "The Dependency Rule, ports and adapters, humble objects"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/component-principles
+    title: "Component cohesion and coupling principles"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/layering-and-domain-logic
+    title: "Layering and domain logic styles"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/data-access-patterns
+    title: "Data access: gateway, Active Record, Data Mapper, Repository"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/unit-of-work-and-identity-map
+    title: "Unit of Work, Identity Map and lazy loading"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/offline-concurrency
+    title: "Optimistic and pessimistic offline locks"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/web-and-remote-boundaries
+    title: "Web controllers, MVC, Remote Facade and DTO"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/evolutionary-architecture
+    title: "Partial boundaries, decisions and fitness functions"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/quantum-and-coupling
+    title: "Architecture quantum, static and dynamic coupling"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/service-granularity-and-decomposition
+    title: "Service granularity and decomposing a monolith"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/data-ownership
+    title: "Data ownership and distributed data access"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/workflows-and-sagas
+    title: "Orchestration, choreography and sagas"
+    prerequisites: []
+    skills: []
+  - id: software-architecture/shared-code-and-contracts
+    title: "Reuse patterns and service contracts"
+    prerequisites: []
+    skills: []

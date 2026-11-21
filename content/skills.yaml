@@ -29,3 +29,179 @@
 - id: debugging
   title: Debugging
   summary: Reading traces, profiles and logs to find the cause, not the symptom.
+
+# Tags used by the planned tracks (from the curriculum outlines).
+- id: algorithm-design
+  title: Algorithm design
+- id: appsec
+  title: Application security
+- id: architecture
+  title: Architecture
+- id: async
+  title: Async
+- id: automation
+  title: Automation
+- id: caching
+  title: Caching
+- id: capacity-estimation
+  title: Capacity estimation
+- id: capacity-planning
+  title: Capacity planning
+- id: clocks
+  title: Clocks
+- id: code-quality
+  title: Code quality
+- id: compilers
+  title: Compilers
+- id: complexity
+  title: Complexity
+- id: consensus
+  title: Consensus
+- id: containers
+  title: Containers
+- id: counting
+  title: Counting
+- id: cryptography
+  title: Cryptography
+- id: data-modeling
+  title: Data modeling
+- id: data-pipelines
+  title: Data pipelines
+- id: data-structures
+  title: Data structures
+- id: databases
+  title: Databases
+- id: discrete-math
+  title: Discrete math
+- id: dns
+  title: DNS
+- id: dynamic-programming
+  title: Dynamic programming
+- id: ebpf
+  title: eBPF
+- id: error-handling
+  title: Error handling
+- id: go-language
+  title: Go language
+- id: graph-theory
+  title: Graph theory
+- id: graphs
+  title: Graphs
+- id: hashing
+  title: Hashing
+- id: http
+  title: HTTP
+- id: incident-response
+  title: Incident response
+- id: indexing
+  title: Indexing
+- id: infrastructure-as-code
+  title: Infrastructure as code
+- id: integration-testing
+  title: Integration testing
+- id: intractability
+  title: Intractability
+- id: language-implementation
+  title: Language implementation
+- id: legacy-code
+  title: Legacy code
+- id: linking
+  title: Linking
+- id: linux
+  title: Linux
+- id: lock-free
+  title: Lock free
+- id: memory
+  title: Memory
+- id: memory-management
+  title: Memory management
+- id: memory-model
+  title: Memory model
+- id: messaging
+  title: Messaging
+- id: metaprogramming
+  title: Metaprogramming
+- id: microservices
+  title: Microservices
+- id: number-theory
+  title: Number theory
+- id: observability
+  title: Observability
+- id: operations
+  title: Operations
+- id: optimisation
+  title: Optimisation
+- id: parsing
+  title: Parsing
+- id: performance
+  title: Performance
+- id: probability
+  title: Probability
+- id: proofs
+  title: Proofs
+- id: python
+  title: Python
+- id: query-performance
+  title: Query performance
+- id: recurrences
+  title: Recurrences
+- id: refactoring
+  title: Refactoring
+- id: release-engineering
+  title: Release engineering
+- id: reliability
+  title: Reliability
+- id: replication
+  title: Replication
+- id: resilience
+  title: Resilience
+- id: resiliency
+  title: Resiliency
+- id: routing
+  title: Routing
+- id: rust
+  title: Rust
+- id: scalability
+  title: Scalability
+- id: scheduling
+  title: Scheduling
+- id: security
+  title: Security
+- id: sql
+  title: SQL
+- id: sre
+  title: SRE
+- id: statistics
+  title: Statistics
+- id: storage
+  title: Storage
+- id: storage-engines
+  title: Storage engines
+- id: system-design
+  title: System design
+- id: systems
+  title: Systems
+- id: tdd
+  title: Test-driven development
+- id: test-design
+  title: Test design
+- id: test-doubles
+  title: Test doubles
+- id: threat-modelling
+  title: Threat modelling
+- id: tls
+  title: TLS
+- id: tooling
+  title: Tooling
+- id: transactions
+  title: Transactions
+- id: transport
+  title: Transport
+- id: types
+  title: Types
+- id: typescript
+  title: TypeScript
+- id: unsafe
+  title: Unsafe code
+- id: virtualization
+  title: Virtualization

@@ -1,0 +1,98 @@
+# Lesson outline for the kubernetes track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: kubernetes/containers-are-processes
+    title: "A container is a process with a view"
+    prerequisites: [linux/namespaces-and-cgroups]
+    skills: [containers, os]
+  - id: kubernetes/images-and-layers
+    title: "Images, layers and registries"
+    prerequisites: [kubernetes/containers-are-processes]
+    skills: [containers]
+  - id: kubernetes/desired-state-and-reconcile
+    title: "Desired state and the reconcile loop"
+    prerequisites: []
+    skills: [kubernetes, distributed-systems]
+  - id: kubernetes/control-plane-components
+    title: "The control plane and the node agents"
+    prerequisites: [kubernetes/desired-state-and-reconcile]
+    skills: [kubernetes]
+  - id: kubernetes/api-objects-labels-ownership
+    title: "Objects, labels, selectors and owners"
+    prerequisites: [kubernetes/desired-state-and-reconcile]
+    skills: [kubernetes]
+  - id: kubernetes/etcd-raft-quorum
+    title: "etcd, Raft and quorum"
+    prerequisites: [kubernetes/control-plane-components]
+    skills: [kubernetes, distributed-systems]
+  - id: kubernetes/life-of-a-kubectl-apply
+    title: "Life of a kubectl apply"
+    prerequisites: [kubernetes/control-plane-components, kubernetes/api-objects-labels-ownership]
+    skills: [kubernetes]
+  - id: kubernetes/pods-and-sandbox
+    title: "Pods: shared namespaces and the sandbox"
+    prerequisites: [kubernetes/containers-are-processes, kubernetes/api-objects-labels-ownership]
+    skills: [kubernetes, containers]
+  - id: kubernetes/probes-and-pod-lifecycle
+    title: "Probes, startup and graceful shutdown"
+    prerequisites: [kubernetes/pods-and-sandbox]
+    skills: [kubernetes]
+  - id: kubernetes/requests-limits-qos
+    title: "Requests, limits and QoS classes"
+    prerequisites: [kubernetes/containers-are-processes, kubernetes/pods-and-sandbox]
+    skills: [kubernetes, scheduling, os]
+  - id: kubernetes/scheduler-placement
+    title: "How the scheduler places pods"
+    prerequisites: [kubernetes/requests-limits-qos]
+    skills: [kubernetes, scheduling]
+  - id: kubernetes/deployments-rolling-updates
+    title: "Deployments and rolling updates"
+    prerequisites: [kubernetes/api-objects-labels-ownership, kubernetes/probes-and-pod-lifecycle]
+    skills: [kubernetes]
+  - id: kubernetes/services-and-kube-proxy
+    title: "Services, endpoints and ingress"
+    prerequisites: [kubernetes/api-objects-labels-ownership, kubernetes/probes-and-pod-lifecycle]
+    skills: [kubernetes, networking]
+  - id: kubernetes/pod-networking-and-network-policy
+    title: "Pod networking and network policy"
+    prerequisites: [kubernetes/services-and-kube-proxy]
+    skills: [kubernetes, networking, security]
+  - id: kubernetes/statefulsets-and-storage
+    title: "StatefulSets, volumes and claims"
+    prerequisites: [kubernetes/pods-and-sandbox, kubernetes/deployments-rolling-updates]
+    skills: [kubernetes, storage]
+  - id: kubernetes/config-and-secrets
+    title: "ConfigMaps and Secrets"
+    prerequisites: [kubernetes/pods-and-sandbox]
+    skills: [kubernetes, security]
+  - id: kubernetes/autoscaling-and-disruption
+    title: "Autoscaling and disruption budgets"
+    prerequisites: [kubernetes/requests-limits-qos, kubernetes/deployments-rolling-updates]
+    skills: [kubernetes, scheduling]
+  - id: kubernetes/rbac-and-api-security
+    title: "Authentication, RBAC and the API server"
+    prerequisites: [kubernetes/life-of-a-kubectl-apply]
+    skills: [kubernetes, security]
+  - id: kubernetes/pod-security-and-isolation
+    title: "Pod security and container isolation"
+    prerequisites: [kubernetes/containers-are-processes, kubernetes/pods-and-sandbox]
+    skills: [security, containers]
+  - id: kubernetes/image-supply-chain-and-admission
+    title: "Image supply chain, scanning and admission"
+    prerequisites: [kubernetes/images-and-layers, kubernetes/life-of-a-kubectl-apply]
+    skills: [security, containers]
+  - id: kubernetes/crds-and-operators
+    title: "Custom resources and operators"
+    prerequisites: [kubernetes/desired-state-and-reconcile, kubernetes/api-objects-labels-ownership]
+    skills: [kubernetes, design]
+  - id: kubernetes/debugging-playbook
+    title: "A debugging playbook"
+    prerequisites: [kubernetes/probes-and-pod-lifecycle, kubernetes/requests-limits-qos, kubernetes/services-and-kube-proxy]
+    skills: [kubernetes, debugging]
+  - id: kubernetes/declarative-vs-imperative-automation
+    title: "Declarative, imperative and idempotent"
+    prerequisites: [kubernetes/desired-state-and-reconcile]
+    skills: [automation]
+  - id: kubernetes/terraform-state-plan-apply
+    title: "Terraform: state, plan and apply"
+    prerequisites: [kubernetes/declarative-vs-imperative-automation]
+    skills: [infrastructure-as-code, automation]

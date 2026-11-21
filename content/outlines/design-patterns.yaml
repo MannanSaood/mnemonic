@@ -1,0 +1,18 @@
+# Extra design topics planned beyond the principles and the 23 patterns. Coming soon until written.
+lessons:
+  - id: design-patterns/cost-of-change-and-complexity
+    title: "Why design: cost of change and complexity"
+    prerequisites: []
+    skills: []
+  - id: design-patterns/deep-modules
+    title: "Deep modules and information hiding"
+    prerequisites: []
+    skills: []
+  - id: design-patterns/smells-and-refactoring
+    title: "Smells and safe refactoring"
+    prerequisites: []
+    skills: []
+  - id: design-patterns/replace-conditional-with-polymorphism
+    title: "From switches to polymorphism, and back"
+    prerequisites: []
+    skills: []

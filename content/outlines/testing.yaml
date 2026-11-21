@@ -1,0 +1,87 @@
+# Lesson outline for the testing track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: testing/goal-of-testing
+    title: "Why tests exist"
+    summary: "Tests are there to let a project keep growing without stalling; every test also costs."
+    prerequisites: []
+    skills: [testing]
+  - id: testing/what-is-a-unit-test
+    title: "What counts as a unit test"
+    summary: "One unit of behaviour, fast, isolated from other tests; and the classical vs London split."
+    prerequisites: [testing/goal-of-testing]
+    skills: [testing, design]
+  - id: testing/anatomy-of-a-test
+    title: "Anatomy of a test"
+    summary: "Arrange, act, assert; fixtures by factory method; names a domain expert can read."
+    prerequisites: [testing/what-is-a-unit-test]
+    skills: [testing, test-design]
+  - id: testing/tdd-red-green-refactor
+    title: "Red, green, refactor"
+    summary: "Failing test, quickest pass, then remove duplication, in tiny steps."
+    prerequisites: [testing/anatomy-of-a-test, code-craft/refactoring-safely]
+    skills: [tdd, testing]
+  - id: testing/tdd-implementation-strategies
+    title: "Fake it, triangulate, or just write it"
+    summary: "Three gears for turning a red test green, and how to change gear."
+    prerequisites: [testing/tdd-red-green-refactor]
+    skills: [tdd]
+  - id: testing/tdd-test-patterns
+    title: "Patterns for choosing the next test"
+    summary: "Test list, one-step test, starter test, evident data, child test, regression test."
+    prerequisites: [testing/tdd-red-green-refactor]
+    skills: [tdd, test-design]
+  - id: testing/xunit-from-scratch
+    title: "How a test runner works"
+    summary: "A test framework is a small program: find tests, set up, run, catch failure, report."
+    prerequisites: [testing/tdd-red-green-refactor]
+    skills: [tdd, testing]
+  - id: testing/four-pillars
+    title: "The four pillars of a valuable test"
+    summary: "Regression protection, resistance to refactoring, fast feedback, maintainability; you cannot max all."
+    prerequisites: [testing/anatomy-of-a-test]
+    skills: [test-design, testing]
+  - id: testing/test-doubles
+    title: "Mocks, stubs and friends"
+    summary: "Five kinds of double, two real roles; mocks check outgoing commands, stubs supply incoming data."
+    prerequisites: [testing/four-pillars, design-patterns/interfaces-and-polymorphism]
+    skills: [test-doubles, testing]
+  - id: testing/observable-behavior
+    title: "Observable behaviour vs implementation detail"
+    summary: "Test what a client can observe; hide the rest, or tests break at every refactor."
+    prerequisites: [testing/test-doubles]
+    skills: [test-design, design]
+  - id: testing/styles-of-unit-testing
+    title: "Output, state and communication tests"
+    summary: "Three styles ranked by how well they resist refactoring and stay small."
+    prerequisites: [testing/observable-behavior]
+    skills: [test-design, testing]
+  - id: testing/functional-core-humble-object
+    title: "Functional core, humble shell"
+    summary: "Push decisions into pure code and keep I/O code thin, so most tests become output-based."
+    prerequisites: [testing/styles-of-unit-testing]
+    skills: [design, test-design]
+  - id: testing/what-to-test
+    title: "Which code deserves unit tests"
+    summary: "Four kinds of code by complexity and collaborators; test the domain, skip the trivial."
+    prerequisites: [testing/functional-core-humble-object]
+    skills: [test-design]
+  - id: testing/integration-tests-and-the-pyramid
+    title: "Integration tests and the pyramid"
+    summary: "A smaller set of slower tests that exercise controllers with real dependencies."
+    prerequisites: [testing/what-to-test]
+    skills: [integration-testing, testing]
+  - id: testing/managed-and-unmanaged-dependencies
+    title: "Managed vs unmanaged dependencies"
+    summary: "Use the real database; mock only outside-visible systems, at the edge."
+    prerequisites: [testing/integration-tests-and-the-pyramid, testing/test-doubles]
+    skills: [integration-testing, test-doubles]
+  - id: testing/testing-the-database
+    title: "Testing the database"
+    summary: "Schema in source control, migrations, transactions per phase, cleanup before the test."
+    prerequisites: [testing/managed-and-unmanaged-dependencies]
+    skills: [integration-testing]
+  - id: testing/test-anti-patterns
+    title: "Test anti-patterns"
+    summary: "Testing private methods, exposing state, leaking domain knowledge, code pollution, mocking concrete classes."
+    prerequisites: [testing/observable-behavior]
+    skills: [test-design]

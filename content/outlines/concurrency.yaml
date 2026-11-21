@@ -1,0 +1,152 @@
+# Lesson outline for the concurrency track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: concurrency/why-concurrency-is-hard
+    title: "Why concurrency is hard"
+    summary: "Races, atomicity, visibility and ordering; concurrency vs parallelism."
+    prerequisites: []
+    skills: [concurrency]
+  - id: concurrency/amdahl-and-scaling
+    title: "How much can parallelism help"
+    summary: "Amdahl's law, serial fractions, the cost of sharing."
+    prerequisites: []
+    skills: [concurrency, performance]
+  - id: concurrency/thread-safety
+    title: "What thread-safe means"
+    summary: "Invariants, state, compound actions, guarding state with locks."
+    prerequisites: []
+    skills: [concurrency]
+  - id: concurrency/mutual-exclusion
+    title: "Mutual exclusion"
+    summary: "Critical sections, the properties a lock must have, Peterson to bakery."
+    prerequisites: []
+    skills: [concurrency]
+  - id: concurrency/memory-models
+    title: "Memory models"
+    summary: "Why reads see old values: compilers, caches, store buffers, fences."
+    prerequisites: []
+    skills: [memory-model, os]
+  - id: concurrency/happens-before-and-publication
+    title: "Happens-before and safe publication"
+    summary: "The rule that makes a write visible, and the ways to hand an object to another thread."
+    prerequisites: []
+    skills: [memory-model, concurrency]
+  - id: concurrency/consistency-conditions
+    title: "Quiescent, sequential, linearizable"
+    summary: "Three ways to say a concurrent object is correct."
+    prerequisites: []
+    skills: [concurrency, distributed-systems]
+  - id: concurrency/linearizability-in-practice
+    title: "Linearizability in practice"
+    summary: "Linearization points, composability, checking histories, relation to distributed stores."
+    prerequisites: []
+    skills: [concurrency, testing, distributed-systems]
+  - id: concurrency/progress-conditions
+    title: "Blocking, lock-free, wait-free"
+    summary: "What can a stalled thread do to everyone else."
+    prerequisites: []
+    skills: [concurrency, lock-free]
+  - id: concurrency/cas-and-consensus
+    title: "CAS and consensus numbers"
+    summary: "Why compare-and-set is special; the hierarchy of primitives."
+    prerequisites: []
+    skills: [lock-free, concurrency]
+  - id: concurrency/spin-locks
+    title: "Spin locks and the cache"
+    summary: "Test-and-set, test-and-test-and-set, backoff, coherence traffic."
+    prerequisites: []
+    skills: [concurrency, os, performance]
+  - id: concurrency/queue-locks
+    title: "Queue locks: CLH and MCS"
+    summary: "Local spinning and FIFO fairness."
+    prerequisites: []
+    skills: [concurrency, performance]
+  - id: concurrency/monitors-and-condition-variables
+    title: "Monitors and condition variables"
+    summary: "Waiting for a condition, lost wakeups, spurious wakeups."
+    prerequisites: []
+    skills: [concurrency]
+  - id: concurrency/semaphores-and-rw-locks
+    title: "Semaphores and reader-writer locks"
+    summary: "Counting permits; readers vs writers and starvation."
+    prerequisites: []
+    skills: [concurrency]
+  - id: concurrency/deadlock-and-liveness
+    title: "Deadlock, livelock and starvation"
+    summary: "Four conditions, lock ordering, open calls, diagnosis."
+    prerequisites: []
+    skills: [concurrency, debugging]
+  - id: concurrency/locking-granularity
+    title: "From coarse to lock-free lists"
+    summary: "One lock, hand-over-hand, optimistic, lazy, lock-free set."
+    prerequisites: []
+    skills: [concurrency, data-structures]
+  - id: concurrency/lock-free-stack-and-aba
+    title: "Lock-free stack and the ABA problem"
+    summary: "CAS retry loops, ABA, tagged pointers, elimination."
+    prerequisites: []
+    skills: [lock-free, data-structures]
+  - id: concurrency/lock-free-queue
+    title: "Lock-free queue"
+    summary: "Michael-Scott style queue, helping, linearization points."
+    prerequisites: []
+    skills: [lock-free, data-structures]
+  - id: concurrency/memory-reclamation
+    title: "Safe memory reclamation"
+    summary: "When can a node be freed: GC, hazard pointers, epochs, RCU."
+    prerequisites: []
+    skills: [lock-free, memory-model]
+  - id: concurrency/concurrent-hash-maps
+    title: "Concurrent hash maps"
+    summary: "Striping, resizing under load, split-ordered lists, cuckoo."
+    prerequisites: []
+    skills: [data-structures, concurrency, performance]
+  - id: concurrency/contention-and-counters
+    title: "Counters under contention"
+    summary: "Sharding, combining, counting networks, adders."
+    prerequisites: []
+    skills: [performance, concurrency, lock-free]
+  - id: concurrency/skiplists
+    title: "Concurrent ordered sets"
+    summary: "Skiplists as a lock-friendly alternative to trees."
+    prerequisites: []
+    skills: [data-structures, lock-free]
+  - id: concurrency/thread-pools
+    title: "Task execution and thread pools"
+    summary: "Tasks vs threads, queues, pool sizing, saturation policy."
+    prerequisites: []
+    skills: [concurrency, performance]
+  - id: concurrency/work-stealing-schedulers
+    title: "Work stealing"
+    summary: "Fork-join, work-stealing deques, parallelism analysis."
+    prerequisites: []
+    skills: [concurrency, performance]
+  - id: concurrency/cancellation-and-shutdown
+    title: "Cancellation and shutdown"
+    summary: "Cooperative cancellation, interruption, graceful stop, poison pills."
+    prerequisites: []
+    skills: [concurrency]
+  - id: concurrency/producer-consumer-backpressure
+    title: "Producer-consumer and backpressure"
+    summary: "Bounded queues, blocking, load shedding."
+    prerequisites: []
+    skills: [concurrency, distributed-systems]
+  - id: concurrency/barriers
+    title: "Barriers and phased work"
+    summary: "Sense reversal, tree barriers, termination detection."
+    prerequisites: []
+    skills: [concurrency]
+  - id: concurrency/transactional-memory
+    title: "Transactional memory"
+    summary: "Composing atomic operations; software and hardware TM."
+    prerequisites: []
+    skills: [concurrency, lock-free]
+  - id: concurrency/concurrency-models
+    title: "Confinement, immutability, actors and CSP"
+    summary: "Ways to avoid sharing at all."
+    prerequisites: []
+    skills: [concurrency, design]
+  - id: concurrency/testing-concurrent-programs
+    title: "Testing concurrent programs"
+    summary: "Stress tests, race detectors, model checking, linearizability checkers."
+    prerequisites: []
+    skills: [testing, debugging, concurrency]

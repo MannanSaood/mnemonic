@@ -1,0 +1,107 @@
+# Lesson outline for the code-craft track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: code-craft/managing-complexity
+    title: "Managing complexity"
+    summary: "Software's main technical job is keeping the amount a reader must hold in their head small."
+    prerequisites: []
+    skills: [design, code-quality]
+  - id: code-craft/abstraction-and-information-hiding
+    title: "Abstraction and information hiding"
+    summary: "Hide the decision most likely to change behind a small, honest interface."
+    prerequisites: [code-craft/managing-complexity]
+    skills: [design, code-quality]
+  - id: code-craft/coupling-and-cohesion
+    title: "Coupling and cohesion"
+    summary: "Judge connections by size, visibility, flexibility; keep one reason to change per module."
+    prerequisites: [code-craft/abstraction-and-information-hiding]
+    skills: [design, code-quality]
+  - id: code-craft/routines-worth-extracting
+    title: "Routines worth extracting"
+    summary: "When to cut a function, how long it can be, and what its parameters say about its design."
+    prerequisites: [code-craft/abstraction-and-information-hiding]
+    skills: [code-quality]
+  - id: code-craft/naming
+    title: "Naming"
+    summary: "A name should state what the thing is; length, scope and role decide how."
+    prerequisites: [code-craft/managing-complexity]
+    skills: [code-quality]
+  - id: code-craft/dry-and-duplication
+    title: "Duplication and DRY"
+    summary: "One piece of knowledge, one place; and why that is about knowledge, not text."
+    prerequisites: [code-craft/coupling-and-cohesion]
+    skills: [design, refactoring]
+  - id: code-craft/guard-clauses-and-nesting
+    title: "Guard clauses and nesting"
+    summary: "Flatten control flow so each line has few conditions in scope."
+    prerequisites: [code-craft/routines-worth-extracting]
+    skills: [code-quality]
+  - id: code-craft/table-driven-methods
+    title: "Table-driven methods"
+    summary: "Replace a pile of branches with data plus one lookup."
+    prerequisites: [code-craft/guard-clauses-and-nesting]
+    skills: [design, extensibility]
+  - id: code-craft/defensive-programming-and-barricades
+    title: "Defensive programming and barricades"
+    summary: "Validate at the border, trust inside it."
+    prerequisites: [code-craft/coupling-and-cohesion]
+    skills: [error-handling]
+  - id: code-craft/assertions-and-contracts
+    title: "Assertions and contracts"
+    summary: "Encode preconditions and invariants so violations stop the program near the cause."
+    prerequisites: [code-craft/defensive-programming-and-barricades]
+    skills: [error-handling, testing]
+  - id: code-craft/error-handling-strategies
+    title: "Error-handling strategies"
+    summary: "Pick one explicit policy for failure: return, raise, recover, degrade, or stop."
+    prerequisites: [code-craft/defensive-programming-and-barricades]
+    skills: [error-handling]
+  - id: code-craft/comments-and-self-documenting-code
+    title: "Comments and self-documenting code"
+    summary: "Let code say what it does; let comments say why."
+    prerequisites: [code-craft/naming]
+    skills: [code-quality]
+  - id: code-craft/debugging-scientifically
+    title: "Debugging scientifically"
+    summary: "Reproduce, shrink, hypothesise, test, fix the cause, then add a test."
+    prerequisites: [code-craft/comments-and-self-documenting-code]
+    skills: [debugging]
+  - id: code-craft/refactoring-safely
+    title: "Refactoring safely"
+    summary: "Behaviour-preserving steps, small, with a smell as the trigger."
+    prerequisites: [testing/tdd-red-green-refactor]
+    skills: [refactoring, design]
+  - id: code-craft/quality-assurance-mix
+    title: "The quality-assurance mix"
+    summary: "No single defect-finding technique wins; combine reviews, tests and tools."
+    prerequisites: [code-craft/refactoring-safely]
+    skills: [testing, code-quality]
+  - id: code-craft/performance-tuning-discipline
+    title: "Tuning without superstition"
+    summary: "Make it right, measure, change one thing, measure again."
+    prerequisites: [code-craft/quality-assurance-mix]
+    skills: [performance]
+  - id: code-craft/legacy-change-algorithm
+    title: "Changing code that has no tests"
+    summary: "Cover, then modify; sprout or wrap when you cannot cover."
+    prerequisites: [code-craft/refactoring-safely]
+    skills: [legacy-code, refactoring]
+  - id: code-craft/seams
+    title: "Seams"
+    summary: "A place where behaviour can change without editing the code at that place."
+    prerequisites: [code-craft/legacy-change-algorithm, design-patterns/interfaces-and-polymorphism]
+    skills: [legacy-code, design, testing]
+  - id: code-craft/breaking-dependencies
+    title: "Breaking dependencies to get under test"
+    summary: "A short catalogue of moves that make a class constructible and observable."
+    prerequisites: [code-craft/seams, testing/test-doubles]
+    skills: [legacy-code, testing]
+  - id: code-craft/characterization-tests
+    title: "Characterization tests"
+    summary: "Tests that record what the code does now, so you can change it on purpose."
+    prerequisites: [code-craft/breaking-dependencies]
+    skills: [legacy-code, testing]
+  - id: code-craft/plain-text-and-code-generation
+    title: "Plain text, shell and generators"
+    summary: "Keep knowledge in text you can script, diff and generate from."
+    prerequisites: [code-craft/dry-and-duplication]
+    skills: [tooling]

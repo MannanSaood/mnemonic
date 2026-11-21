@@ -1,0 +1,106 @@
+# Lesson outline for the compilers track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: compilers/pipeline-overview
+    title: "From source text to running program"
+    prerequisites: []
+    skills: [compilers]
+  - id: compilers/lexing-and-tokens
+    title: "Lexing: turning characters into tokens"
+    prerequisites: [compilers/pipeline-overview]
+    skills: [compilers, parsing]
+  - id: compilers/regex-to-automata
+    title: "Regular expressions, NFAs and DFAs"
+    prerequisites: [compilers/lexing-and-tokens]
+    skills: [compilers, parsing]
+  - id: compilers/grammars-and-ambiguity
+    title: "Grammars, derivations and ambiguity"
+    prerequisites: [compilers/lexing-and-tokens]
+    skills: [compilers, parsing]
+  - id: compilers/recursive-descent-parsing
+    title: "Recursive-descent parsing"
+    prerequisites: [compilers/grammars-and-ambiguity]
+    skills: [compilers, parsing]
+  - id: compilers/pratt-parsing
+    title: "Pratt parsing: operators and precedence"
+    prerequisites: [compilers/recursive-descent-parsing]
+    skills: [compilers, parsing]
+  - id: compilers/lr-parsing
+    title: "Shift-reduce and LR parsing"
+    prerequisites: [compilers/grammars-and-ambiguity, compilers/recursive-descent-parsing]
+    skills: [compilers, parsing]
+  - id: compilers/syntax-trees-and-tree-walkers
+    title: "Syntax trees and tree-walking interpreters"
+    prerequisites: [compilers/recursive-descent-parsing]
+    skills: [compilers, language-implementation]
+  - id: compilers/scope-and-name-resolution
+    title: "Scope, environments and name resolution"
+    prerequisites: [compilers/syntax-trees-and-tree-walkers]
+    skills: [compilers, language-implementation]
+  - id: compilers/types-and-semantic-analysis
+    title: "Types and semantic analysis"
+    prerequisites: [compilers/syntax-trees-and-tree-walkers, compilers/scope-and-name-resolution]
+    skills: [compilers]
+  - id: compilers/functions-and-closures
+    title: "Functions, closures and captured variables"
+    prerequisites: [compilers/scope-and-name-resolution]
+    skills: [compilers, language-implementation]
+  - id: compilers/bytecode-and-stack-vm
+    title: "Bytecode and a stack virtual machine"
+    prerequisites: [compilers/syntax-trees-and-tree-walkers, compilers/scope-and-name-resolution]
+    skills: [compilers, language-implementation]
+  - id: compilers/intermediate-representations
+    title: "Intermediate representations and control-flow graphs"
+    prerequisites: [compilers/bytecode-and-stack-vm]
+    skills: [compilers, optimisation]
+  - id: compilers/dataflow-analysis
+    title: "Data-flow analysis and fixed points"
+    prerequisites: [compilers/intermediate-representations]
+    skills: [compilers, optimisation]
+  - id: compilers/ssa-form
+    title: "Static single assignment form"
+    prerequisites: [compilers/dataflow-analysis]
+    skills: [compilers, optimisation]
+  - id: compilers/local-optimisation
+    title: "Local optimisation: folding, value numbering, peepholes"
+    prerequisites: [compilers/intermediate-representations]
+    skills: [compilers, optimisation]
+  - id: compilers/global-and-loop-optimisation
+    title: "Global and loop optimisation"
+    prerequisites: [compilers/dataflow-analysis, compilers/ssa-form, compilers/local-optimisation]
+    skills: [compilers, optimisation]
+  - id: compilers/instruction-selection
+    title: "Instruction selection"
+    prerequisites: [compilers/intermediate-representations]
+    skills: [compilers]
+  - id: compilers/instruction-scheduling
+    title: "Instruction scheduling"
+    prerequisites: [compilers/instruction-selection]
+    skills: [compilers, optimisation]
+  - id: compilers/register-allocation
+    title: "Register allocation by graph colouring"
+    prerequisites: [compilers/dataflow-analysis, compilers/instruction-selection]
+    skills: [compilers, optimisation]
+  - id: compilers/stack-frames-and-calling-conventions
+    title: "Stack frames and calling conventions"
+    prerequisites: [compilers/bytecode-and-stack-vm]
+    skills: [compilers, os]
+  - id: compilers/objects-and-method-dispatch
+    title: "Objects, classes and method dispatch"
+    prerequisites: [compilers/functions-and-closures, compilers/bytecode-and-stack-vm]
+    skills: [compilers, language-implementation]
+  - id: compilers/hash-tables-and-interning
+    title: "Hash tables and string interning in a runtime"
+    prerequisites: [compilers/bytecode-and-stack-vm]
+    skills: [compilers, language-implementation]
+  - id: compilers/garbage-collection
+    title: "Garbage collection: mark-sweep and tri-colour marking"
+    prerequisites: [compilers/bytecode-and-stack-vm, compilers/hash-tables-and-interning]
+    skills: [compilers, language-implementation]
+  - id: compilers/error-reporting-and-recovery
+    title: "Error reporting and recovery"
+    prerequisites: [compilers/recursive-descent-parsing]
+    skills: [compilers, debugging]
+  - id: compilers/interpreter-performance-and-jit-ideas
+    title: "Making interpreters fast: value packing, caching, JIT"
+    prerequisites: [compilers/bytecode-and-stack-vm, compilers/register-allocation, compilers/garbage-collection]
+    skills: [compilers, optimisation]

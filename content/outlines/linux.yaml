@@ -1,0 +1,114 @@
+# Lesson outline for the linux track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: linux/linux-big-picture
+    title: "The Linux big picture"
+    prerequisites: [(os)]
+    skills: [linux, os]
+  - id: linux/syscall-path
+    title: "The syscall path"
+    prerequisites: [linux/linux-big-picture, (arch)]
+    skills: [linux, os]
+  - id: linux/tasks-and-task-struct
+    title: "Tasks, task_struct and /proc"
+    prerequisites: [linux/linux-big-picture, (os)]
+    skills: [linux, os]
+  - id: linux/fork-clone-exec-and-cow
+    title: "fork, clone, exec and copy-on-write"
+    prerequisites: [linux/tasks-and-task-struct, (os)]
+    skills: [linux, os]
+  - id: linux/signals-exit-and-reaping
+    title: "Signals, exit and reaping"
+    prerequisites: [linux/fork-clone-exec-and-cow]
+    skills: [linux, os]
+  - id: linux/the-scheduler-cfs-and-eevdf
+    title: "The scheduler: CFS, EEVDF and policies"
+    prerequisites: [linux/tasks-and-task-struct, (os)]
+    skills: [linux, os, performance]
+  - id: linux/interrupts-and-deferred-work
+    title: "Interrupts, softirqs and deferred work"
+    prerequisites: [linux/syscall-path, (arch)]
+    skills: [linux, os]
+  - id: linux/kernel-synchronisation
+    title: "Kernel synchronisation"
+    prerequisites: [linux/interrupts-and-deferred-work, (os), (arch)]
+    skills: [linux, concurrency]
+  - id: linux/kernel-memory-allocators
+    title: "Kernel memory: pages, slab and kmalloc"
+    prerequisites: [linux/kernel-synchronisation, (os)]
+    skills: [linux, memory]
+  - id: linux/process-address-space-and-vmas
+    title: "The process address space and VMAs"
+    prerequisites: [linux/kernel-memory-allocators, (arch)]
+    skills: [linux, memory]
+  - id: linux/page-faults-minor-and-major
+    title: "Page faults: minor, major and copy-on-write"
+    prerequisites: [linux/process-address-space-and-vmas]
+    skills: [linux, memory, debugging]
+  - id: linux/mmap-and-shared-memory
+    title: "mmap and shared memory"
+    prerequisites: [linux/page-faults-minor-and-major]
+    skills: [linux, memory]
+  - id: linux/memory-accounting-reclaim-and-oom
+    title: "Memory accounting, reclaim, swap and the OOM killer"
+    prerequisites: [linux/page-faults-minor-and-major, linux/kernel-memory-allocators]
+    skills: [linux, memory, performance]
+  - id: linux/vfs-and-file-descriptors
+    title: "The VFS and file descriptors"
+    prerequisites: [linux/syscall-path, (os)]
+    skills: [linux, storage]
+  - id: linux/the-page-cache-and-readahead
+    title: "The page cache and readahead"
+    prerequisites: [linux/vfs-and-file-descriptors, linux/page-faults-minor-and-major]
+    skills: [linux, storage, performance]
+  - id: linux/writeback-fsync-and-durability
+    title: "Writeback, fsync and durability"
+    prerequisites: [linux/the-page-cache-and-readahead, (os)]
+    skills: [linux, storage]
+  - id: linux/block-layer-and-nvme
+    title: "The block layer, I/O schedulers and NVMe"
+    prerequisites: [linux/the-page-cache-and-readahead, (arch)]
+    skills: [linux, storage, performance]
+  - id: linux/the-read-path-end-to-end
+    title: "The read() path end to end"
+    prerequisites: [linux/syscall-path, linux/page-faults-minor-and-major, linux/the-page-cache-and-readahead, linux/block-layer-and-nvme]
+    skills: [linux, os, storage, debugging]
+  - id: linux/io-multiplexing-and-epoll
+    title: "I/O multiplexing and epoll"
+    prerequisites: [linux/vfs-and-file-descriptors, linux/signals-exit-and-reaping]
+    skills: [linux, os, networking]
+  - id: linux/io-uring-and-async-io
+    title: "io_uring and asynchronous I/O"
+    prerequisites: [linux/io-multiplexing-and-epoll, linux/block-layer-and-nvme]
+    skills: [linux, performance]
+  - id: linux/pipes-sockets-and-ipc
+    title: "Pipes, sockets and IPC"
+    prerequisites: [linux/vfs-and-file-descriptors, linux/mmap-and-shared-memory]
+    skills: [linux, os, networking]
+  - id: linux/namespaces
+    title: "Namespaces"
+    prerequisites: [linux/fork-clone-exec-and-cow, linux/vfs-and-file-descriptors, (os)]
+    skills: [linux, containers]
+  - id: linux/cgroups-v2
+    title: "cgroups v2"
+    prerequisites: [linux/the-scheduler-cfs-and-eevdf, linux/memory-accounting-reclaim-and-oom, linux/namespaces]
+    skills: [linux, containers, performance]
+  - id: linux/permissions-capabilities-and-seccomp
+    title: "Permissions, capabilities and seccomp"
+    prerequisites: [linux/vfs-and-file-descriptors, (os)]
+    skills: [linux, security, containers]
+  - id: linux/containers-from-scratch
+    title: "Containers from scratch"
+    prerequisites: [linux/namespaces, linux/cgroups-v2, linux/permissions-capabilities-and-seccomp]
+    skills: [linux, containers]
+  - id: linux/boot-and-systemd
+    title: "Boot, init and systemd"
+    prerequisites: [linux/signals-exit-and-reaping, linux/cgroups-v2, (os)]
+    skills: [linux, os]
+  - id: linux/ebpf-fundamentals
+    title: "eBPF fundamentals"
+    prerequisites: [linux/syscall-path]
+    skills: [linux, observability, security]
+  - id: linux/observability-and-triage
+    title: "Observability and triage with the USE method"
+    prerequisites: [linux/the-read-path-end-to-end, linux/ebpf-fundamentals]
+    skills: [linux, observability, debugging, performance]

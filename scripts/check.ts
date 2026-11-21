@@ -8,7 +8,7 @@ import { getTopic, listRoadmaps, listTopics, prepareCode } from "../src/lib/cont
 
 const args = process.argv.slice(2);
 const files = args.length ? args : fs.readdirSync("content", { withFileTypes: true })
-  .filter((d) => d.isDirectory() && d.name !== "glossary" && d.name !== "roadmaps")
+  .filter((d) => d.isDirectory() && !["glossary", "roadmaps", "outlines"].includes(d.name))
   .flatMap((d) => fs.readdirSync(path.join("content", d.name)).filter((f) => f.endsWith(".mdx")).map((f) => path.join("content", d.name, f)));
 
 let failed = 0;

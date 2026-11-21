@@ -1,4 +1,5 @@
-# Tracks shown on the home page, in order. A track goes live when it has at least one topic file.
+# Tracks shown on the home page, in this order. A track lists its written lessons; planned
+# lessons come from content/outlines/<track>.yaml and show as coming soon.
 - id: design-patterns
   title: Software design and design patterns
   summary: Principles, the 23 classic patterns, and when not to use them, in Go, Python, TypeScript and Rust.
@@ -6,21 +7,89 @@
   groups: [Principles, Creational, Structural, Behavioral]
 - id: go-internals
   title: Go internals
-  summary: The scheduler, the garbage collector, interfaces and maps, as the runtime sees them.
+  summary: Goroutines and the scheduler, the garbage collector, interfaces, maps and channels, as the runtime sees them.
   status: planned
 - id: linux
-  title: Linux and the OS
-  summary: Syscalls, virtual memory, the read() path, and eBPF.
+  title: Linux
+  summary: Processes, syscalls, virtual memory, the read() path, cgroups and eBPF.
   status: planned
 - id: networking
   title: Networking
-  summary: TCP from handshake to close, DNS, TLS, and HTTP in practice.
+  summary: From packets and routing to TCP, DNS, TLS and HTTP, and how to debug them.
   status: planned
 - id: distributed-systems
   title: Distributed systems
-  summary: Consensus, replication, clocks, and failure.
+  summary: Failure, clocks, replication, consensus and the trade-offs between them.
+  status: planned
+- id: concurrency
+  title: Concurrency
+  summary: Threads, locks, channels, memory models and the bugs that only show up under load.
+  status: planned
+- id: operating-systems
+  title: Operating systems
+  summary: Scheduling, memory, files and devices, from the kernel's point of view.
+  status: planned
+- id: databases
+  title: Databases
+  summary: Storage engines, indexes, transactions, isolation and query performance.
+  status: planned
+- id: system-design
+  title: System design
+  summary: Estimating load, choosing data stores, caching, queues and scaling a service.
+  status: planned
+- id: software-architecture
+  title: Software architecture
+  summary: Boundaries, layering, data ownership, services and how systems evolve.
   status: planned
 - id: kubernetes
-  title: Kubernetes
-  summary: Controllers, the API server, scheduling, and operators.
+  title: Kubernetes and cloud
+  summary: Containers, the control plane, controllers and operators, and running workloads well.
+  status: planned
+- id: performance
+  title: Performance and observability
+  summary: Measuring before tuning, profiles, tracing, metrics and eBPF.
+  status: planned
+- id: reliability
+  title: Reliability and SRE
+  summary: SLOs, error budgets, incidents, releases and resilient systems.
+  status: planned
+- id: testing
+  title: Testing
+  summary: Test design, doubles, integration tests and working with legacy code.
+  status: planned
+- id: code-craft
+  title: Code craft
+  summary: Naming, routines, error handling, refactoring and debugging, the daily habits of good code.
+  status: planned
+- id: security
+  title: Security
+  summary: Threat modelling, cryptography basics, authentication and application security.
+  status: planned
+- id: algorithms
+  title: Algorithms and data structures
+  summary: Complexity, the core structures, graphs and dynamic programming, with the intuition behind them.
+  status: planned
+- id: math-for-cs
+  title: Math for computer science
+  summary: Proofs, counting, probability, number theory and graphs, the math behind the code.
+  status: planned
+- id: computer-architecture
+  title: Computer architecture
+  summary: CPUs, caches, memory and the machine your code really runs on.
+  status: planned
+- id: compilers
+  title: Compilers
+  summary: Lexing, parsing, types, code generation and linking.
+  status: planned
+- id: python
+  title: Python in depth
+  summary: The data model, the interpreter, async and packaging.
+  status: planned
+- id: typescript
+  title: TypeScript in depth
+  summary: The type system, inference, generics and the runtime it compiles to.
+  status: planned
+- id: rust
+  title: Rust in depth
+  summary: Ownership, borrowing, traits, async and unsafe code.
   status: planned

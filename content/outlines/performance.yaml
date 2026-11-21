@@ -1,0 +1,157 @@
+# Lesson outline for the performance track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: performance/what-performance-means
+    title: "What \"fast\" means"
+    summary: "Latency, throughput and utilisation are different questions; every claim needs a time scale and a percentile."
+    prerequisites: []
+    skills: [performance , debugging]
+  - id: performance/latency-and-percentiles
+    title: "Latency, averages and percentiles"
+    summary: "Why the mean hides the pain and what p50/p99/p999 mean for a request path."
+    prerequisites: [performance/what-performance-means]
+    skills: [performance, statistics ]
+  - id: performance/queues-and-utilisation
+    title: "Queues and the utilisation cliff"
+    summary: "Waiting time explodes as a resource nears full; Little's law."
+    prerequisites: [performance/what-performance-means]
+    skills: [performance]
+  - id: performance/use-method
+    title: "The USE method"
+    summary: "For every resource check utilisation, saturation, errors, in that order of cheapness."
+    prerequisites: [performance/queues-and-utilisation]
+    skills: [performance, debugging]
+  - id: performance/investigation-methods
+    title: "Methods and anti-methods"
+    summary: "Problem statement, scientific method, drill-down, workload characterisation; and the streetlight and random-change anti-methods."
+    prerequisites: [performance/use-method]
+    skills: [debugging, performance]
+  - id: performance/scalability-laws
+    title: "Amdahl and the Universal Scalability Law"
+    summary: "Why adding workers stops helping, and why it can hurt."
+    prerequisites: [performance/queues-and-utilisation]
+    skills: [performance, concurrency]
+  - id: performance/caching-and-buffering
+    title: "Caching, buffering and hit ratios"
+    summary: "Every layer caches; hit ratio, not hit time, drives average cost."
+    prerequisites: [performance/latency-and-percentiles]
+    skills: [performance, os]
+  - id: performance/cpu-run-queue
+    title: "The CPU run queue and scheduler latency"
+    summary: "Saturation of a CPU is waiting threads, measured as scheduler latency."
+    prerequisites: [operating-systems/scheduling, performance/use-method]
+    skills: [os, performance]
+  - id: performance/load-average
+    title: "Reading load average"
+    summary: "What the three numbers include on Linux and why 40 on 8 cores may mean slow disks."
+    prerequisites: [performance/cpu-run-queue]
+    skills: [os, debugging]
+  - id: performance/cpu-stalls-and-cache
+    title: "Cycles, stalls and CPU caches"
+    summary: "A \"busy\" CPU is often waiting for memory; CPI, cache lines, locality."
+    prerequisites: [performance/cpu-run-queue]
+    skills: [os, performance]
+  - id: performance/cpu-limits-and-throttling
+    title: "CPU quotas and throttling"
+    summary: "In containers, saturation can happen at 25% machine utilisation."
+    prerequisites: [performance/cpu-run-queue, linux/cgroups]
+    skills: [os, kubernetes]
+  - id: performance/priority-and-inversion
+    title: "Priorities, nice and priority inversion"
+    summary: "How low-priority work can block high-priority work, and what inheritance fixes."
+    prerequisites: [performance/cpu-run-queue]
+    skills: [os, concurrency]
+  - id: performance/counters-tracing-profiling
+    title: "Counters, tracing and profiling"
+    summary: "Three kinds of observability data and what each costs."
+    prerequisites: [performance/use-method]
+    skills: [observability ]
+  - id: performance/sampling-and-flame-graphs
+    title: "Sampling profilers and flame graphs"
+    summary: "Sample stacks at a fixed rate, merge them, read the width."
+    prerequisites: [performance/counters-tracing-profiling]
+    skills: [observability, debugging]
+  - id: performance/thread-state-analysis
+    title: "Thread state analysis"
+    summary: "Where did each thread spend its time: running, runnable, blocked, sleeping."
+    prerequisites: [performance/counters-tracing-profiling, performance/cpu-run-queue]
+    skills: [observability, concurrency]
+  - id: performance/syscall-analysis
+    title: "Syscall analysis"
+    summary: "Counting and timing the application/kernel boundary."
+    prerequisites: [linux/syscalls, performance/counters-tracing-profiling]
+    skills: [os, debugging]
+  - id: performance/observer-effect
+    title: "The observer effect and tool overhead"
+    summary: "Measuring changes the measurement; picking the cheapest tool that answers."
+    prerequisites: [performance/counters-tracing-profiling]
+    skills: [observability]
+  - id: performance/memory-pressure
+    title: "Memory pressure, paging and the OOM killer"
+    summary: "Available vs free, major faults, swap, cgroup OOM."
+    prerequisites: [linux/virtual-memory, performance/use-method]
+    skills: [os, debugging]
+  - id: performance/disk-io-latency
+    title: "Disk and file system latency"
+    summary: "Why await and queue depth, not throughput, expose a slow disk."
+    prerequisites: [linux/read-path, performance/use-method]
+    skills: [os, performance]
+  - id: performance/benchmarking-pitfalls
+    title: "Micro-benchmarks and load tests"
+    summary: "Benchmarks lie by omission: warm-up, coordinated omission, the wrong bottleneck."
+    prerequisites: [performance/latency-and-percentiles, performance/investigation-methods]
+    skills: [performance, testing]
+  - id: performance/ebpf-what-and-why
+    title: "eBPF: programs at kernel hooks"
+    summary: "What eBPF is, the lineage from packet filters, and why it beats modules and counters."
+    prerequisites: [linux/syscalls, performance/counters-tracing-profiling]
+    skills: [ebpf , os]
+  - id: performance/ebpf-program-lifecycle
+    title: "From source to a running eBPF program"
+    summary: "Write, compile, load via bpf(), verify, JIT, attach."
+    prerequisites: [performance/ebpf-what-and-why]
+    skills: [ebpf, os]
+  - id: performance/ebpf-verifier
+    title: "The verifier: proof before execution"
+    summary: "Register type tracking, bounds checks, loops, helper rules, reading the log."
+    prerequisites: [performance/ebpf-program-lifecycle]
+    skills: [ebpf]
+  - id: performance/ebpf-hooks
+    title: "Hooks and program types"
+    summary: "kprobe, fentry, tracepoint, uprobe, XDP, TC, cgroup, LSM; context and return codes."
+    prerequisites: [performance/ebpf-program-lifecycle]
+    skills: [ebpf, networking]
+  - id: performance/ebpf-maps-and-buffers
+    title: "Maps, perf buffers and ring buffers"
+    summary: "Getting data out of the kernel without drowning in events."
+    prerequisites: [performance/ebpf-program-lifecycle]
+    skills: [ebpf]
+  - id: performance/ebpf-co-re-btf
+    title: "CO-RE and BTF: one binary, many kernels"
+    summary: "Why offsets move and how relocation fixes them at load time."
+    prerequisites: [performance/ebpf-program-lifecycle]
+    skills: [ebpf]
+  - id: performance/bpftrace-and-bcc-recipes
+    title: "bpftrace and the classic tools"
+    summary: "One-liners and the named tools: opensnoop, runqlat, biolatency, tcpretrans."
+    prerequisites: [performance/ebpf-hooks, performance/ebpf-maps-and-buffers]
+    skills: [ebpf, debugging]
+  - id: performance/ebpf-networking
+    title: "eBPF for packets: XDP and TC"
+    summary: "Drop, pass, redirect; why Cilium and Katran can bypass iptables."
+    prerequisites: [performance/ebpf-hooks, networking/packet-path-on-a-host]
+    skills: [ebpf, networking]
+  - id: performance/ebpf-security
+    title: "eBPF for security: seccomp-bpf and LSM"
+    summary: "Policy plus context; observe versus enforce."
+    prerequisites: [performance/ebpf-hooks]
+    skills: [ebpf, security ]
+  - id: performance/ebpf-in-kubernetes
+    title: "eBPF on a Kubernetes node"
+    summary: "Cgroup-id attribution, DaemonSet agents, kube-proxy replacement."
+    prerequisites: [performance/ebpf-hooks, performance/ebpf-maps-and-buffers, kubernetes/node-agents]
+    skills: [ebpf, kubernetes]
+  - id: performance/writing-ebpf-in-go-and-rust
+    title: "Writing eBPF: C, Go, Rust, Python"
+    summary: "Kernel half versus user half; why Go cannot be the kernel half."
+    prerequisites: [performance/ebpf-program-lifecycle, performance/ebpf-co-re-btf]
+    skills: [ebpf, go-runtime]

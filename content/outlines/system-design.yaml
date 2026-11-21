@@ -1,0 +1,90 @@
+# Lesson outline for the system-design track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: system-design/back-of-envelope-estimation
+    title: "Back-of-envelope estimation"
+    prerequisites: []
+    skills: [capacity-estimation, system-design]
+  - id: system-design/framing-a-design
+    title: "Framing a design: requirements, trade-offs, a first sketch"
+    prerequisites: [system-design/back-of-envelope-estimation]
+    skills: [system-design]
+  - id: system-design/scale-from-zero
+    title: "From one server to millions of users"
+    prerequisites: [system-design/back-of-envelope-estimation]
+    skills: [scalability, system-design]
+  - id: system-design/caching-strategies
+    title: "Caching: where, how, and how it goes stale"
+    prerequisites: [system-design/scale-from-zero]
+    skills: [caching, scalability]
+  - id: system-design/replication-and-sharding
+    title: "Replication and sharding"
+    prerequisites: [system-design/scale-from-zero]
+    skills: [databases, scalability, distributed-systems]
+  - id: system-design/rate-limiter-algorithms
+    title: "Rate limiter algorithms"
+    prerequisites: [system-design/scale-from-zero]
+    skills: [scalability, resilience]
+  - id: system-design/consistent-hashing
+    title: "Consistent hashing"
+    prerequisites: [system-design/replication-and-sharding]
+    skills: [distributed-systems, scalability]
+  - id: system-design/replicated-kv-quorums
+    title: "A replicated key-value store: CAP and quorums"
+    prerequisites: [system-design/replication-and-sharding, system-design/consistent-hashing]
+    skills: [distributed-systems, databases]
+  - id: system-design/lsm-storage-engine
+    title: "Inside a key-value store node: write path and read path"
+    prerequisites: [system-design/replicated-kv-quorums]
+    skills: [databases, os]
+  - id: system-design/unique-ids
+    title: "Unique IDs without a central counter"
+    prerequisites: [system-design/replication-and-sharding]
+    skills: [distributed-systems]
+  - id: system-design/url-shortener
+    title: "A URL shortener"
+    prerequisites: [system-design/caching-strategies, system-design/unique-ids]
+    skills: [system-design, databases]
+  - id: system-design/web-crawler
+    title: "A web crawler"
+    prerequisites: [system-design/scale-from-zero, system-design/rate-limiter-algorithms]
+    skills: [system-design, networking]
+  - id: system-design/notification-pipeline
+    title: "A notification pipeline"
+    prerequisites: [system-design/scale-from-zero, system-design/rate-limiter-algorithms]
+    skills: [messaging, system-design]
+  - id: system-design/news-feed-fanout
+    title: "News feed: fan-out on write or on read"
+    prerequisites: [system-design/caching-strategies, system-design/replication-and-sharding]
+    skills: [system-design, caching]
+  - id: system-design/chat-and-presence
+    title: "Chat: persistent connections, ordering and presence"
+    prerequisites: [system-design/replication-and-sharding, system-design/unique-ids]
+    skills: [networking, system-design]
+  - id: system-design/autocomplete-trie
+    title: "Search autocomplete with a trie"
+    prerequisites: [system-design/caching-strategies]
+    skills: [system-design, design]
+  - id: system-design/blob-pipelines
+    title: "Video and file pipelines: chunks, queues, resumable work"
+    prerequisites: [system-design/notification-pipeline]
+    skills: [messaging, system-design]
+  - id: system-design/microservice-boundaries
+    title: "Where to cut a service boundary"
+    prerequisites: []
+    skills: [microservices, design]
+  - id: system-design/splitting-the-monolith
+    title: "Splitting a monolith without stopping the business"
+    prerequisites: [system-design/microservice-boundaries]
+    skills: [microservices, databases]
+  - id: system-design/service-communication
+    title: "Synchronous calls, events and shared data"
+    prerequisites: [system-design/microservice-boundaries]
+    skills: [microservices, messaging]
+  - id: system-design/sagas
+    title: "Sagas: a business transaction across services"
+    prerequisites: [system-design/service-communication]
+    skills: [microservices, distributed-systems]
+  - id: system-design/resilience-patterns
+    title: "Timeouts, retries, bulkheads and circuit breakers"
+    prerequisites: [system-design/service-communication]
+    skills: [resilience, microservices]

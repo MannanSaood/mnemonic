@@ -1,0 +1,167 @@
+# Lesson outline for the algorithms track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: algorithms/complexity-and-growth
+    title: "Counting work: big-O and growth rates"
+    summary: "Describe cost as a function of input size and know which growth rates are fine at which scale."
+    prerequisites: []
+    skills: [complexity]
+  - id: algorithms/cost-models-and-memory-hierarchy
+    title: "When the model lies"
+    summary: "Big-O hides constants, caches and I/O; reason about both the model and the machine."
+    prerequisites: [algorithms/complexity-and-growth]
+    skills: [complexity, os]
+  - id: algorithms/divide-and-conquer-and-recurrences
+    title: "Split, solve, merge"
+    summary: "Turn a recursive design into a recurrence and read off its cost."
+    prerequisites: [algorithms/complexity-and-growth, math-for-cs/divide-and-conquer-recurrences]
+    skills: [complexity, algorithm-design]
+  - id: algorithms/arrays-and-linked-lists
+    title: "Contiguous versus linked"
+    summary: "Why arrays usually beat lists in practice, and what each makes cheap."
+    prerequisites: [algorithms/complexity-and-growth]
+    skills: [data-structures]
+  - id: algorithms/amortized-analysis
+    title: "Cheap on average, guaranteed"
+    summary: "Why a doubling buffer or a counter is O(1) per operation although single operations can be slow."
+    prerequisites: [algorithms/complexity-and-growth, algorithms/arrays-and-linked-lists]
+    skills: [complexity, data-structures]
+  - id: algorithms/stacks-queues-and-ring-buffers
+    title: "Order of service"
+    summary: "LIFO, FIFO, deques and bounded ring buffers as pipeline parts."
+    prerequisites: [algorithms/arrays-and-linked-lists]
+    skills: [data-structures]
+  - id: algorithms/hash-tables
+    title: "Hash tables"
+    summary: "Chaining, open addressing, load factor, resizing; what O(1) actually means."
+    prerequisites: [algorithms/arrays-and-linked-lists, algorithms/amortized-analysis]
+    skills: [hashing, data-structures]
+  - id: algorithms/universal-hashing-and-adversarial-keys
+    title: "Hashing under attack"
+    summary: "Why a fixed hash can be forced to O(n) lookups, and how randomization defends."
+    prerequisites: [algorithms/hash-tables, math-for-cs/random-variables-and-expectation]
+    skills: [hashing]
+  - id: algorithms/bloom-filters-and-sketches
+    title: "Approximate membership and counts"
+    summary: "Trade exactness for tiny memory: Bloom filters, count-min sketch, HyperLogLog."
+    prerequisites: [algorithms/hash-tables, math-for-cs/birthday-principle-and-collisions]
+    skills: [hashing]
+  - id: algorithms/sorting-fundamentals
+    title: "Sorting"
+    summary: "Insertion, merge, heap, quick sort: costs, stability, the n log n floor."
+    prerequisites: [algorithms/divide-and-conquer-and-recurrences]
+    skills: [algorithm-design]
+  - id: algorithms/linear-time-sorting-and-selection
+    title: "Beating n log n, and picking the k-th"
+    summary: "Counting, radix and bucket sort; quickselect and median of medians."
+    prerequisites: [algorithms/sorting-fundamentals]
+    skills: [algorithm-design]
+  - id: algorithms/binary-search
+    title: "Binary search and bisecting answers"
+    summary: "Search sorted data and search over answers, with an invariant you can trust."
+    prerequisites: [algorithms/divide-and-conquer-and-recurrences]
+    skills: [algorithm-design]
+  - id: algorithms/heaps-and-priority-queues
+    title: "Heaps"
+    summary: "The structure behind schedulers, top-k and Dijkstra."
+    prerequisites: [algorithms/arrays-and-linked-lists, algorithms/binary-search]
+    skills: [data-structures]
+  - id: algorithms/balanced-search-trees
+    title: "Ordered maps"
+    summary: "BSTs, why balance matters, red-black and treap ideas."
+    prerequisites: [algorithms/binary-search, algorithms/heaps-and-priority-queues]
+    skills: [data-structures]
+  - id: algorithms/b-trees-and-database-indexes
+    title: "B-trees and storage indexes"
+    summary: "Wide nodes for block storage; how a database index works."
+    prerequisites: [algorithms/balanced-search-trees, algorithms/cost-models-and-memory-hierarchy]
+    skills: [data-structures, os]
+  - id: algorithms/augmented-trees-and-interval-queries
+    title: "Trees that answer more questions"
+    summary: "Store extra info per node to get ranks and interval overlap."
+    prerequisites: [algorithms/balanced-search-trees]
+    skills: [data-structures]
+  - id: algorithms/graph-representations-and-bfs
+    title: "Graphs and breadth-first search"
+    summary: "Adjacency lists versus matrices; BFS; fewest hops."
+    prerequisites: [algorithms/stacks-queues-and-ring-buffers]
+    skills: [graphs]
+  - id: algorithms/dfs-and-topological-sort
+    title: "Depth-first search and dependency order"
+    summary: "DFS, edge types, cycles, topological order, strongly connected components."
+    prerequisites: [algorithms/graph-representations-and-bfs]
+    skills: [graphs]
+  - id: algorithms/union-find
+    title: "Disjoint sets"
+    summary: "Merge groups and ask \"same group?\" in near-constant time."
+    prerequisites: [algorithms/arrays-and-linked-lists, algorithms/amortized-analysis]
+    skills: [graphs, data-structures]
+  - id: algorithms/minimum-spanning-trees
+    title: "Cheapest connected network"
+    summary: "Kruskal and Prim; the cut property."
+    prerequisites: [algorithms/heaps-and-priority-queues, algorithms/union-find]
+    skills: [graphs]
+  - id: algorithms/shortest-paths
+    title: "Shortest paths"
+    summary: "Dijkstra, Bellman-Ford, DAG relaxation, the A* idea, all-pairs briefly."
+    prerequisites: [algorithms/heaps-and-priority-queues, algorithms/graph-representations-and-bfs, algorithms/dfs-and-topological-sort]
+    skills: [graphs]
+  - id: algorithms/max-flow-and-matching
+    title: "Flow and matching"
+    summary: "Augmenting paths, min-cut, bipartite assignment."
+    prerequisites: [algorithms/graph-representations-and-bfs, algorithms/shortest-paths]
+    skills: [graphs]
+  - id: algorithms/greedy-algorithms
+    title: "Greedy choices"
+    summary: "When the locally best step is provably optimal, and when it is not."
+    prerequisites: [algorithms/sorting-fundamentals, algorithms/heaps-and-priority-queues]
+    skills: [algorithm-design]
+  - id: algorithms/dynamic-programming-foundations
+    title: "Dynamic programming"
+    summary: "Overlapping subproblems, memoization versus tables, design the recurrence first."
+    prerequisites: [algorithms/divide-and-conquer-and-recurrences]
+    skills: [dynamic-programming]
+  - id: algorithms/dp-on-sequences
+    title: "DP on strings and sequences"
+    summary: "Edit distance, longest common subsequence, longest increasing subsequence."
+    prerequisites: [algorithms/dynamic-programming-foundations]
+    skills: [dynamic-programming]
+  - id: algorithms/knapsack-and-pseudo-polynomial-time
+    title: "Knapsack and pseudo-polynomial time"
+    summary: "Partition, subset sum, knapsack; fast in the numbers but not polynomial in the input size."
+    prerequisites: [algorithms/dynamic-programming-foundations]
+    skills: [dynamic-programming, intractability]
+  - id: algorithms/backtracking-and-pruning
+    title: "Backtracking and search"
+    summary: "Systematic enumeration, pruning, constraint solving."
+    prerequisites: [algorithms/dfs-and-topological-sort]
+    skills: [algorithm-design]
+  - id: algorithms/string-matching-and-tries
+    title: "Searching text"
+    summary: "Rabin-Karp, KMP, tries, suffix structures."
+    prerequisites: [algorithms/hash-tables]
+    skills: [data-structures]
+  - id: algorithms/randomized-algorithms
+    title: "Using coin flips on purpose"
+    summary: "Random pivots, sampling, reservoir sampling; expected versus worst case."
+    prerequisites: [algorithms/sorting-fundamentals, math-for-cs/random-variables-and-expectation]
+    skills: [algorithm-design]
+  - id: algorithms/parallel-algorithms-work-and-span
+    title: "Parallel speedup"
+    summary: "Work, span, and what limits speedup."
+    prerequisites: [algorithms/divide-and-conquer-and-recurrences, algorithms/sorting-fundamentals]
+    skills: [concurrency, complexity]
+  - id: algorithms/np-completeness-and-reductions
+    title: "Hard problems and reductions"
+    summary: "Recognise intractable problems; prove hardness by reduction."
+    prerequisites: [algorithms/shortest-paths, algorithms/max-flow-and-matching, algorithms/knapsack-and-pseudo-polynomial-time]
+    skills: [intractability]
+  - id: algorithms/approximation-and-heuristics
+    title: "Living with hard problems"
+    summary: "Approximation guarantees, local search, annealing, exact solvers."
+    prerequisites: [algorithms/np-completeness-and-reductions, algorithms/backtracking-and-pruning]
+    skills: [intractability, algorithm-design]
+  - id: algorithms/modeling-and-design-method
+    title: "Choosing the algorithm"
+    summary: "A question list that turns a messy requirement into a known problem."
+    prerequisites: [algorithms/graph-representations-and-bfs, algorithms/dynamic-programming-foundations, algorithms/np-completeness-and-reductions]
+    skills: [algorithm-design]

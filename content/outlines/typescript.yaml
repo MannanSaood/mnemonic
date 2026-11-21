@@ -1,0 +1,102 @@
+# Lesson outline for the typescript track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: typescript/ts-and-js
+    title: "TypeScript is JavaScript plus erasable types"
+    prerequisites: []
+    skills: [typescript, types]
+  - id: typescript/types-as-sets
+    title: "Types are sets of values"
+    prerequisites: []
+    skills: [types]
+  - id: typescript/structural-typing
+    title: "Structural typing and excess property checks"
+    prerequisites: []
+    skills: [types, design]
+  - id: typescript/inference-and-widening
+    title: "How a variable gets its type"
+    prerequisites: []
+    skills: [types]
+  - id: typescript/narrowing
+    title: "Control-flow narrowing"
+    prerequisites: []
+    skills: [types]
+  - id: typescript/any-unknown-assertions
+    title: "any, unknown and assertions"
+    prerequisites: []
+    skills: [types, debugging]
+  - id: typescript/valid-states-design
+    title: "Make illegal states unrepresentable"
+    prerequisites: []
+    skills: [design, types]
+  - id: typescript/discriminated-unions
+    title: "Tagged unions and exhaustiveness"
+    prerequisites: []
+    skills: [design, types]
+  - id: typescript/functions
+    title: "Function types, overloads, this"
+    prerequisites: []
+    skills: [typescript]
+  - id: typescript/generics
+    title: "Generics as functions between types"
+    prerequisites: []
+    skills: [types]
+  - id: typescript/mapped-types
+    title: "keyof, indexed access, mapped and utility types"
+    prerequisites: []
+    skills: [types]
+  - id: typescript/conditional-types
+    title: "Conditional types, infer, distribution"
+    prerequisites: []
+    skills: [types]
+  - id: typescript/template-literal-types
+    title: "Template literal types and DSLs"
+    prerequisites: []
+    skills: [types, design]
+  - id: typescript/variance-and-assignability
+    title: "Subtypes, variance, soundness traps"
+    prerequisites: []
+    skills: [types]
+  - id: typescript/classes-and-mixins
+    title: "Classes, interfaces, mixins"
+    prerequisites: []
+    skills: [design, typescript]
+  - id: typescript/brands-nominal-typing
+    title: "Brands for nominal typing"
+    prerequisites: []
+    skills: [design, types]
+  - id: typescript/readonly-and-immutability
+    title: "readonly, as const, satisfies"
+    prerequisites: []
+    skills: [design, types]
+  - id: typescript/index-signatures-and-records
+    title: "Index signatures, Record and Map"
+    prerequisites: []
+    skills: [types]
+  - id: typescript/error-handling
+    title: "Exceptions, null and Result types"
+    prerequisites: []
+    skills: [design, typescript]
+  - id: typescript/async-and-promises
+    title: "Promises, async/await and workers"
+    prerequisites: []
+    skills: [async, concurrency]
+  - id: typescript/modules-and-declarations
+    title: "Modules, .d.ts and @types"
+    prerequisites: []
+    skills: [tooling]
+  - id: typescript/runtime-validation
+    title: "Types vanish: validate at the boundary"
+    prerequisites: []
+    skills: [types, design]
+  - id: typescript/testing-types-and-code
+    title: "Testing types and code"
+    prerequisites: []
+    skills: [testing]
+  - id: typescript/tooling-and-tsconfig
+    title: "tsconfig, strict mode, build and speed"
+    prerequisites: []
+    skills: [tooling]
+  - id: typescript/migration
+    title: "Migrating JavaScript to TypeScript"
+    prerequisites: []
+    skills: [tooling]

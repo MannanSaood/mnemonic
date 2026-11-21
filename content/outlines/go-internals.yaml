@@ -1,0 +1,142 @@
+# Lesson outline for the go-internals track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: go-internals/goroutine-basics
+    title: "What a goroutine is"
+    summary: "A function plus a small growable stack, scheduled by the runtime, not the kernel."
+    prerequisites: []
+    skills: [concurrency, go-runtime]
+  - id: go-internals/stack-growth
+    title: "Goroutine stacks that grow"
+    summary: "How a 2 KB stack becomes bigger by copying, and why stack pointers are special."
+    prerequisites: []
+    skills: [go-runtime, memory-management]
+  - id: go-internals/gmp-scheduler
+    title: "G, M and P"
+    summary: "Goroutines, OS threads and processors, run queues, GOMAXPROCS."
+    prerequisites: []
+    skills: [concurrency, go-runtime]
+  - id: go-internals/work-stealing
+    title: "Work stealing and run queues"
+    summary: "Local queues, global queue, stealing half, why there is no central lock."
+    prerequisites: [concurrency/work-stealing-schedulers]
+    skills: [concurrency, go-runtime]
+  - id: go-internals/blocking-and-handoff
+    title: "When a goroutine blocks"
+    summary: "Park vs syscall vs network I/O, the netpoller, sysmon and the P handoff."
+    prerequisites: []
+    skills: [go-runtime, os, concurrency]
+  - id: go-internals/preemption
+    title: "Preemption"
+    summary: "Cooperative checks at calls, then signal-based async preemption since 1.14."
+    prerequisites: []
+    skills: [go-runtime]
+  - id: go-internals/channels-hchan
+    title: "Inside a channel"
+    summary: "The hchan struct, buffer, wait queues, direct handoff, close."
+    prerequisites: []
+    skills: [concurrency, go-runtime]
+  - id: go-internals/select
+    title: "Inside select"
+    summary: "Random choice, lock ordering, nil channels, default, timeouts."
+    prerequisites: []
+    skills: [concurrency, go-runtime]
+  - id: go-internals/channel-patterns
+    title: "Pipelines, fan-out and ownership"
+    summary: "Pipelines, fan-out/fan-in, or-done, confinement, who closes."
+    prerequisites: []
+    skills: [concurrency]
+  - id: go-internals/context-cancellation
+    title: "Context and cancellation"
+    summary: "Cancellation tree, deadlines, values, why cancel never kills a goroutine."
+    prerequisites: []
+    skills: [concurrency, go-language]
+  - id: go-internals/goroutine-leaks
+    title: "Goroutine leaks"
+    summary: "How goroutines get stuck forever and how to find them."
+    prerequisites: []
+    skills: [concurrency, debugging]
+  - id: go-internals/mutex-internals
+    title: "Mutex and RWMutex"
+    summary: "Fast path, spinning, parking, starvation mode, writer preference."
+    prerequisites: [concurrency/mutual-exclusion]
+    skills: [concurrency, go-runtime]
+  - id: go-internals/waitgroup-once-pool
+    title: "WaitGroup, Once, Cond, Pool, errgroup"
+    summary: "The small sync tools and each one's sharp edge."
+    prerequisites: []
+    skills: [concurrency]
+  - id: go-internals/atomics
+    title: "sync/atomic"
+    summary: "Atomic operations, typed atomics, atomic.Value, when to prefer them."
+    prerequisites: [concurrency/cas-and-consensus]
+    skills: [concurrency, memory-model]
+  - id: go-internals/memory-model
+    title: "The Go memory model"
+    summary: "Happens-before edges Go gives you, and what a race really means."
+    prerequisites: [concurrency/memory-models]
+    skills: [memory-model, concurrency]
+  - id: go-internals/race-detector
+    title: "The race detector"
+    summary: "Vector clocks, cost, limits, reading a report."
+    prerequisites: []
+    skills: [debugging, testing, concurrency]
+  - id: go-internals/escape-analysis
+    title: "Stack or heap"
+    summary: "Escape analysis, what makes values escape, reading -gcflags=-m."
+    prerequisites: []
+    skills: [memory-management, performance]
+  - id: go-internals/allocator
+    title: "The allocator"
+    summary: "Size classes, spans, per-P caches, tiny allocator."
+    prerequisites: []
+    skills: [memory-management, go-runtime]
+  - id: go-internals/gc-tricolor
+    title: "Garbage collection"
+    summary: "Concurrent tri-colour mark-sweep, write barrier, assists, pauses."
+    prerequisites: []
+    skills: [memory-management, go-runtime]
+  - id: go-internals/gc-tuning
+    title: "Tuning the GC"
+    summary: "GOGC, GOMEMLIMIT, containers, profiling allocations, sync.Pool."
+    prerequisites: []
+    skills: [memory-management, performance]
+  - id: go-internals/interfaces
+    title: "Interface values"
+    summary: "eface, iface, itab, dynamic dispatch, the typed-nil trap."
+    prerequisites: []
+    skills: [go-language, go-runtime]
+  - id: go-internals/slices
+    title: "Slices underneath"
+    summary: "Header, append growth, aliasing, full slice expressions."
+    prerequisites: []
+    skills: [go-language, memory-management]
+  - id: go-internals/maps
+    title: "Maps underneath"
+    summary: "Hash table layout, growth, random order, concurrent-write detection, Swiss tables."
+    prerequisites: []
+    skills: [go-language, go-runtime]
+  - id: go-internals/strings-and-utf8
+    title: "Strings, bytes and runes"
+    summary: "Immutable byte sequences, conversions that copy, range semantics."
+    prerequisites: []
+    skills: [go-language]
+  - id: go-internals/generics
+    title: "Generics and GC shapes"
+    summary: "Type parameters, constraints, shape stenciling and dictionaries."
+    prerequisites: []
+    skills: [go-language, go-runtime]
+  - id: go-internals/defer-panic-recover
+    title: "Defer, panic and recover"
+    summary: "Defer stack, open-coded defers, panics across goroutines, recover rules."
+    prerequisites: []
+    skills: [go-language, go-runtime]
+  - id: go-internals/profiling
+    title: "Profiling a Go service"
+    summary: "CPU, heap, goroutine, mutex, block profiles and execution traces."
+    prerequisites: []
+    skills: [performance, debugging]
+  - id: go-internals/cgo-and-unsafe
+    title: "cgo and unsafe"
+    summary: "What crossing into C costs, what unsafe.Pointer promises, pinning."
+    prerequisites: []
+    skills: [go-runtime, os]

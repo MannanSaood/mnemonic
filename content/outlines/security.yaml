@@ -1,0 +1,102 @@
+# Lesson outline for the security track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: security/security-mindset-and-threat-models
+    title: "Thinking like a defender: assets, adversaries, boundaries"
+    prerequisites: []
+    skills: [security, threat-modelling]
+  - id: security/randomness-and-entropy
+    title: "Randomness you can bet a key on"
+    prerequisites: [security/security-mindset-and-threat-models]
+    skills: [security, cryptography]
+  - id: security/hash-functions
+    title: "Hash functions and what \"broken\" means"
+    prerequisites: [security/security-mindset-and-threat-models]
+    skills: [cryptography]
+  - id: security/password-storage
+    title: "Storing passwords so a leak is survivable"
+    prerequisites: [security/hash-functions]
+    skills: [security, cryptography]
+  - id: security/block-ciphers-and-modes
+    title: "Block ciphers, AES, and why modes matter"
+    prerequisites: [security/randomness-and-entropy]
+    skills: [cryptography]
+  - id: security/authenticated-encryption
+    title: "MACs and authenticated encryption"
+    prerequisites: [security/hash-functions, security/block-ciphers-and-modes]
+    skills: [cryptography]
+  - id: security/hash-mac-signature-compared
+    title: "Hash vs MAC vs signature"
+    prerequisites: [security/hash-functions, security/authenticated-encryption]
+    skills: [cryptography]
+  - id: security/diffie-hellman-key-exchange
+    title: "Agreeing on a key in public"
+    prerequisites: [security/randomness-and-entropy, security/hash-mac-signature-compared]
+    skills: [cryptography, networking]
+  - id: security/rsa-and-padding
+    title: "RSA, malleability and padding"
+    prerequisites: [security/diffie-hellman-key-exchange]
+    skills: [cryptography]
+  - id: security/elliptic-curves-and-signatures
+    title: "Elliptic curves and modern signatures"
+    prerequisites: [security/diffie-hellman-key-exchange, security/rsa-and-padding]
+    skills: [cryptography]
+  - id: security/tls-handshake
+    title: "The TLS 1.3 handshake, step by step"
+    prerequisites: [security/authenticated-encryption, security/diffie-hellman-key-exchange, security/elliptic-curves-and-signatures]
+    skills: [networking, cryptography]
+  - id: security/authentication-protocols
+    title: "Challenge-response, replay and reflection"
+    prerequisites: [security/hash-mac-signature-compared]
+    skills: [security, networking]
+  - id: security/access-control
+    title: "Access control: ACLs, capabilities, least privilege"
+    prerequisites: [security/security-mindset-and-threat-models]
+    skills: [security, os]
+  - id: security/sessions-and-cookies
+    title: "Sessions, tokens and cookies"
+    prerequisites: [security/randomness-and-entropy, security/access-control]
+    skills: [appsec, networking]
+  - id: security/csrf-and-same-origin
+    title: "Cross-site request forgery and the same-origin idea"
+    prerequisites: [security/sessions-and-cookies]
+    skills: [appsec]
+  - id: security/injection-and-parameterised-queries
+    title: "Injection and parameterised queries"
+    prerequisites: [security/security-mindset-and-threat-models]
+    skills: [appsec]
+  - id: security/xss-and-output-encoding
+    title: "Cross-site scripting and output encoding"
+    prerequisites: [security/injection-and-parameterised-queries]
+    skills: [appsec]
+  - id: security/broken-access-control-web
+    title: "Broken access control in web apps"
+    prerequisites: [security/access-control, security/sessions-and-cookies]
+    skills: [appsec]
+  - id: security/input-validation-and-canonicalisation
+    title: "Validating input without fooling yourself"
+    prerequisites: [security/injection-and-parameterised-queries, security/xss-and-output-encoding]
+    skills: [appsec]
+  - id: security/brute-force-and-audit-logging
+    title: "Brute force, enumeration and audit logs"
+    prerequisites: [security/password-storage, security/sessions-and-cookies]
+    skills: [appsec]
+  - id: security/memory-safety-and-mitigations
+    title: "Memory safety and exploit mitigations"
+    prerequisites: [security/security-mindset-and-threat-models]
+    skills: [security, os]
+  - id: security/side-channels-and-constant-time
+    title: "Side channels and constant-time code"
+    prerequisites: [security/block-ciphers-and-modes, security/memory-safety-and-mitigations]
+    skills: [security, cryptography]
+  - id: security/secrets-and-key-management
+    title: "Secrets and key management"
+    prerequisites: [security/authenticated-encryption, security/tls-handshake]
+    skills: [security, cryptography]
+  - id: security/post-quantum-cryptography
+    title: "After Shor: post-quantum cryptography"
+    prerequisites: [security/rsa-and-padding, security/elliptic-curves-and-signatures]
+    skills: [cryptography]
+  - id: security/secure-development-lifecycle
+    title: "Secure development: risk, review, disclosure"
+    prerequisites: [security/security-mindset-and-threat-models]
+    skills: [security, design, testing]

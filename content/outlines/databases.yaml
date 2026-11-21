@@ -1,0 +1,132 @@
+# Lesson outline for the databases track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: databases/what-a-database-does
+    title: "What a database does for you"
+    summary: "Layers of an engine and what each promises"
+    prerequisites: []
+    skills: [databases]
+  - id: databases/relational-model-and-keys
+    title: "Tables, keys and constraints"
+    summary: "Relations, primary/foreign keys, integrity as a contract"
+    prerequisites: [databases/what-a-database-does]
+    skills: [databases, sql, data-modeling]
+  - id: databases/select-joins-aggregates
+    title: "SELECT, joins and GROUP BY"
+    summary: "Reading a query as filter, combine, collapse"
+    prerequisites: [databases/relational-model-and-keys]
+    skills: [sql]
+  - id: databases/null-and-three-valued-logic
+    title: "NULL is not a value"
+    summary: "Three-valued logic and the bugs it causes"
+    prerequisites: [databases/select-joins-aggregates]
+    skills: [sql]
+  - id: databases/window-functions-and-ctes
+    title: "Window functions and CTEs"
+    summary: "Per-row context without collapsing rows; recursion"
+    prerequisites: [databases/select-joins-aggregates]
+    skills: [sql]
+  - id: databases/normalization-and-schema-design
+    title: "Normalisation and schema design"
+    summary: "Functional dependencies, anomalies, when to denormalise"
+    prerequisites: [databases/relational-model-and-keys]
+    skills: [data-modeling]
+  - id: databases/document-vs-relational
+    title: "Relational, document and graph models"
+    summary: "Where each shape wins; schema-on-read vs write"
+    prerequisites: [databases/normalization-and-schema-design]
+    skills: [data-modeling]
+  - id: databases/pages-and-slotted-layout
+    title: "Pages and the slotted layout"
+    summary: "How rows live in fixed-size blocks"
+    prerequisites: [databases/what-a-database-does]
+    skills: [storage-engines, os]
+  - id: databases/buffer-pool
+    title: "The buffer pool"
+    summary: "Caching pages, dirty pages, eviction"
+    prerequisites: [databases/pages-and-slotted-layout]
+    skills: [storage-engines, os]
+  - id: databases/b-tree-lookup-and-splits
+    title: "B+-trees: lookup and splits"
+    summary: "Search, insert, split, merge"
+    prerequisites: [databases/pages-and-slotted-layout]
+    skills: [indexing, storage-engines]
+  - id: databases/b-tree-practicalities
+    title: "B-trees in the real world"
+    summary: "Fill factor, appends, bloat, latches"
+    prerequisites: [databases/b-tree-lookup-and-splits, databases/buffer-pool]
+    skills: [indexing, concurrency]
+  - id: databases/index-design-and-where-clause
+    title: "Designing indexes for WHERE"
+    summary: "Column order, ranges, functions, LIKE"
+    prerequisites: [databases/b-tree-lookup-and-splits, databases/select-joins-aggregates]
+    skills: [indexing, query-performance]
+  - id: databases/covering-and-partial-indexes
+    title: "Covering and partial indexes"
+    summary: "Index-only scans, filtered indexes, cost of writes"
+    prerequisites: [databases/index-design-and-where-clause]
+    skills: [indexing, query-performance]
+  - id: databases/row-vs-column-storage
+    title: "Row versus column storage"
+    summary: "OLTP vs analytics layouts"
+    prerequisites: [databases/pages-and-slotted-layout]
+    skills: [storage-engines]
+  - id: databases/lsm-trees
+    title: "LSM trees"
+    summary: "Memtable, WAL, SSTables, reads across levels"
+    prerequisites: [databases/b-tree-lookup-and-splits]
+    skills: [storage-engines]
+  - id: databases/compaction-and-amplification
+    title: "Compaction and the RUM trade-off"
+    summary: "Leveled vs size-tiered, three amplifications"
+    prerequisites: [databases/lsm-trees]
+    skills: [storage-engines]
+  - id: databases/query-operators-and-joins
+    title: "Operators and join algorithms"
+    summary: "Scan, sort, nested-loop, merge, hash join"
+    prerequisites: [databases/select-joins-aggregates, databases/b-tree-lookup-and-splits]
+    skills: [query-performance]
+  - id: databases/optimizer-and-statistics
+    title: "The optimiser and statistics"
+    summary: "Cardinality estimates, join order, why plans go wrong"
+    prerequisites: [databases/query-operators-and-joins]
+    skills: [query-performance]
+  - id: databases/explain-plans-and-pagination
+    title: "Reading plans, bind parameters, paging"
+    summary: "Plans as evidence; keyset vs OFFSET"
+    prerequisites: [databases/optimizer-and-statistics, databases/index-design-and-where-clause]
+    skills: [query-performance]
+  - id: databases/transactions-and-acid
+    title: "Transactions and ACID"
+    summary: "What each letter really promises"
+    prerequisites: [databases/what-a-database-does]
+    skills: [transactions]
+  - id: databases/isolation-levels-and-anomalies
+    title: "Isolation levels and anomalies"
+    summary: "Dirty read to write skew"
+    prerequisites: [databases/transactions-and-acid]
+    skills: [transactions]
+  - id: databases/locking-and-deadlocks
+    title: "Locks, 2PL and deadlocks"
+    summary: "Pessimistic control and its failure mode"
+    prerequisites: [databases/isolation-levels-and-anomalies]
+    skills: [transactions, concurrency]
+  - id: databases/mvcc-and-snapshot-isolation
+    title: "MVCC and snapshot isolation"
+    summary: "Versions, snapshots, SSI"
+    prerequisites: [databases/isolation-levels-and-anomalies]
+    skills: [transactions]
+  - id: databases/wal-and-crash-recovery
+    title: "Write-ahead log and recovery"
+    summary: "Steal/no-force, redo/undo, checkpoints, ARIES"
+    prerequisites: [databases/buffer-pool, databases/transactions-and-acid]
+    skills: [transactions, storage-engines]
+  - id: databases/online-schema-change
+    title: "Online schema and index changes"
+    summary: "Migrations without downtime"
+    prerequisites: [databases/index-design-and-where-clause, databases/locking-and-deadlocks]
+    skills: [databases, operations]
+  - id: databases/app-patterns-orm-pooling
+    title: "Application patterns: ORM, N+1, pooling"
+    summary: "The client side of database performance"
+    prerequisites: [databases/explain-plans-and-pagination, databases/isolation-levels-and-anomalies]
+    skills: [databases, query-performance]

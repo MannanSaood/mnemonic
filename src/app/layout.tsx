@@ -33,6 +33,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <Link href="/" className="brand">Mnemonic<span>.</span></Link>
               <nav className="head-links" aria-label="Site">
                 <Link href="/">Tracks</Link>
+                <Link href="/roadmaps/">Roadmaps</Link>
                 <Link href="/glossary/">Glossary</Link>
               </nav>
               <Search />

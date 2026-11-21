@@ -1,0 +1,147 @@
+# Lesson outline for the math-for-cs track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: math-for-cs/logic-and-proof-techniques
+    title: "Statements and how to prove them"
+    summary: "Propositions, quantifiers, implication, cases, contradiction; logic as it appears in code and SAT."
+    prerequisites: []
+    skills: [proofs]
+  - id: math-for-cs/induction-and-loop-invariants
+    title: "Induction and loop invariants"
+    summary: "Prove a loop or recursion correct by proving a property that survives each step."
+    prerequisites: [math-for-cs/logic-and-proof-techniques]
+    skills: [proofs, algorithm-design]
+  - id: math-for-cs/state-machines-and-invariants
+    title: "State machines and the invariant principle"
+    summary: "Model a protocol or process as states and transitions; prove safety with an invariant."
+    prerequisites: [math-for-cs/induction-and-loop-invariants]
+    skills: [proofs, discrete-math]
+  - id: math-for-cs/recursive-data-and-structural-induction
+    title: "Recursive data and structural induction"
+    summary: "Prove facts about trees, expressions and strings by following their definitions."
+    prerequisites: [math-for-cs/induction-and-loop-invariants]
+    skills: [proofs]
+  - id: math-for-cs/sets-functions-and-relations
+    title: "Sets, functions, relations"
+    summary: "The vocabulary for schemas, maps, joins and counting by bijection."
+    prerequisites: [math-for-cs/logic-and-proof-techniques]
+    skills: [discrete-math]
+  - id: math-for-cs/sums-and-series
+    title: "Sums for cost analysis"
+    summary: "Evaluate and bound the sums that loop costs turn into."
+    prerequisites: [math-for-cs/induction-and-loop-invariants]
+    skills: [discrete-math, complexity]
+  - id: math-for-cs/recurrences
+    title: "Recurrences"
+    summary: "Solve Hanoi-style and linear recurrences; guess and verify; closed forms."
+    prerequisites: [math-for-cs/induction-and-loop-invariants, math-for-cs/sums-and-series]
+    skills: [recurrences]
+  - id: math-for-cs/divide-and-conquer-recurrences
+    title: "Divide-and-conquer recurrences"
+    summary: "The master-theorem family and the more general Akra-Bazzi statement."
+    prerequisites: [math-for-cs/recurrences]
+    skills: [recurrences, complexity]
+  - id: math-for-cs/asymptotic-notation-in-depth
+    title: "Asymptotics as algebra"
+    summary: "Manipulate O-terms inside formulas; relate to the big-O taught in algorithms."
+    prerequisites: [math-for-cs/sums-and-series]
+    skills: [complexity]
+  - id: math-for-cs/floors-ceilings-and-mod
+    title: "Floors, ceilings and mod"
+    summary: "Integer division and remainder identities; correct pagination, bucketing and wraparound."
+    prerequisites: [math-for-cs/sets-functions-and-relations]
+    skills: [discrete-math]
+  - id: math-for-cs/divisibility-gcd-and-primes
+    title: "Divisibility, GCD and primes"
+    summary: "Euclid's algorithm, Bezout, factorisation uniqueness."
+    prerequisites: [math-for-cs/induction-and-loop-invariants, math-for-cs/floors-ceilings-and-mod]
+    skills: [number-theory]
+  - id: math-for-cs/modular-arithmetic-and-inverses
+    title: "Modular arithmetic"
+    summary: "Clock arithmetic, inverses, cancelling, and why hash-mod-n resharding hurts."
+    prerequisites: [math-for-cs/divisibility-gcd-and-primes]
+    skills: [number-theory]
+  - id: math-for-cs/euler-theorem-and-rsa
+    title: "Euler, Fermat and RSA"
+    summary: "Fast exponentiation, Euler's theorem, and the RSA scheme as an application of everything above."
+    prerequisites: [math-for-cs/modular-arithmetic-and-inverses]
+    skills: [number-theory]
+  - id: math-for-cs/counting-rules
+    title: "Counting rules"
+    summary: "Sum, product, bijection and division rules; sequences, subsets, multisets."
+    prerequisites: [math-for-cs/sets-functions-and-relations]
+    skills: [counting]
+  - id: math-for-cs/pigeonhole-and-inclusion-exclusion
+    title: "Pigeonhole and inclusion-exclusion"
+    summary: "Existence by crowding; counting overlaps correctly."
+    prerequisites: [math-for-cs/counting-rules]
+    skills: [counting]
+  - id: math-for-cs/binomial-coefficients-and-combinatorial-proofs
+    title: "Binomial coefficients"
+    summary: "Choosing k of n, identities, and proving by counting twice."
+    prerequisites: [math-for-cs/counting-rules]
+    skills: [counting]
+  - id: math-for-cs/generating-functions
+    title: "Generating functions"
+    summary: "Encode a sequence as a power series and solve counting and recurrence problems by algebra."
+    prerequisites: [math-for-cs/recurrences, math-for-cs/binomial-coefficients-and-combinatorial-proofs]
+    skills: [recurrences, counting]
+  - id: math-for-cs/graph-theory-for-systems
+    title: "Graph theory for systems"
+    summary: "Degrees, walks, connectivity, trees, bipartite graphs, colouring."
+    prerequisites: [math-for-cs/sets-functions-and-relations]
+    skills: [graph-theory, graphs]
+  - id: math-for-cs/dags-partial-orders-and-scheduling
+    title: "DAGs, partial orders and scheduling"
+    summary: "Dependencies as orders, critical path, parallel schedules."
+    prerequisites: [math-for-cs/graph-theory-for-systems]
+    skills: [graph-theory, algorithm-design]
+  - id: math-for-cs/network-topology-and-routing-metrics
+    title: "Network topologies and their costs"
+    summary: "Diameter, switch count, congestion; compare fabrics."
+    prerequisites: [math-for-cs/graph-theory-for-systems]
+    skills: [graph-theory, networking]
+  - id: math-for-cs/matching-and-stable-assignment
+    title: "Matchings and stable assignment"
+    summary: "Hall-style conditions and the proposal algorithm for stable matchings."
+    prerequisites: [math-for-cs/graph-theory-for-systems]
+    skills: [graph-theory, algorithm-design]
+  - id: math-for-cs/probability-spaces-and-the-four-step-method
+    title: "Probability spaces"
+    summary: "Sample space, events, probability: the four-step method that stops guesswork."
+    prerequisites: [math-for-cs/counting-rules]
+    skills: [probability]
+  - id: math-for-cs/conditional-probability-and-independence
+    title: "Conditional probability and independence"
+    summary: "Updating beliefs, tree diagrams, Simpson's paradox, independence of events."
+    prerequisites: [math-for-cs/probability-spaces-and-the-four-step-method]
+    skills: [probability]
+  - id: math-for-cs/birthday-principle-and-collisions
+    title: "Birthday principle and collisions"
+    summary: "When random identifiers or hashes collide: the square-root rule."
+    prerequisites: [math-for-cs/probability-spaces-and-the-four-step-method]
+    skills: [probability, hashing]
+  - id: math-for-cs/random-variables-and-expectation
+    title: "Random variables and expectation"
+    summary: "Expected cost, linearity, geometric and binomial distributions."
+    prerequisites: [math-for-cs/probability-spaces-and-the-four-step-method]
+    skills: [probability]
+  - id: math-for-cs/deviation-markov-chebyshev-and-sampling
+    title: "Deviation bounds and sampling"
+    summary: "How far from the average can you be, and how many samples do you need."
+    prerequisites: [math-for-cs/random-variables-and-expectation]
+    skills: [probability]
+  - id: math-for-cs/random-walks-and-pagerank
+    title: "Random walks and PageRank"
+    summary: "Gambler's ruin, random walks on graphs, stationary distributions."
+    prerequisites: [math-for-cs/graph-theory-for-systems, math-for-cs/random-variables-and-expectation]
+    skills: [probability, graphs]
+  - id: math-for-cs/harmonic-numbers-and-stirling
+    title: "Harmonic numbers and Stirling's formula"
+    summary: "The two approximations behind many algorithm analyses."
+    prerequisites: [math-for-cs/sums-and-series, math-for-cs/asymptotic-notation-in-depth]
+    skills: [complexity, discrete-math]
+  - id: math-for-cs/infinite-sets-and-undecidability
+    title: "Limits of computation"
+    summary: "Diagonalisation, the halting problem, what no tool can decide in general."
+    prerequisites: [math-for-cs/logic-and-proof-techniques, math-for-cs/sets-functions-and-relations]
+    skills: [proofs]

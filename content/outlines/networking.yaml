@@ -1,0 +1,162 @@
+# Lesson outline for the networking track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: networking/layers-and-encapsulation
+    title: "Layers and encapsulation"
+    summary: "Each layer wraps the data of the one above in its own header."
+    prerequisites: []
+    skills: [networking]
+  - id: networking/delay-loss-throughput
+    title: "Delay, loss and throughput"
+    summary: "The four delays on a hop, queues, and the bandwidth-delay product."
+    prerequisites: [networking/layers-and-encapsulation]
+    skills: [networking, performance]
+  - id: networking/ip-addressing-and-cidr
+    title: "IP addresses, subnets and CIDR"
+    summary: "Network and host bits, prefixes, special ranges."
+    prerequisites: [networking/layers-and-encapsulation]
+    skills: [networking]
+  - id: networking/forwarding-and-routing-table
+    title: "Forwarding: longest prefix match"
+    summary: "How a host or router picks the next hop."
+    prerequisites: [networking/ip-addressing-and-cidr]
+    skills: [networking, os]
+  - id: networking/ethernet-arp-switching
+    title: "Ethernet, ARP and switches"
+    summary: "Frames, MAC addresses, learning switches, resolving IP to MAC."
+    prerequisites: [networking/forwarding-and-routing-table]
+    skills: [networking]
+  - id: networking/mtu-and-fragmentation
+    title: "MTU, fragmentation and path MTU discovery"
+    summary: "Why big packets vanish and small ones work."
+    prerequisites: [networking/forwarding-and-routing-table]
+    skills: [networking, debugging]
+  - id: networking/nat-and-conntrack
+    title: "NAT and connection tracking"
+    summary: "Address rewriting, state tables, port exhaustion."
+    prerequisites: [networking/forwarding-and-routing-table]
+    skills: [networking, os]
+  - id: networking/icmp-ping-traceroute
+    title: "ICMP, ping and traceroute"
+    summary: "Control messages and the TTL trick."
+    prerequisites: [networking/forwarding-and-routing-table]
+    skills: [networking, debugging]
+  - id: networking/ospf-bgp-routing
+    title: "How routes are learned: OSPF and BGP"
+    summary: "Intra-domain link state versus inter-domain policy routing."
+    prerequisites: [networking/forwarding-and-routing-table]
+    skills: [networking, routing]
+  - id: networking/packet-path-on-a-host
+    title: "The packet path inside a Linux host"
+    summary: "Socket to route to ARP to netfilter to NIC."
+    prerequisites: [networking/forwarding-and-routing-table, networking/ethernet-arp-switching, linux/syscalls]
+    skills: [networking, os]
+  - id: networking/ports-sockets-multiplexing
+    title: "Ports, sockets and the 5-tuple"
+    summary: "How a segment finds its process."
+    prerequisites: [networking/layers-and-encapsulation, linux/syscalls]
+    skills: [networking, os]
+  - id: networking/udp
+    title: "UDP: datagrams with no promises"
+    summary: "A header of four fields, a checksum, and nothing else."
+    prerequisites: [networking/ports-sockets-multiplexing]
+    skills: [networking]
+  - id: networking/reliable-transfer-principles
+    title: "Building reliability on a lossy link"
+    summary: "ACKs, timers, sequence numbers, pipelining, go-back-N and selective repeat."
+    prerequisites: [networking/udp]
+    skills: [networking, distributed-systems]
+  - id: networking/tcp-connection-lifecycle
+    title: "TCP handshake and teardown"
+    summary: "SYN, SYN-ACK, ACK; FIN; options; reset."
+    prerequisites: [networking/reliable-transfer-principles]
+    skills: [networking]
+  - id: networking/tcp-states-time-wait
+    title: "TCP states: TIME_WAIT and CLOSE_WAIT"
+    summary: "Reading ss states and what each says about the app."
+    prerequisites: [networking/tcp-connection-lifecycle]
+    skills: [networking, debugging]
+  - id: networking/tcp-retransmission
+    title: "TCP timeouts and retransmission"
+    summary: "RTT estimation, RTO, fast retransmit, SACK, spurious timeouts."
+    prerequisites: [networking/tcp-connection-lifecycle]
+    skills: [networking]
+  - id: networking/tcp-flow-control
+    title: "Flow control and the receive window"
+    summary: "The receiver's window, window scaling, zero window."
+    prerequisites: [networking/tcp-retransmission]
+    skills: [networking]
+  - id: networking/nagle-and-delayed-ack
+    title: "Nagle and delayed ACK"
+    summary: "Two small-packet optimisations that can stall each other."
+    prerequisites: [networking/tcp-flow-control]
+    skills: [networking, performance]
+  - id: networking/tcp-congestion-control
+    title: "Congestion control: slow start and AIMD"
+    summary: "cwnd, slow start, congestion avoidance, fast recovery."
+    prerequisites: [networking/tcp-retransmission, networking/tcp-flow-control]
+    skills: [networking]
+  - id: networking/congestion-modern
+    title: "CUBIC, BBR, ECN and bufferbloat"
+    summary: "Loss-based versus model-based control; queues and marking."
+    prerequisites: [networking/tcp-congestion-control]
+    skills: [networking, performance]
+  - id: networking/dns-resolution
+    title: "DNS: from name to address"
+    summary: "Stub, recursive, authoritative; the walk from the root."
+    prerequisites: [networking/ports-sockets-multiplexing]
+    skills: [networking, dns]
+  - id: networking/dns-caching-and-failures
+    title: "DNS caching, TTLs and failure modes"
+    summary: "Negative caching, search domains, ndots, why dig and the app disagree."
+    prerequisites: [networking/dns-resolution]
+    skills: [networking, dns, debugging]
+  - id: networking/http-evolution
+    title: "HTTP/1.1, HTTP/2 and HTTP/3"
+    summary: "Head-of-line blocking at two layers."
+    prerequisites: [networking/tcp-connection-lifecycle, networking/dns-resolution]
+    skills: [networking, http]
+  - id: networking/quic
+    title: "QUIC: a transport built on UDP"
+    summary: "Streams, connection IDs, integrated crypto handshake."
+    prerequisites: [networking/udp, networking/tcp-congestion-control]
+    skills: [networking, transport]
+  - id: networking/tls-handshake
+    title: "The TLS handshake"
+    summary: "Key exchange, certificates, 1.3 in one round trip."
+    prerequisites: [networking/tcp-connection-lifecycle]
+    skills: [networking, tls, security]
+  - id: networking/certificates-and-pki
+    title: "Certificates, chains and mTLS"
+    summary: "What a certificate proves, chains, SNI, client certs."
+    prerequisites: [networking/tls-handshake]
+    skills: [tls, security]
+  - id: networking/dnssec
+    title: "DNSSEC: signing the phone book"
+    summary: "Signed records and the chain of trust."
+    prerequisites: [networking/dns-resolution, networking/certificates-and-pki]
+    skills: [dns, security]
+  - id: networking/load-balancing-and-cdn
+    title: "Load balancers, proxies and CDNs"
+    summary: "L4 versus L7, anycast, consistent hashing hint, edge caching."
+    prerequisites: [networking/tcp-connection-lifecycle, networking/http-evolution]
+    skills: [networking]
+  - id: networking/datacenter-and-overlay-networks
+    title: "Data center networks and overlays"
+    summary: "Clos topology, VXLAN-style encapsulation and why MTU shrinks."
+    prerequisites: [networking/mtu-and-fragmentation, networking/nat-and-conntrack]
+    skills: [networking, kubernetes]
+  - id: networking/trace-a-request
+    title: "Life of a request: curl https://..."
+    summary: "Every protocol so far in one trace."
+    prerequisites: [networking/packet-path-on-a-host, networking/tcp-connection-lifecycle, networking/dns-resolution, networking/tls-handshake]
+    skills: [networking, debugging]
+  - id: networking/troubleshooting-playbook
+    title: "Troubleshooting: symptom to first command"
+    summary: "ss, ip, dig, curl -w, mtr, tcpdump."
+    prerequisites: [networking/trace-a-request]
+    skills: [networking, debugging]
+  - id: networking/socket-programming
+    title: "Sockets from code: servers, backlog and timeouts"
+    summary: "listen/accept, backlog, deadlines, connection reuse, in four languages."
+    prerequisites: [networking/ports-sockets-multiplexing, networking/tcp-states-time-wait]
+    skills: [networking, concurrency]

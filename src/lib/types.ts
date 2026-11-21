@@ -110,7 +110,10 @@ export interface TopicMeta {
 
 export interface Track { id: string; title: string; summary: string; status: "live" | "planned"; groups?: string[] }
 
-export interface SkillEntry { id: string; title: string; summary: string }
+/** A planned lesson from content/outlines/<track>.yaml (shown as coming soon until written). */
+export interface OutlineLesson { id: string; title: string; summary?: string; prerequisites: string[]; skills: string[] }
+
+export interface SkillEntry { id: string; title: string; summary?: string }
 
 /** A goal profile: the skills a role needs, each at a depth, with the reason. */
 export interface RoadmapProfile {

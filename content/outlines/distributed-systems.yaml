@@ -1,0 +1,142 @@
+# Lesson outline for the distributed-systems track, from the curriculum notes. Lessons not yet written show as coming soon.
+lessons:
+  - id: distributed-systems/why-distributed-is-hard
+    title: "Why distributed is hard"
+    summary: "Partial failure, latency, no shared clock"
+    prerequisites: []
+    skills: [distributed-systems]
+  - id: distributed-systems/failure-models-and-impossibility
+    title: "Failure models and impossibility"
+    summary: "Crash, omission, Byzantine; sync models; Two Generals, FLP"
+    prerequisites: [distributed-systems/why-distributed-is-hard]
+    skills: [distributed-systems, consensus]
+  - id: distributed-systems/reliable-links-and-idempotency
+    title: "Reliable links and idempotency"
+    summary: "Acks, retransmits, duplicates, exactly-once myths"
+    prerequisites: [distributed-systems/why-distributed-is-hard]
+    skills: [networking, distributed-systems]
+  - id: distributed-systems/resiliency-patterns
+    title: "Timeouts, retries, circuit breakers"
+    summary: "Keeping one failure from spreading"
+    prerequisites: [distributed-systems/reliable-links-and-idempotency]
+    skills: [resiliency]
+  - id: distributed-systems/failure-detection
+    title: "Failure detection"
+    summary: "Heartbeats, timeouts, phi-accrual, gossip"
+    prerequisites: [distributed-systems/failure-models-and-impossibility]
+    skills: [distributed-systems]
+  - id: distributed-systems/physical-clocks-and-skew
+    title: "Physical clocks and skew"
+    summary: "NTP, drift, why timestamps lie"
+    prerequisites: [distributed-systems/why-distributed-is-hard]
+    skills: [clocks]
+  - id: distributed-systems/lamport-clocks
+    title: "Lamport clocks"
+    summary: "Ordering events without time"
+    prerequisites: [distributed-systems/physical-clocks-and-skew]
+    skills: [clocks]
+  - id: distributed-systems/vector-clocks
+    title: "Vector clocks and version vectors"
+    summary: "Detecting concurrency"
+    prerequisites: [distributed-systems/lamport-clocks]
+    skills: [clocks]
+  - id: distributed-systems/replication-leader-follower
+    title: "Leader-follower replication"
+    summary: "Log shipping, sync vs async, failover"
+    prerequisites: [distributed-systems/why-distributed-is-hard]
+    skills: [replication]
+  - id: distributed-systems/replication-lag-and-session-guarantees
+    title: "Replication lag and session guarantees"
+    summary: "Read-your-writes, monotonic reads"
+    prerequisites: [distributed-systems/replication-leader-follower]
+    skills: [replication]
+  - id: distributed-systems/multi-leader-and-conflicts
+    title: "Multi-leader replication and conflicts"
+    summary: "Conflict detection, LWW and its data loss"
+    prerequisites: [distributed-systems/vector-clocks, distributed-systems/replication-leader-follower]
+    skills: [replication]
+  - id: distributed-systems/quorums-and-leaderless
+    title: "Quorums and leaderless replication"
+    summary: "N, R, W and what w + r > n does not give"
+    prerequisites: [distributed-systems/vector-clocks, distributed-systems/replication-lag-and-session-guarantees]
+    skills: [replication]
+  - id: distributed-systems/anti-entropy-and-gossip
+    title: "Anti-entropy, read repair and gossip"
+    summary: "How replicas converge"
+    prerequisites: [distributed-systems/quorums-and-leaderless]
+    skills: [replication]
+  - id: distributed-systems/crdts
+    title: "CRDTs"
+    summary: "Merging without coordination"
+    prerequisites: [distributed-systems/vector-clocks, distributed-systems/anti-entropy-and-gossip]
+    skills: [replication]
+  - id: distributed-systems/consistency-models
+    title: "Consistency models and CAP"
+    summary: "Linearizable to eventual, and what CAP says"
+    prerequisites: [distributed-systems/replication-lag-and-session-guarantees]
+    skills: [replication, consensus]
+  - id: distributed-systems/leader-election-and-fencing
+    title: "Leader election, leases and fencing"
+    summary: "Who is leader, and how to stop a stale one"
+    prerequisites: [distributed-systems/failure-detection, distributed-systems/consistency-models]
+    skills: [consensus]
+  - id: distributed-systems/raft-leader-election
+    title: "Raft: leader election"
+    summary: "Terms, votes, randomised timeouts"
+    prerequisites: [distributed-systems/leader-election-and-fencing]
+    skills: [consensus]
+  - id: distributed-systems/raft-log-replication
+    title: "Raft: log replication and safety"
+    summary: "Commit by majority, log repair, partitions"
+    prerequisites: [distributed-systems/raft-leader-election]
+    skills: [consensus]
+  - id: distributed-systems/paxos-and-consensus-landscape
+    title: "Paxos and the consensus family"
+    summary: "Paxos, Multi-Paxos, ZAB, Byzantine"
+    prerequisites: [distributed-systems/raft-log-replication]
+    skills: [consensus]
+  - id: distributed-systems/partitioning-and-consistent-hashing
+    title: "Partitioning and consistent hashing"
+    summary: "Splitting data across nodes"
+    prerequisites: [distributed-systems/replication-leader-follower]
+    skills: [distributed-systems]
+  - id: distributed-systems/rebalancing-and-secondary-indexes
+    title: "Rebalancing, hot spots and secondary indexes"
+    summary: "Moving data, routing, local vs global indexes"
+    prerequisites: [distributed-systems/partitioning-and-consistent-hashing]
+    skills: [distributed-systems]
+  - id: distributed-systems/distributed-transactions-2pc
+    title: "Two-phase commit"
+    summary: "Atomic commit across nodes, blocking"
+    prerequisites: [distributed-systems/raft-log-replication, databases/transactions-and-acid]
+    skills: [transactions, consensus]
+  - id: distributed-systems/sagas-and-outbox
+    title: "Sagas, outbox and idempotent consumers"
+    summary: "Business transactions without 2PC"
+    prerequisites: [distributed-systems/reliable-links-and-idempotency, distributed-systems/distributed-transactions-2pc]
+    skills: [transactions, resiliency]
+  - id: distributed-systems/spanner-calvin-percolator
+    title: "Spanner, Calvin and Percolator"
+    summary: "Three ways to get global transactions"
+    prerequisites: [distributed-systems/distributed-transactions-2pc, distributed-systems/physical-clocks-and-skew]
+    skills: [transactions, clocks]
+  - id: distributed-systems/event-logs-and-streams
+    title: "Event logs, CDC and stream processing"
+    summary: "The log as integration backbone"
+    prerequisites: [distributed-systems/replication-leader-follower, distributed-systems/sagas-and-outbox]
+    skills: [data-pipelines]
+  - id: distributed-systems/load-balancing-and-caching
+    title: "Load balancing, replication and caching"
+    summary: "Spreading and shielding load"
+    prerequisites: [distributed-systems/resiliency-patterns, distributed-systems/partitioning-and-consistent-hashing]
+    skills: [distributed-systems, networking]
+  - id: distributed-systems/reconciliation-loops
+    title: "Reconciliation loops and controllers"
+    summary: "Level-triggered convergence"
+    prerequisites: [distributed-systems/raft-log-replication]
+    skills: [distributed-systems, operations]
+  - id: distributed-systems/testing-and-observability
+    title: "Testing and observing distributed systems"
+    summary: "Fault injection, SLOs, traces"
+    prerequisites: [distributed-systems/resiliency-patterns]
+    skills: [observability, resiliency]

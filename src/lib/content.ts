@@ -8,6 +8,7 @@ import {
   STEP_KEYS,
   type CodeLine,
   type GlossaryEntry,
+  type OutlineLesson,
   type Lang,
   type LangCode,
   type PreparedCode,
@@ -75,6 +76,17 @@ export function listRoadmaps(): RoadmapProfile[] {
     }
     return r;
   });
+}
+
+/** Planned lessons for a track (content/outlines/<track>.yaml), minus the ones already written. */
+export function getOutline(track: string): OutlineLesson[] {
+  const f = path.join(CONTENT, "outlines", `${track}.yaml`);
+  if (!fs.existsSync(f)) return [];
+  const data = YAML.parse(fs.readFileSync(f, "utf8")) as { lessons?: OutlineLesson[] };
+  const written = new Set(listTopics().map((t) => t.id));
+  return (data.lessons ?? [])
+    .map((l) => ({ ...l, prerequisites: l.prerequisites ?? [], skills: l.skills ?? [] }))
+    .filter((l) => !written.has(l.id));
 }
 
 /* ---------------- topics ---------------- */
@@ -176,7 +188,7 @@ let prereqWarned = false;
 export function listTopics(): TopicMeta[] {
   const out: TopicMeta[] = [];
   for (const track of fs.readdirSync(CONTENT, { withFileTypes: true })) {
-    if (!track.isDirectory()) continue;
+    if (!track.isDirectory() || ["glossary", "roadmaps", "outlines"].includes(track.name)) continue;
     for (const f of fs.readdirSync(path.join(CONTENT, track.name))) {
       if (f.endsWith(".mdx")) out.push(parseTopic(path.join(CONTENT, track.name, f)).meta);
     }
