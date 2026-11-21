@@ -1,0 +1,623 @@
+---
+title: Bloom filters and sketches
+track: algorithms
+group: Data structures
+order: 9
+summary: A Bloom filter answers "have I seen this?" with "definitely not" or "maybe" from a few bits per item. A "no" lets you skip a slow lookup; the "maybe" is wrong at a rate you choose with bits per item and hash count. Count-min sketches and HyperLogLog trade exactness for memory the same way.
+intent: Put a small probabilistic structure in front of a slow store, size it for the error rate you can afford, and know the one thing it cannot do.
+changeRequest: Follow every link on every crawled page, not just sitemaps. That is about 2 billion URLs this quarter.
+languages: [go, python, typescript, rust]
+glossary: [bloom-filter, false-positive-rate, counting-bloom-filter, count-min-sketch, hyperloglog]
+
+prerequisites: [algorithms/hash-tables, math-for-cs/birthday-principle-and-collisions]
+skills: [hashing]
+depths: [overview, engineer, deep]
+
+playground:
+  model: bloom-filters-and-sketches
+  scenarios:
+    - try: "Press Crawl a page a few times and watch the outlined bits of each link."
+      notice: "New URLs find at least one 0 bit and skip the database. Links to pages already crawled find all their bits set and go to the database to be confirmed."
+    - try: "Crawl until you have 32 or more URLs, then try k = 1, k = 5 and k = 8 and compare the bars."
+      notice: "One hash is several times worse. The curve bottoms out near (m/n) ln 2 and rises again as extra hashes fill the array."
+    - try: "Set m to 128 and crawl 10 pages."
+      notice: "Over 90% of the bits are set and the filter says maybe to most URLs it never saw. The database is asked about almost every link."
+    - try: "Press Clear its bits on a few recently crawled URLs, then crawl more pages."
+      notice: "Other URLs shared those bits. They now test no, and the crawler fetches them a second time."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 104, h: 48, title: link parser, sub: offer(url) }
+      after:  { x: 12, y: 111, w: 104, h: 48, title: link parser, sub: offer(url) }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 260, h: 236, title: frontier, sub: "pictured as: a set" }
+      after:  { x: 140, y: 20, w: 120, h: 48, title: frontier, sub: seen? }
+    - id: hashes
+      kind: concrete
+      before: { x: 160, y: 72, w: 220, h: 32, title: hash set of urls }
+      after:  { x: 140, y: 111, w: 120, h: 48, title: k hashes, sub: "h1 + i·h2" }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 290, y: 111, w: 120, h: 48, title: "" }
+      after:  { x: 290, y: 111, w: 120, h: 48, title: bit array, sub: ~10 bits / url }
+    - id: "no"
+      kind: concrete
+      before: { x: 160, y: 120, w: 220, h: 32, title: ~100 bytes per url }
+      after:  { x: 430, y: 30, w: 118, h: 48, title: "no", sub: skip the db }
+    - id: store
+      kind: concrete
+      before: { x: 160, y: 168, w: 220, h: 32, title: all in ram }
+      after:  { x: 430, y: 111, w: 118, h: 48, title: crawl db, sub: only on maybe }
+    - id: billion
+      kind: concrete
+      appears: change
+      before: { x: 424, y: 202, w: 124, h: 44, title: 2b urls, sub: ~200 GB set }
+      after:  { x: 430, y: 202, w: 118, h: 44, title: 2b urls, sub: 2.4 GB filter }
+  edges:
+    - { from: client, to: context, label: url }
+    - { from: context, to: hashes, label: hash }
+    - { from: hashes, to: strategy, label: k bits }
+    - { from: strategy, to: "no", label: any 0 }
+    - { from: strategy, to: store, label: all 1 }
+    - { from: billion, to: strategy, label: fits }
+
+code:
+  go:
+    before:
+      file: frontier.go
+      source: |
+        // frontier.go
+        type Frontier struct {
+            mu      sync.Mutex
+            seen    map[string]struct{} // every URL ever queued, kept in memory
+            enqueue func(url string)
+        }
+
+        func NewFrontier(enqueue func(string)) *Frontier {
+            return &Frontier{seen: make(map[string]struct{}), enqueue: enqueue}
+        }
+
+        func (f *Frontier) Offer(url string) {
+            url = normalize(url)
+            f.mu.Lock()
+            _, dup := f.seen[url]
+            if !dup {
+                f.seen[url] = struct{}{}
+            }
+            f.mu.Unlock()
+            if !dup {
+                f.enqueue(url)
+            }
+        }
+      roles: { context: [2, 6], hashes: [4, 4], "no": [4, 4], store: [17, 17], client: [12, 23] }
+      change:
+        - after: 23
+          add:
+            - ""
+            - "func (f *Frontier) OnPage(html []byte) {"
+            - "    for _, link := range extractLinks(html) { // every link on every page, not just sitemaps"
+            - "        f.Offer(link)"
+            - "    }"
+            - "}"
+    after:
+      file: frontier.go
+      source: |
+        // frontier.go: a Bloom filter in memory, the crawl database behind it
+        type Frontier struct {
+            mu      sync.Mutex
+            seen    *bloom.BloomFilter // github.com/bits-and-blooms/bloom/v3
+            db      CrawlDB
+            enqueue func(url string)
+        }
+
+        func NewFrontier(enqueue func(string), db CrawlDB, expected uint) *Frontier {
+            // about 9.6 bits per URL and 7 hash functions for a 1% false-positive rate
+            return &Frontier{seen: bloom.NewWithEstimates(expected, 0.01), db: db, enqueue: enqueue}
+        }
+
+        func (f *Frontier) Offer(ctx context.Context, url string) error {
+            url = normalize(url)
+            f.mu.Lock()
+            maybe := f.seen.TestString(url) // are all k bits set?
+            f.mu.Unlock()
+            if maybe {
+                queued, err := f.db.WasQueued(ctx, url) // the only database round trip
+                if err != nil || queued {
+                    return err
+                }
+            }
+            f.mu.Lock()
+            f.seen.AddString(url) // set the URL's k bits
+            f.mu.Unlock()
+            if err := f.db.MarkQueued(ctx, url); err != nil {
+                return err
+            }
+            f.enqueue(url)
+            return nil
+        }
+
+        func (f *Frontier) OnPage(ctx context.Context, html []byte) error {
+            for _, link := range extractLinks(html) {
+                if err := f.Offer(ctx, link); err != nil {
+                    return err
+                }
+            }
+            return nil
+        }
+      roles: { context: [2, 7], strategy: [4, 4], size: [9, 12], billion: [9, 12], hash: [17, 17], hashes: [17, 17], check: [16, 18], maybe: [19, 24], store: [19, 24], "no": [25, 31], client: [35, 42] }
+    again:
+      file: frontier_test.go
+      source: |
+        // frontier_test.go: a filter sized for a million URLs stays near 1% false positives
+        func TestFalsePositiveRate(t *testing.T) {
+            f := bloom.NewWithEstimates(1_000_000, 0.01)
+            for i := range 1_000_000 {
+                f.AddString(fmt.Sprintf("https://shop.example.com/p/%d", i))
+            }
+            if r := bloom.EstimateFalsePositiveRate(f.Cap(), f.K(), 1_000_000); r > 0.012 {
+                t.Fatalf("false-positive rate %.4f", r)
+            }
+        }
+    cost:
+      before: { text: "2 billion URLs as strings · ~200 GB of RAM", value: 0.9 }
+      after: { text: "2.4 GB of bits · 1% of new URLs cost a lookup", value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Library
+      note: 'The standard library has no Bloom filter. `bits-and-blooms/bloom/v3` is the common one: `NewWithEstimates(n, fp)` picks m and k, `AddString`, `TestString` and `TestAndAddString` do the work, and it hashes with murmur. It is not safe for concurrent writers, hence the mutex. A `map[string]struct{}` costs the string bytes plus a 16-byte header and a slot per URL.'
+      seenIn: '`bloom.NewWithEstimates`, `TestAndAddString`, `Merge` to OR two filters of the same shape. `axiomhq/hyperloglog` for distinct counts.'
+
+  python:
+    before:
+      file: frontier.py
+      source: |
+        # frontier.py
+        from collections.abc import Callable
+
+
+        class Frontier:
+            """Decides which discovered links still need crawling."""
+
+            def __init__(self, enqueue: Callable[[str], None]) -> None:
+                self.enqueue = enqueue
+                self.seen: set[str] = set()  # every URL ever queued, kept in memory
+
+            def offer(self, url: str) -> None:
+                url = normalize(url)
+                if url in self.seen:
+                    return
+                self.seen.add(url)
+                self.enqueue(url)
+      roles: { context: [5, 10], hashes: [10, 10], "no": [10, 10], store: [16, 16], client: [12, 17] }
+      change:
+        - after: 17
+          add:
+            - ""
+            - "    def on_page(self, html: str) -> None:"
+            - "        for link in extract_links(html):  # every link on every page, not just sitemaps"
+            - "            self.offer(link)"
+    after:
+      file: frontier.py
+      source: |
+        # frontier.py: a Bloom filter in memory, the crawl database behind it
+        from collections.abc import Callable
+
+        from rbloom import Bloom
+
+
+        class Frontier:
+            """Decides which discovered links still need crawling."""
+
+            def __init__(self, enqueue: Callable[[str], None], db: CrawlDB, expected: int) -> None:
+                self.enqueue = enqueue
+                self.db = db
+                self.seen = Bloom(expected, 0.01)  # about 9.6 bits per URL, 7 hashes
+
+            def offer(self, url: str) -> None:
+                url = normalize(url)
+                if url in self.seen and self.db.was_queued(url):  # maybe: ask the database
+                    return
+                self.seen.add(url)  # set the URL's k bits
+                self.db.mark_queued(url)
+                self.enqueue(url)
+
+            def on_page(self, html: str) -> None:
+                for link in extract_links(html):
+                    self.offer(link)
+      roles: { context: [7, 13], strategy: [13, 13], size: [13, 13], billion: [13, 13], hash: [17, 17], hashes: [17, 17], check: [17, 17], maybe: [17, 18], store: [17, 18], "no": [19, 21], client: [23, 25] }
+    again:
+      file: test_frontier.py
+      source: |
+        # test_frontier.py: a filter sized for 100,000 URLs stays near 1% false positives
+        def test_false_positive_rate():
+            seen = Bloom(100_000, 0.01)
+            for i in range(100_000):
+                seen.add(f"https://shop.example.com/p/{i}")
+            fp = sum(f"https://other.example.com/{i}" in seen for i in range(100_000))
+            assert fp < 1_300
+    cost:
+      before: { text: "2 billion URLs as strings · ~200 GB of RAM", value: 0.9 }
+      after: { text: "2.4 GB of bits · 1% of new URLs cost a lookup", value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Library
+      note: 'Nothing in the standard library. `rbloom` is a fast filter written in Rust: `Bloom(expected_items, false_positive_rate)`, `add`, and `in`. By default it hashes with the built-in `hash`, which is randomised per process for `str`, so a filter saved to disk is only reloadable with your own `hash_func`. A `set` of URLs costs the string objects (about 50 bytes of header each, plus the text) and the table slots.'
+      seenIn: '`rbloom.Bloom`, `Bloom.save` with a custom `hash_func`. `datasketch` for HyperLogLog and MinHash. Redis `PFADD` and `PFCOUNT` through `redis-py`.'
+
+  typescript:
+    before:
+      file: frontier.ts
+      source: |
+        // frontier.ts
+        export class Frontier {
+          private seen = new Set<string>(); // every URL ever queued, kept in memory
+
+          constructor(private enqueue: (url: string) => void) {}
+
+          offer(raw: string): void {
+            const url = normalize(raw);
+            if (this.seen.has(url)) return;
+            this.seen.add(url);
+            this.enqueue(url);
+          }
+        }
+      roles: { context: [2, 5], hashes: [3, 3], "no": [3, 3], store: [10, 10], client: [7, 12] }
+      change:
+        - after: 12
+          add:
+            - ""
+            - "  onPage(html: string): void {"
+            - "    for (const link of extractLinks(html)) this.offer(link); // every link, not just sitemaps"
+            - "  }"
+    after:
+      file: frontier.ts
+      source: |
+        // frontier.ts: a Bloom filter in memory, the crawl database behind it
+        import { BloomFilter } from "bloom-filters";
+
+        export class Frontier {
+          private seen: BloomFilter;
+
+          constructor(private enqueue: (url: string) => void, private db: CrawlDB, expected: number) {
+            this.seen = BloomFilter.create(expected, 0.01); // about 9.6 bits per URL
+          }
+
+          async offer(raw: string): Promise<void> {
+            const url = normalize(raw);
+            if (this.seen.has(url) && (await this.db.wasQueued(url))) return; // maybe: ask the database
+            this.seen.add(url); // set the URL's k bits
+            await this.db.markQueued(url);
+            this.enqueue(url);
+          }
+
+          async onPage(html: string): Promise<void> {
+            for (const link of extractLinks(html)) await this.offer(link);
+          }
+        }
+      roles: { context: [4, 9], strategy: [5, 5], size: [7, 9], billion: [8, 8], hash: [13, 13], hashes: [13, 13], check: [13, 13], maybe: [13, 13], store: [13, 13], "no": [14, 16], client: [19, 21] }
+    again:
+      file: frontier.test.ts
+      source: |
+        // frontier.test.ts: a filter sized for 100,000 URLs stays near 1% false positives
+        test("false-positive rate", () => {
+          const seen = BloomFilter.create(100_000, 0.01);
+          for (let i = 0; i < 100_000; i++) seen.add(`https://shop.example.com/p/${i}`);
+          let fp = 0;
+          for (let i = 0; i < 100_000; i++) if (seen.has(`https://other.example.com/${i}`)) fp++;
+          assert.ok(fp < 1_300);
+        });
+    cost:
+      before: { text: "a Set stops at 2^24 entries · and ~100 B each", value: 0.9 }
+      after: { text: "2.4 GB of bits · 1% of new URLs cost a lookup", value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Library
+      note: 'No built-in filter. The `bloom-filters` package has `BloomFilter.create(n, rate)` with `add` and `has`, plus `CountMinSketch`, `HyperLogLog` and cuckoo filters. The plain `Set` fails earlier than you might expect: in V8 a `Set` or `Map` holds at most 2^24 (about 16.7 million) entries and then throws a RangeError, long before 2 billion.'
+      seenIn: '`BloomFilter.create`, `CountMinSketch`, `HyperLogLog` from `bloom-filters`. Redis `BF.ADD` and `BF.EXISTS` (the RedisBloom module) through `node-redis` when several crawlers share one filter.'
+
+  rust:
+    before:
+      file: frontier.rs
+      source: |
+        // frontier.rs
+        use std::collections::HashSet;
+
+        pub struct Frontier<F: FnMut(String)> {
+            seen: HashSet<String>, // every URL ever queued, kept in memory
+            enqueue: F,
+        }
+
+        impl<F: FnMut(String)> Frontier<F> {
+            pub fn offer(&mut self, url: &str) {
+                let url = normalize(url);
+                if self.seen.insert(url.clone()) {
+                    (self.enqueue)(url);
+                }
+            }
+        }
+      roles: { context: [4, 7], hashes: [5, 5], "no": [5, 5], store: [12, 12], client: [10, 15] }
+      change:
+        - after: 15
+          add:
+            - ""
+            - "    pub fn on_page(&mut self, html: &str) {"
+            - "        for link in extract_links(html) { // every link on every page, not just sitemaps"
+            - "            self.offer(&link);"
+            - "        }"
+            - "    }"
+    after:
+      file: frontier.rs
+      source: |
+        // frontier.rs: a Bloom filter in memory, the crawl database behind it
+        use bloomfilter::Bloom;
+
+        pub struct Frontier<F: FnMut(String)> {
+            seen: Bloom<String>,
+            db: CrawlDb,
+            enqueue: F,
+        }
+
+        impl<F: FnMut(String)> Frontier<F> {
+            pub fn new(enqueue: F, db: CrawlDb, expected: usize) -> Result<Self, &'static str> {
+                // about 9.6 bits per URL and 7 hashes for 1% false positives
+                Ok(Self { seen: Bloom::new_for_fp_rate(expected, 0.01)?, db, enqueue })
+            }
+
+            pub fn offer(&mut self, url: &str) -> Result<(), DbError> {
+                let url = normalize(url);
+                if self.seen.check(&url) && self.db.was_queued(&url)? {
+                    return Ok(()); // maybe, and the database confirms: already queued
+                }
+                self.seen.set(&url); // set the URL's k bits
+                self.db.mark_queued(&url)?;
+                (self.enqueue)(url);
+                Ok(())
+            }
+
+            pub fn on_page(&mut self, html: &str) -> Result<(), DbError> {
+                for link in extract_links(html) {
+                    self.offer(&link)?;
+                }
+                Ok(())
+            }
+        }
+      roles: { context: [4, 8], strategy: [5, 5], size: [11, 14], billion: [11, 14], hash: [18, 18], hashes: [18, 18], check: [18, 18], maybe: [18, 20], store: [18, 20], "no": [21, 24], client: [27, 32] }
+    again:
+      file: tests/frontier.rs
+      source: |
+        // tests/frontier.rs: a filter sized for 100,000 URLs stays near 1% false positives
+        #[test]
+        fn false_positive_rate() {
+            let mut seen = Bloom::new_for_fp_rate(100_000, 0.01).unwrap();
+            for i in 0..100_000 {
+                seen.set(&format!("https://shop.example.com/p/{i}"));
+            }
+            let fp = (0..100_000).filter(|i| seen.check(&format!("https://other.example.com/{i}"))).count();
+            assert!(fp < 1_300);
+        }
+    cost:
+      before: { text: "2 billion URLs as strings · ~200 GB of RAM", value: 0.9 }
+      after: { text: "2.4 GB of bits · 1% of new URLs cost a lookup", value: 0.2 }
+    lens:
+      need: 2
+      needLabel: Library
+      note: 'The `bloomfilter` crate: `Bloom::new_for_fp_rate(items, fp)` returns a `Result` (in version 3), then `set`, `check` and `check_and_set` take any `Hash` value. To build the same bits in another process, create both with `new_for_fp_rate_with_seed` and the same seed, or ship the filter with `as_slice` and `from_slice`. A `HashSet<String>` costs the heap string (24-byte header plus the text) and a slot per URL.'
+      seenIn: '`bloomfilter::Bloom`, `check_and_set` to test and insert in one call. RocksDB''s per-file filters through the `rocksdb` crate. `hyperloglogplus` for distinct counts.'
+
+walk:
+  - text: A parsed page offers a link. The frontier normalises the URL and hashes it twice; the two hashes generate k bit positions, h1 + i·h2 for i from 0 to k − 1.
+    nodes: [client, context, hashes]
+    edges: [client>context, context>hashes]
+    role: hash
+  - text: It reads those k bits. Nothing else is stored, so this costs k memory reads whatever the number of URLs.
+    nodes: [hashes, strategy]
+    edges: [hashes>strategy]
+    role: check
+  - text: If any bit is 0, no URL that was added could have produced this pattern. The answer is a certain no, so the frontier skips the database, sets the k bits and queues the page.
+    nodes: [strategy, "no"]
+    edges: [strategy>no]
+    role: "no"
+  - text: If all k bits are 1, the URL was probably added before, or other URLs happened to set all its bits. Only the database can tell, so this is the one case that pays for a round trip.
+    nodes: [strategy, store]
+    edges: [strategy>store]
+    role: maybe
+  - text: For 2 billion URLs at 1%, the array needs about 9.6 bits per URL, 2.4 GB in all, and 7 hash functions. The hash set it replaces would need around 200 GB.
+    nodes: [billion, strategy]
+    edges: [billion>strategy]
+    role: size
+
+checks:
+  overview:
+    question: A Bloom filter in front of a database says a URL is not present. What do you know?
+    options:
+      - text: It is definitely not present, so you can skip the database
+        correct: true
+        why: Right. Every added URL set all of its bits, and bits only turn on. A 0 at any of the URL's positions proves it was never added.
+      - text: It is probably not present, so check the database to be sure
+        why: The doubt runs the other way. "No" is certain; "maybe" is the answer that can be wrong.
+      - text: Nothing; the filter can be wrong both ways
+        why: A Bloom filter has no false negatives as long as nobody clears bits. Only its "maybe" can be wrong.
+  engineer:
+    question: You need a Bloom filter for 100 million URLs at a 1% false-positive rate. About how much memory does it take?
+    options:
+      - text: About 120 MB
+        correct: true
+        why: Right. 1% needs about 9.6 bits per item with the best k (7). 100 million times 9.6 bits is 960 million bits, 120 MB.
+      - text: About 12 MB
+        why: That is about one bit per URL, which gives a false-positive rate near 60%.
+      - text: About 10 GB
+        why: That is the size of the URLs themselves. The filter stores no URLs, only bits.
+  deep:
+    question: A count-min sketch reports 1,240 views for one product page. What does that tell you about the true count?
+    options:
+      - text: The true count is at most 1,240
+        correct: true
+        why: Right. Every row's counter for the page holds its true count plus whatever collided with it, so each counter is an overestimate and the minimum is the tightest one. With width e/ε and depth ln(1/δ), the excess is at most ε times the total count, with probability 1 − δ.
+      - text: The true count is at least 1,240
+        why: Collisions only add to a counter. A sketch can overcount, never undercount.
+      - text: The true count is 1,240 give or take a symmetric error
+        why: The error is one-sided. That is what makes the minimum across rows the right estimate.
+
+reference:
+  roles:
+    - role: Bit array
+      example: m bits, about 10 per item for 1%
+      job: Holds the evidence. Bits only turn on.
+    - role: Hash functions
+      example: k positions from two hashes, h1 + i·h2
+      job: Map each item to k bits. Add sets them; a query reads them.
+    - role: Slow store
+      example: the crawl database, an SSTable on disk, a remote service
+      job: The source of truth, asked only when the filter says maybe.
+    - role: Sizing formula
+      example: m = −n·ln(p) / (ln 2)², k = (m/n)·ln 2
+      job: Turns the item count and target error rate into bits and hashes.
+  useWhen:
+    - A cheap "definitely not" saves an expensive lookup on most queries, like reads that miss in an LSM tree or links to new URLs.
+    - Sets too large to hold exactly in memory, where a small error rate is acceptable or can be checked behind the filter.
+    - Several nodes need to share or merge membership cheaply; filters of the same shape merge with OR.
+  avoidWhen:
+    - You need to delete items. Use a counting Bloom filter or a cuckoo filter, or rebuild periodically.
+    - You need to list or retrieve the items. A filter stores only bits.
+    - The set is small enough for an exact hash set, or false positives are not acceptable and there is no store behind the filter to check.
+  tradeoffs:
+    - Each halving of the false-positive rate costs about 1.44 more bits per item.
+    - The size is fixed when the filter is created. Add far more items than planned and the rate climbs towards 100%.
+    - More hashes help only up to (m/n)·ln 2; beyond it they fill the array and the rate rises again.
+  lookalikes:
+    - name: Counting Bloom filter
+      how: Counters in place of bits so items can be removed. Several times the memory.
+    - name: Cuckoo filter
+      how: Stores short fingerprints in a cuckoo hash table. Supports deletes and is smaller than a Bloom filter at low error rates.
+    - name: Count-min sketch
+      how: Estimates how often each item occurred, never under the true count.
+    - name: HyperLogLog
+      how: Estimates how many distinct items occurred, in a few kilobytes.
+---
+
+## [concept] Bloom filters and sketches
+
+**A Bloom filter hashes each item to k bits in a bit array and sets them. A query checks the same k bits: any 0 means "definitely never added", all 1s means "maybe". It never stores the items, so it takes a few bits per item.**
+
+A <Term id="bloom-filter">Bloom filter</Term> is an answer to a question that comes up whenever a lookup is expensive: can I skip it? Put the filter in memory in front of the slow store. A "no" is always right, so it skips the store outright. A "maybe" goes to the store, and is wrong at a <Term id="false-positive-rate">false-positive rate</Term> that you choose when you size the filter.
+
+<Depth level={2}>
+Sizing has two knobs: bits per item (m/n) and the number of hash functions k. The rate is about (1 − e^(−kn/m))^k, the chance that all k bits of a new item were already set by others. For a target rate p, the best k is (m/n)·ln 2 and you need about 1.44·log₂(1/p) bits per item: 9.6 bits and 7 hashes for 1%, 14.4 bits and 10 hashes for 0.1%. The size depends on the rate, not on the size of the items.
+
+The same trade, a little error for a lot less memory, gives two more sketches. A <Term id="count-min-sketch">count-min sketch</Term> estimates how often each item occurred, and a <Term id="hyperloglog">HyperLogLog</Term> estimates how many distinct items there were.
+</Depth>
+
+<Depth level={3}>
+The formula comes from treating the bits as independent. After n items with k hashes each, a given bit is still 0 with probability (1 − 1/m)^(kn) ≈ e^(−kn/m). A new item is a false positive when all k of its bits are 1, which gives (1 − e^(−kn/m))^k. Minimising over k gives k = (m/n)·ln 2, the point where about half the bits are set, and a rate of about 0.6185^(m/n). Kirsch and Mitzenmacher showed in 2006 that two hash functions combined as h1 + i·h2 give the same asymptotic rate as k independent ones, which is what most libraries do.
+</Depth>
+
+## [problem] A crawler that remembers every URL
+
+A web crawler parses each page it fetches and offers the links to a frontier. The frontier keeps a set of every URL it has ever queued, so no page is fetched twice. It is the obvious design, and it is exact.
+
+For a site list of a few million pages, the set is a few hundred megabytes and lookups are a hash and a slot read.
+
+<Depth level={2}>
+A set of strings costs the strings. A typical URL is 60 to 80 characters, and each entry adds an object header and a hash table slot, so about 100 bytes per URL is a fair estimate in any of the four languages. Memory grows linearly with everything the crawler has ever seen, and it never shrinks.
+</Depth>
+
+<Depth level={3}>
+The exact set also has to survive restarts and be shared between crawler processes, so in practice it ends up in a database anyway. The in-memory set is a cache of that database, and the question is how small that cache can be.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** follow every link on every crawled page, not just sitemaps. That is about 2 billion URLs this quarter.
+
+The marked lines offer every link on every page. At 100 bytes per URL the set needs about 200 GB, which no crawler box has. Moving the set to the crawl database makes every link a network round trip: 40 links per page times thousands of pages a second is more lookups than the database can serve. Sharding the set by host spreads the memory but not the total.
+
+<Depth level={2}>
+Most of those lookups are for URLs that are new, and the database spends its time saying "never seen it". A structure that can answer "never seen it" locally, without storing the URLs, removes those round trips.
+</Depth>
+
+<Depth level={3}>
+In TypeScript the set fails before memory does: V8 caps a `Set` at 2^24 entries, about 16.7 million, and throws a RangeError on the next add.
+</Depth>
+
+## [morph] Keep bits, not URLs
+
+Drag the slider. The set of strings becomes k hash functions over a bit array, and the database moves behind it.
+
+A link whose bits include a 0 is new for certain, so the frontier skips the database, sets the bits and queues the page. A link whose bits are all 1 is probably a page already queued, and the database confirms it. At 1% false positives, 99 of every 100 new URLs never touch the database, and the filter for 2 billion URLs takes 2.4 GB.
+
+<Depth level={2}>
+Size the filter for the most items you expect, not the current count. Past its planned capacity the rate climbs quickly: at twice the planned items a 1% filter is near 16%. Long-running crawlers rotate filters: start a new one when the current one is full and check both, or rebuild from the database during a quiet hour.
+</Depth>
+
+<Depth level={3}>
+Many crawlers drop the database check and treat "maybe" as "seen". Then a false positive means a page is never crawled, 1% of new URLs, and no database is needed on the hot path at all. Whether that is acceptable is a product decision, and the filter makes the trade explicit: the rate is a number you chose.
+</Depth>
+
+## [walk] Follow one link
+
+One new URL, then one already crawled. Use the numbered buttons.
+
+<Depth level={2}>
+Never delete by clearing bits. Other items share them, so clearing one item's bits turns some of the others into false negatives, the one error the filter promised never to make. If you need deletes, a <Term id="counting-bloom-filter">counting Bloom filter</Term> keeps a small counter per position, or a cuckoo filter stores short fingerprints that can be removed.
+</Depth>
+
+<Depth level={3}>
+The same structure sits inside storage engines. RocksDB, LevelDB and Cassandra keep a Bloom filter per sorted file, so a read for a key skips every file whose filter says no and usually touches one file on disk. RocksDB's classic setting of 10 bits per key gives about 1%. PostgreSQL's `bloom` extension builds an index from per-row signatures in the same way.
+</Depth>
+
+## [again] The same request, with a filter in front
+
+Two billion URLs now cost 2.4 GB of bits plus the database, which sees one lookup for each already-seen link and for about 1% of the new ones. The test pins the sizing: a filter built for its item count stays near the rate it was built for.
+
+<Depth level={2}>
+Counting is the next question a crawler gets: how many times was each URL linked, and how many distinct hosts did we see today? A count-min sketch answers the first with d rows of w counters. Each item increments one counter per row; its estimate is the smallest of those counters. Collisions only add, so the estimate is never too low. HyperLogLog answers the second: Redis's `PFADD` and `PFCOUNT` use 12 KB per key for any number of items, with a standard error of 0.81%.
+</Depth>
+
+<Depth level={3}>
+HyperLogLog hashes each item and looks at the run of leading zero bits. Seeing a hash that starts with 20 zeros suggests about 2^20 distinct items. One such observation is very noisy, so the hash's first bits pick one of many registers, each register keeps the longest run it has seen, and a harmonic mean of the registers gives the estimate. Two sketches merge by taking the maximum per register, which is why distinct counts can be combined across servers and days.
+</Depth>
+
+## [play] Tune a filter in front of the crawl database
+
+Crawl pages and watch each link's bits. Every "no" skips the database; every "maybe" costs a lookup. Change the bits and the hash count and compare the measured rate with the formula. Then try to delete a URL.
+
+## [lens] Filters in each language
+
+None of the four standard libraries has a Bloom filter, and each ecosystem has one well-known package. The structure is small enough to write yourself: a bit vector and two hashes.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+A filter built in one process is only useful to another if both use the same m, k and hash functions with the same seeds. If you persist or share a filter, fix the hash and its seed explicitly, and store them with the bits.
+</Depth>
+
+<Depth level={3}>
+Several crawler processes can share one filter in Redis with the RedisBloom commands `BF.RESERVE`, `BF.ADD` and `BF.EXISTS`, or merge their local filters periodically by OR-ing bit arrays of the same shape.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="bloom-filters-and-sketches" />
+
+### Sizing at a glance
+
+| Target false positives | Bits per item | Best k |
+|---|---|---|
+| 10% | 4.8 | 3 |
+| 1% | 9.6 | 7 |
+| 0.1% | 14.4 | 10 |
+| 0.01% | 19.2 | 13 |
+
+Bits per item is −ln(p) / (ln 2)², and the best k is that times ln 2, rounded. Memory is bits per item times the number of items you plan for, whatever the size of the items.

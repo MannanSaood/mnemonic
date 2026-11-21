@@ -1,0 +1,16 @@
+# Terms introduced by algorithms/bloom-filters-and-sketches.
+- id: bloom-filter
+  term: Bloom filter
+  short: A bit array and k hash functions that answer set membership with "definitely not" or "maybe". It stores no items, so it uses a few bits per item.
+- id: false-positive-rate
+  term: False-positive rate
+  short: For a Bloom filter, the share of items never added that it still says "maybe" to. About (1 - e^(-kn/m))^k for n items, m bits and k hashes.
+- id: counting-bloom-filter
+  term: Counting Bloom filter
+  short: A Bloom filter with a small counter in place of each bit, so an item can be removed by decrementing. Costs several times the memory.
+- id: count-min-sketch
+  term: Count-min sketch
+  short: A few rows of counters, one hash per row, that estimate how often each item occurred. Collisions only add, so an estimate is never below the true count.
+- id: hyperloglog
+  term: HyperLogLog
+  short: A sketch that estimates how many distinct items a stream contained from the longest runs of leading zeros in their hashes, in a few kilobytes for billions of items.
