@@ -41,6 +41,7 @@ export function getTracks(): Track[] {
 }
 
 let glossaryCache: Record<string, GlossaryEntry> | null = null;
+export const dupWarnings = new Set<string>();
 export function getGlossary(): Record<string, GlossaryEntry> {
   if (glossaryCache) return glossaryCache;
   // content/glossary.yaml plus one optional file per lesson in content/glossary/*.yaml
@@ -50,8 +51,11 @@ export function getGlossary(): Record<string, GlossaryEntry> {
   glossaryCache = {};
   for (const f of files) {
     for (const g of (YAML.parse(fs.readFileSync(f, "utf8")) ?? []) as GlossaryEntry[]) {
-      if (glossaryCache[g.id] && glossaryCache[g.id].short !== g.short)
-        throw new Error(`[content] glossary term "${g.id}" is defined twice with different text (${path.relative(process.cwd(), f)})`);
+      if (glossaryCache[g.id]) {
+        // Two lessons may define the same term; the first definition wins.
+        if (glossaryCache[g.id].short !== g.short) dupWarnings.add(`[content] glossary term "${g.id}" is also defined in ${path.relative(process.cwd(), f)}; the first definition is used`);
+        continue;
+      }
       glossaryCache[g.id] = g;
     }
   }
