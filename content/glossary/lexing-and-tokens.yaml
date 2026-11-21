@@ -1,0 +1,13 @@
+# Terms introduced by compilers/lexing-and-tokens.
+- id: token
+  term: Token
+  short: The smallest meaningful unit of source text, such as a name, a number, a string or an operator, tagged with its kind and position.
+- id: maximal-munch
+  term: Maximal munch
+  short: The lexer rule that each token is the longest piece of input that could form one, so >= is one operator, not > followed by =.
+- id: lookahead
+  term: Lookahead
+  short: Looking at the next character or token without consuming it, to decide what the current one is.
+- id: source-span
+  term: Source span
+  short: The start and end offsets of a token in the source text, kept so errors can point at the exact line and column.

@@ -1,0 +1,644 @@
+---
+title: "Lexing: turning characters into tokens"
+track: compilers
+group: Front end
+order: 2
+summary: A lexer reads source text once, left to right, and groups its characters into tokens, each with a kind, its text and its position.
+intent: Know how a lexer decides where one token ends and the next begins, and why splitting on spaces is not the same thing.
+changeRequest: On-call engineers can now write alert rules in the UI, and they write cpu>=0.9 and env=="prod eu".
+languages: [go, python, typescript, rust]
+glossary: [token, maximal-munch, lookahead, source-span]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [compilers/pipeline-overview]
+skills: [compilers, parsing]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: lexing-and-tokens
+  scenarios:
+    - try: Answer the prediction, then press Start scanning and Next token on the No spaces rule.
+      notice: "The scanner finds 7 tokens where split() finds 4 words, and 3 of those words are wrong. After >, one peek at = decides that >= is a single operator."
+    - try: Turn longest match off and run the same rule to the end.
+      notice: ">= falls apart into > and a stray =, and == into two errors. One character of lookahead is what keeps two-character operators whole."
+    - try: Pick Open string and step through it.
+      notice: "The error token stops at the end of line 1 with its position, 1:8. Scanning carries on, so line 2 still produces and, cpu, > and 0.9."
+    - try: Type your own rule, with a comment or a stray @, and run it.
+      notice: The comment and spaces are skipped without making tokens. A bad character becomes one error token, and the result line lists every error with its line and column.
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: rule engine, sub: gets words }
+      after:  { x: 12, y: 30, w: 112, h: 48, title: parser, sub: asks for next token }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: { go: strings.Fields, python: str.split, typescript: split on spaces, rust: split_whitespace }, sub: a word is whatever sits between spaces }
+      after:  { x: 150, y: 30, w: 150, h: 56, title: lexer, sub: "start · pos · peek" }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 30, w: 110, h: 56, title: "" }
+      after:  { x: 330, y: 30, w: 220, h: 56, title: Token, sub: "kind · text · span" }
+    - id: name
+      kind: concrete
+      before: { x: 170, y: 64, w: 230, h: 32, title: "cpu > 0.9: 3 words" }
+      after:  { x: 12, y: 196, w: 100, h: 44, title: Name, sub: "cpu, and" }
+    - id: op
+      kind: concrete
+      before: { x: 170, y: 106, w: 230, h: 32, title: "cpu>=0.9: 1 word" }
+      after:  { x: 122, y: 196, w: 100, h: 44, title: Op, sub: ">= in one" }
+    - id: str
+      kind: concrete
+      before: { x: 170, y: 148, w: 230, h: 32, title: '"prod eu": 2 words' }
+      after:  { x: 232, y: 196, w: 100, h: 44, title: String, sub: '"prod eu"' }
+    - id: err
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 206, w: 230, h: 32, title: "error, no position" }
+      after:  { x: 342, y: 196, w: 100, h: 44, title: Error, sub: "at line:col" }
+  edges:
+    - { from: client, to: context, label: pulls }
+    - { from: context, to: strategy, label: emits }
+    - { from: name, to: strategy, kind: implements }
+    - { from: op, to: strategy, kind: implements }
+    - { from: str, to: strategy, kind: implements, label: kind of }
+    - { from: err, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: rules.go
+      source: |
+        // rules.go: a rule is conditions joined by "and", words split on spaces
+        func parseRule(rule string) ([]Condition, error) {
+            words := strings.Fields(rule)
+            var conds []Condition
+            for i := 0; i < len(words); i += 4 {
+                if i+3 > len(words) {
+                    return nil, fmt.Errorf("incomplete condition at word %d", i)
+                }
+                conds = append(conds, Condition{Metric: words[i], Op: words[i+1], Value: words[i+2]})
+                if i+3 < len(words) && words[i+3] != "and" {
+                    return nil, fmt.Errorf("expected and, got %q", words[i+3])
+                }
+            }
+            return conds, nil
+        }
+
+        // tested with:
+        const rule = `cpu > 0.9 and env == "prod"`
+      roles: { context: [3, 3], client: [2, 15], name: [9, 9], op: [3, 3], str: [3, 3], err: [10, 12] }
+      change:
+        - { line: 18, replace: 'const rule = `cpu>=0.9 and env=="prod eu"`' }
+        - { after: 18, add: ['// words: cpu>=0.9 · and · env=="prod · eu"', '// Condition{cpu>=0.9, and, env=="prod}, then: expected and, got "eu\""'] }
+    after:
+      file: lexer.go
+      source: |
+        // lexer.go: read the rule once, left to right, and hand out tokens
+        type Token struct {
+            Kind       Kind   // Name, Keyword, Number, String, Op, Error, EOF
+            Text       string
+            Start, End int    // byte offsets, for error positions
+        }
+
+        type Lexer struct {
+            src string
+            pos int // next byte to read
+        }
+
+        func (l *Lexer) peek() byte {
+            if l.pos >= len(l.src) {
+                return 0
+            }
+            return l.src[l.pos]
+        }
+
+        func (l *Lexer) Next() Token {
+            for l.peek() == ' ' || l.peek() == '\t' || l.peek() == '\n' {
+                l.pos++
+            }
+            start := l.pos
+            tok := func(k Kind) Token { return Token{k, l.src[start:l.pos], start, l.pos} }
+            if l.pos >= len(l.src) {
+                return tok(EOF)
+            }
+            c := l.src[l.pos]
+            l.pos++
+            switch {
+            case strings.IndexByte("<>=!", c) >= 0:
+                if l.peek() == '=' { // longest match: ">=" is one token, not two
+                    l.pos++
+                    return tok(Op)
+                }
+                if c == '=' || c == '!' {
+                    return tok(Error) // a lone = or !
+                }
+                return tok(Op)
+            case strings.IndexByte("+-*/()", c) >= 0:
+                return tok(Op)
+            case c == '"':
+                for l.peek() != '"' && l.peek() != '\n' && l.peek() != 0 {
+                    l.pos++
+                }
+                if l.peek() != '"' {
+                    return tok(Error) // unterminated: stop at the end of the line
+                }
+                l.pos++
+                return tok(String)
+            case isDigit(c):
+                for isDigit(l.peek()) || l.peek() == '.' {
+                    l.pos++
+                }
+                return tok(Number)
+            case isLetter(c):
+                for isLetter(l.peek()) || isDigit(l.peek()) {
+                    l.pos++
+                }
+                if keywords[l.src[start:l.pos]] {
+                    return tok(Keyword)
+                }
+                return tok(Name)
+            }
+            return tok(Error) // no token starts with this character
+        }
+      roles: { strategy: [2, 6], context: [8, 18], client: [20, 20], skip: [21, 24], munch: [32, 40], string: [43, 51], word: [57, 64], emit: [25, 25], name: [57, 64], op: [32, 42], str: [43, 51], err: [47, 49] }
+    again:
+      file: rules.go
+      source: |
+        // The parser pulls tokens, and spaces no longer decide anything:
+        //   cpu>=0.9 and env=="prod eu"
+        //   Name cpu · Op >= · Number 0.9 · Keyword and · Name env · Op == · String "prod eu"
+        // A broken rule says where: 1:8: unterminated string
+    cost:
+      before: { text: 2 of 3 new rules rejected, value: 0.75 }
+      after: { text: 7 tokens · errors at line:col, value: 0.08 }
+    lens:
+      need: 2
+      needLabel: In the library
+      note: '`go/scanner` is the real Go lexer: each `Scan()` call returns a position, a `token.Token` such as `token.GEQ`, and the literal text. It also inserts the semicolons you never type, at the ends of lines. For a small rule language, `text/scanner` gives you Go-style names, numbers, strings and comments with positions, and you add the operators.'
+      seenIn: '`go/scanner` with `go/token` positions. `text/scanner.Scanner` with its `Mode` bits. The lexer in `text/template/parse`, written as state functions, explained in Rob Pike''s 2011 talk Lexical Scanning in Go.'
+
+  python:
+    before:
+      file: rules.py
+      source: |
+        # rules.py: a rule is conditions joined by "and", words split on spaces
+        def parse_rule(rule: str) -> list[Condition]:
+            words = rule.split()
+            conds = []
+            for i in range(0, len(words), 4):
+                if i + 3 > len(words):
+                    raise RuleError(f"incomplete condition at word {i}")
+                conds.append(Condition(metric=words[i], op=words[i + 1], value=words[i + 2]))
+                if i + 3 < len(words) and words[i + 3] != "and":
+                    raise RuleError(f"expected and, got {words[i + 3]!r}")
+            return conds
+
+        # tested with:
+        RULE = 'cpu > 0.9 and env == "prod"'
+      roles: { context: [3, 3], client: [2, 11], name: [8, 8], op: [3, 3], str: [3, 3], err: [9, 10] }
+      change:
+        - { line: 14, replace: "RULE = 'cpu>=0.9 and env==\"prod eu\"'" }
+        - { after: 14, add: ['# words: cpu>=0.9 · and · env=="prod · eu"', "# Condition('cpu>=0.9', 'and', 'env==\"prod'), then: expected and, got 'eu\"'"] }
+    after:
+      file: lexer.py
+      source: |
+        # lexer.py: one pass over the rule, yielding tokens with positions
+        import re
+        from dataclasses import dataclass
+        from typing import Iterator
+
+        KEYWORDS = {"and", "or", "not", "true", "false"}
+        TOKEN_RE = re.compile(r"""
+              (?P<SKIP>\s+|\#[^\n]*)
+            | (?P<NUMBER>\d+(?:\.\d+)?)
+            | (?P<NAME>[A-Za-z_]\w*)
+            | (?P<STRING>"[^"\n]*")
+            | (?P<UNTERMINATED>"[^"\n]*)
+            | (?P<OP>[<>=!]=|[<>+\-*/()])
+            | (?P<BAD>.)
+        """, re.VERBOSE)
+
+        @dataclass(frozen=True)
+        class Token:
+            kind: str
+            text: str
+            start: int
+            end: int
+
+        def tokens(rule: str) -> Iterator[Token]:
+            for m in TOKEN_RE.finditer(rule):
+                kind, text = m.lastgroup, m.group()
+                if kind == "SKIP":
+                    continue
+                if kind == "NAME" and text in KEYWORDS:
+                    kind = "KEYWORD"
+                if kind in ("UNTERMINATED", "BAD"):
+                    raise RuleError(f"{kind.lower()} {text!r} at offset {m.start()}")
+                yield Token(kind, text, m.start(), m.end())
+            yield Token("EOF", "", len(rule), len(rule))
+      roles: { strategy: [17, 22], context: [24, 34], client: [24, 24], skip: [27, 28], munch: [13, 13], string: [11, 12], word: [29, 30], emit: [33, 33], name: [10, 10], op: [13, 13], str: [11, 11], err: [31, 32] }
+    again:
+      file: rules.py
+      source: |
+        # The parser pulls tokens, and spaces no longer decide anything:
+        #   list(tokens('cpu>=0.9 and env=="prod eu"'))
+        #   NAME cpu · OP >= · NUMBER 0.9 · KEYWORD and · NAME env · OP == · STRING "prod eu" · EOF
+        # A broken rule says where: unterminated '"prod' at offset 7
+    cost:
+      before: { text: 2 of 3 new rules rejected, value: 0.75 }
+      after: { text: 7 tokens · errors at an offset, value: 0.1 }
+    lens:
+      need: 2
+      needLabel: In the library
+      note: 'For a small language, one regular expression with named groups is the idiomatic lexer: `finditer` walks it across the text and `m.lastgroup` names the kind. The alternatives are tried in order, so listing `>=` before `>` is how you get longest match. This version raises at the first bad token; collect error tokens instead if you want every error in one pass.'
+      seenIn: '`tokenize` lexes Python itself into `TokenInfo(type, string, start, end, line)` with (row, column) positions; `python -m tokenize file.py` prints them. Since 3.12 it uses the interpreter''s own C tokenizer, and f-strings arrive as `FSTRING_START`, `FSTRING_MIDDLE` and `FSTRING_END` (PEP 701). The `re` docs include a Writing a Tokenizer example in this style.'
+
+  typescript:
+    before:
+      file: rules.ts
+      source: |
+        // rules.ts: a rule is conditions joined by "and", words split on spaces
+        export function parseRule(rule: string): Condition[] {
+          const words = rule.trim().split(/\s+/);
+          const conds: Condition[] = [];
+          for (let i = 0; i < words.length; i += 4) {
+            if (i + 3 > words.length) throw new RuleError(`incomplete condition at word ${i}`);
+            conds.push({ metric: words[i], op: words[i + 1], value: words[i + 2] });
+            if (i + 3 < words.length && words[i + 3] !== "and") {
+              throw new RuleError(`expected and, got ${JSON.stringify(words[i + 3])}`);
+            }
+          }
+          return conds;
+        }
+
+        // tested with:
+        const rule = 'cpu > 0.9 and env == "prod"';
+      roles: { context: [3, 3], client: [2, 13], name: [7, 7], op: [3, 3], str: [3, 3], err: [8, 10] }
+      change:
+        - { line: 16, replace: "const rule = 'cpu>=0.9 and env==\"prod eu\"';" }
+        - { after: 16, add: ['// words: cpu>=0.9 · and · env=="prod · eu"', '// { metric: "cpu>=0.9", op: "and", value: "env==\"prod" }, then: expected and, got "eu\""'] }
+    after:
+      file: lexer.ts
+      source: |
+        // lexer.ts: one pass over the rule, yielding tokens with positions
+        type Kind = "name" | "keyword" | "number" | "string" | "op" | "error" | "eof";
+        interface Token { kind: Kind; text: string; start: number; end: number }
+
+        const KEYWORDS = new Set(["and", "or", "not", "true", "false"]);
+        const isDigit = (c: string) => c >= "0" && c <= "9";
+        const isWord = (c: string) => /^[A-Za-z0-9_]$/.test(c);
+
+        export function* lex(src: string): Generator<Token> {
+          let pos = 0;
+          const peek = () => src[pos] ?? "";
+          for (;;) {
+            while (/^\s$/.test(peek())) pos++;
+            const start = pos;
+            const tok = (kind: Kind): Token => ({ kind, text: src.slice(start, pos), start, end: pos });
+            if (pos >= src.length) { yield tok("eof"); return; }
+            const c = src[pos++];
+            if ("<>=!".includes(c)) {
+              if (peek() === "=") pos++; // longest match: ">=" is one token, not two
+              else if (c === "=" || c === "!") { yield tok("error"); continue; } // a lone = or !
+              yield tok("op");
+            } else if ("+-*/()".includes(c)) {
+              yield tok("op");
+            } else if (c === '"') {
+              while (pos < src.length && peek() !== '"' && peek() !== "\n") pos++;
+              if (peek() !== '"') { yield tok("error"); continue; } // unterminated: stop at end of line
+              pos++;
+              yield tok("string");
+            } else if (isDigit(c)) {
+              while (isDigit(peek()) || peek() === ".") pos++;
+              yield tok("number");
+            } else if (/^[A-Za-z_]$/.test(c)) {
+              while (isWord(peek())) pos++;
+              yield tok(KEYWORDS.has(src.slice(start, pos)) ? "keyword" : "name");
+            } else {
+              yield tok("error"); // no token starts with this character
+            }
+          }
+        }
+      roles: { strategy: [2, 3], context: [9, 39], client: [9, 9], skip: [13, 14], munch: [18, 21], string: [24, 28], word: [32, 34], emit: [15, 15], name: [32, 34], op: [18, 23], str: [24, 28], err: [26, 26] }
+    again:
+      file: rules.ts
+      source: |
+        // The parser pulls tokens, and spaces no longer decide anything:
+        //   [...lex('cpu>=0.9 and env=="prod eu"')]
+        //   name cpu · op >= · number 0.9 · keyword and · name env · op == · string "prod eu" · eof
+        // A broken rule says where: error '"prod' at 7..12
+    cost:
+      before: { text: 2 of 3 new rules rejected, value: 0.75 }
+      after: { text: 7 tokens · errors with spans, value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Hand-written
+      note: 'A generator function makes the lexer lazy: the parser pulls one token at a time with `next()`, and nothing is scanned that the parser does not ask for. TypeScript has no lexer in the standard library, so small languages either hand-write one like this or use a library such as `moo`.'
+      seenIn: '`ts.createScanner()` exposes the TypeScript compiler''s own lexer; `scan()` returns a `SyntaxKind`. It scans `>` on its own and lets the parser ask for a rescan (`reScanGreaterToken`) where `>=` or `>>` is meant, so `Array<Array<number>>` can close two type arguments. The same parser-driven rescan decides whether `/` starts a regular expression.'
+
+  rust:
+    before:
+      file: rules.rs
+      source: |
+        // rules.rs: a rule is conditions joined by "and", words split on spaces
+        pub fn parse_rule(rule: &str) -> Result<Vec<Condition>, RuleError> {
+            let words: Vec<&str> = rule.split_whitespace().collect();
+            let mut conds = Vec::new();
+            for chunk in words.chunks(4) {
+                match chunk {
+                    [metric, op, value] | [metric, op, value, "and"] => {
+                        conds.push(Condition::new(metric, op, value));
+                    }
+                    [_, _, _, other] => return Err(RuleError::new(format!("expected and, got {other:?}"))),
+                    _ => return Err(RuleError::new(format!("incomplete condition: {chunk:?}"))),
+                }
+            }
+            Ok(conds)
+        }
+
+        // tested with:
+        const RULE: &str = r#"cpu > 0.9 and env == "prod""#;
+      roles: { context: [3, 3], client: [2, 15], name: [7, 8], op: [3, 3], str: [3, 3], err: [10, 11] }
+      change:
+        - { line: 18, replace: 'const RULE: &str = r#"cpu>=0.9 and env=="prod eu""#;' }
+        - { after: 18, add: ['// words: cpu>=0.9 · and · env=="prod · eu"', '// Condition("cpu>=0.9", "and", "env==\"prod"), then: expected and, got "eu\""'] }
+    after:
+      file: lexer.rs
+      source: |
+        // lexer.rs: one pass over the rule, yielding tokens with byte spans
+        use std::{iter::Peekable, str::CharIndices};
+
+        const KEYWORDS: [&str; 5] = ["and", "or", "not", "true", "false"];
+
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub enum Kind { Name, Keyword, Number, Str, Op, Error(&'static str) }
+
+        pub struct Token<'a> { pub kind: Kind, pub text: &'a str, pub span: (usize, usize) }
+
+        pub struct Lexer<'a> { src: &'a str, chars: Peekable<CharIndices<'a>> }
+
+        impl<'a> Iterator for Lexer<'a> {
+            type Item = Token<'a>;
+
+            fn next(&mut self) -> Option<Token<'a>> {
+                while self.chars.next_if(|&(_, c)| c.is_whitespace()).is_some() {}
+                let (start, c) = self.chars.next()?; // None: end of input
+                let kind = match c {
+                    '<' | '>' | '=' | '!' => {
+                        if self.chars.next_if(|&(_, n)| n == '=').is_some() {
+                            Kind::Op // longest match: ">=" is one token, not two
+                        } else if c == '=' || c == '!' {
+                            Kind::Error("a lone = or !")
+                        } else {
+                            Kind::Op
+                        }
+                    }
+                    '+' | '-' | '*' | '/' | '(' | ')' => Kind::Op,
+                    '"' => {
+                        while self.chars.next_if(|&(_, n)| n != '"' && n != '\n').is_some() {}
+                        match self.chars.next_if(|&(_, n)| n == '"') {
+                            Some(_) => Kind::Str,
+                            None => Kind::Error("unterminated string"),
+                        }
+                    }
+                    '0'..='9' => {
+                        while self.chars.next_if(|&(_, n)| n.is_ascii_digit() || n == '.').is_some() {}
+                        Kind::Number
+                    }
+                    c if c.is_alphabetic() || c == '_' => {
+                        while self.chars.next_if(|&(_, n)| n.is_alphanumeric() || n == '_').is_some() {}
+                        Kind::Name
+                    }
+                    _ => Kind::Error("unexpected character"),
+                };
+                let end = self.chars.peek().map_or(self.src.len(), |&(i, _)| i);
+                let text = &self.src[start..end];
+                let kind = if kind == Kind::Name && KEYWORDS.contains(&text) { Kind::Keyword } else { kind };
+                Some(Token { kind, text, span: (start, end) })
+            }
+        }
+      roles: { strategy: [6, 9], context: [11, 51], client: [16, 16], skip: [17, 18], munch: [20, 28], string: [30, 36], word: [41, 44], emit: [47, 50], name: [41, 44], op: [20, 29], str: [30, 36], err: [34, 34] }
+    again:
+      file: rules.rs
+      source: |
+        // The parser pulls tokens, and spaces no longer decide anything:
+        //   Lexer::new(r#"cpu>=0.9 and env=="prod eu""#).map(|t| t.text).collect::<Vec<_>>()
+        //   ["cpu", ">=", "0.9", "and", "env", "==", "\"prod eu\""]
+        // A broken rule says where: Error("unterminated string") at span (7, 12)
+    cost:
+      before: { text: 2 of 3 new rules rejected, value: 0.75 }
+      after: { text: 7 tokens · errors with spans, value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Hand-written or derived
+      note: '`Peekable::next_if` is one character of lookahead in a single call: it consumes the next character only if it matches. Tokens borrow `&str` slices of the source, so lexing copies no text. For bigger languages, the `logos` crate derives a lexer from regex attributes on an enum and compiles it into one state machine.'
+      seenIn: 'rustc''s `rustc_lexer` emits punctuation one character at a time, and `rustc_parse` glues adjacent ones such as `>` and `=` when no space separates them. Procedural macros see that as `proc_macro::Punct` with `Spacing::Joint`. Rust block comments nest, which a lexer built only from regular expressions cannot count.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The parser asks for the next token. The lexer skips spaces and comments, then remembers where this token starts.
+    nodes: [client, context]
+    edges: [client>context]
+    role: skip
+  - text: "It reads `>`. That could be the whole operator or the start of `>=`. One peek at the next character decides, and the lexer always takes the longest match."
+    nodes: [context, op, strategy]
+    edges: [op>strategy]
+    role: munch
+  - text: A quote starts a string, which runs to the closing quote, spaces and all. If the line ends first, the lexer emits an error token with its position and carries on from the next line.
+    nodes: [str, err, strategy]
+    edges: [str>strategy, err>strategy]
+    role: string
+  - text: "A letter starts a word. The lexer reads letters and digits, then looks the word up: `and` is a keyword, `cpu` is a name."
+    nodes: [name, strategy]
+    edges: [name>strategy]
+    role: word
+  - text: Each token leaves with its kind, its text and its span. The parser never sees a character again, only tokens.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: emit
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: What does a lexer hand to the parser for cpu >= 0.9?
+    options:
+      - text: Three tokens, a name cpu, an operator >= and a number 0.9, each with its position.
+        correct: true
+        why: Right. The lexer groups characters into labelled pieces. Building structure out of them is the parser's job.
+      - text: A tree with >= at the root and cpu and 0.9 as its children.
+        why: That is the parser's output. The lexer only cuts the text into tokens and does not know how they nest.
+      - text: The characters c, p, u, >, =, 0, ., 9 with the spaces removed.
+        why: Then every later stage would have to rediscover where names and numbers end. Grouping them once is the lexer's whole job.
+  engineer:
+    question: The lexer has just read >. Why does it look at the next character before emitting a token?
+    options:
+      - text: To decide between the operator > and the operator >=, taking the longer one if it can.
+        correct: true
+        why: Right. This is maximal munch with one character of lookahead. Without it, >= becomes > followed by a stray =.
+      - text: To skip any spaces that follow the operator.
+        why: Spaces are skipped at the start of the next token. The peek after > exists only to find a possible =.
+      - text: To check that the right operand is a number.
+        why: The lexer does not know about operands. Whether a number belongs there is decided by the parser and later the type checker.
+  deep:
+    question: A rule file has an unterminated string on line 3 of 40. What should a production lexer do?
+    options:
+      - text: Emit an error token at 3:col that stops at the end of the line, and keep scanning, so later errors are reported in the same run.
+        correct: true
+        why: Right. Errors become tokens with source spans. Stopping the string at the newline keeps one missing quote from swallowing the rest of the file.
+      - text: Stop at the first error and report that the rule is invalid.
+        why: The author then fixes one error per run, and without a position they have to hunt for it.
+      - text: Treat everything up to the end of the file as the string.
+        why: Then every token after line 3 vanishes into the string, and the parser reports confusing errors far from the real one.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Lexer (scanner)
+      example: { go: "Lexer.Next()", python: "tokens(rule)", typescript: "lex(src)", rust: "impl Iterator for Lexer" }
+      job: Reads the source once, left to right, and returns one token per call.
+    - role: Token
+      example: "kind · text · span"
+      job: A labelled piece of source with its start and end offsets.
+    - role: Keyword table
+      example: and, or, not, true, false
+      job: Turns a scanned word into a keyword or leaves it a name.
+    - role: Error token
+      example: unterminated string at 1:8
+      job: Carries a problem and its position to the parser instead of stopping the scan.
+    - role: Parser
+      example: The rule parser
+      job: Pulls tokens, one at a time, and never looks at characters.
+  useWhen:
+    - Any input with structure, even a one-line rule or filter language. Splitting on spaces breaks the first time someone leaves one out.
+    - You want errors that point at a line and column.
+  avoidWhen:
+    - The format already has a parser, such as JSON, YAML or CEL. Use it.
+    - The input really is a list of words, such as command-line arguments after the shell has split them.
+  tradeoffs:
+    - A hand-written lexer is fast and gives the best errors, but every token kind is code you maintain.
+    - One big regular expression is short, and its alternative order decides longest match. Errors and context-sensitive tokens are harder.
+    - Lexer generators turn token rules into a state machine. They are fast, but add a build step.
+    - Some tokens depend on context, such as / as divide or regex in JavaScript, or >> closing two generics. Then the parser has to steer the lexer.
+  lookalikes:
+    - name: Parser
+      how: Builds nested structure from tokens. A lexer cannot match nested brackets; a parser can.
+    - name: Regular expressions and automata
+      how: Each token rule is a regular language, so a lexer can be generated as one finite automaton.
+    - name: Splitting on a delimiter
+      how: Works when a delimiter is guaranteed, as in CSV without quotes. It cannot handle tokens that touch or delimiters inside strings.
+---
+
+## [concept] A lexer cuts text into tokens
+
+**A lexer reads source text once, left to right, and groups its characters into <Term id="token">tokens</Term>, each with a kind, its text and its position.**
+
+`cpu >= 0.9 and env == "prod"` becomes seven tokens: a name, an operator, a number, a keyword, a name, an operator and a string. The parser that comes next works with those seven pieces and never looks at a character again.
+
+<Depth level={2}>
+A lexer keeps two marks in the text: where the current token started and the next character to read. It reads one character, and that character decides the kind of token: a digit starts a number, a letter a word, a quote a string. Then it keeps reading while the characters still belong. Sometimes one character is not enough. After `>` it takes one <Term id="lookahead">lookahead</Term> peek to see whether `=` follows. Words are read the same way whether they are names or keywords. The lexer looks the word up in a keyword table afterwards.
+</Depth>
+
+<Depth level={3}>
+Every token in a typical language is described by a regular expression, so a lexer is a finite automaton: it needs no stack and runs in time linear in the input. Most production compilers still write theirs by hand, because hand-written code gives better error messages and handles the awkward cases. Those cases are the tokens that depend on context, such as nested comments or `/` in JavaScript.
+</Depth>
+
+## [problem] Rules split on spaces
+
+An alerting service lets teams write rules such as `cpu > 0.9 and env == "prod"`. The rule parser does what most first versions do. It splits the rule on whitespace and reads the words in groups of four: metric, operator, value, then `and`.
+
+It passes every test, because every test rule was written by the engineer who wrote the parser, with a space around every operator.
+
+<Depth level={2}>
+Splitting on spaces assumes that spaces separate tokens and never appear inside one. Neither is a rule of the language. It is a habit of the people who wrote the tests.
+</Depth>
+
+<Depth level={3}>
+The same assumption also hides positions. After `split()` the words have lost their offsets, so the best error message available is "word 3 is wrong".
+</Depth>
+
+## [pain] Then on-call writes the rules
+
+**Change request:** on-call engineers can now write alert rules in the UI, and they write `cpu>=0.9 and env=="prod eu"`.
+
+Splitting gives four words: `cpu>=0.9`, `and`, `env=="prod` and `eu"`. The parser builds a nonsense condition from the first three and rejects the rule with "expected and, got `eu"`". The person reading that message has no way to know that the real problem is a missing space.
+
+<Depth level={2}>
+Patching it fails one case at a time. Insert spaces around operators with a regular expression, and you also change the inside of strings. Then `>` gets padded inside `>=`. Then someone writes a comment. Each fix is a new special case, and none of them knows where a token begins.
+</Depth>
+
+<Depth level={3}>
+The worst failures are the ones that are not rejected. `env == "prod eu"` alone splits into `env`, `==`, `"prod` and `eu"`. A looser parser that took the first three words would silently compare `env` with `"prod`, a value that never matches, and the alert would never fire.
+</Depth>
+
+## [morph] From words to tokens
+
+Drag the slider. The splitter disappears. In its place a lexer hands out tokens one at a time, and each token says what it is and where it came from.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The lexer decides where a token ends by looking at characters, not at spaces. A digit cannot continue a name, so `cpu>=` ends the name at `>`. A quote runs to the next quote, so `"prod eu"` is one token. Whitespace and comments become things to skip, not separators.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The lexer holds the source and one offset. `Next` slices `l.src[start:l.pos]` for the token text, so no bytes are copied. The real Go lexer, `go/scanner`, returns positions as compact `token.Pos` integers that a `token.FileSet` turns back into file, line and column.</Lang>
+<Lang only="python">One compiled regular expression is the whole lexer. Each alternative is a named group, `finditer` tries them in order at each position, and `m.lastgroup` names the one that matched. Order is what makes `>=` win over `>`. `\w` also matches non-ASCII letters, so names such as `größe` work.</Lang>
+<Lang only="typescript">The lexer is a generator, so it is lazy. Each `yield` hands one token to the parser and pauses until the parser asks for the next. The token text is a `slice` of the source, and the positions are UTF-16 code unit offsets, the same units the editor uses.</Lang>
+<Lang only="rust">`Peekable<CharIndices>` gives each character with its byte offset, and `next_if` consumes a character only if it matches, which is lookahead and advance in one call. Tokens borrow `&'a str` slices of the source, so the lifetime ties every token to the text it came from.</Lang>
+</Depth>
+
+## [walk] Scan one rule
+
+`cpu>=0.9 and env=="prod eu"`, token by token. Step through it with the numbered buttons.
+
+<Depth level={3}>
+Taking the longest match is called <Term id="maximal-munch">maximal munch</Term>. It explains a few classic surprises. In C, `x+++y` lexes as `x ++ + y`, never `x + ++y`. Older C++ needed a space in `vector<vector<int> >`, because `>>` was always one token, until C++11 changed the rule. Keeping a <Term id="source-span">source span</Term> on every token costs two integers, and every later error message depends on it.
+</Depth>
+
+## [again] On-call writes the rule again
+
+The same rule, through the lexer. Seven tokens come out, the same seven as for the spaced-out version, and the parser accepts the rule. A rule that really is broken now says where, for example `1:8: unterminated string`.
+
+<Depth level={2}>
+Make the error token stop at the end of the line. One missing quote then costs one error, and the lexer still reports problems on the following lines in the same run.
+</Depth>
+
+<Depth level={3}>
+Tokens are also the right place to keep what tools need later. A formatter wants comments, so it asks the lexer to keep them as trivia attached to the next token. Roslyn, the C# compiler, attaches comments and whitespace to tokens as trivia, which lets refactorings rewrite code without losing a comment.
+</Depth>
+
+## [play] Scan a rule yourself
+
+Pick a rule or type one, then step the scanner and watch where each token ends. Compare its tokens with the words that `split()` produces, then break the scanner by turning off longest match.
+
+## [lens] How each language scans
+
+Each language ships a lexer for its own source, and you can call it. For your own rule language you write a small one, as above, or derive one from a table of regular expressions.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Reading your language's own lexer output is a good way to learn it. Try `python -m tokenize` on a file, or print the tokens from `go/scanner`.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="lexing-and-tokens" />
+
+### What to keep on every token
+
+Kind, start and end offsets, and nothing else that can be recomputed. The text is a slice of the source. Line and column can be computed from the offset when an error is printed, which is what Go's `token.FileSet` does. If tools will rewrite the code, also keep the whitespace and comments around each token.
