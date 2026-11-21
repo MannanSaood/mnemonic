@@ -1,0 +1,641 @@
+---
+title: "Raft: leader election"
+track: distributed-systems
+group: Consensus
+order: 17
+summary: Servers elect one leader per term by majority vote, using random timeouts so one candidate usually stands alone, and step down whenever they see a higher term.
+intent: Only a server that a majority voted for in the current term may lead, so two leaders can never win the same term, even across a partition.
+changeRequest: Two replicas promoted themselves in the same second last week. Make failover deterministic, so the lowest-numbered live replica takes over.
+languages: [go, python, typescript, rust]
+glossary: [raft-term, election-timeout, split-vote, majority-quorum, raft-heartbeat, pre-vote, check-quorum, split-brain]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [distributed-systems/leader-election-and-fencing]
+skills: [consensus]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: raft-leader-election
+  scenarios:
+    - try: "Crash the leader and watch the rings."
+      notice: "The first follower whose timer runs out raises the term, votes for itself and asks the others. With three votes it leads, usually within a few hundred milliseconds."
+    - try: "Set the timeout to 150 ms with no randomness, restart everything if needed, and crash the leader."
+      notice: "Every follower stands at the same moment and votes for itself. Nobody reaches three, they all time out together, and the term climbs with no leader."
+    - try: "Choose Split · leader with 3 and watch the side of two."
+      notice: "They time out again and again and their term climbs, but two votes are never three. When you reconnect, their high term forces one extra election."
+    - try: "Choose Split · leader with 2, wait for the three to elect, then reconnect."
+      notice: "For a while there are two leaders, in different terms. The old one steps down as soon as a message with the higher term reaches it."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 118, h: 52, title: Watchdog, sub: 3 s · fixed }
+      after:  { x: 12, y: 30, w: 118, h: 52, title: Election timer, sub: random 150–300 ms }
+    - id: context
+      kind: context
+      before: { x: 156, y: 18, w: 266, h: 236, title: Replica S2, sub: decides alone }
+      after:  { x: 156, y: 30, w: 150, h: 56, title: Candidate, sub: asks for votes }
+    - id: promote
+      kind: concrete
+      before: { x: 176, y: 150, w: 226, h: 40, title: promote() }
+      after:  { x: 330, y: 204, w: 110, h: 40, title: becomeLeader }
+    - id: term
+      kind: concrete
+      before: { x: 176, y: 90, w: 226, h: 40, title: primary alive? }
+      after:  { x: 156, y: 204, w: 150, h: 40, title: term + 1 · on disk }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 330, y: 30, w: 220, h: 56, title: "" }
+      after:  { x: 330, y: 30, w: 220, h: 56, title: Majority vote, sub: 3 of 5 · once per term }
+    - id: voters
+      kind: concrete
+      before: { x: 440, y: 110, w: 110, h: 56, title: Other replicas, sub: never asked }
+      after:  { x: 450, y: 120, w: 100, h: 56, title: Followers, sub: one vote each }
+  edges:
+    - { from: client, to: context, label: fires }
+    - { from: context, to: term, label: raises }
+    - { from: context, to: strategy, label: RequestVote }
+    - { from: voters, to: strategy, label: grant }
+    - { from: strategy, to: promote, label: 3 votes }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: replica.go
+      source: |
+        // replica.go: take over if the primary goes quiet
+        func (r *Replica) watchPrimary(ctx context.Context) {
+            for {
+                select {
+                case <-r.heartbeats: // the primary is alive
+                case <-time.After(3 * time.Second):
+                    r.promote() // no news for 3 s: the primary is dead, I take over
+                    return
+                case <-ctx.Done():
+                    return
+                }
+            }
+        }
+      roles: { client: [6, 6], context: [2, 13], term: [5, 6], promote: [7, 7] }
+      change:
+        - { line: 7, replace: '            if r.lowestLiveReplica() != r.id {' }
+        - { after: 7, add: ['                continue // only the lowest live id takes over', '            }', '            r.promote()'] }
+    after:
+      file: node.go
+      source: |
+        // node.go: the election half of Raft
+        func (n *Node) run(ctx context.Context) {
+            for {
+                timeout := 150*time.Millisecond + rand.N(150*time.Millisecond)
+                select {
+                case <-n.heartbeat: // AppendEntries from a current leader, or a vote granted
+                case <-time.After(timeout):
+                    if !n.isLeader() {
+                        n.startElection(ctx)
+                    }
+                case <-ctx.Done():
+                    return
+                }
+            }
+        }
+
+        func (n *Node) startElection(ctx context.Context) {
+            n.mu.Lock()
+            n.term++
+            n.votedFor = n.id
+            n.role = Candidate
+            n.persist() // term and vote must survive a crash
+            term, votes := n.term, 1
+            req := VoteRequest{Term: term, Candidate: n.id, LastLogIndex: n.lastIndex(), LastLogTerm: n.lastTerm()}
+            n.mu.Unlock()
+            for _, p := range n.peers {
+                go func() {
+                    reply, err := p.RequestVote(ctx, req)
+                    if err != nil {
+                        return // unreachable: its vote never arrives
+                    }
+                    n.mu.Lock()
+                    defer n.mu.Unlock()
+                    if reply.Term > n.term {
+                        n.becomeFollower(reply.Term) // someone is ahead: step down
+                    } else if reply.Granted && n.term == term && n.role == Candidate {
+                        votes++
+                        if votes > (len(n.peers)+1)/2 {
+                            n.becomeLeader() // starts sending heartbeats at once
+                        }
+                    }
+                }()
+            }
+        }
+
+        // HandleRequestVote: one vote per term, first come, first served
+        func (n *Node) HandleRequestVote(req VoteRequest) VoteReply {
+            n.mu.Lock()
+            defer n.mu.Unlock()
+            if req.Term > n.term {
+                n.becomeFollower(req.Term)
+            }
+            free := n.votedFor == None || n.votedFor == req.Candidate
+            if req.Term < n.term || !free || !n.logUpToDate(req.LastLogIndex, req.LastLogTerm) {
+                return VoteReply{Term: n.term, Granted: false}
+            }
+            n.votedFor = req.Candidate
+            n.persist()
+            n.resetElectionTimer() // granting a vote resets the election timer
+            return VoteReply{Term: n.term, Granted: true}
+        }
+      roles: { client: [2, 15], timeout: [4, 10], context: [17, 44], candidacy: [18, 25], term: [19, 22], request: [26, 28], strategy: [36, 41], vote: [47, 61], voters: [47, 61], win: [37, 40], promote: [39, 39] }
+    again:
+      file: election_test.go
+      source: |
+        // election_test.go: the same partition, with Raft
+        func TestMinorityCannotElect(t *testing.T) {
+            c := newTestCluster(t, 5)
+            c.partition([]int{1, 2}, []int{3, 4, 5}) // the old leader, 1, is with the two
+            c.advance(2 * time.Second)
+            major, minor := c.leaderOf(3, 4, 5), c.leaderOf(1, 2)
+            if major == nil {
+                t.Fatal("the side of three should elect a leader")
+            }
+            if minor != nil && minor.Term() >= major.Term() {
+                t.Fatal("any leader on the side of two must be from an older term")
+            }
+        }
+    cost:
+      before: { text: 2 primaries during a partition, value: 0.85 }
+      after: { text: 1 leader per term · ~300 ms failover, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Go has the two most used Raft libraries. `etcd-io/raft` is only the state machine: you call `Tick()`, and carry its messages and storage yourself. `hashicorp/raft` is a whole node with transport and storage. Write your own only to learn.'
+      seenIn: '`etcd-io/raft` (etcd, CockroachDB, its `Config` has `ElectionTick`, `HeartbeatTick`, `PreVote` and `CheckQuorum`). `hashicorp/raft` (Consul, Nomad, Vault''s integrated storage).'
+
+  python:
+    before:
+      file: replica.py
+      source: |
+        # replica.py: take over if the primary goes quiet
+        async def watch_primary(self) -> None:
+            while True:
+                try:
+                    async with asyncio.timeout(3.0):
+                        await self.heartbeats.get()  # the primary is alive
+                except TimeoutError:
+                    await self.promote()  # no news for 3 s: the primary is dead, I take over
+                    return
+      roles: { client: [5, 5], context: [2, 9], term: [5, 7], promote: [8, 8] }
+      change:
+        - { line: 8, replace: '            if self.lowest_live_replica() != self.id:' }
+        - { after: 8, add: ['                continue  # only the lowest live id takes over', '            await self.promote()'] }
+    after:
+      file: node.py
+      source: |
+        # node.py: the election half of Raft
+        async def run(self) -> None:
+            while True:
+                try:
+                    async with asyncio.timeout(random.uniform(0.150, 0.300)):
+                        await self.heartbeat.wait()  # AppendEntries from a leader, or a vote granted
+                    self.heartbeat.clear()
+                except TimeoutError:
+                    if self.role != Role.LEADER:
+                        await self.start_election()
+
+        async def start_election(self) -> None:
+            self.term += 1
+            self.voted_for = self.id
+            self.role = Role.CANDIDATE
+            self.persist()  # term and vote must survive a crash
+            term, votes = self.term, 1
+            req = VoteRequest(term, self.id, self.last_index(), self.last_term())
+            try:
+                for reply in asyncio.as_completed([p.request_vote(req) for p in self.peers], timeout=0.15):
+                    granted, peer_term = await reply
+                    if peer_term > self.term:
+                        self.become_follower(peer_term)  # someone is ahead: step down
+                        return
+                    if granted and self.term == term and self.role == Role.CANDIDATE:
+                        votes += 1
+                        if votes > (len(self.peers) + 1) // 2:
+                            self.become_leader()  # starts sending heartbeats at once
+                            return
+            except TimeoutError:
+                return  # no majority in time; the next timeout starts a new term
+
+        def handle_request_vote(self, req: VoteRequest) -> tuple[bool, int]:
+            """One vote per term, first come, first served."""
+            if req.term > self.term:
+                self.become_follower(req.term)
+            free = self.voted_for in (None, req.candidate)
+            if req.term < self.term or not free or not self.log_up_to_date(req.last_index, req.last_term):
+                return False, self.term
+            self.voted_for = req.candidate
+            self.persist()
+            self.heartbeat.set()  # granting a vote resets the election timer
+            return True, self.term
+      roles: { client: [2, 10], timeout: [5, 10], context: [12, 31], candidacy: [13, 18], term: [13, 16], request: [19, 21], strategy: [25, 29], vote: [33, 43], voters: [33, 43], win: [26, 29], promote: [28, 28] }
+    again:
+      file: test_election.py
+      source: |
+        # test_election.py: the same partition, with Raft
+        async def test_minority_cannot_elect(cluster):
+            cluster.partition([1, 2], [3, 4, 5])  # the old leader, 1, is with the two
+            await cluster.advance(2.0)
+            major, minor = cluster.leader_of(3, 4, 5), cluster.leader_of(1, 2)
+            assert major is not None
+            assert minor is None or minor.term < major.term
+    cost:
+      before: { text: 2 primaries during a partition, value: 0.85 }
+      after: { text: 1 leader per term · ~300 ms failover, value: 0.15 }
+    lens:
+      need: 1
+      needLabel: Rare
+      note: 'Python has no widely used production Raft. Services that need a leader usually get one from a coordination service that runs consensus for them: an etcd lease or election through a client library, or a ZooKeeper election recipe through `kazoo`. `PySyncObj` implements Raft for small clusters.'
+      seenIn: '`kazoo`''s `Election` recipe on ZooKeeper. etcd clients with leases. `PySyncObj`.'
+
+  typescript:
+    before:
+      file: replica.ts
+      source: |
+        // replica.ts: take over if the primary goes quiet
+        private lastHeartbeat = Date.now();
+
+        private watchPrimary(): void {
+          setInterval(() => {
+            if (Date.now() - this.lastHeartbeat > 3_000) {
+              this.promote(); // no news for 3 s: the primary is dead, I take over
+            }
+          }, 500);
+        }
+      roles: { client: [5, 6], context: [4, 10], term: [6, 6], promote: [7, 7] }
+      change:
+        - { line: 6, replace: '    if (Date.now() - this.lastHeartbeat > 3_000 && this.lowestLiveReplica() === this.id) {' }
+    after:
+      file: node.ts
+      source: |
+        // node.ts: the election half of Raft
+        private resetElectionTimer(): void {
+          clearTimeout(this.electionTimer);
+          const timeout = 150 + Math.random() * 150; // a fresh random timeout each time
+          this.electionTimer = setTimeout(() => this.startElection(), timeout);
+        }
+
+        private async startElection(): Promise<void> {
+          this.term += 1;
+          this.votedFor = this.id;
+          this.role = "candidate";
+          await this.persist(); // term and vote must survive a crash
+          const term = this.term;
+          let votes = 1;
+          this.resetElectionTimer(); // if this election splits, try again later
+          const req = { term, candidate: this.id, lastLogIndex: this.lastIndex(), lastLogTerm: this.lastTerm() };
+          for (const peer of this.peers) {
+            peer.requestVote(req).then((reply) => {
+              if (reply.term > this.term) return this.becomeFollower(reply.term); // someone is ahead
+              if (reply.granted && this.term === term && this.role === "candidate") {
+                votes += 1;
+                if (votes > (this.peers.length + 1) / 2) this.becomeLeader(); // heartbeats start now
+              }
+            }, () => {}); // unreachable: its vote never arrives
+          }
+        }
+
+        // one vote per term, first come, first served
+        async handleRequestVote(req: VoteRequest): Promise<VoteReply> {
+          if (req.term > this.term) this.becomeFollower(req.term);
+          const free = this.votedFor === null || this.votedFor === req.candidate;
+          if (req.term < this.term || !free || !this.logUpToDate(req.lastLogIndex, req.lastLogTerm)) {
+            return { term: this.term, granted: false };
+          }
+          this.votedFor = req.candidate;
+          await this.persist(); // on disk before the reply leaves
+          this.resetElectionTimer();
+          return { term: this.term, granted: true };
+        }
+      roles: { client: [2, 6], timeout: [2, 6], context: [8, 26], candidacy: [9, 16], term: [9, 12], request: [17, 18], strategy: [20, 23], vote: [28, 39], voters: [28, 39], win: [21, 22], promote: [22, 22] }
+    again:
+      file: election.test.ts
+      source: |
+        // election.test.ts: the same partition, with Raft
+        test("a minority cannot elect", async () => {
+          const c = new TestCluster(5);
+          c.partition([1, 2], [3, 4, 5]); // the old leader, 1, is with the two
+          await c.advance(2_000);
+          const major = c.leaderOf(3, 4, 5), minor = c.leaderOf(1, 2);
+          assert.ok(major);
+          assert.ok(!minor || minor.term < major.term);
+        });
+    cost:
+      before: { text: 2 primaries during a partition, value: 0.85 }
+      after: { text: 1 leader per term · ~300 ms failover, value: 0.15 }
+    lens:
+      need: 1
+      needLabel: Rare
+      note: 'Node has no mainstream production Raft. Services elect a leader through something that already runs consensus: the `etcd3` package''s elections and leases, or a Kubernetes Lease. Teaching implementations of Raft in TypeScript are common; they are for learning.'
+      seenIn: '`etcd3`''s `Election` API. Kubernetes `Lease` objects, which etcd stores with Raft underneath.'
+
+  rust:
+    before:
+      file: replica.rs
+      source: |
+        // replica.rs: take over if the primary goes quiet
+        async fn watch_primary(&self) {
+            loop {
+                match timeout(Duration::from_secs(3), self.heartbeat.notified()).await {
+                    Ok(()) => continue, // the primary is alive
+                    Err(_) => {
+                        self.promote().await; // no news for 3 s: the primary is dead, I take over
+                        return;
+                    }
+                }
+            }
+        }
+      roles: { client: [4, 4], context: [2, 12], term: [4, 5], promote: [7, 7] }
+      change:
+        - { line: 6, replace: '            Err(_) if self.lowest_live_replica() == self.id => {' }
+        - { after: 9, add: ['            Err(_) => continue, // a lower id will take over'] }
+    after:
+      file: node.rs
+      source: |
+        // node.rs: the election half of Raft
+        async fn run(self: Arc<Self>) {
+            loop {
+                let timeout = Duration::from_millis(rand::thread_rng().gen_range(150..300));
+                tokio::select! {
+                    _ = self.heartbeat.notified() => {} // AppendEntries from a leader, or a vote granted
+                    _ = tokio::time::sleep(timeout) => {
+                        if !self.is_leader() {
+                            self.clone().start_election().await;
+                        }
+                    }
+                }
+            }
+        }
+
+        async fn start_election(self: Arc<Self>) {
+            let (term, req) = {
+                let mut s = self.state.lock().unwrap();
+                s.term += 1;
+                s.voted_for = Some(self.id);
+                s.role = Role::Candidate;
+                s.persist(); // term and vote must survive a crash
+                (s.term, VoteRequest { term: s.term, candidate: self.id, last_index: s.last_index(), last_term: s.last_term() })
+            };
+            let mut replies: FuturesUnordered<_> = self.peers.iter().map(|p| p.request_vote(req.clone())).collect();
+            let mut votes = 1;
+            while let Some(reply) = replies.next().await {
+                let Ok(reply) = reply else { continue }; // unreachable: its vote never arrives
+                let mut s = self.state.lock().unwrap();
+                if reply.term > s.term {
+                    s.become_follower(reply.term); // someone is ahead: step down
+                    return;
+                }
+                if reply.granted && s.term == term && s.role == Role::Candidate {
+                    votes += 1;
+                    if votes > (self.peers.len() + 1) / 2 {
+                        s.become_leader(); // starts sending heartbeats at once
+                        return;
+                    }
+                }
+            }
+        }
+
+        // one vote per term, first come, first served
+        fn handle_request_vote(&self, req: VoteRequest) -> VoteReply {
+            let mut s = self.state.lock().unwrap();
+            if req.term > s.term {
+                s.become_follower(req.term);
+            }
+            let free = s.voted_for.is_none() || s.voted_for == Some(req.candidate);
+            if req.term < s.term || !free || !s.log_up_to_date(req.last_index, req.last_term) {
+                return VoteReply { term: s.term, granted: false };
+            }
+            s.voted_for = Some(req.candidate);
+            s.persist();
+            self.heartbeat.notify_one(); // granting a vote resets the election timer
+            VoteReply { term: s.term, granted: true }
+        }
+      roles: { client: [2, 14], timeout: [4, 10], context: [16, 42], candidacy: [17, 24], term: [19, 22], request: [25, 27], strategy: [34, 40], vote: [45, 58], voters: [45, 58], win: [35, 39], promote: [37, 37] }
+    again:
+      file: tests/election.rs
+      source: |
+        // tests/election.rs: the same partition, with Raft
+        #[tokio::test(start_paused = true)]
+        async fn minority_cannot_elect() {
+            let c = TestCluster::new(5).await;
+            c.partition(&[1, 2], &[3, 4, 5]); // the old leader, 1, is with the two
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let major = c.leader_of(&[3, 4, 5]).expect("the side of three elects");
+            assert!(c.leader_of(&[1, 2]).map_or(true, |m| m.term < major.term));
+        }
+    cost:
+      before: { text: 2 primaries during a partition, value: 0.85 }
+      after: { text: 1 leader per term · ~300 ms failover, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Rust has two maintained libraries. `openraft` is async on tokio, with `election_timeout_min`, `election_timeout_max` and `heartbeat_interval` in its `Config`. `raft-rs` is TiKV''s port of etcd''s state machine, driven by your own loop.'
+      seenIn: '`raft-rs` in TiKV. `openraft` in Databend''s meta service. tokio''s paused clock for deterministic election tests.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: S3 hears no heartbeat before its random timer runs out. It was the first to wake; the others still have time on their clocks.
+    nodes: [client, context]
+    edges: [client>context]
+    role: timeout
+  - text: It raises the term from 4 to 5, votes for itself and writes both to disk before asking anyone.
+    nodes: [context, term]
+    edges: [context>term]
+    role: candidacy
+  - text: It sends RequestVote for term 5 to every other server, with the index and term of its last log entry.
+    nodes: [context, strategy, voters]
+    edges: [context>strategy]
+    role: request
+  - text: Each follower has not voted in term 5 yet, and S3's log is at least as up to date as its own, so it grants the vote, saves it, and resets its own timer.
+    nodes: [voters, strategy]
+    edges: [voters>strategy]
+    role: vote
+  - text: With its own vote and two more, S3 has 3 of 5 and becomes leader for term 5. It sends heartbeats at once, which stops anyone else's election.
+    nodes: [strategy, promote]
+    edges: [strategy>promote]
+    role: win
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: A five-server Raft cluster loses its leader. How many votes does a candidate need to win?
+    options:
+      - text: "3, a majority of all five, counting its own vote"
+        correct: true
+        why: Right. A majority of the whole cluster, floor(5/2) + 1. Any two majorities of five share a server, and that server votes only once per term.
+      - text: "2, a majority of the four servers still running"
+        why: The majority is of the full cluster, not of whoever is reachable. Otherwise both sides of a partition could each find a majority of what they can see.
+      - text: "5, every server"
+        why: Then one crashed server would stop all elections. A majority is enough, which is why five servers tolerate two failures.
+  engineer:
+    question: Why does each Raft server pick its election timeout at random from a range, such as 150 to 300 ms?
+    options:
+      - text: So that one server usually times out first and collects its votes before the others become candidates.
+        correct: true
+        why: Right. With equal timeouts, followers time out together, each votes for itself, and the vote splits. The randomness must be larger than the time a vote request takes to arrive.
+      - text: So that the leader can tell which follower is the fastest.
+        why: The leader does not use timeouts to rank anyone. Timeouts only decide when a follower gives up waiting and stands.
+      - text: To spread heartbeat traffic over time.
+        why: Heartbeats come from the leader on its own fixed interval. The randomness is in the followers' election timers.
+  deep:
+    question: Why must a server write its current term and vote to disk before it replies to RequestVote?
+    options:
+      - text: If it crashed and restarted without them, it could vote again in the same term, and two candidates could each count it toward a majority.
+        correct: true
+        why: Right. One vote per term is what makes two leaders in one term impossible. Forgetting a vote after a restart breaks that, so the vote must be durable before it leaves.
+      - text: So that the new leader can read the votes from the followers' disks.
+        why: Votes are only sent to the candidate. Nobody reads them back from disk except the server itself after a restart.
+      - text: Because the log entries must be written in the same file.
+        why: Where it is stored does not matter; that it survives a crash before the reply is sent does.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Follower
+      example: S1, S2, S4, S5 between elections
+      job: Answers the leader and candidates. Votes once per term. Becomes a candidate when its election timer runs out.
+    - role: Candidate
+      example: S3 after its timeout
+      job: Raises the term, votes for itself, asks everyone else. Wins with a majority, steps down on a higher term, or times out and tries again.
+    - role: Leader
+      example: S3 in term 5
+      job: Sends heartbeats so nobody else stands. Steps down the moment it sees a higher term.
+    - role: Term
+      example: a number on every message
+      job: A logical clock. Each term has at most one leader; stale servers recognise they are behind by the number.
+  useWhen:
+    - Several servers must agree on one leader for a replicated log, configuration store or lock service, and must keep working when a minority fails.
+    - You can run an odd number of servers (3 or 5) on reasonably reliable, low-latency links.
+  avoidWhen:
+    - You only need a leader for a background job and already run etcd, ZooKeeper or Kubernetes. Use their leases or election APIs rather than embedding Raft.
+    - The servers are spread across continents. Elections and every commit wait on round trips to a majority.
+  tradeoffs:
+    - Five servers tolerate two failures, three tolerate one. Four also tolerate only one, so even sizes add cost without adding tolerance.
+    - The election timeout trades failover time against false elections. It must be well above the time to reach every server, and well below the time between failures.
+    - In basic Raft a leader cut off in a minority keeps believing it leads until it hears a higher term. CheckQuorum makes it step down by itself.
+    - A server returning from a partition with an inflated term disrupts a healthy leader. Pre-Vote prevents that.
+  lookalikes:
+    - name: Bully algorithm
+      how: The highest or lowest id that is alive wins. It needs accurate failure detection, which a partition breaks; Raft needs only a majority.
+    - name: Leases
+      how: A leader holds a time-limited lock from a coordination service. Often built on top of Raft (etcd) or Zab (ZooKeeper).
+    - name: Paxos
+      how: Solves the same consensus problem. Multi-Paxos elects a distinguished proposer too, but the paper leaves much of it open; Raft spells out election and log rules together.
+---
+
+## [concept] Raft: leader election
+
+**Raft servers elect one leader per numbered <Term id="raft-term">term</Term>. A candidate needs votes from a <Term id="majority-quorum">majority</Term> of the cluster, and each server votes at most once per term, so no term can have two leaders.**
+
+A follower that hears nothing from a leader for its <Term id="election-timeout">election timeout</Term> becomes a candidate: it raises the term, votes for itself and asks the others. The leader keeps everyone else quiet with <Term id="raft-heartbeat">heartbeats</Term>.
+
+<Depth level={2}>
+Three outcomes end an election. The candidate wins a majority and becomes leader. It hears from a leader whose term is at least its own and goes back to being a follower. Or nobody wins, a <Term id="split-vote">split vote</Term>, and the candidates time out and try again in a new term. Random timeouts make the third case rare: one server usually wakes first and wins before the others stand.
+</Depth>
+
+<Depth level={3}>
+The term is the safety net for everything else. Every message carries one; a server that sees a higher term adopts it and becomes a follower, and a message with a lower term is rejected. A deposed leader never needs to be told it lost: the first message from the new term tells it.
+</Depth>
+
+## [problem] Replicas that take over on their own
+
+A database has one primary and two replicas. Each replica watches the primary's heartbeats, and if it hears nothing for 3 seconds it promotes itself. In testing, kill the primary and a replica takes over within seconds.
+
+<Depth level={2}>
+Each replica decides alone, from what it can see. That is the flaw: "the primary is dead" and "I cannot reach the primary" look the same from inside one server.
+</Depth>
+
+<Depth level={3}>
+This is a failure detector with no agreement step. A timeout can only ever say "I have not heard"; turning that into "and therefore I lead" needs everyone else's view too.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** two replicas promoted themselves in the same second last week. Make failover deterministic, so the lowest-numbered live replica takes over.
+
+The fix works for crashes. Then a switch fails and splits the network. The primary can still reach one replica, the other replica can reach neither. That replica is the lowest live id it can see, so it promotes itself. Two primaries accept writes for twenty minutes: a <Term id="split-brain">split brain</Term>.
+
+<Depth level={2}>
+"Lowest live id" is decided from each server's own view of who is alive, and a partition gives each side a different view. Any rule that each server evaluates alone has the same hole.
+</Depth>
+
+<Depth level={3}>
+The repair is worse than the outage: two divergent histories of writes, and no record of which came first. Fencing tokens (the previous lesson) stop a stale primary's writes from landing; they do not stop two from being elected.
+</Depth>
+
+## [morph] Ask for votes instead of deciding alone
+
+Drag the slider. The fixed watchdog becomes a random election timer, the replica becomes a candidate that must collect votes, and taking over needs 3 of 5.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+In the partition above, only the side with a majority can elect. The side without one keeps timing out and raising its term, but it can never collect enough votes. The paper's timing rule ties the numbers together: the time to reach every server must be much less than the election timeout, which must be much less than the time between failures. It suggests 150 to 300 ms as a conservative range; etcd defaults to a 100 ms heartbeat and a 1000 ms election timeout.
+</Depth>
+
+<Depth level={3}>
+Votes have one more condition, covered fully in the next lesson: a server refuses its vote if its own log is more up to date than the candidate's, comparing the term of the last entry and then its index. That is what stops a server missing committed entries from becoming leader.
+</Depth>
+
+## [walk] Follow one election
+
+The leader of term 4 has crashed. Follow S3 from its timeout to its first heartbeat as leader. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The candidate fans out one goroutine per peer and counts votes under the node's mutex. `rand.N` from `math/rand/v2` draws the timeout as a `time.Duration` directly.</Lang>
+<Lang only="python">`asyncio.as_completed` hands back replies in arrival order, so the candidate can declare victory at the third vote without waiting for the rest. Its `timeout` bounds the whole election.</Lang>
+<Lang only="typescript">On one event loop there are no locks, but the checks after each `await` matter: by the time a vote arrives the node may have stepped down, so it re-checks the term and role before counting.</Lang>
+<Lang only="rust">`FuturesUnordered` yields replies as they arrive. The state lock is taken after each `await` and dropped at the end of the iteration, never held across an await point.</Lang>
+</Depth>
+
+## [again] The same partition, with Raft
+
+The same switch failure: two servers on one side, three on the other. The side of three elects a leader in a higher term within a few hundred milliseconds. The side of two can never get three votes. If the old leader was on that side it can still think it leads, but it cannot commit anything, and it steps down the moment the network heals.
+
+<Depth level={2}>
+Two extensions make partitions smoother. <Term id="check-quorum">CheckQuorum</Term> makes a leader step down when it has not heard from a majority for an election timeout. <Term id="pre-vote">Pre-Vote</Term> makes a server ask whether it could win before raising its term, so a server returning from a partition does not depose a healthy leader.
+</Depth>
+
+<Depth level={3}>
+The paper measured this. With no randomness, elections in their five-server cluster took more than 10 seconds because of repeated split votes; adding just 5 ms of randomness brought the median down to 287 ms. In the playground messages take 15 to 21 ms, so it needs more randomness than that to see the same effect.
+</Depth>
+
+## [play] Kill the leader
+
+Five servers in slow motion. The ring around each server is its election timer; heartbeats from the leader refill it. Crash and restart servers, split the network, and change how random the timeouts are.
+
+## [lens] How each language does it
+
+Go and Rust have production Raft libraries; most systems that need consensus use one of them, or etcd built on one. Python and TypeScript services almost always get leader election from a coordination service instead.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+The code shown is the election half of Raft, simplified for reading. Real libraries add log replication, snapshots, membership changes, Pre-Vote and CheckQuorum, and are tested with fault injection for years.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="raft-leader-election" />
+
+### Why odd numbers
+
+A majority of 3 is 2, so 3 servers survive 1 failure. A majority of 4 is 3, so 4 servers also survive only 1, and every election and commit waits for one more server. A majority of 5 is 3, so 5 servers survive 2. That is why clusters are sized 3 or 5, and rarely more: each extra pair adds one more tolerated failure and makes every commit wait on more servers.

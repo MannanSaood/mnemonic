@@ -1,0 +1,24 @@
+- id: raft-term
+  term: Term
+  short: A numbered period in Raft that starts with an election and has at most one leader. Terms act as a logical clock; a server that sees a higher term adopts it and becomes a follower.
+- id: election-timeout
+  term: Election timeout
+  short: How long a Raft follower waits without hearing from a leader before it becomes a candidate. Each server picks it at random from a range, such as 150 to 300 ms.
+- id: split-vote
+  term: Split vote
+  short: An election in which several candidates divide the votes so that none reaches a majority. The term ends without a leader and a new election follows.
+- id: majority-quorum
+  term: Majority quorum
+  short: More than half of the servers, floor(n/2) + 1. Any two majorities share at least one server, which is why two leaders cannot both win the same term.
+- id: raft-heartbeat
+  term: Heartbeat
+  short: An empty AppendEntries message the Raft leader sends regularly so followers know it is alive and reset their election timers.
+- id: pre-vote
+  term: Pre-Vote
+  short: A Raft extension in which a server first asks whether it could win before raising its term, so a server rejoining after a partition does not force a needless election.
+- id: check-quorum
+  term: CheckQuorum
+  short: A Raft extension in which a leader steps down if it has not heard from a majority within an election timeout, so a leader cut off in a minority stops leading on its own.
+- id: split-brain
+  term: Split brain
+  short: Two nodes both acting as the primary at once, usually after a network partition, each accepting writes the other does not see.
