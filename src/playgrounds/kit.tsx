@@ -13,7 +13,7 @@ export function useModel<S, A>(step: (s: S, a: A) => S, init: () => S) {
 
 export function PgFrame({ title, onReset, toolbar, children }: { title: string; onReset: () => void; toolbar?: ReactNode; children: ReactNode }) {
   return (
-    <section className="pg" aria-label={`Playground: ${title}`}>
+    <section className="pg" data-pagefind-ignore aria-label={`Playground: ${title}`}>
       <header className="pg-head">
         <span className="label">Playground · {title}</span>
         <div className="pg-tools">

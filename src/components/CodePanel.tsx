@@ -4,7 +4,7 @@ import type { PreparedCode, Range } from "@/lib/types";
 /** Pre-highlighted code with optional highlighted line range and change markers. */
 export function CodePanel({ code, note, lit }: { code: PreparedCode; note: string; lit?: Range | null }) {
   return (
-    <div className="code">
+    <div className="code" data-pagefind-ignore>
       <div className="code-head">
         <span className="label">{code.file}</span>
         <span className="label">{note}</span>
