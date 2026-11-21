@@ -63,14 +63,27 @@ Ciechanowski, Josh Comeau and Red Blob Games. Notes: `design/research.md`.
   not just watches an animation. It is lesson step 7, "Try it", and can also be placed inline
   anywhere in prose or on a Reference page with `<Playground model="..." />`.
 - Planned playgrounds:
-  - **Strategy:** swap the payment provider on a live mini-checkout, add a new provider, and
-    watch the change-cost meter. In the "switch" design the reader can forget one of the
-    places, and a refund fails.
+  - **Strategy (built):** two checkouts side by side, one with branches on the provider name
+    and one with Strategy, both taking live traffic. Change request 1, "Add Klarna": every edit
+    ships at once, so the branch design exposes customers to half-done states (lost sales,
+    stuck refunds) while the strategy design changes in one step. Change request 2, "PayPal
+    changed its refund call": one line in both designs, showing what Strategy does not buy.
   - **Observer:** add or remove subscribers, fire events, watch messages flow.
   - **Decorator:** stack or reorder middleware, see which requests get logged or rejected.
   - Later tracks: Go scheduler (add goroutines, block one in a syscall, watch the P handoff);
     Raft (kill the leader, partition nodes, watch the election); TCP (drop or delay packets);
     virtual memory (touch pages, cause minor or major faults).
+- **Every topic gets its own playground design (user, 2026-11-21).** Playgrounds exist so
+  people understand; a generic "click to switch and see it change" widget is not enough. For
+  each topic, before designing:
+  1. Write down what the reader should be able to do or understand after playing (1-3
+     outcomes). Every element on screen must serve one of them, or it goes.
+  2. Search the web for the best existing interactive explanations of that topic (explorable
+     explanations, visualisers, simulators) and note what makes them work.
+  3. Design the playground around a realistic situation where the concept's benefit or cost
+     shows up through the reader's own actions, and end with a result that uses the reader's
+     own numbers and states the takeaway.
+  Record the outcomes and the sources in `design/research.md` under that topic.
 - **Built from the visualiser kit:** a model (plain TypeScript state plus pure step
   functions, testable without a browser) + controls (buttons, choices, toggles, sliders,
   drag) + a view, all from shared pieces in `src/playgrounds/kit`. Models are registered by

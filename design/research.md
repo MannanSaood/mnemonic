@@ -53,3 +53,20 @@ Rules that follow:
    the model shows the consequence instead of preventing it.
 4. Every control works with the keyboard; the event log is announced to screen readers; reduced
    motion swaps animation for instant updates.
+
+## Strategy playground (2026-11-21)
+
+Outcomes the reader should leave with:
+1. Adding a provider: in a branch-on-name design the change is spread over several places,
+   and with continuous deployment customers hit the half-done states. With Strategy it is one
+   unit of change.
+2. Changing one provider costs the same in both designs: Strategy pays off where the list of
+   variants changes, not everywhere.
+
+Sources checked: an existing interactive Strategy demo
+(ozidan13.github.io/SOLID-Principles-Design-Patterns, "payment processing demo") lets you pick
+a payment strategy and see the behaviour change. That shows the mechanics but not why the
+pattern matters; a first version of ours did the same and the user found it meaningless.
+Ours instead runs live traffic through both designs while the reader makes real change
+requests, and ends each request with the reader's own numbers (deploys, lines, lost sales,
+stuck refunds).

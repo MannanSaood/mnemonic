@@ -1,33 +1,44 @@
 // Run with: npm test  (Node's built-in test runner with TypeScript type stripping)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { init, step, costOf, type State, type Action } from "../src/playgrounds/strategy-checkout/model.ts";
+import { init, requestCost, requestDone, step, type Action, type State } from "../src/playgrounds/strategy-checkout/model.ts";
 import { computeRoadmap } from "../src/lib/roadmap.ts";
 
 const run = (s: State, ...actions: Action[]) => actions.reduce(step, s);
 
-test("switch design: paying with a provider config does not list fails at config", () => {
-  const s = run(init("switch"), { type: "select", provider: "klarna" }, { type: "pay" });
-  assert.equal(s.log[0].ok, false);
-  assert.match(s.log[0].text, /Config rejected/);
+test("checkout: editing config first exposes customers to the half-done branch design", () => {
+  const s = run(init(), { type: "editPlace", place: "config" }, { type: "editPlace", place: "pay" }, { type: "editPlace", place: "refund" });
+  const b = requestCost(s.branch);
+  assert.equal(b.deploys, 3);
+  assert.equal(b.lines, 5);
+  assert.ok(b.lostSales + b.stuckRefunds > 0, "some customer should hit a half-done state");
 });
 
-test("switch design: forgetting the Refund branch charges the customer but cannot refund", () => {
-  const s = run(init("switch"),
-    { type: "teach", place: "config", provider: "klarna" },
-    { type: "teach", place: "pay", provider: "klarna" },
-    { type: "select", provider: "klarna" }, { type: "pay" }, { type: "refund" });
-  assert.equal(s.log[1].ok, true);
-  assert.equal(s.log[0].ok, false);
-  assert.match(s.log[0].text, /Refund failed/);
-  assert.deepEqual(costOf(s), { text: "3 lines · 2 places edited", value: 0.5, good: false });
+test("checkout: config last is a safe order with no failures", () => {
+  const s = run(init(), { type: "editPlace", place: "pay" }, { type: "editPlace", place: "refund" }, { type: "editPlace", place: "config" });
+  const b = requestCost(s.branch);
+  assert.equal(b.lostSales + b.stuckRefunds, 0);
 });
 
-test("strategy design: one new type makes pay and refund work", () => {
-  const s = run(init("strategy"), { type: "addType", provider: "klarna" },
-    { type: "select", provider: "klarna" }, { type: "pay" }, { type: "refund" });
-  assert.ok(s.log[0].ok && s.log[1].ok);
-  assert.equal(costOf(s)?.text, "1 new type · 0 edits");
+test("checkout: the strategy design adds Klarna in one deploy with no failures", () => {
+  const s = run(init(), { type: "addProvider" });
+  const c = requestCost(s.strategy);
+  assert.equal(c.deploys, 1);
+  assert.equal(c.files, 1);
+  assert.equal(c.lostSales + c.stuckRefunds, 0);
+  assert.ok(s.strategy.lastBatch.some((e) => e.provider === "klarna" && e.ok));
+});
+
+test("checkout: PayPal's refund change costs one line in both designs", () => {
+  let s = run(init(), { type: "editPlace", place: "pay" }, { type: "editPlace", place: "refund" }, { type: "editPlace", place: "config" }, { type: "addProvider" });
+  assert.ok(requestDone(s));
+  s = run(s, { type: "next" });
+  assert.equal(s.request, 1);
+  assert.ok(s.branch.lastBatch.some((e) => e.provider === "paypal" && !e.ok), "PayPal refunds fail before the fix");
+  s = run(s, { type: "fixPaypal", side: "branch" }, { type: "fixPaypal", side: "strategy" });
+  assert.equal(requestCost(s.branch).lines, 1);
+  assert.equal(requestCost(s.strategy).lines, 1);
+  assert.ok(requestDone(s));
 });
 
 const lesson = (id: string, skills: string[], prerequisites: string[] = [], order = 0) => ({

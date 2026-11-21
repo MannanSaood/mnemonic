@@ -18,12 +18,14 @@ depths: [overview, engineer, deep]
 playground:
   model: strategy-checkout
   scenarios:
-    - try: In the switch design, pay with Stripe, then refund it.
-      notice: The call goes through a `case "stripe"` branch in Pay and another one in Refund.
-    - try: Still in the switch design, add Klarna to the config list and to the Pay switch only. Pay with Klarna, then refund.
-      notice: The payment works and the refund fails. The customer has paid and cannot get the money back, and nothing warned you.
-    - try: Switch to the strategy design and add the Klarna type. Pay and refund with Klarna.
-      notice: One addition, and both calls work. The meter shows no edits to existing code.
+    - try: "Do change request 1 in the branch design, editing the code from the top down."
+      notice: "Each edit ships on its own. Between edits, real customers hit the half-done code: lost sales, then refunds that cannot go through."
+    - try: "Do the same request in the strategy design."
+      notice: "One change, one deploy, and nothing was ever half done."
+    - try: "Press Reset and find an order of branch edits that no customer notices."
+      notice: "It exists (offer Klarna in config last), but you have to know every place and the right order. Strategy removes the need to know."
+    - try: "Do change request 2, PayPal's new refund call."
+      notice: "One line in both designs. Strategy helps when the list of variants changes, not with changes inside one variant."
 
 # ---------------------------------------------------------------- diagram
 # Boxes are in SVG units. "before" is the design in the Problem step, "after" the refactored one.
@@ -535,9 +537,11 @@ One line of wiring remains: whatever turns the config string `"klarna"` into the
 Tests follow the same split. The Klarna provider gets its own tests against Klarna's sandbox. Checkout's tests use a fake provider that records what it was asked to charge and refund, and they never change when a provider is added.
 </Depth>
 
-## [play] Run the checkout yourself
+## [play] Ship real changes to live traffic
 
-This checkout runs both designs. Take payments, add Klarna, and try to break it.
+Two copies of the same checkout run side by side: one with branches on the provider name, one with Strategy. Customers keep paying and asking for refunds while you work, and every change you make goes to production at once.
+
+Work through the two change requests in both designs, then compare what each one cost.
 
 ## [lens] How each language writes it
 
