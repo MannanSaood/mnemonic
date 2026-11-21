@@ -1,0 +1,574 @@
+---
+title: Prototype
+track: design-patterns
+group: Creational
+order: 23
+summary: Make new objects by copying a configured example, and let the object's own clone() decide which parts the copy gets fresh and which it shares.
+intent: Only the object knows which of its parts are data to copy and which are services to share, so copying belongs to the object.
+changeRequest: Jobs get a labels map for cost tracking.
+languages: [go, python, typescript, rust]
+glossary: [shallow-copy, deep-copy, aliasing, immutable-object]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: prototype
+  scenarios:
+    - try: "Keep Shallow copy. Predict, then copy the template for US and set its DB_HOST."
+      notice: "The template changes too. Follow the arrows in the heap: the copy is a new job object, but its env field points at the template's map."
+    - try: "Copy for EU, set its DB_HOST, and run all jobs."
+      notice: "All three jobs now write to the EU database, including the US job. The last write to the shared map wins."
+    - try: "Set retries on one shallow copy, then switch to No copy and do it again."
+      notice: "A shallow copy keeps top-level fields apart; only nested objects are shared. With no copy at all, everything is shared."
+    - try: "Play the whole scenario with Deep copy, then with the job's own clone()."
+      notice: "Deep copy gets the databases right but makes three HTTP pools. The job's clone() copies the env and shares the pool: right on both counts."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: admin UI, sub: templates }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: registry, sub: templates by name }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: copy sites, sub: { go: "struct copy + maps.Clone ×3", python: "copy.copy + dict() ×3", typescript: "spread + spread ×3", rust: "struct literal ×3" } }
+      after:  { x: 168, y: 24, w: 170, h: 64, title: JobConfig, sub: env · client }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 380, y: 24, w: 170, h: 64, title: "" }
+      after:  { x: 380, y: 24, w: 170, h: 64, title: { go: Clone(), python: clone(), typescript: clone(), rust: "derive(Clone)" }, sub: copy data · share client }
+    - id: scheduler
+      kind: concrete
+      before: { x: 188, y: 66, w: 222, h: 36, title: scheduler, sub: copies env by hand }
+      after:  { x: 168, y: 204, w: 96, h: 40, title: scheduler }
+    - id: backfill
+      kind: concrete
+      before: { x: 188, y: 112, w: 222, h: 36, title: backfill, sub: copies env by hand }
+      after:  { x: 272, y: 204, w: 96, h: 40, title: backfill }
+    - id: preview
+      kind: concrete
+      before: { x: 188, y: 158, w: 222, h: 36, title: preview, sub: copies env by hand }
+      after:  { x: 376, y: 204, w: 96, h: 40, title: preview }
+    - id: labels
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 212, w: 222, h: 36, title: + labels ×3 }
+      after:  { x: 380, y: 120, w: 170, h: 40, title: labels, sub: one line in clone }
+  edges:
+    - { from: client, to: context, label: holds }
+    - { from: context, to: strategy, label: defines }
+    - { from: scheduler, to: strategy, label: calls }
+    - { from: backfill, to: strategy }
+    - { from: preview, to: strategy }
+    - { from: labels, to: strategy }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: scheduler.go · backfill.go · preview.go
+      source: |
+        // scheduler.go
+        func jobForTenant(t *JobConfig, tenant Tenant) *JobConfig {
+            job := *t
+            job.Env = maps.Clone(t.Env)
+            job.Name = t.Name + "-" + tenant.ID
+            job.Env["DB_HOST"] = tenant.Region + "-db.internal"
+            return &job
+        }
+
+        // backfill.go
+        func backfillJob(t *JobConfig, day time.Time) *JobConfig {
+            job := *t
+            job.Env = maps.Clone(t.Env)
+            job.Env["AS_OF"] = day.Format(time.DateOnly)
+            return &job
+        }
+
+        // preview.go: a dry run from the admin UI
+        func dryRun(t *JobConfig) *JobConfig {
+            job := *t
+            job.Env = maps.Clone(t.Env)
+            job.Env["DRY_RUN"] = "1"
+            return &job
+        }
+      roles: { context: [2, 24], scheduler: [2, 8], backfill: [11, 16], preview: [19, 24] }
+      change:
+        - { after: 4, add: ['    job.Labels = maps.Clone(t.Labels)'] }
+        - { after: 13, add: ['    job.Labels = maps.Clone(t.Labels)'] }
+        - { after: 21, add: ['    job.Labels = maps.Clone(t.Labels)'] }
+    after:
+      file: job.go · scheduler.go
+      source: |
+        type JobConfig struct {
+            Name     string
+            Schedule string
+            Retries  int
+            Env      map[string]string
+            Client   *http.Client // shared on purpose
+        }
+
+        // Clone copies what a job may change, and shares what every job uses.
+        func (c *JobConfig) Clone() *JobConfig {
+            job := *c
+            job.Env = maps.Clone(c.Env)
+            return &job
+        }
+
+        // scheduler.go
+        func jobForTenant(t *JobConfig, tenant Tenant) *JobConfig {
+            job := t.Clone()
+            job.Name = t.Name + "-" + tenant.ID
+            job.Env["DB_HOST"] = tenant.Region + "-db.internal"
+            return job
+        }
+
+        // backfill.go and preview.go call t.Clone() the same way.
+        job := templates["nightly-billing"].Clone()
+      roles: { context: [1, 7], strategy: [9, 14], scheduler: [16, 22], backfill: [24, 24], preview: [24, 24], client: [25, 25], lookup: [25, 25], copy: [11, 11], fresh: [12, 12], override: [18, 20] }
+    again:
+      file: job.go
+      source: |
+        // Clone, after Labels arrive: one new line, and no copy site changes.
+        func (c *JobConfig) Clone() *JobConfig {
+            job := *c
+            job.Env = maps.Clone(c.Env)
+            job.Labels = maps.Clone(c.Labels)
+            return &job
+        }
+    cost:
+      before: { text: 3 lines · 3 places, value: 0.75 }
+      after: { text: 1 line · 1 place, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`job := *t` copies the struct, but maps, slices and pointers inside it still point at the same data. That is the classic Go aliasing bug. Give the type a `Clone` method that knows its fields. `maps.Clone` and `slices.Clone` are themselves shallow: a map of slices needs more care.'
+      seenIn: '`(*http.Request).Clone(ctx)` returns a deep copy with a new context. `(*tls.Config).Clone()` copies a TLS config so one server can adjust it without touching another''s. `maps.Clone` and `slices.Clone` (Go 1.21).'
+
+  python:
+    before:
+      file: scheduler.py · backfill.py · preview.py
+      source: |
+        # scheduler.py
+        def job_for_tenant(t: JobConfig, tenant: Tenant) -> JobConfig:
+            job = copy.copy(t)
+            job.env = dict(t.env)
+            job.name = f"{t.name}-{tenant.id}"
+            job.env["DB_HOST"] = f"{tenant.region}-db.internal"
+            return job
+
+        # backfill.py
+        def backfill_job(t: JobConfig, day: date) -> JobConfig:
+            job = copy.copy(t)
+            job.env = dict(t.env)
+            job.env["AS_OF"] = day.isoformat()
+            return job
+
+        # preview.py: a dry run from the admin UI
+        def dry_run(t: JobConfig) -> JobConfig:
+            job = copy.copy(t)
+            job.env = dict(t.env)
+            job.env["DRY_RUN"] = "1"
+            return job
+      roles: { context: [2, 21], scheduler: [2, 7], backfill: [10, 14], preview: [17, 21] }
+      change:
+        - { after: 4, add: ['    job.labels = dict(t.labels)'] }
+        - { after: 12, add: ['    job.labels = dict(t.labels)'] }
+        - { after: 19, add: ['    job.labels = dict(t.labels)'] }
+    after:
+      file: job.py · scheduler.py
+      source: |
+        @dataclass
+        class JobConfig:
+            name: str
+            schedule: str
+            retries: int
+            env: dict[str, str]
+            client: httpx.Client  # shared on purpose
+
+            def clone(self, **changes) -> "JobConfig":
+                job = dataclasses.replace(self, **changes)
+                job.env = dict(self.env)
+                return job
+
+        # scheduler.py
+        def job_for_tenant(t: JobConfig, tenant: Tenant) -> JobConfig:
+            job = t.clone(name=f"{t.name}-{tenant.id}")
+            job.env["DB_HOST"] = f"{tenant.region}-db.internal"
+            return job
+
+        # backfill.py and preview.py call t.clone() the same way.
+        job = TEMPLATES["nightly-billing"].clone()
+      roles: { context: [1, 7], strategy: [9, 12], scheduler: [14, 18], backfill: [20, 20], preview: [20, 20], client: [21, 21], lookup: [21, 21], copy: [10, 10], fresh: [11, 11], override: [16, 17] }
+    again:
+      file: job.py
+      source: |
+        # clone(), after labels arrive: one new line, and no copy site changes.
+            def clone(self, **changes) -> "JobConfig":
+                job = dataclasses.replace(self, **changes)
+                job.env = dict(self.env)
+                job.labels = dict(self.labels)
+                return job
+    cost:
+      before: { text: 3 lines · 3 places, value: 0.75 }
+      after: { text: 1 line · 1 place, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`copy.copy` is shallow and `copy.deepcopy` copies everything, including things meant to be shared, such as an HTTP client. A `clone()` method, or a `__copy__` / `__deepcopy__` hook, puts the decision in the class. Frozen dataclasses with `dataclasses.replace` avoid the problem for flat data.'
+      seenIn: '`dataclasses.replace(obj, **changes)`, and `copy.replace` since Python 3.13. `datetime.replace(…)` returns a modified copy. The `copy` module''s `__copy__` and `__deepcopy__` hooks let a class control its own copying.'
+
+  typescript:
+    before:
+      file: scheduler.ts · backfill.ts · preview.ts
+      source: |
+        // scheduler.ts
+        function jobForTenant(t: JobConfig, tenant: Tenant): JobConfig {
+          const job = { ...t, env: { ...t.env } };
+          job.name = `${t.name}-${tenant.id}`;
+          job.env.DB_HOST = `${tenant.region}-db.internal`;
+          return job;
+        }
+
+        // backfill.ts
+        function backfillJob(t: JobConfig, day: string): JobConfig {
+          const job = { ...t, env: { ...t.env } };
+          job.env.AS_OF = day;
+          return job;
+        }
+
+        // preview.ts: a dry run from the admin UI
+        function dryRun(t: JobConfig): JobConfig {
+          const job = { ...t, env: { ...t.env } };
+          job.env.DRY_RUN = "1";
+          return job;
+        }
+      roles: { context: [2, 21], scheduler: [2, 7], backfill: [10, 14], preview: [17, 21] }
+      change:
+        - { line: 3, replace: '  const job = { ...t, env: { ...t.env }, labels: { ...t.labels } };' }
+        - { line: 11, replace: '  const job = { ...t, env: { ...t.env }, labels: { ...t.labels } };' }
+        - { line: 18, replace: '  const job = { ...t, env: { ...t.env }, labels: { ...t.labels } };' }
+    after:
+      file: job.ts · scheduler.ts
+      source: |
+        class JobConfig {
+          name = "";
+          schedule = "";
+          retries = 3;
+          env: Record<string, string> = {};
+          client!: HttpClient; // shared on purpose
+
+          clone(): JobConfig {
+            const job = Object.assign(Object.create(JobConfig.prototype), this) as JobConfig;
+            job.env = { ...this.env };
+            return job;
+          }
+        }
+
+        // scheduler.ts
+        function jobForTenant(t: JobConfig, tenant: Tenant): JobConfig {
+          const job = t.clone();
+          job.name = `${t.name}-${tenant.id}`;
+          job.env.DB_HOST = `${tenant.region}-db.internal`;
+          return job;
+        }
+
+        // backfill.ts and preview.ts call t.clone() the same way.
+        const job = templates.get("nightly-billing")!.clone();
+      roles: { context: [1, 6], strategy: [8, 12], scheduler: [15, 21], backfill: [23, 23], preview: [23, 23], client: [24, 24], lookup: [24, 24], copy: [9, 9], fresh: [10, 10], override: [17, 19] }
+    again:
+      file: job.ts
+      source: |
+        // clone(), after labels arrive: one new line, and no copy site changes.
+          clone(): JobConfig {
+            const job = Object.assign(Object.create(JobConfig.prototype), this) as JobConfig;
+            job.env = { ...this.env };
+            job.labels = { ...this.labels };
+            return job;
+          }
+    cost:
+      before: { text: 3 lines · 3 places, value: 0.75 }
+      after: { text: 1 line · 1 place, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Spread (`{ ...t }`) is a shallow copy, and it drops the class: the result is a plain object without methods. `structuredClone` copies deeply but also drops class prototypes and throws on functions, so it cannot copy an HTTP client. A `clone()` method keeps the prototype and decides field by field.'
+      seenIn: '`Request.clone()` and `Response.clone()` in the Fetch API copy a request or response so its body can be read twice. `structuredClone()` for plain data. JavaScript''s own objects inherit from prototype objects, the same word used for a different idea.'
+
+  rust:
+    before:
+      file: scheduler.rs · backfill.rs · preview.rs
+      source: |
+        // scheduler.rs
+        fn job_for_tenant(t: &JobConfig, tenant: &Tenant) -> JobConfig {
+            let mut env = t.env.clone();
+            env.insert("DB_HOST".into(), format!("{}-db.internal", tenant.region));
+            JobConfig { name: format!("{}-{}", t.name, tenant.id), schedule: t.schedule.clone(),
+                        retries: t.retries, env, client: Arc::clone(&t.client) }
+        }
+
+        // backfill.rs
+        fn backfill_job(t: &JobConfig, day: NaiveDate) -> JobConfig {
+            let mut env = t.env.clone();
+            env.insert("AS_OF".into(), day.to_string());
+            JobConfig { name: t.name.clone(), schedule: t.schedule.clone(),
+                        retries: t.retries, env, client: Arc::clone(&t.client) }
+        }
+
+        // preview.rs: a dry run from the admin UI
+        fn dry_run(t: &JobConfig) -> JobConfig {
+            let mut env = t.env.clone();
+            env.insert("DRY_RUN".into(), "1".into());
+            JobConfig { name: t.name.clone(), schedule: t.schedule.clone(),
+                        retries: t.retries, env, client: Arc::clone(&t.client) }
+        }
+      roles: { context: [2, 23], scheduler: [2, 7], backfill: [10, 15], preview: [18, 23] }
+      change:
+        - { line: 6, replace: '                retries: t.retries, env, labels: t.labels.clone(), client: Arc::clone(&t.client) }' }
+        - { line: 14, replace: '                retries: t.retries, env, labels: t.labels.clone(), client: Arc::clone(&t.client) }' }
+        - { line: 22, replace: '                retries: t.retries, env, labels: t.labels.clone(), client: Arc::clone(&t.client) }' }
+    after:
+      file: job.rs · scheduler.rs
+      source: |
+        #[derive(Clone)]
+        struct JobConfig {
+            name: String,
+            schedule: String,
+            retries: u32,
+            env: HashMap<String, String>, // clone() copies the entries
+            client: Arc<HttpClient>,      // clone() copies the pointer: shared on purpose
+        }
+
+        // scheduler.rs
+        fn job_for_tenant(t: &JobConfig, tenant: &Tenant) -> JobConfig {
+            let mut job = t.clone();
+            job.name = format!("{}-{}", t.name, tenant.id);
+            job.env.insert("DB_HOST".into(), format!("{}-db.internal", tenant.region));
+            job
+        }
+
+        // backfill.rs and preview.rs call t.clone() the same way.
+        let job = templates["nightly-billing"].clone();
+      roles: { strategy: [1, 1], context: [2, 8], scheduler: [10, 16], backfill: [18, 18], preview: [18, 18], client: [19, 19], lookup: [19, 19], copy: [12, 12], fresh: [6, 7], override: [13, 14] }
+    again:
+      file: job.rs
+      source: |
+        // After labels arrive: one new field. derive(Clone) copies it; nothing else changes.
+            labels: HashMap<String, String>,
+    cost:
+      before: { text: 3 lines · 3 places, value: 0.7 }
+      after: { text: 1 field · 0 edits, value: 0.08 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: '`#[derive(Clone)]` writes the prototype method for you. Owned data such as a `HashMap` is copied, and sharing has to be spelled out with `Arc` or `Rc`. Mutating something shared also needs `Mutex` or `RefCell`, so the silent shared-map bug cannot happen by accident.'
+      seenIn: 'The `Clone` trait, everywhere. `reqwest::Client` is cheap to clone because it keeps its connection pool behind an `Arc`, so clones share one pool. `Arc::clone(&x)` is the conventional way to say "share, do not copy".'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The scheduler looks up the nightly-billing template by name. Ops configured it in the admin UI; the code never constructs one from scratch.
+    nodes: [client, context]
+    edges: [client>context]
+    role: lookup
+  - text: { go: '`Clone` starts with `job := *c`, which copies every field. Strings and the retry count are values; the `*http.Client` pointer is copied, so both jobs share one pool, as intended.', python: '`dataclasses.replace` makes a new `JobConfig` with the same field values. The `env` dict and the client are still the template''s objects at this point.', typescript: '`Object.assign` copies every own property onto a new object with the `JobConfig` prototype. The `env` object and the client are still the template''s.', rust: '`t.clone()` calls the derived `Clone`: each field is cloned in turn. Strings are copied; the `Arc` is cloned, which bumps a reference count and shares the client.' }
+    nodes: [scheduler, strategy, context]
+    edges: [scheduler>strategy, context>strategy]
+    role: copy
+  - text: { go: '`maps.Clone` gives the copy its own Env map. This line is the whole point: without it, every job and the template share one map.', python: '`dict(self.env)` gives the copy its own env dict. Without it, every job and the template share one dict.', typescript: '`{ ...this.env }` gives the copy its own env object. Without it, every job and the template share one object.', rust: 'The derived `Clone` copies the `HashMap`''s entries into a new map. Sharing it would have needed an `Rc` or `Arc` in the type.' }
+    nodes: [strategy, context]
+    edges: [context>strategy]
+    role: fresh
+  - text: The scheduler changes the name and DB_HOST on its own copy. The template, and every other tenant's job, stay exactly as they were.
+    nodes: [scheduler]
+    edges: []
+    role: override
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these situations calls for a Prototype?
+    options:
+      - text: Ops define job templates in an admin UI while the system runs, and each tenant's job starts as a copy of a template with two fields changed.
+        correct: true
+        why: Right. The kinds of object are data, not classes, and the fastest correct way to make one is to copy a configured example.
+      - text: A Deployment has a dozen optional settings, and callers set a few of them.
+        why: That is Builder. You assemble one object from parts rather than copying an existing one.
+      - text: The service must create storage, a queue and a secrets store that all belong to the same cloud.
+        why: That is Abstract Factory. The concern is a matching family, not copying an example.
+  engineer:
+    question: In Go, Python or TypeScript, JobConfig gains a labels map. Clone() copies env but nobody adds labels to it. What happens?
+    options:
+      - text: Every clone shares the template's labels map, so a label set on one job appears on the template and on every other job.
+        correct: true
+        why: Right. The copy of the outer object still holds a reference to the same map. This is why the copy logic belongs in one Clone method, next to the fields.
+      - text: Each clone gets an empty labels map.
+        why: The field is copied, and what gets copied is the reference to the template's map. The clone sees all of the template's labels.
+      - text: The code fails to compile until Clone handles the new field.
+        why: Not in these languages. A struct copy, copy.copy or a spread copies every field without complaint. (Rust's struct literals do force it; derive(Clone) handles it for you.)
+  deep:
+    question: Why can't the shared-map bug happen silently in Rust when JobConfig derives Clone and env is a HashMap?
+    options:
+      - text: Cloning a HashMap copies its entries. Sharing one map needs Rc or Arc in the type, and mutating it then needs RefCell or Mutex.
+        correct: true
+        why: Right. Ownership makes sharing visible in the type. A clone either owns its own map or explicitly shares one, and both are written down.
+      - text: Rust's runtime copies the map on the first write.
+        why: Rust has no runtime copy-on-write for HashMap. Copy-on-write exists only if you ask for it, for example with Cow or Arc::make_mut.
+      - text: derive(Clone) refuses to compile for structs that contain maps.
+        why: It compiles fine. It requires every field to implement Clone, which HashMap<String, String> does.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Prototype
+      example: { go: "JobConfig with Clone()", python: "JobConfig with clone()", typescript: "JobConfig with clone()", rust: "JobConfig, #[derive(Clone)]" }
+      job: Knows how to copy itself, field by field.
+    - role: Concrete prototype
+      example: "the nightly-billing template"
+      job: A configured instance that new objects start from.
+    - role: Prototype registry
+      example: "templates by name"
+      job: Holds the examples, so clients ask for a name instead of a class.
+    - role: Client
+      example: "scheduler, backfill, preview"
+      job: Clones an example and adjusts the copy.
+  useWhen:
+    - The kinds of object are defined at runtime, as data or configuration, not as classes.
+    - Building an object from scratch is expensive or needs many settings, and new ones differ from an example in a few fields.
+    - Several places copy the same kind of object and must agree on what a copy shares.
+  avoidWhen:
+    - The objects are immutable. Share them, or make a modified copy with a replace or with-style function; no clone logic is needed.
+    - Construction is cheap and every field is set by the caller anyway.
+  tradeoffs:
+    - Every class with nested mutable state needs a correct clone, kept up to date as fields are added.
+    - Deciding what to share and what to copy is the hard part, and it is easy to get wrong both ways.
+    - Objects with cycles or external resources (sockets, files, pools) are hard or impossible to deep-copy.
+  lookalikes:
+    - name: Builder
+      how: Assembles a new object from parts. Prototype starts from a finished object and copies it.
+    - name: Abstract Factory
+      how: Can be implemented with prototypes, keeping one example per product and cloning it.
+    - name: Flyweight
+      how: Shares one object on purpose to save memory. Prototype makes copies so they can change independently.
+    - name: Memento
+      how: Copies an object's state to restore it later. Prototype copies it to start a new, separate object.
+---
+
+## [concept] Prototype
+
+**Make new objects by copying a configured example, and let the object's own clone() decide which parts the copy gets fresh and which it shares.**
+
+Only the object knows which of its parts are data to copy and which are services to share. Copying belongs to the object.
+
+<Depth level={2}>
+A <Term id="shallow-copy">shallow copy</Term> makes a new outer object whose fields still point at the original's nested objects. A <Term id="deep-copy">deep copy</Term> copies everything it can reach, including things that should be shared. Neither is right on its own. A job needs its own env map and the same HTTP pool as every other job. The prototype's `clone()` writes that decision down once, next to the fields.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Prototype as an object creational pattern. Its example is a graphical editor whose palette tools create notes by cloning an example note, so the framework never names the note classes. It suggests a prototype manager, a registry of examples by name, when the set of prototypes changes at runtime. It calls implementing clone the hardest part of the pattern, precisely because of the shallow versus deep copy question, and notes that some clones need re-initialising after the copy.
+</Depth>
+
+## [problem] Three places that copy a job
+
+A job scheduler runs nightly billing for many tenants. Ops configure a template once in an admin UI, and the code makes each tenant's job by copying the template and changing a few fields. A backfill tool and a dry-run preview copy templates too.
+
+Read it once. Each copy site knows that the env map must be copied separately. Someone learned that the hard way.
+
+<Depth level={2}>
+The knowledge "env is a map, copy it" lives in three functions, far from the struct that defines env. Each one must also know what *not* to copy: the HTTP client is shared on purpose.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">In Go, `job := *t` copies the struct, but a map field is a pointer to the map's data. Two structs with the same map field share one map, and writes through either are seen by both.</Lang>
+<Lang only="python">In Python, `copy.copy` creates a new instance whose attributes refer to the same objects. `job.env` and `t.env` are one dict until something replaces the attribute.</Lang>
+<Lang only="typescript">In TypeScript, `{ ...t }` copies own properties one level deep. `job.env` and `t.env` are the same object until the spread is applied to `env` too.</Lang>
+<Lang only="rust">In Rust there is no shared map to worry about here: cloning a `HashMap` copies it. The cost is visible instead. Each site writes out a full struct literal and has to remember to `Arc::clone` the client.</Lang>
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** jobs get a labels map for cost tracking.
+
+Each copy site needs one more line. Miss one, and every job made there shares a single labels map with the template.
+
+<Depth level={2}>
+The miss is silent. A label set on one tenant's job appears on the template and on every job copied from it. The cost report quietly charges tenants for each other's runs. Tests that copy one job and check it pass.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">Rust's struct literals must name every field, so a missing `labels` is a compile error at each site. That is safe, but still three edits for one new field.</Lang>
+<Lang only="go">Go's struct copy includes the new field automatically, which is exactly the problem: it is included as a shared map.</Lang>
+<Lang only="python">`copy.copy` includes the new attribute automatically, as a reference to the template's dict.</Lang>
+<Lang only="typescript">The spread includes the new property automatically, as a reference to the template's object.</Lang>
+</Depth>
+
+## [morph] Move the copying into the object
+
+Drag the slider. The three copy sites collapse into one `clone()` on the job itself, and the sites just call it.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The registry of templates by name is the client's view now. It asks for "nightly-billing" and gets a copy, without knowing how a job is built or which of its fields are nested. New kinds of job are new templates in the admin UI, not new code.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The `Clone` method sits next to the struct, so the next person to add a map field sees the method that must change. A test that clones, mutates the clone and checks the original is cheap insurance.</Lang>
+<Lang only="python">`dataclasses.replace` creates the new instance through `__init__`, so `__post_init__` validation runs for clones too. Python 3.13 adds `copy.replace`, which calls the same machinery.</Lang>
+<Lang only="typescript">`Object.create(JobConfig.prototype)` keeps the class, so the clone still has `clone()` and any other methods. A spread would return a plain object.</Lang>
+<Lang only="rust">`#[derive(Clone)]` generates the method from the field list, so a new field is cloned with no further edits. The `Arc` field makes sharing explicit in the type.</Lang>
+</Depth>
+
+## [walk] Follow one tenant's job being made
+
+One tenant's job, from template to running copy. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`maps.Clone` allocates a new map sized for the entries and copies them; the values here are strings, which are immutable, so sharing their bytes is safe. A map of slices would need each slice cloned as well.</Lang>
+<Lang only="python">`dict(self.env)` copies the key and value references into a new dict. The strings inside are shared, which is safe because Python strings are immutable.</Lang>
+<Lang only="typescript">The spread copies property references into a new object. String values are immutable, so sharing them is safe; nested objects would need their own copy.</Lang>
+<Lang only="rust">Cloning `HashMap<String, String>` clones every `String`, which allocates. If templates are large and cloned often, `Arc<str>` values or a persistent map make copies cheap, at the cost of explicit sharing.</Lang>
+</Depth>
+
+## [again] Labels, the second time
+
+The same request after the refactor. One line in `clone()`, next to the field it copies. None of the copy sites change, and none of them can forget.
+
+<Depth level={2}>
+A test belongs with the method: clone the template, change every nested field on the clone, and assert the template is unchanged. When someone adds the next map field, that test is where they notice.
+</Depth>
+
+<Depth level={3}>
+The alternative that removes the question entirely is immutability. If env were an <Term id="immutable-object">immutable</Term> map, sharing it would be safe, and a change would produce a new map. Many configuration systems go that way.
+</Depth>
+
+## [play] Clone a job template for two regions
+
+Make a US and an EU copy of the billing template, give each its own database, and run them. Watch the heap: the arrows show what each copy really shares.
+
+## [lens] How each language writes it
+
+Every language here can copy an object. They differ in what a plain copy shares by default, and Rust is the one where a silent shared map cannot happen.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="prototype" />
+
+### Shallow, deep, or the object's own clone
+
+A shallow copy shares every nested object, which causes <Term id="aliasing">aliasing</Term> bugs when the copy is changed. A deep copy shares nothing, which duplicates pools, caches and clients that should be shared, and fails on sockets and cycles. Python's own documentation lists that second problem. Write `clone()` on the class, copy what a copy may change, share what every copy should use, and test it.

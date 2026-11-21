@@ -1,0 +1,10 @@
+# Terms introduced by the Prototype lesson.
+- id: shallow-copy
+  term: Shallow copy
+  short: A new outer object whose fields still refer to the same nested objects (maps, lists, clients) as the original.
+- id: deep-copy
+  term: Deep copy
+  short: A copy that recursively copies every object it can reach, so nothing is shared with the original, including things that should be.
+- id: aliasing
+  term: Aliasing
+  short: Two names or fields referring to the same object, so a change made through one is seen through the other.
