@@ -1,0 +1,16 @@
+# Terms introduced by math-for-cs/induction-and-loop-invariants.
+- id: mathematical-induction
+  term: Induction
+  short: A proof for every n in two parts. The base case shows the claim for the first n; the inductive step shows that if it holds for n, it holds for n + 1.
+- id: strong-induction
+  term: Strong induction
+  short: Induction where the step may assume the claim for every smaller case, not just the one before. It suits recursion that splits input into uneven parts.
+- id: loop-invariant
+  term: Loop invariant
+  short: A statement about a loop's variables that is true before the first iteration and stays true after every iteration. With the exit condition, it gives the loop's result.
+- id: loop-variant
+  term: Termination measure
+  short: A non-negative integer, such as hi - lo, that strictly falls on every iteration. Because it cannot fall forever, the loop must end. Also called a loop variant.
+- id: half-open-range
+  term: Half-open range
+  short: A range [lo, hi) that includes lo and excludes hi. Its length is hi - lo, it is empty when lo == hi, and two ranges join without overlap.

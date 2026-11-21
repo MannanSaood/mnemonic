@@ -1,0 +1,628 @@
+---
+title: Induction and loop invariants
+track: math-for-cs
+group: Proof
+order: 2
+summary: A loop is correct when some statement about its variables is true before it starts, stays true after every iteration, and gives the answer when the loop stops. That is induction over iterations, and it finds off-by-one bugs that tests miss.
+intent: Prove a loop correct by naming the invariant it keeps, checking the base case, the step and the exit, and showing that the loop ends.
+changeRequest: Webhook consumers stop using the nightly batch and poll every second from their saved cursor.
+languages: [go, python, typescript, rust]
+glossary: [mathematical-induction, strong-induction, loop-invariant, loop-variant, half-open-range]
+
+prerequisites: [math-for-cs/logic-and-proof-techniques]
+skills: [proofs, algorithm-design]
+depths: [overview, engineer, deep]
+
+playground:
+  model: induction-and-loop-invariants
+  scenarios:
+    - try: "Pick since = 132 (caught up) and step the shipped search with the split invariant."
+      notice: "The invariant row for the start is already ✗: hi = n − 1 claims the last event is ≥ 132 without looking. Every iteration keeps the invariant, and the search still returns 7 instead of 8."
+    - try: "Click the boxed len(log) - 1 to change it to len(log)."
+      notice: "All nine chips in the exhaustive test turn green, and the proof card shows base, step and exit all holding."
+    - try: "Now change lo < hi to lo <= hi and run cursor 132 to the end."
+      notice: "mid reaches n and the search reads past the end of the log. With cursor 113 and hi back at n − 1 the same line makes the loop repeat one state forever: hi − lo stops falling."
+    - try: "Choose the invariant 0 ≤ lo ≤ hi ≤ n on the fixed code."
+      notice: "It holds on every row and proves nothing about the answer. An invariant is only useful if it is strong enough to give the result at the exit."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 104, h: 48, title: consumer, sub: poll(since) }
+      after:  { x: 12, y: 111, w: 104, h: 48, title: consumer, sub: poll(since) }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 260, h: 236, title: cursor search, sub: "pictured as: halve until found" }
+      after:  { x: 140, y: 20, w: 120, h: 48, title: lower bound, sub: first seq ≥ since }
+    - id: init
+      kind: concrete
+      before: { x: 160, y: 72, w: 220, h: 32, title: "hi = n − 1" }
+      after:  { x: 140, y: 111, w: 120, h: 48, title: start, sub: "[0, n) unknown" }
+    - id: mid
+      kind: concrete
+      before: { x: 160, y: 120, w: 220, h: 32, title: "mid = (lo+hi)/2" }
+      after:  { x: 140, y: 202, w: 120, h: 48, title: iteration, sub: keep one half }
+    - id: exit
+      kind: concrete
+      before: { x: 160, y: 168, w: 220, h: 32, title: return lo }
+      after:  { x: 430, y: 30, w: 118, h: 48, title: lo == hi, sub: the answer }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 290, y: 111, w: 120, h: 48, title: "" }
+      after:  { x: 290, y: 111, w: 120, h: 48, title: invariant, sub: "< since | ≥ since" }
+    - id: change
+      kind: concrete
+      appears: change
+      before: { x: 424, y: 202, w: 124, h: 44, title: caught up, sub: returns n − 1 }
+      after:  { x: 430, y: 202, w: 118, h: 44, title: caught up, sub: returns n }
+  edges:
+    - { from: client, to: context, label: since }
+    - { from: init, to: strategy, label: base }
+    - { from: mid, to: strategy, label: step }
+    - { from: strategy, to: exit, label: exit }
+    - { from: strategy, to: change, label: empty page }
+
+code:
+  go:
+    before:
+      file: events.go
+      source: |
+        // events.go: the webhook dispatcher pages through an append-only log sorted by Seq
+
+        // firstAtOrAfter returns the index of the first event with Seq >= since.
+        func firstAtOrAfter(events []Event, since int64) int {
+            lo, hi := 0, len(events)-1
+            for lo < hi {
+                mid := (lo + hi) / 2
+                if events[mid].Seq < since {
+                    lo = mid + 1
+                } else {
+                    hi = mid
+                }
+            }
+            return lo
+        }
+
+        // Page returns up to limit events at or after since.
+        func Page(events []Event, since int64, limit int) []Event {
+            i := firstAtOrAfter(events, since)
+            return events[i:min(i+limit, len(events))]
+        }
+      roles: { context: [3, 15], init: [5, 5], mid: [7, 7], exit: [14, 14], client: [17, 21] }
+      change:
+        - after: 21
+          add:
+            - ""
+            - "// Poll runs every second for each webhook consumer, from its saved cursor."
+            - "func Poll(c *Consumer) {"
+            - "    for _, e := range Page(eventLog.Events(), c.Cursor, 100) {"
+            - "        deliver(c, e)"
+            - "        c.Cursor = e.Seq + 1"
+            - "    }"
+            - "}"
+    after:
+      file: events.go
+      source: |
+        // events.go: the same search, with its invariant written down
+
+        // firstAtOrAfter returns the index of the first event with Seq >= since,
+        // or len(events) when there is none: the consumer is caught up.
+        func firstAtOrAfter(events []Event, since int64) int {
+            lo, hi := 0, len(events) // the half-open range [lo, hi) is still unknown
+            // Invariant: events[:lo] all have Seq < since, events[hi:] all have Seq >= since.
+            for lo < hi { // hi - lo shrinks every iteration, so the loop ends
+                mid := lo + (hi-lo)/2 // lo <= mid < hi: always a real index
+                if events[mid].Seq < since {
+                    lo = mid + 1 // events[:mid+1] are all < since
+                } else {
+                    hi = mid // events[mid:] are all >= since
+                }
+            }
+            // lo == hi, so the invariant splits the whole slice at lo.
+            return lo
+        }
+
+        func Page(events []Event, since int64, limit int) []Event {
+            i := firstAtOrAfter(events, since)
+            return events[i:min(i+limit, len(events))]
+        }
+
+        func Poll(c *Consumer) {
+            for _, e := range Page(eventLog.Events(), c.Cursor, 100) {
+                deliver(c, e)
+                c.Cursor = e.Seq + 1
+            }
+        }
+      roles: { context: [3, 18], init: [6, 6], strategy: [7, 7], base: [6, 7], measure: [8, 8], mid: [9, 9], step: [9, 14], exit: [16, 17], client: [25, 30], change: [25, 30], caught: [25, 30] }
+    again:
+      file: events_test.go
+      source: |
+        // events_test.go: every cursor against sort.Search, including both ends
+        func TestFirstAtOrAfter(t *testing.T) {
+            var events []Event
+            for _, s := range []int64{101, 104, 109, 113, 117, 120, 126, 131} {
+                events = append(events, Event{Seq: s})
+            }
+            for since := int64(99); since <= 133; since++ {
+                want := sort.Search(len(events), func(i int) bool { return events[i].Seq >= since })
+                if got := firstAtOrAfter(events, since); got != want {
+                    t.Errorf("since %d: got %d, want %d", since, got, want)
+                }
+            }
+        }
+    cost:
+      before: { text: "3,600 duplicate webhooks per caught-up consumer per hour", value: 0.85 }
+      after: { text: "0 duplicates · every cursor proved, not sampled", value: 0.08 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`sort.Search(n, f)` is the standard lower bound: it returns the smallest index where `f` is true, or `n`, which is exactly the half-open contract. `slices.BinarySearch` and `BinarySearchFunc` return the index and whether it was found. Inside, `sort.Search` computes the midpoint as `int(uint(i+j) >> 1)` so the sum cannot go negative. Go has no `assert`; write the invariant as a comment and check it in a test.'
+      seenIn: '`sort.Search`, `slices.BinarySearchFunc`, `sort.SearchInts`. Kafka-style log readers and Prometheus TSDB chunk lookups both search a sorted offset or time index this way.'
+
+  python:
+    before:
+      file: events.py
+      source: |
+        # events.py: the webhook dispatcher pages through an append-only log sorted by seq
+
+
+        def first_at_or_after(events: list[Event], since: int) -> int:
+            """Index of the first event with seq >= since."""
+            lo, hi = 0, len(events) - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if events[mid].seq < since:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return lo
+
+
+        def page(events: list[Event], since: int, limit: int) -> list[Event]:
+            i = first_at_or_after(events, since)
+            return events[i : i + limit]
+      roles: { context: [4, 13], init: [6, 6], mid: [8, 8], exit: [13, 13], client: [16, 18] }
+      change:
+        - after: 18
+          add:
+            - ""
+            - ""
+            - "def poll(consumer: Consumer) -> None:"
+            - "    \"\"\"Runs every second for each webhook consumer, from its saved cursor.\"\"\""
+            - "    for e in page(event_log.events(), consumer.cursor, 100):"
+            - "        deliver(consumer, e)"
+            - "        consumer.cursor = e.seq + 1"
+    after:
+      file: events.py
+      source: |
+        # events.py: the same search, with its invariant written down
+
+
+        def first_at_or_after(events: list[Event], since: int) -> int:
+            """Index of the first event with seq >= since, or len(events) if caught up."""
+            lo, hi = 0, len(events)  # the half-open range [lo, hi) is still unknown
+            # Invariant: events[:lo] all have seq < since, events[hi:] all have seq >= since.
+            while lo < hi:  # hi - lo shrinks every iteration, so the loop ends
+                mid = (lo + hi) // 2  # lo <= mid < hi; Python ints cannot overflow
+                if events[mid].seq < since:
+                    lo = mid + 1  # events[:mid + 1] are all < since
+                else:
+                    hi = mid  # events[mid:] are all >= since
+            # lo == hi, so the invariant splits the whole list at lo.
+            return lo
+
+
+        def page(events: list[Event], since: int, limit: int) -> list[Event]:
+            i = first_at_or_after(events, since)
+            return events[i : i + limit]
+
+
+        def poll(consumer: Consumer) -> None:
+            for e in page(event_log.events(), consumer.cursor, 100):
+                deliver(consumer, e)
+                consumer.cursor = e.seq + 1
+      roles: { context: [4, 15], init: [6, 6], strategy: [7, 7], base: [6, 7], measure: [8, 8], mid: [9, 9], step: [9, 13], exit: [14, 15], client: [23, 26], change: [23, 26], caught: [23, 26] }
+    again:
+      file: test_events.py
+      source: |
+        # test_events.py: every cursor against bisect, including both ends
+        from bisect import bisect_left
+
+
+        def test_first_at_or_after():
+            events = [Event(seq=s) for s in (101, 104, 109, 113, 117, 120, 126, 131)]
+            for since in range(99, 134):
+                want = bisect_left(events, since, key=lambda e: e.seq)
+                assert first_at_or_after(events, since) == want, since
+    cost:
+      before: { text: "3,600 duplicate webhooks per caught-up consumer per hour", value: 0.85 }
+      after: { text: "0 duplicates · every cursor proved, not sampled", value: 0.08 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: '`bisect.bisect_left(a, x)` is the lower bound and returns `len(a)` when every item is smaller. Since Python 3.10 it takes `key=`, so it works on a list of objects. Python ints have no fixed width, so `(lo + hi) // 2` cannot overflow. `assert` statements are removed when Python runs with `-O`, so an invariant check that must run in production needs an explicit `if` and `raise`.'
+      seenIn: '`bisect.bisect_left`, `bisect.bisect_right`, `bisect.insort`. `sortedcontainers.SortedList.bisect_left` for a list that keeps itself sorted.'
+
+  typescript:
+    before:
+      file: events.ts
+      source: |
+        // events.ts: the webhook dispatcher pages through an append-only log sorted by seq
+
+        /** Index of the first event with seq >= since. */
+        export function firstAtOrAfter(events: readonly Event[], since: number): number {
+          let lo = 0, hi = events.length - 1;
+          while (lo < hi) {
+            const mid = Math.floor((lo + hi) / 2);
+            if (events[mid].seq < since) lo = mid + 1;
+            else hi = mid;
+          }
+          return lo;
+        }
+
+        export function page(events: readonly Event[], since: number, limit: number): Event[] {
+          const i = firstAtOrAfter(events, since);
+          return events.slice(i, i + limit);
+        }
+      roles: { context: [3, 12], init: [5, 5], mid: [7, 7], exit: [11, 11], client: [14, 17] }
+      change:
+        - after: 17
+          add:
+            - ""
+            - "// poll runs every second for each webhook consumer, from its saved cursor."
+            - "export async function poll(c: Consumer): Promise<void> {"
+            - "  for (const e of page(eventLog.events(), c.cursor, 100)) {"
+            - "    await deliver(c, e);"
+            - "    c.cursor = e.seq + 1;"
+            - "  }"
+            - "}"
+    after:
+      file: events.ts
+      source: |
+        // events.ts: the same search, with its invariant written down
+
+        /** Index of the first event with seq >= since, or events.length if caught up. */
+        export function firstAtOrAfter(events: readonly Event[], since: number): number {
+          let lo = 0, hi = events.length; // the half-open range [lo, hi) is still unknown
+          // Invariant: events before lo have seq < since, events from hi on have seq >= since.
+          while (lo < hi) { // hi - lo shrinks every iteration, so the loop ends
+            const mid = lo + ((hi - lo) >>> 1); // lo <= mid < hi: always a real index
+            if (events[mid].seq < since) lo = mid + 1; // events up to mid are < since
+            else hi = mid; // events from mid on are >= since
+          }
+          // lo === hi, so the invariant splits the whole array at lo.
+          return lo;
+        }
+
+        export function page(events: readonly Event[], since: number, limit: number): Event[] {
+          const i = firstAtOrAfter(events, since);
+          return events.slice(i, i + limit);
+        }
+
+        export async function poll(c: Consumer): Promise<void> {
+          for (const e of page(eventLog.events(), c.cursor, 100)) {
+            await deliver(c, e);
+            c.cursor = e.seq + 1;
+          }
+        }
+      roles: { context: [3, 14], init: [5, 5], strategy: [6, 6], base: [5, 6], measure: [7, 7], mid: [8, 8], step: [8, 10], exit: [12, 13], client: [21, 26], change: [21, 26], caught: [21, 26] }
+    again:
+      file: events.test.ts
+      source: |
+        // events.test.ts: every cursor against a linear scan, including both ends
+        test("firstAtOrAfter matches a scan for every cursor", () => {
+          const events = [101, 104, 109, 113, 117, 120, 126, 131].map((seq) => ({ seq }) as Event);
+          for (let since = 99; since <= 133; since++) {
+            const i = events.findIndex((e) => e.seq >= since);
+            assert.equal(firstAtOrAfter(events, since), i === -1 ? events.length : i, `since ${since}`);
+          }
+        });
+    cost:
+      before: { text: "3,600 duplicate webhooks per caught-up consumer per hour", value: 0.85 }
+      after: { text: "0 duplicates · every cursor proved, not sampled", value: 0.08 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'Neither JavaScript nor Node has a binary search on arrays, so this loop gets written by hand, and the off-by-one with it. Numbers are doubles, so `lo + hi` stays exact up to 2^53. The bit-shift shortcut is the trap: `>> 1` converts to a signed 32-bit integer first and goes negative past 2^31, while `>>> 1` is unsigned and safe for any array length JavaScript allows (under 2^32).'
+      seenIn: '`Array.prototype.findIndex` as the linear reference in tests, `fast-check` to generate sorted arrays and cursors, `lodash.sortedIndexBy` for a ready-made lower bound.'
+
+  rust:
+    before:
+      file: events.rs
+      source: |
+        // events.rs: the webhook dispatcher pages through an append-only log sorted by seq
+
+        /// Index of the first event with seq >= since.
+        pub fn first_at_or_after(events: &[Event], since: u64) -> usize {
+            let (mut lo, mut hi) = (0, events.len() - 1);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if events[mid].seq < since {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        }
+
+        pub fn page(events: &[Event], since: u64, limit: usize) -> &[Event] {
+            let i = first_at_or_after(events, since);
+            &events[i..(i + limit).min(events.len())]
+        }
+      roles: { context: [3, 15], init: [5, 5], mid: [7, 7], exit: [14, 14], client: [17, 20] }
+      change:
+        - after: 20
+          add:
+            - ""
+            - "/// Runs every second for each webhook consumer, from its saved cursor."
+            - "pub fn poll(c: &mut Consumer, log: &EventLog) {"
+            - "    for e in page(log.events(), c.cursor, 100) {"
+            - "        deliver(c, e);"
+            - "        c.cursor = e.seq + 1;"
+            - "    }"
+            - "}"
+    after:
+      file: events.rs
+      source: |
+        // events.rs: the same search, with its invariant written down
+
+        /// Index of the first event with seq >= since, or events.len() if caught up.
+        pub fn first_at_or_after(events: &[Event], since: u64) -> usize {
+            let (mut lo, mut hi) = (0, events.len()); // the half-open range lo..hi is still unknown
+            // Invariant: events[..lo] all have seq < since, events[hi..] all have seq >= since.
+            while lo < hi { // hi - lo shrinks every iteration, so the loop ends
+                let mid = lo + (hi - lo) / 2; // lo <= mid < hi: always a real index
+                if events[mid].seq < since {
+                    lo = mid + 1; // events[..=mid] are all < since
+                } else {
+                    hi = mid; // events[mid..] are all >= since
+                }
+            }
+            // lo == hi, so the invariant splits the whole slice at lo.
+            lo
+        }
+
+        pub fn page(events: &[Event], since: u64, limit: usize) -> &[Event] {
+            let i = first_at_or_after(events, since);
+            &events[i..(i + limit).min(events.len())]
+        }
+
+        pub fn poll(c: &mut Consumer, log: &EventLog) {
+            for e in page(log.events(), c.cursor, 100) {
+                deliver(c, e);
+                c.cursor = e.seq + 1;
+            }
+        }
+      roles: { context: [3, 17], init: [5, 5], strategy: [6, 6], base: [5, 6], measure: [7, 7], mid: [8, 8], step: [8, 13], exit: [15, 16], client: [24, 29], change: [24, 29], caught: [24, 29] }
+    again:
+      file: tests/events.rs
+      source: |
+        // tests/events.rs: every cursor against partition_point, including both ends
+        #[test]
+        fn first_at_or_after_matches_partition_point() {
+            let events: Vec<Event> = [101, 104, 109, 113, 117, 120, 126, 131].map(Event::with_seq).to_vec();
+            for since in 99..=133 {
+                let want = events.partition_point(|e| e.seq < since);
+                assert_eq!(first_at_or_after(&events, since), want, "since {since}");
+            }
+            assert_eq!(first_at_or_after(&[], 5), 0);
+        }
+    cost:
+      before: { text: "3,600 duplicate webhooks per caught-up consumer per hour", value: 0.85 }
+      after: { text: "0 duplicates · every cursor proved, not sampled", value: 0.08 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: '`slice::partition_point(pred)` returns the first index where `pred` is false, the same lower bound with the same half-open contract. The before code has a second bug that Rust surfaces: on an empty log, `events.len() - 1` underflows `usize`, which panics in a debug build and wraps to `usize::MAX` in release. `debug_assert!` checks an invariant in tests and debug builds and costs nothing in release.'
+      seenIn: '`slice::partition_point`, `binary_search_by_key`, `BTreeMap::range(since..)` when the log is a map. `proptest` to generate sorted logs and cursors.'
+
+walk:
+  - text: Before the loop, nothing is known, so lo = 0 and hi = n. Both sides of the split are empty, and a statement about every event in an empty range is true. That is the base case.
+    nodes: [client, context, init, strategy]
+    edges: [client>context, init>strategy]
+    role: base
+  - text: One iteration reads events[mid]. If it is below since, so is everything before it, and lo moves past mid. Otherwise everything from mid on is at least since, and hi moves to mid. Either way the invariant still holds. That is the inductive step.
+    nodes: [mid, strategy]
+    edges: [mid>strategy]
+    role: step
+  - text: The unknown range hi − lo is a non-negative integer and shrinks every iteration, because lo ≤ mid < hi. It cannot shrink forever, so the loop ends.
+    nodes: [strategy]
+    edges: []
+    role: measure
+  - text: At the exit lo == hi. The invariant now covers every event, so lo is exactly where events stop being below since.
+    nodes: [strategy, exit]
+    edges: [strategy>exit]
+    role: exit
+  - text: A caught-up consumer sends a cursor past the last event. The search returns n, the page is empty, and nothing is delivered twice.
+    nodes: [client, change, strategy]
+    edges: [strategy>change]
+    role: caught
+
+checks:
+  overview:
+    question: What must a loop invariant do to prove a loop correct?
+    options:
+      - text: Hold before the first iteration, stay true after every iteration, and give the answer when the loop stops
+        correct: true
+        why: Right. Those are the base case, the inductive step and the exit. Together they cover every run of the loop, whatever the input size.
+      - text: Hold at the end of the loop on the inputs in the test suite
+        why: That is a test, not a proof. The caught-up cursor passed every test that started from an event in the log.
+      - text: Hold after most iterations
+        why: One iteration that breaks it is enough to lose the proof for every run that reaches that iteration.
+  engineer:
+    question: "A lower-bound search starts with lo = 0, hi = len(a) − 1 and loops while lo < hi. For which query is it wrong?"
+    options:
+      - text: A value larger than every element
+        correct: true
+        why: Right. The answer is len(a), but hi never exceeds len(a) − 1, so it returns the last index. The invariant claims the last element is large enough before anyone has checked it.
+      - text: A value smaller than every element
+        why: That answer is 0, and lo starts at 0 and never has a reason to move. It comes out right.
+      - text: A value equal to an element in the middle
+        why: The loop finds the first match correctly; every iteration preserves the split.
+  deep:
+    question: "Java's Arrays.binarySearch computed mid = (low + high) / 2 for years. What went wrong on arrays of more than about 2^30 elements?"
+    options:
+      - text: low + high exceeded 2^31 − 1, wrapped to a negative int, and mid became a negative index
+        correct: true
+        why: Right. Joshua Bloch reported it in 2006. The invariant was fine on paper, but the arithmetic was not the arithmetic of the proof. lo + (hi − lo) / 2 or an unsigned shift keeps mid between lo and hi.
+      - text: The loop stopped terminating because hi − lo no longer fell
+        why: The measure still fell. The program crashed on a negative index before that mattered.
+      - text: Binary search needs a sorted array and large arrays were rarely sorted
+        why: The arrays were sorted. The failure was in computing the midpoint.
+
+reference:
+  roles:
+    - role: Invariant
+      example: "events[:lo] < since ≤ events[hi:]"
+      job: States what the loop has proved so far. True at the start, kept by every iteration.
+    - role: Base case
+      example: "lo = 0, hi = n: both sides empty"
+      job: Shows the invariant holds before any work. The caught-up bug lives here.
+    - role: Inductive step
+      example: one iteration moves lo past mid or hi down to mid
+      job: Shows that an iteration that starts with the invariant true ends with it true.
+    - role: Termination measure
+      example: hi − lo
+      job: A non-negative integer that falls every iteration, so the loop ends.
+    - role: Exit condition
+      example: lo == hi
+      job: With the invariant, gives the result the function promises.
+  useWhen:
+    - A loop moves two indices or a window, such as binary search, partition, two pointers or a sliding window.
+    - Pagination, cursors and offsets, where the edges (empty, first, caught up) are the common cases in production.
+    - Code review of a loop that looks right. Writing the invariant down shows which line establishes it.
+  avoidWhen:
+    - A library function already does it with a documented contract (sort.Search, bisect_left, partition_point). Use it and test against it.
+    - The loop is a plain map or filter over a collection; the invariant is trivial and saying it adds noise.
+  tradeoffs:
+    - A stronger invariant is easier to use at the exit but harder to keep in each step. Pick the weakest one that still gives the answer.
+    - Invariants as runtime asserts catch bugs in tests but cost time in hot loops; most languages strip them in release builds.
+    - An invariant proves the algorithm, not the arithmetic. Overflow and index types still need checking.
+  lookalikes:
+    - name: Property-based test
+      how: Searches many inputs for a counterexample. Finds the caught-up cursor quickly, but does not prove the absence of others.
+    - name: Precondition and postcondition
+      how: State what a function needs and promises. The invariant is the bridge between them inside the loop.
+    - name: Strong induction
+      how: Assumes every smaller case, not just the previous one. Fits recursion such as quicksort.
+---
+
+## [concept] Induction and loop invariants
+
+**A loop is correct if some statement about its variables is true before the first iteration, stays true after every iteration, and gives the answer when the loop stops. That statement is the loop invariant, and checking it is a proof by induction on the number of iterations.**
+
+<Term id="mathematical-induction">Induction</Term> proves a claim for every n with two steps. Prove it for the first case, then prove that each case passes it on to the next. A <Term id="loop-invariant">loop invariant</Term> applies the same idea to a loop. The first case is the state before the loop, and each iteration is one step. Tests check the inputs someone thought of. An invariant covers every input, including the ones nobody thought of.
+
+<Depth level={2}>
+Proving a loop with an invariant takes four checks. **Base case:** the invariant holds after initialisation. **Step:** if it holds at the top of an iteration, it holds at the bottom. **Exit:** the invariant plus the loop condition being false implies the result you promised. **Termination:** some non-negative integer, the <Term id="loop-variant">termination measure</Term>, falls every iteration. Most off-by-one bugs break the base case or the exit, and the bodies of the iterations are usually fine.
+
+Write the invariant as a comment next to the loop. If you cannot state one, you do not yet know why the loop works, and neither will the next reader.
+</Depth>
+
+<Depth level={3}>
+Ordinary induction, <Term id="strong-induction">strong induction</Term> (assume every smaller case) and the well-ordering principle (every non-empty set of naturals has a least element) prove the same things. MIT's Mathematics for Computer Science shows each can be rewritten as the others. Well ordering is how termination arguments work: if the loop ran forever, the set of measure values would have no least element, which is impossible for naturals. Choose by convenience. Recursion that splits into uneven parts, like quicksort, reads most naturally as strong induction on the input size.
+</Depth>
+
+## [problem] A cursor search over an event log
+
+A webhook dispatcher keeps an append-only event log sorted by sequence number, with gaps where old events were compacted. Each consumer stores a cursor: the next sequence number it wants. A page is the events with `seq >= cursor`, found with a binary search for the first such event.
+
+The search was written by hand and reviewed. A nightly batch job calls it with the start of yesterday's range, and it has returned the right page every night for a year.
+
+<Depth level={2}>
+This search is a lower bound: the first index whose value is at least the target, or the length of the log when no value is. That last case matters. It is a real answer, not an error, and it means "nothing new".
+</Depth>
+
+<Depth level={3}>
+Binary search is famous for being easy to describe and hard to get exactly right. Jon Bentley reported in Programming Pearls that most professional programmers he asked could not write a correct one, and the version in Java's standard library had an overflow bug for nine years.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** webhook consumers stop using the nightly batch and poll every second from their saved cursor.
+
+The marked lines poll in a loop and save `seq + 1` after each delivery. Within a minute, consumers that are caught up start getting the last event again on every poll. A payment-succeeded webhook arrives 3,600 times an hour. The nightly job never asked for a cursor past the last event; a poller asks for little else.
+
+<Depth level={2}>
+Walk the code with cursor 132 and a log whose last event is 131. lo = 0, hi = 7. The loop moves lo up to 7 and stops with lo == hi. It returns 7, and the page holds event 131 again. No iteration did anything wrong. The search can never return 8, because hi starts at 7 and only goes down.
+</Depth>
+
+<Depth level={3}>
+In Rust the same code has a second edge: on an empty log `events.len() - 1` underflows. A debug build panics with "attempt to subtract with overflow", and a release build wraps to `usize::MAX` and panics on the index instead. Both are the same mistake, a starting value that claims something the code never checked.
+</Depth>
+
+## [morph] Name what the loop knows
+
+Drag the slider. The picture of "halve until found" becomes a statement the loop keeps: everything left of lo is below the cursor, everything from hi on is at or above it, and the range between is still unknown.
+
+With that statement written down, the bug is visible in the first line. `hi = len(events) - 1` claims the last event is at least the cursor before the loop has looked at it. Starting at `hi = len(events)` makes the known-large side empty, which is true for any cursor. The <Term id="half-open-range">half-open range</Term> [lo, hi) is what makes the base case free.
+
+<Depth level={2}>
+Pick one convention and keep it everywhere: half-open ranges with `hi` excluded, `while lo < hi`, `lo = mid + 1`, `hi = mid`. Each line then has a reason. Mixing a closed range with `hi = mid` is how loops end up hanging or skipping an element.
+</Depth>
+
+<Depth level={3}>
+`lo + (hi - lo) / 2` is always between lo and hi − 1 when lo < hi, so `events[mid]` is a real index and both branches shrink hi − lo by at least one. `(lo + hi) / 2` gives the same value mathematically but can overflow a fixed-width integer when lo + hi does not fit, which is the arithmetic the proof assumed away.
+</Depth>
+
+## [walk] Follow one search
+
+The four parts of the proof, then the caught-up consumer. Use the numbered buttons.
+
+<Depth level={2}>
+The same template proves other loops. A ledger loop that sums payments keeps "total equals the sum of the first i payments". A retry loop with a deadline keeps "at most one charge request is in flight and attempts are below the cap"; the measure is the attempts left.
+</Depth>
+
+<Depth level={3}>
+The well-known fallacy that all horses are the same colour uses an inductive step that works for every n except one. Going from 1 horse to 2, the two overlapping groups of size 1 share no horse, so nothing links their colours. A step that fails for one small n breaks the proof for every n after it. Loops fail the same way: an iteration that is correct for ranges of length 3 and more can still be wrong for length 1.
+</Depth>
+
+## [again] The same request, with the invariant
+
+The poller now gets an empty page when it is caught up, and a duplicate never goes out. The test runs every cursor from below the first event to past the last and compares the result with the library's lower bound.
+
+<Depth level={2}>
+The test is cheap because the proof told you where to look. The proof separates three kinds of input: below every element, inside the range, and above every element. A test should have at least one cursor of each kind, plus the empty log.
+</Depth>
+
+<Depth level={3}>
+For two indices, an invariant is easy to check in a test: write a function that evaluates it, call it at the top of each iteration under a debug flag, and run the property test. Rust's `debug_assert!`, Python's `assert` and Go's test-only helpers all do this without a cost in production.
+</Depth>
+
+## [play] Step the loop and watch the invariant
+
+Pick a cursor, choose the invariant you want to check, and step the search one iteration at a time. Each row says whether the invariant holds at the loop head. Then switch lines of code and watch which part of the proof breaks.
+
+## [lens] Lower bounds in each language
+
+Go, Python and Rust ship a lower bound with exactly this contract. TypeScript does not, so its teams write the loop by hand, and the invariant matters most there.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Whatever the language, test a hand-written search against the library one or a linear scan, over every cursor in a small range that starts below the first element and ends past the last.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="induction-and-loop-invariants" />
+
+### The proof template
+
+| Part | Question | For the cursor search |
+|---|---|---|
+| Base case | Is it true after initialisation? | lo = 0, hi = n: both sides empty |
+| Step | Does one iteration keep it? | Reading events[mid] moves one boundary past what it proves |
+| Exit | Invariant plus stop condition gives the result? | lo == hi, so lo is the split |
+| Termination | What falls every time and cannot go below 0? | hi − lo |
