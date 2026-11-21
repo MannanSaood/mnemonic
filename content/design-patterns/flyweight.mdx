@@ -1,0 +1,540 @@
+---
+title: Flyweight
+track: design-patterns
+group: Structural
+order: 35
+summary: When millions of objects carry the same heavy data, store that data once and let every object point at the shared copy.
+intent: Memory should grow with the number of distinct shared states, not with the number of objects.
+changeRequest: Support wants a whole day of logs searchable, so the store must hold 10 million lines instead of 1 million.
+languages: [go, python, typescript, rust]
+glossary: [intrinsic-state, extrinsic-state, flyweight-factory, interning]
+
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design]
+depths: [overview, engineer, deep]
+
+playground:
+  model: flyweight
+  scenarios:
+    - try: "At 10M lines, move the six repeating fields to Shared and measure."
+      notice: "3.2 GB falls to about 1 GB. The shared pool is only about 4 MB; what is left is the data that differs on every line."
+    - try: "Add the timestamp to Shared and measure again."
+      notice: "Every shared object is now unique: 10 million of them, and more memory than not sharing at all."
+    - try: "Keep the six fields shared and switch to 10k lines."
+      notice: "Almost no saving. Flyweight pays off only when objects far outnumber distinct shared states."
+    - try: "With the level shared, set line 42 to WARN."
+      notice: "Hundreds of lines change at once. Shared state must never be written through one of its users."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 110, h: 48, title: ingest, sub: parses lines }
+      after:  { x: 12, y: 30, w: 110, h: 48, title: ingest, sub: asks the pool }
+    - id: context
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 250, title: LogLine ×1M, sub: all 9 fields on every line }
+      after:  { x: 150, y: 30, w: 160, h: 52, title: LogLine ×10M, sub: time · trace · args · meta }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 340, y: 30, w: 200, h: 52, title: "" }
+      after:  { x: 340, y: 30, w: 200, h: 52, title: LogMeta, sub: shared · read-only }
+    - id: pool
+      kind: concrete
+      before: { x: 170, y: 62, w: 230, h: 30, title: service · host · region }
+      after:  { x: 12, y: 150, w: 120, h: 44, title: MetaPool, sub: factory }
+    - id: metaA
+      kind: concrete
+      before: { x: 170, y: 102, w: 230, h: 30, title: version · template }
+      after:  { x: 300, y: 150, w: 112, h: 44, title: checkout, sub: eu-west-1 }
+    - id: metaB
+      kind: concrete
+      before: { x: 170, y: 142, w: 230, h: 30, title: level }
+      after:  { x: 428, y: 150, w: 112, h: 44, title: billing, sub: us-east-2 }
+    - id: day
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 202, w: 230, h: 30, title: all ×10 · 3.2 GB }
+      after:  { x: 300, y: 214, w: 240, h: 44, title: 10M lines · 1 GB, sub: still 14,400 metas }
+  edges:
+    - { from: client, to: context, label: creates }
+    - { from: client, to: pool, label: asks }
+    - { from: context, to: strategy, label: points to }
+    - { from: pool, to: strategy, label: hands out }
+    - { from: metaA, to: strategy, kind: implements }
+    - { from: metaB, to: strategy, kind: implements }
+    - { from: day, to: strategy, kind: implements }
+
+code:
+  go:
+    before:
+      file: store.go
+      source: |
+        type LogLine struct {
+            Time     time.Time
+            TraceID  [16]byte
+            Level    string
+            Service  string
+            Host     string
+            Region   string
+            Version  string
+            Template string
+            Args     []string
+        }
+
+        func (s *Store) Add(raw Raw) {
+            s.lines = append(s.lines, LogLine{
+                Time: raw.Time, TraceID: raw.TraceID,
+                Level: raw.Level, Service: raw.Service, Host: raw.Host,
+                Region: raw.Region, Version: raw.Version,
+                Template: raw.Template, Args: raw.Args,
+            })
+        }
+
+        const maxLines = 1_000_000
+      roles: { context: [1, 11], metaB: [4, 4], pool: [5, 7], metaA: [8, 9], client: [13, 20] }
+      change:
+        - { line: 22, replace: 'const maxLines = 10_000_000 // a day of logs: 3.2 GB, the pod has 2' }
+    after:
+      file: store.go
+      source: |
+        // LogMeta is the shared part: the same for thousands of lines, never modified.
+        type LogMeta struct {
+            Level, Service, Host, Region, Version, Template string
+        }
+
+        type LogLine struct {
+            Time    time.Time
+            TraceID [16]byte
+            Meta    unique.Handle[LogMeta] // one pointer
+            Args    []string
+        }
+
+        func (s *Store) Add(raw Raw) {
+            meta := unique.Make(LogMeta{raw.Level, raw.Service, raw.Host, raw.Region, raw.Version, raw.Template})
+            s.lines = append(s.lines, LogLine{Time: raw.Time, TraceID: raw.TraceID, Meta: meta, Args: raw.Args})
+        }
+
+        // reading a shared field goes through the handle
+        func (l LogLine) Service() string { return l.Meta.Value().Service }
+      roles: { strategy: [2, 4], context: [6, 11], client: [13, 16], pool: [14, 14], key: [14, 14], intern: [14, 14], store: [15, 15], read: [18, 19] }
+    again:
+      file: store.go
+      source: |
+        // the same change; nothing else moves
+        const maxLines = 10_000_000 // about 1 GB now
+    cost:
+      before: { text: 3.2 GB · over the 2 GB limit, value: 0.95 }
+      after: { text: 1.0 GB · fits, value: 0.33 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Share a pointer to an immutable struct, or use `unique.Make` (Go 1.23). Its handles compare with a pointer compare, and the package holds values through weak pointers, so the GC can drop ones nobody uses. Give the shared struct no setters.'
+      seenIn: '`net/netip.Addr` keeps its IPv6 zone as a `unique.Handle`, so all addresses with the same zone share one string. Each Go type has one runtime type descriptor, shared by every value of that type and returned by `reflect.TypeOf`.'
+
+  python:
+    before:
+      file: store.py
+      source: |
+        @dataclass
+        class LogLine:
+            time: float
+            trace_id: str
+            level: str
+            service: str
+            host: str
+            region: str
+            version: str
+            template: str
+            args: tuple[str, ...]
+
+        def add(store: list[LogLine], raw: dict) -> None:
+            store.append(LogLine(
+                raw["time"], raw["trace_id"], raw["level"], raw["service"], raw["host"],
+                raw["region"], raw["version"], raw["template"], tuple(raw["args"]),
+            ))
+
+        MAX_LINES = 1_000_000
+      roles: { context: [1, 11], metaB: [5, 5], pool: [6, 8], metaA: [9, 10], client: [13, 17] }
+      change:
+        - { line: 19, replace: 'MAX_LINES = 10_000_000  # a day of logs, and the process runs out of memory' }
+    after:
+      file: store.py
+      source: |
+        @dataclass(frozen=True, slots=True)
+        class LogMeta:
+            """Shared by every line with the same values. Never modified."""
+            level: str
+            service: str
+            host: str
+            region: str
+            version: str
+            template: str
+
+        @dataclass(slots=True)
+        class LogLine:
+            time: float
+            trace_id: str
+            meta: LogMeta  # one reference
+            args: tuple[str, ...]
+
+        _metas: dict[LogMeta, LogMeta] = {}
+
+        def add(store: list[LogLine], raw: dict) -> None:
+            key = LogMeta(raw["level"], raw["service"], raw["host"], raw["region"], raw["version"], raw["template"])
+            meta = _metas.setdefault(key, key)
+            store.append(LogLine(raw["time"], raw["trace_id"], meta, tuple(raw["args"])))
+
+        # reading a shared field goes through the shared object: line.meta.service
+      roles: { strategy: [1, 9], context: [11, 16], pool: [18, 18], client: [20, 23], key: [21, 21], intern: [22, 22], store: [23, 23], read: [25, 25] }
+    again:
+      file: store.py
+      source: |
+        # the same change; nothing else moves
+        MAX_LINES = 10_000_000  # fits now
+    cost:
+      before: { text: over the memory limit, value: 0.95 }
+      after: { text: about a third of the memory, value: 0.33 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`sys.intern` shares strings; a dict of frozen dataclasses shares whole records. `slots=True` (or `__slots__`) is the other half: it drops the per-object `__dict__`, often the biggest saving when you hold millions of small objects.'
+      seenIn: 'CPython keeps one shared object for each small int from -5 to 256, and interns identifier-like string constants in your code. `sys.intern` is there for your own strings. Enum members are single shared instances.'
+
+  typescript:
+    before:
+      file: store.ts
+      source: |
+        interface LogLine {
+          time: number;
+          traceId: string;
+          level: string;
+          service: string;
+          host: string;
+          region: string;
+          version: string;
+          template: string;
+          args: string[];
+        }
+
+        function add(store: LogLine[], raw: RawLine): void {
+          store.push({ ...raw, args: [...raw.args] });
+        }
+
+        const MAX_LINES = 1_000_000;
+      roles: { context: [1, 11], metaB: [4, 4], pool: [5, 7], metaA: [8, 9], client: [13, 15] }
+      change:
+        - { line: 17, replace: 'const MAX_LINES = 10_000_000; // a day of logs; the heap limit is hit first' }
+    after:
+      file: store.ts
+      source: |
+        // Shared by every line with the same values. Never modified.
+        interface LogMeta {
+          readonly level: string; readonly service: string; readonly host: string;
+          readonly region: string; readonly version: string; readonly template: string;
+        }
+
+        interface LogLine { time: number; traceId: string; meta: LogMeta; args: string[] }
+
+        const metas = new Map<string, LogMeta>();
+
+        function add(store: LogLine[], raw: RawLine): void {
+          const key = `${raw.level}|${raw.service}|${raw.host}|${raw.region}|${raw.version}|${raw.template}`;
+          let meta = metas.get(key);
+          if (!meta) {
+            meta = Object.freeze({ level: raw.level, service: raw.service, host: raw.host, region: raw.region, version: raw.version, template: raw.template });
+            metas.set(key, meta);
+          }
+          store.push({ time: raw.time, traceId: raw.traceId, meta, args: raw.args });
+        }
+
+        // reading a shared field goes through the shared object: line.meta.service
+      roles: { strategy: [2, 5], context: [7, 7], pool: [9, 9], client: [11, 19], key: [12, 12], intern: [13, 17], store: [18, 18], read: [21, 21] }
+    again:
+      file: store.ts
+      source: |
+        // the same change; nothing else moves
+        const MAX_LINES = 10_000_000; // fits now
+    cost:
+      before: { text: over the heap limit, value: 0.95 }
+      after: { text: about a third of the memory, value: 0.33 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Share frozen objects through a `Map`; each line holds a reference. Strings parsed at runtime are separate copies even when equal, so the map key costs one string per lookup, not per stored line. `Object.freeze` turns an accidental write into an error in strict mode.'
+      seenIn: 'V8 gives objects with the same layout one shared hidden class (a map), a flyweight for object shapes. Three.js lets many `Mesh` objects share one `BufferGeometry` and `Material`, and `InstancedMesh` draws them in one call.'
+
+  rust:
+    before:
+      file: store.rs
+      source: |
+        struct LogLine {
+            time: SystemTime,
+            trace_id: [u8; 16],
+            level: String,
+            service: String,
+            host: String,
+            region: String,
+            version: String,
+            template: String,
+            args: Vec<String>,
+        }
+
+        fn add(store: &mut Vec<LogLine>, raw: Raw) {
+            store.push(LogLine {
+                time: raw.time, trace_id: raw.trace_id,
+                level: raw.level, service: raw.service, host: raw.host,
+                region: raw.region, version: raw.version,
+                template: raw.template, args: raw.args,
+            });
+        }
+
+        const MAX_LINES: usize = 1_000_000;
+      roles: { context: [1, 11], metaB: [4, 4], pool: [5, 7], metaA: [8, 9], client: [13, 20] }
+      change:
+        - { line: 22, replace: 'const MAX_LINES: usize = 10_000_000; // a day of logs: 3.2 GB, the pod has 2' }
+    after:
+      file: store.rs
+      source: |
+        /// Shared by every line with the same values. Never modified.
+        #[derive(PartialEq, Eq, Hash)]
+        struct LogMeta {
+            level: String, service: String, host: String,
+            region: String, version: String, template: String,
+        }
+
+        struct LogLine {
+            time: SystemTime,
+            trace_id: [u8; 16],
+            meta: Arc<LogMeta>, // one pointer
+            args: Vec<String>,
+        }
+
+        fn add(store: &mut Vec<LogLine>, metas: &mut HashSet<Arc<LogMeta>>, raw: Raw) {
+            let key = LogMeta { level: raw.level, service: raw.service, host: raw.host, region: raw.region, version: raw.version, template: raw.template };
+            let meta = match metas.get(&key) {
+                Some(m) => Arc::clone(m),
+                None => { let m = Arc::new(key); metas.insert(Arc::clone(&m)); m }
+            };
+            store.push(LogLine { time: raw.time, trace_id: raw.trace_id, meta, args: raw.args });
+        }
+
+        // reading a shared field goes through the Arc: line.meta.service
+      roles: { strategy: [2, 6], context: [8, 13], pool: [15, 15], client: [15, 22], key: [16, 16], intern: [17, 20], store: [21, 21], read: [24, 24] }
+    again:
+      file: store.rs
+      source: |
+        // the same change; nothing else moves
+        const MAX_LINES: usize = 10_000_000; // about 1 GB now
+    cost:
+      before: { text: 3.2 GB · over the 2 GB limit, value: 0.95 }
+      after: { text: 1.0 GB · fits, value: 0.33 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`Arc<T>` (or `Rc<T>` on one thread) is the shared reference, and a `HashSet<Arc<T>>` is the factory: `Arc<T>` borrows as `T`, so you can look up by value. Shared data behind an `Arc` is immutable unless you add a lock, which is the rule Flyweight needs anyway.'
+      seenIn: '`Arc<str>` is the usual way to share one immutable string among many owners. Bevy shares meshes and materials between entities through asset `Handle`s. The Rust compiler interns its types and symbols, and crates such as `lasso` and `string-interner` do the same for your strings.'
+
+walk:
+  - text: Ingest parses a raw line and builds the key from the six fields that repeat across lines.
+    nodes: [client]
+    edges: []
+    role: key
+  - text: { go: '`unique.Make` returns a handle to the one canonical copy of that `LogMeta`, creating it only the first time it sees those values.', python: '`setdefault` returns the `LogMeta` already in the pool for that key, or stores this one if it is new.', typescript: 'The `Map` returns the `LogMeta` already stored for that key, or a new frozen one is created and stored.', rust: 'The set returns a clone of the existing `Arc<LogMeta>`, or a new `Arc` is created and stored.' }
+    nodes: [pool, strategy]
+    edges: [client>pool, pool>strategy]
+    role: intern
+  - text: The line stores only what is its own (time, trace id, args) plus one reference to the shared part.
+    nodes: [context, strategy]
+    edges: [client>context, context>strategy]
+    role: store
+  - text: Thousands of lines point at the same LogMeta. Reading a field follows the reference; nothing writes through it.
+    nodes: [context, strategy, metaA, metaB]
+    edges: [context>strategy, metaA>strategy, metaB>strategy]
+    role: read
+
+checks:
+  overview:
+    question: Which situation is a good fit for Flyweight?
+    options:
+      - text: A map shows 2 million delivery markers, and each uses one of 12 icons, a 40 KB bitmap each.
+        correct: true
+        why: Right. Huge numbers of objects, heavy state that repeats (the icon), and light state that differs (the position). Store 12 bitmaps and 2 million positions.
+      - text: Every order object has 30 fields, and they are different for every order.
+        why: Nothing repeats, so there is nothing to share. Flyweight saves memory only when many objects carry the same data.
+      - text: A service creates a new database connection for every request and wants to reuse them.
+        why: That is a connection pool. Pooled objects are lent to one user at a time and hold changing state. A flyweight is used by many at once and never changes.
+  engineer:
+    question: After LogMeta is shared, a support tool must correct the level of one line from ERROR to WARN. What is the right change?
+    options:
+      - text: Build the LogMeta with the corrected level, get it from the pool, and point that one line at it.
+        correct: true
+        why: Right. Shared objects are never modified. Changing a line means choosing a different shared object.
+      - text: Set line.meta.level to WARN.
+        why: The LogMeta is shared, so every line that points at it changes level too. In the playground that is hundreds of lines at once.
+      - text: Give each line its own copy of LogMeta from now on, so edits stay local.
+        why: That works, and throws away all the saving. One edit path does not justify copying the shared state for ten million lines.
+  deep:
+    question: The pool keeps every LogMeta it has ever handed out, in a Python dict, a TypeScript Map or a Rust HashSet. What happens when old lines are evicted from the store?
+    options:
+      - text: The pool still references each LogMeta, so unused ones stay in memory until you remove them. Go's unique package avoids this by holding its values through weak pointers.
+        correct: true
+        why: Right. A strong map keeps everything alive. Use weak references (Python's `weakref.WeakValueDictionary`, JavaScript's `WeakRef`) or evict from the pool when lines go, if the set of shared values keeps changing.
+      - text: The runtime frees each LogMeta as soon as no line uses it, whatever pool holds it.
+        why: No. A reference from the pool is a reference like any other. Garbage collectors and reference counts only free values that nothing points to.
+      - text: Each evicted line takes its own copy of LogMeta with it, so the pool shrinks automatically.
+        why: No. Lines hold references to one shared copy. Evicting a line drops a reference; it does not touch the pool.
+
+reference:
+  roles:
+    - role: Flyweight
+      example: LogMeta
+      job: The shared object. Holds only intrinsic state and is never modified.
+    - role: Flyweight factory
+      example: { go: "unique.Make", python: "the _metas dict", typescript: "the metas Map", rust: "HashSet<Arc<LogMeta>>" }
+      job: Hands out the existing shared object for a key, or creates and stores it the first time.
+    - role: Context
+      example: LogLine
+      job: Holds the extrinsic state (time, trace id, args) and a reference to its flyweight.
+    - role: Client
+      example: ingest
+      job: Splits incoming data into the shared key and the per-object part, and asks the factory.
+  useWhen:
+    - You hold very many objects, and memory is the limit.
+    - Most of each object's data repeats across objects and can be separated out.
+    - The shared part never changes after it is created.
+  avoidWhen:
+    - Objects are few, or the repeated data is small. The pool and the indirection cost more than they save.
+    - The data you would share changes per object over time.
+    - Code depends on object identity: with sharing, two different lines can hold the identical shared object.
+  tradeoffs:
+    - Every read of a shared field follows one more pointer.
+    - Creating an object costs a lookup in the factory.
+    - The factory can keep unused shared objects alive unless it uses weak references or eviction.
+    - Shared state must be immutable, which rules out some convenient setters.
+  lookalikes:
+    - name: Object pool
+      how: Reuses objects one user at a time, and they hold changing state. A flyweight is used by many at once and never changes.
+    - name: Singleton
+      how: Exactly one instance of a type. A flyweight factory keeps one instance per distinct value, which can be thousands.
+    - name: Prototype
+      how: Copies an existing object to make a new one. Flyweight avoids the copy and shares the original.
+---
+
+## [concept] Flyweight
+
+**When millions of objects carry the same heavy data, store that data once and let every object point at the shared copy.**
+
+Memory then grows with the number of *different* shared values, which is usually small, instead of with the number of objects.
+
+<Depth level={2}>
+The pattern splits each object's data in two. <Term id="intrinsic-state">Intrinsic state</Term> is the same wherever the object is used (here, service, host, region, version and the log template), so it goes into a shared flyweight. <Term id="extrinsic-state">Extrinsic state</Term> differs per use (the timestamp, the trace id, the arguments) and stays with each line. A <Term id="flyweight-factory">flyweight factory</Term> makes sure equal intrinsic state is stored once.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Flyweight as an object structural pattern. Its example is a document editor with one object per character: the character code is shared, and position and style come from the context. The book applies the pattern only when all of these hold: very many objects, high storage cost, most state can be made extrinsic, few shared objects remain once it is, and the program does not depend on object identity. It also notes that the savings are largest when extrinsic state can be computed instead of stored.
+</Depth>
+
+## [problem] A log store that repeats itself
+
+A log search service keeps the most recent lines in memory, so support can filter them instantly. Each line stores nine fields.
+
+Read it once. Six of the fields repeat across lines: there are 40 services, 600 hosts and 320 log templates, but a million lines.
+
+<Depth level={2}>
+Each repeated value is its own string per line. A million lines each carry their own copy of `checkout-api`, of `eu-west-1`, and of the 60-character template they were logged from.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Strings parsed from a buffer are often substrings that share bytes with that buffer, which can keep a whole read buffer alive per line. Copying them fixes that and leaves you with millions of small, separate copies instead.</Lang>
+<Lang only="python">`json.loads` reuses repeated object keys within one call, but not values. Every `"checkout-api"` you parse is a new `str` object with its own header.</Lang>
+<Lang only="typescript">V8 interns string literals and property names, but strings built at runtime, such as parsed log fields, are separate heap objects even when equal.</Lang>
+<Lang only="rust">Each `String` owns its own heap buffer. Ten million lines with six owned strings each means sixty million small allocations, plus a 24-byte `String` header for each.</Lang>
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** support wants a whole day of logs searchable, so the store must hold 10 million lines instead of 1 million.
+
+One number changes. Memory goes from about 320 MB to 3.2 GB, and the pod's limit is 2 GB. The service is killed for running out of memory.
+
+<Depth level={2}>
+Buying a bigger pod works once. The cost is linear in lines, so the next retention request doubles it again. The waste is the six fields: they make up about two thirds of every line.
+</Depth>
+
+<Depth level={3}>
+The fix has to change how a line is stored, not how many are kept. Nothing about the data says that `checkout-api` needs to exist ten million times.
+</Depth>
+
+## [morph] Split the line in two
+
+Drag the slider. The six repeating fields leave `LogLine` and become one shared `LogMeta`. Each line keeps its own time, trace id and arguments, plus one reference.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The split is the design decision. A field belongs in the shared part only if it is the same for many lines and never changes after the line is written. Put a per-line field in there by mistake and every shared object becomes unique again.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`unique.Make` needs a comparable type, which a struct of strings is. Comparing two `unique.Handle` values is a pointer compare, so filtering by `Meta == wanted` is cheaper than comparing six strings.</Lang>
+<Lang only="python">`frozen=True` makes `LogMeta` hashable and turns accidental writes into a `FrozenInstanceError`. `slots=True` removes each instance's `__dict__`, which matters for the ten million `LogLine` objects even more than for the shared ones.</Lang>
+<Lang only="typescript">`readonly` stops writes at compile time, and `Object.freeze` stops them at runtime. Both matter here, because one write through a shared object changes every line that uses it.</Lang>
+<Lang only="rust">`Arc<LogMeta>` gives shared ownership with no way to get `&mut LogMeta` while other lines hold it. The borrow checker enforces the rule the pattern depends on.</Lang>
+</Depth>
+
+## [walk] Follow one line in
+
+One log line, from parsing to storage. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">The `unique` package keeps its canonical values in a concurrent map and refers to them through weak pointers. When no handle to a value remains, the entry becomes eligible for removal after a garbage collection.</Lang>
+<Lang only="python">The temporary `key` object is built for every line and discarded when it already exists in the pool. That costs an allocation per line during ingest, but nothing per line in what you keep.</Lang>
+<Lang only="typescript">The string key is built per line and dropped after the lookup. Only the first `LogMeta` for each key survives, and every line refers to it.</Lang>
+<Lang only="rust">The `key` is moved into the new `Arc` the first time, and dropped otherwise. Each line holds a clone of the `Arc`: one pointer, plus an atomic increment of the shared reference count.</Lang>
+</Depth>
+
+## [again] Ten million lines, the second time
+
+The same change after the refactor: one number. Ten million lines now take about 1 GB, and the pool holds about 14,400 shared objects, around 4 MB.
+
+<Depth level={2}>
+The remaining gigabyte is the extrinsic state: timestamps, trace ids and arguments. Flyweight cannot shrink data that is different on every line. To go further you would change that data itself, for example by storing arguments compressed.
+</Depth>
+
+<Depth level={3}>
+Growth is now in two parts. Lines add about 100 bytes each, and new combinations of host, template and version add one shared object each. Watch the second number: a field that seems to repeat but does not, such as a pod name in a fast-scaling deployment, slowly turns the pool into one object per line.
+</Depth>
+
+## [play] Decide what to share
+
+A log line with nine fields, and a store that holds up to ten million of them. Move fields between the line and the shared part, change how many lines are loaded, and measure each split.
+
+Look for the split that saves the most, the one that costs more than no sharing, and what happens when someone writes to a shared object.
+
+## [lens] How each language writes it
+
+The pattern is the same everywhere: one map from value to shared object. Some runtimes already do it for you for some values, such as string literals and small integers.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="flyweight" />
+
+### Interning is Flyweight for values
+
+<Term id="interning">Interning</Term> is the most common flyweight: one canonical copy of each distinct string or value, handed out to everyone who needs it. Go has `unique.Make` (1.23), Python has `sys.intern`, and Rust programs use `Arc<str>` or an interning crate. Before you design a flyweight class, check whether interning the few heavy fields gets you most of the saving.

@@ -1,0 +1,13 @@
+# Terms introduced by the Flyweight lesson.
+- id: intrinsic-state
+  term: Intrinsic state
+  short: In Flyweight, the part of an object that is the same in every context it is used in, so one copy can be shared.
+- id: extrinsic-state
+  term: Extrinsic state
+  short: In Flyweight, the part that differs for every use, such as a position or a timestamp. Each user keeps it, or passes it in.
+- id: flyweight-factory
+  term: Flyweight factory
+  short: The pool that hands out shared objects. It returns the existing one for a key, or creates and stores it the first time.
+- id: interning
+  term: Interning
+  short: Keeping one canonical copy of each distinct value, usually strings, and handing out references to that copy instead of new duplicates.
