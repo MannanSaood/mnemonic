@@ -1,0 +1,571 @@
+---
+title: Probes, startup and graceful shutdown
+track: kubernetes
+group: Running workloads
+order: 9
+summary: Startup, liveness and readiness probes answer three different questions, and shutdown is a race between endpoint removal and SIGTERM. Get either wrong and every deploy drops requests or every outage restarts every pod.
+intent: Give each probe the one question it can answer honestly, and shut down so that no request is in flight or on its way when the process exits.
+changeRequest: Deploy the payments API ten times a day instead of once a week, without failing a single payment.
+languages: [go, python, typescript, rust]
+glossary: [startup-probe, liveness-probe, readiness-probe, prestop-hook, termination-grace-period, crash-loop-backoff, endpoint-slice, pid-one]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [kubernetes/pods-and-sandbox]
+skills: [kubernetes]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: probes-and-pod-lifecycle
+  scenarios:
+    - try: "Run the deploy as it starts: no readiness probe."
+      notice: "The rollout finishes in seconds, and for the next 20 s nearly every request goes to a pod that is still booting."
+    - try: "Turn on readiness, then switch the app to Drains, then add a 5 s preStop sleep."
+      notice: "Readiness removes the boot failures. Draining stops the cut-off requests. Only the preStop sleep removes the refused ones, because the load balancers lag by 3 s."
+    - try: "Turn on the database outage."
+      notice: "With liveness checking the database, every pod restarts at once and is still booting when the database comes back. Switch liveness to Process only and nothing restarts."
+    - try: "Set the boot time to 45 s."
+      notice: "Liveness gives up before the app is up, the kubelet restarts it with growing backoff, and the rollout stalls. A startup probe fixes it without loosening liveness."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 118, h: 52, title: Load balancer, sub: sends to the pod }
+      after:  { x: 12, y: 24, w: 130, h: 52, title: Load balancer, sub: ready pods · 3 s late }
+    - id: context
+      kind: context
+      before: { x: 156, y: 18, w: 266, h: 236, title: Payments pod, sub: one /health for all }
+      after:  { x: 160, y: 24, w: 170, h: 52, title: kubelet, sub: probes · signals }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 350, y: 24, w: 198, h: 52, title: "" }
+      after:  { x: 350, y: 24, w: 198, h: 52, title: Three questions, sub: started? alive? ready? }
+    - id: ready
+      kind: concrete
+      before: { x: 176, y: 62, w: 226, h: 36, title: readiness = /health }
+      after:  { x: 12, y: 116, w: 130, h: 52, title: /readyz, sub: database ok? }
+    - id: live
+      kind: concrete
+      before: { x: 176, y: 106, w: 226, h: 36, title: liveness = /health }
+      after:  { x: 160, y: 116, w: 170, h: 52, title: /livez, sub: process answers? }
+    - id: term
+      kind: concrete
+      before: { x: 176, y: 150, w: 226, h: 36, title: SIGTERM · exit now }
+      after:  { x: 350, y: 116, w: 198, h: 52, title: preStop then SIGTERM, sub: drain within grace }
+    - id: change
+      kind: concrete
+      appears: change
+      before: { x: 176, y: 200, w: 226, h: 36, title: 10 deploys a day }
+      after:  { x: 12, y: 206, w: 536, h: 44, title: 10 deploys a day, sub: zero failed payments }
+  edges:
+    - { from: context, to: strategy, label: asks }
+    - { from: strategy, to: ready, label: ready? }
+    - { from: strategy, to: live, label: alive? }
+    - { from: ready, to: client, label: endpoints }
+    - { from: context, to: term, label: stop }
+    - { from: change, to: context }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: main.go
+      source: |
+        // main.go: the payments API
+        func main() {
+            db := mustOpenDB(os.Getenv("DATABASE_URL"))
+            mux := http.NewServeMux()
+            mux.HandleFunc("POST /payments", payments(db))
+            mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+                if err := db.PingContext(r.Context()); err != nil { // the database is part of "healthy"
+                    http.Error(w, "db down", http.StatusServiceUnavailable)
+                    return
+                }
+                w.WriteHeader(http.StatusOK)
+            }) // liveness and readiness both probe /health
+            log.Fatal(http.ListenAndServe(":8080", mux)) // no SIGTERM handler: Go exits at once
+        }
+      roles: { client: [13, 13], context: [2, 14], ready: [6, 12], live: [6, 12], term: [13, 13], change: [13, 13] }
+      change:
+        - { line: 13, replace: '    srv := &http.Server{Addr: ":8080", Handler: mux}' }
+        - { after: 13, add: ['    go srv.ListenAndServe()', '    <-sigterm // added for frequent deploys: shut down cleanly', '    srv.Shutdown(context.Background()) // closes the listener while traffic still arrives'] }
+    after:
+      file: main.go
+      source: |
+        // main.go: the payments API, with probes it can answer honestly
+        func main() {
+            ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+            defer stop()
+            db := mustOpenDB(os.Getenv("DATABASE_URL"))
+            mux := http.NewServeMux()
+            mux.HandleFunc("POST /payments", payments(db))
+            mux.HandleFunc("GET /livez", func(w http.ResponseWriter, r *http.Request) {
+                w.WriteHeader(http.StatusOK) // the process can answer: all liveness asks
+            })
+            mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+                if err := db.PingContext(r.Context()); err != nil {
+                    http.Error(w, "db down", http.StatusServiceUnavailable) // no traffic for now, no restart
+                    return
+                }
+                w.WriteHeader(http.StatusOK)
+            })
+            srv := &http.Server{Addr: ":8080", Handler: mux}
+            go func() {
+                if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+                    log.Fatal(err)
+                }
+            }()
+            <-ctx.Done() // SIGTERM arrives after the preStop sleep: load balancers have moved on
+            shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second) // under the 30 s grace period
+            defer cancel()
+            if err := srv.Shutdown(shutdownCtx); err != nil { // stop accepting, finish in-flight requests
+                log.Printf("forced shutdown: %v", err)
+            }
+        }
+      roles: { client: [11, 17], context: [2, 30], strategy: [8, 17], live: [8, 10], ready: [11, 17], term: [24, 29], change: [24, 29], startup: [18, 23], readiness: [11, 17], liveness: [8, 10], sigterm: [24, 24], drain: [25, 29] }
+    again:
+      file: main_test.go
+      source: |
+        // main_test.go: a payment in flight survives the shutdown
+        func TestShutdownFinishesInFlight(t *testing.T) {
+            srv := httptest.NewServer(slowPayment(2 * time.Second))
+            done := make(chan int)
+            go func() { resp, _ := http.Post(srv.URL+"/payments", "application/json", body()); done <- resp.StatusCode }()
+            time.Sleep(100 * time.Millisecond) // the payment is in flight
+            ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+            defer cancel()
+            require.NoError(t, srv.Config.Shutdown(ctx)) // what SIGTERM triggers
+            require.Equal(t, http.StatusOK, <-done)
+        }
+    cost:
+      before: { text: ~80 failed payments per deploy, value: 0.75 }
+      after: { text: 0 failed payments per deploy, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'A Go program with no handler dies on SIGTERM at once, mid-request. `signal.NotifyContext` turns SIGTERM into a cancelled context, and `http.Server.Shutdown` closes the listeners, then waits for active connections to go idle. It closes the listeners first, so the preStop sleep must cover the endpoint lag.'
+      seenIn: '`signal.NotifyContext` (Go 1.16+). `http.Server.Shutdown`. `grpc.Server.GracefulStop` for gRPC services.'
+
+  python:
+    before:
+      file: app.py
+      source: |
+        # app.py: the payments API
+        app = FastAPI()
+        db = Database(os.environ["DATABASE_URL"])
+
+        @app.post("/payments")
+        async def create_payment(p: Payment) -> Receipt:
+            return await charge(db, p)
+
+        @app.get("/health")  # liveness and readiness both probe /health
+        async def health() -> dict:
+            await db.execute("SELECT 1")  # the database is part of "healthy"
+            return {"ok": True}
+
+        # run: uvicorn app:app --port 8080  (on SIGTERM it stops accepting at once, then drains)
+      roles: { client: [14, 14], context: [1, 14], ready: [9, 12], live: [9, 12], term: [14, 14], change: [14, 14] }
+      change:
+        - { line: 14, replace: '# run: uvicorn app:app --port 8080 --timeout-graceful-shutdown 20  (added for frequent deploys)' }
+    after:
+      file: app.py
+      source: |
+        # app.py: the payments API, with probes it can answer honestly
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            app.state.db = await Database.connect(os.environ["DATABASE_URL"])
+            yield  # SIGTERM: uvicorn stops accepting, lets in-flight requests finish, then resumes here
+            await app.state.db.close()
+
+        app = FastAPI(lifespan=lifespan)
+
+        @app.get("/livez")
+        async def livez() -> dict:
+            return {"ok": True}  # the event loop answers: all liveness asks
+
+        @app.get("/readyz")
+        async def readyz(response: Response) -> dict:
+            try:
+                await app.state.db.execute("SELECT 1")
+            except DatabaseError:
+                response.status_code = 503  # no traffic for now, no restart
+                return {"ready": False}
+            return {"ready": True}
+
+        # run: exec uvicorn app:app --port 8080 --timeout-graceful-shutdown 20
+        # the pod spec adds preStop: sleep 5, so SIGTERM comes after load balancers have moved on
+      roles: { client: [14, 21], context: [1, 24], strategy: [10, 21], live: [10, 12], ready: [14, 21], term: [23, 24], change: [23, 24], startup: [2, 4], readiness: [14, 21], liveness: [10, 12], sigterm: [24, 24], drain: [5, 6] }
+    again:
+      file: test_shutdown.py
+      source: |
+        # test_shutdown.py: a payment in flight survives the shutdown
+        async def test_shutdown_finishes_in_flight(running_server):
+            slow = asyncio.create_task(running_server.client.post("/payments", json=SLOW_PAYMENT))
+            await asyncio.sleep(0.1)  # the payment is in flight
+            running_server.process.send_signal(signal.SIGTERM)
+            assert (await slow).status_code == 200
+            assert await running_server.exit_code() == 0
+    cost:
+      before: { text: ~80 failed payments per deploy, value: 0.75 }
+      after: { text: 0 failed payments per deploy, value: 0.05 }
+    lens:
+      need: 2
+      needLabel: Mostly handled
+      note: 'uvicorn and gunicorn catch SIGTERM, stop accepting and wait for requests in flight; your cleanup goes after the `yield` in the lifespan. The trap is the entrypoint: a shell script that starts the server without `exec` keeps the shell as PID 1, and the signal may never reach Python.'
+      seenIn: 'uvicorn `--timeout-graceful-shutdown`. gunicorn `--graceful-timeout`. FastAPI and Starlette lifespan handlers.'
+
+  typescript:
+    before:
+      file: server.ts
+      source: |
+        // server.ts: the payments API
+        const db = new Pool({ connectionString: process.env.DATABASE_URL });
+        const app = express();
+        app.post("/payments", express.json(), async (req, res) => { res.json(await charge(db, req.body)); });
+        app.get("/health", async (_req, res) => { // liveness and readiness both probe /health
+          try {
+            await db.query("SELECT 1"); // the database is part of "healthy"
+            res.sendStatus(200);
+          } catch {
+            res.sendStatus(503);
+          }
+        });
+        app.listen(8080); // no SIGTERM handler: Node exits at once, mid-request
+      roles: { client: [13, 13], context: [1, 13], ready: [5, 12], live: [5, 12], term: [13, 13], change: [13, 13] }
+      change:
+        - { line: 13, replace: 'const server = app.listen(8080);' }
+        - { after: 13, add: ['process.on("SIGTERM", () => server.close(() => process.exit(0))); // added for frequent deploys'] }
+    after:
+      file: server.ts
+      source: |
+        // server.ts: the payments API, with probes it can answer honestly
+        const db = new Pool({ connectionString: process.env.DATABASE_URL });
+        const app = express();
+        app.post("/payments", express.json(), async (req, res) => { res.json(await charge(db, req.body)); });
+        app.get("/livez", (_req, res) => { res.sendStatus(200); }); // the event loop answers: all liveness asks
+        app.get("/readyz", async (_req, res) => {
+          try {
+            await db.query("SELECT 1");
+            res.sendStatus(200);
+          } catch {
+            res.sendStatus(503); // no traffic for now, no restart
+          }
+        });
+        const server = app.listen(8080);
+
+        process.on("SIGTERM", () => { // arrives after the preStop sleep: load balancers have moved on
+          server.close(() => void db.end().then(() => process.exit(0))); // stop accepting, finish in-flight
+          server.closeIdleConnections(); // idle keep-alive sockets would hold close() open
+          setTimeout(() => process.exit(1), 20_000).unref(); // give up under the 30 s grace period
+        });
+      roles: { client: [6, 13], context: [1, 20], strategy: [5, 13], live: [5, 5], ready: [6, 13], term: [16, 20], change: [16, 20], startup: [14, 14], readiness: [6, 13], liveness: [5, 5], sigterm: [16, 16], drain: [17, 19] }
+    again:
+      file: shutdown.test.ts
+      source: |
+        // shutdown.test.ts: a payment in flight survives the shutdown
+        test("a payment in flight survives SIGTERM", async () => {
+          const child = startServer({ paymentDelayMs: 2_000 });
+          const slow = fetch(`${child.url}/payments`, { method: "POST", body: SLOW_PAYMENT });
+          await sleep(100); // the payment is in flight
+          child.process.kill("SIGTERM");
+          assert.equal((await slow).status, 200);
+          assert.equal(await child.exitCode(), 0);
+        });
+    cost:
+      before: { text: ~80 failed payments per deploy, value: 0.75 }
+      after: { text: 0 failed payments per deploy, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'With no listener, SIGTERM ends a Node process immediately. `server.close()` stops new connections but waits for open ones, and idle keep-alive sockets can hold it open; `closeIdleConnections()` (Node 18.2+) closes those. Add a hard deadline below the grace period.'
+      seenIn: '`process.on("SIGTERM")`. `http.Server.close` and `closeIdleConnections`. Libraries such as `@godaddy/terminus` and `http-terminator` wrap the same steps.'
+
+  rust:
+    before:
+      file: main.rs
+      source: |
+        // main.rs: the payments API
+        #[tokio::main]
+        async fn main() -> anyhow::Result<()> {
+            let db = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+            let app = Router::new()
+                .route("/payments", post(create_payment))
+                .route("/health", get(health)) // liveness and readiness both probe /health
+                .with_state(db);
+            let listener = TcpListener::bind("0.0.0.0:8080").await?;
+            axum::serve(listener, app).await?; // as PID 1 with no handler, SIGTERM is ignored
+            Ok(())
+        }
+
+        async fn health(State(db): State<PgPool>) -> StatusCode {
+            match sqlx::query("SELECT 1").execute(&db).await { // the database is part of "healthy"
+                Ok(_) => StatusCode::OK,
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+            }
+        }
+      roles: { client: [10, 10], context: [3, 12], ready: [14, 19], live: [14, 19], term: [10, 10], change: [10, 10] }
+      change:
+        - { line: 10, replace: '    axum::serve(listener, app)' }
+        - { after: 10, add: ['        .with_graceful_shutdown(sigterm()) // added for frequent deploys', '        .await?;'] }
+    after:
+      file: main.rs
+      source: |
+        // main.rs: the payments API, with probes it can answer honestly
+        #[tokio::main]
+        async fn main() -> anyhow::Result<()> {
+            let db = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+            let app = Router::new()
+                .route("/payments", post(create_payment))
+                .route("/livez", get(|| async { StatusCode::OK })) // the runtime answers: all liveness asks
+                .route("/readyz", get(readyz))
+                .with_state(db);
+            let listener = TcpListener::bind("0.0.0.0:8080").await?;
+            let mut term = signal(SignalKind::terminate())?; // a handler: PID 1 now hears SIGTERM
+            let shutdown = async move {
+                term.recv().await; // arrives after the preStop sleep: load balancers have moved on
+            };
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown) // stop accepting, wait for in-flight requests
+                .await?;
+            Ok(()) // the kubelet's SIGKILL at the grace deadline is the backstop
+        }
+
+        async fn readyz(State(db): State<PgPool>) -> StatusCode {
+            match sqlx::query("SELECT 1").execute(&db).await {
+                Ok(_) => StatusCode::OK,
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE, // no traffic for now, no restart
+            }
+        }
+      roles: { client: [21, 26], context: [3, 19], strategy: [7, 8], live: [7, 7], ready: [21, 26], term: [11, 18], change: [11, 18], startup: [10, 10], readiness: [21, 26], liveness: [7, 7], sigterm: [11, 14], drain: [15, 18] }
+    again:
+      file: tests/shutdown.rs
+      source: |
+        // tests/shutdown.rs: a payment in flight survives the shutdown
+        #[tokio::test]
+        async fn payment_in_flight_survives_sigterm() {
+            let server = TestServer::spawn(Duration::from_secs(2)).await; // payments take 2 s
+            let slow = tokio::spawn(server.post_payment());
+            tokio::time::sleep(Duration::from_millis(100)).await; // the payment is in flight
+            server.signal(Signal::SIGTERM);
+            assert_eq!(slow.await.unwrap().status(), StatusCode::OK);
+            assert!(server.wait().await.success());
+        }
+    cost:
+      before: { text: ~80 failed payments per deploy, value: 0.75 }
+      after: { text: 0 failed payments per deploy, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'A Rust binary installs no signal handlers. As PID 1 in a container it therefore ignores SIGTERM, and every pod waits out the grace period and dies by SIGKILL. `tokio::signal::unix` registers a handler, and axum''s `with_graceful_shutdown` stops accepting and waits for connections in flight.'
+      seenIn: '`tokio::signal::unix::signal(SignalKind::terminate())`. axum `serve(...).with_graceful_shutdown`. hyper and tonic have the same hook.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A v2 pod starts. The app opens its database pool before it listens. The startup probe tries /livez every 5 s, and until it passes once, liveness and readiness wait.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: startup
+  - text: /readyz passes, the pod is marked ready, and its EndpointSlice entry says so. A few seconds later every load balancer is sending it payments.
+    nodes: [strategy, ready, client]
+    edges: [strategy>ready, ready>client]
+    role: readiness
+  - text: The database fails over for 40 s. /readyz fails and the pod leaves the endpoints, but /livez still passes, so nothing restarts. When the database is back, the pod is ready in one probe period.
+    nodes: [strategy, live]
+    edges: [strategy>live]
+    role: liveness
+  - text: The next rollout replaces this pod. It leaves the endpoints at once and its 5 s preStop sleep starts; the load balancers catch up during the sleep. Then the kubelet sends SIGTERM.
+    nodes: [context, term]
+    edges: [context>term]
+    role: sigterm
+  - text: The app stops accepting, finishes the payments in flight, closes its pool and exits, well inside the 30 s grace period. No SIGKILL, no failed request.
+    nodes: [term, change]
+    edges: [context>term]
+    role: drain
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: A pod's readiness probe starts failing. What does Kubernetes do?
+    options:
+      - text: Takes the pod out of the Service's endpoints until the probe passes again. Nothing restarts.
+        correct: true
+        why: Right. Readiness controls traffic only. The container keeps running and gets traffic back when the probe passes.
+      - text: Restarts the container.
+        why: That is what a failing liveness probe does. Readiness never restarts anything.
+      - text: Deletes the pod and creates a new one.
+        why: Probes act on containers inside the same pod. Replacing pods is the job of controllers such as a ReplicaSet.
+  engineer:
+    question: After every kubectl delete, your pod takes exactly 30 seconds to go away, and its logs show no shutdown message. What is the likely cause?
+    options:
+      - text: The process never handles SIGTERM, so it runs until SIGKILL at the end of the 30 s grace period.
+        correct: true
+        why: Right. Often it is PID 1 in the container with no handler, which the kernel does not kill on SIGTERM, or a shell entrypoint that does not pass the signal on.
+      - text: The liveness probe takes 30 seconds to fail.
+        why: Probes stop mattering once the pod is terminating. The 30 s is the default terminationGracePeriodSeconds.
+      - text: The kubelet always waits the full grace period before it stops a container.
+        why: It sends SIGTERM first. A process that exits on SIGTERM is gone in milliseconds, and the pod with it.
+  deep:
+    question: The app handles SIGTERM by closing its listener and draining, and has a readiness probe. Clients still see refused connections on every rollout. Why?
+    options:
+      - text: The pod is removed from the endpoints and sent SIGTERM at the same time, and kube-proxy and load balancers take a few seconds to stop routing to it.
+        correct: true
+        why: Right. The listener closes while traffic is still arriving. A preStop sleep a little longer than that propagation delay keeps the app serving until nobody sends to it any more.
+      - text: The readiness probe has to fail failureThreshold times before the pod leaves the endpoints.
+        why: A terminating pod is marked not ready at once, without waiting for any probe. The delay is in propagating that change.
+      - text: SIGTERM is delivered to every container in the pod in a random order.
+        why: Containers do get SIGTERM in no particular order, but this app is a single container. The refusals come from routing that has not caught up.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Startup probe
+      example: /livez, 12 × 5 s
+      job: Answers "has it finished starting?". Runs only until the first success; holds liveness and readiness off until then.
+    - role: Liveness probe
+      example: /livez
+      job: Answers "is it beyond repair?". Restarts the container after failureThreshold failures. Must not depend on anything outside the process.
+    - role: Readiness probe
+      example: /readyz
+      job: Answers "should it get traffic now?". Takes the pod out of the endpoints while it fails; may depend on the database.
+    - role: preStop hook
+      example: "sleep: 5 s"
+      job: Runs before SIGTERM. A short sleep keeps the app serving while endpoint removal reaches every load balancer.
+    - role: Grace period
+      example: terminationGracePeriodSeconds 30
+      job: The deadline from the start of shutdown to SIGKILL. preStop and draining must both fit inside it.
+  useWhen:
+    - Every long-running service behind a Service needs a readiness probe and SIGTERM handling, or it drops requests on each deploy.
+    - Add a liveness probe when the process can get stuck in a way only a restart fixes, such as a deadlock or an exhausted event loop.
+    - Add a startup probe when start-up is slow or varies, so liveness can stay strict once the app is running.
+  avoidWhen:
+    - Do not point liveness at a shared dependency. An outage of the dependency then restarts every pod at once, adding load and removing capacity when you can least afford it.
+    - Do not use a large initialDelaySeconds on liveness to cover slow starts. It delays detection of real hangs too; a startup probe does the job without that cost.
+  tradeoffs:
+    - Short probe periods and low thresholds notice problems sooner and also fail on brief slowdowns, such as a garbage collection pause or a slow node.
+    - A longer preStop sleep makes shutdowns safer and rollouts slower, and it must stay well inside the grace period.
+    - Readiness that checks dependencies protects users from a broken pod, but if every pod checks the same dependency, all of them leave the endpoints together and the Service has nothing to route to.
+  lookalikes:
+    - name: Load balancer health checks
+      how: The same idea one layer out. A cloud load balancer probing nodes or pods acts like readiness, with its own interval and threshold on top of Kubernetes'.
+    - name: Process supervisors
+      how: systemd's Restart= and watchdog do what liveness does, for one machine. They have no notion of readiness or endpoints.
+    - name: Connection draining
+      how: Load balancers can keep existing connections open to a deregistered backend for a while. It covers requests in flight, not new requests sent before the change arrives.
+---
+
+## [concept] Probes, startup and graceful shutdown
+
+**The kubelet asks each container three separate questions. Has it finished starting? Is it beyond repair? Should it get traffic now? The <Term id="startup-probe">startup</Term>, <Term id="liveness-probe">liveness</Term> and <Term id="readiness-probe">readiness</Term> probes answer them, and shutdown is a fourth contract: a <Term id="prestop-hook">preStop hook</Term>, SIGTERM, and SIGKILL at a deadline.**
+
+Readiness decides whether traffic comes. Liveness decides whether to restart. Startup holds both off while the app boots. Each must answer only its own question, or a slow start, a database blip or a deploy turns into failed requests.
+
+<Depth level={2}>
+Probes can be an HTTP GET (any status from 200 to 399 passes), a TCP connect, a command in the container, or a gRPC health check. Each has initialDelaySeconds, periodSeconds (10 by default), timeoutSeconds (1), and failureThreshold (3). A failing liveness probe restarts the container with growing backoff; a failing readiness probe only takes the pod out of the <Term id="endpoint-slice">EndpointSlice</Term>.
+</Depth>
+
+<Depth level={3}>
+Shutdown has its own order. The pod is marked terminating, which takes it out of the endpoints and starts the kubelet's shutdown at the same moment. The kubelet runs the preStop hook, then sends SIGTERM to PID 1 of each container, and sends SIGKILL to whatever is left when <Term id="termination-grace-period">terminationGracePeriodSeconds</Term> (30 by default) runs out. If preStop is still running at the deadline, the kubelet allows one extra 2 seconds.
+</Depth>
+
+## [problem] One health endpoint for everything
+
+The payments API has a `/health` endpoint that pings the database and returns 200 if it answers. Both the liveness and the readiness probe call it. The process runs the HTTP server and nothing else; it was never written to do anything special on SIGTERM. Deploys happen once a week, at night, and nobody has noticed a problem.
+
+<Depth level={2}>
+"Healthy" here means two things at once: this process works, and its database works. Liveness acts on the first; readiness should act on the second. Combined, a database problem looks like a broken process.
+</Depth>
+
+<Depth level={3}>
+What the process does on SIGTERM depends on the runtime. Go and Node.js exit at once by default. uvicorn drains. A Rust binary installs no handler at all, and as <Term id="pid-one">PID 1 in a container</Term> it ignores the signal until SIGKILL.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** deploy the payments API ten times a day instead of once a week, without failing a single payment.
+
+The team adds a SIGTERM handler that closes the server. The first day of frequent deploys, the error dashboard shows a burst of refused connections at every rollout, around 80 failed payments each time. A week later the database fails over for 40 seconds. Every pod fails liveness within the same 30 seconds, every pod restarts, and the API is down for two minutes after the database has come back.
+
+<Depth level={2}>
+Closing the server on SIGTERM does not help, because SIGTERM arrives while load balancers are still sending to the pod. Endpoint removal and the signal start together, and the removal takes seconds to reach every node. The restart storm is the liveness probe doing exactly what it was told: the database was down, so "healthy" was false.
+</Depth>
+
+<Depth level={3}>
+Restarts make it worse each time. The kubelet waits 10 s before the second restart, then 20 s, then 40 s, up to 5 minutes: <Term id="crash-loop-backoff">CrashLoopBackOff</Term>. Pods that kept failing liveness during the outage are still waiting out their backoff when the database is back.
+</Depth>
+
+## [morph] Give each probe one question
+
+Drag the slider. `/health` splits in two: `/livez` answers only whether the process can respond, and `/readyz` checks the database. SIGTERM handling becomes a drain that starts after a preStop sleep.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The pod spec gets a startup probe on `/livez` with a generous budget (failureThreshold × periodSeconds), a liveness probe on `/livez` with the defaults, a readiness probe on `/readyz`, and `lifecycle.preStop` with a 5 second sleep. The `sleep` action runs in the kubelet, so the image needs no sleep binary; it is on by default since Kubernetes 1.30 and stable since 1.34. Older clusters use an exec hook that runs `sleep 5`.
+</Depth>
+
+<Depth level={3}>
+The app's own drain deadline (20 s here) must leave room inside the grace period for the preStop sleep, or SIGKILL arrives mid-drain. A terminating pod's endpoint stays in the EndpointSlice with `ready: false`, `terminating: true`, and `serving` still true while it can serve, so proxies that understand those conditions can drain more gently.
+</Depth>
+
+## [walk] Follow one pod's life
+
+A v2 pod from start, through a database failover, to the next rollout that replaces it. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`Shutdown` returns `http.ErrServerClosed` from `ListenAndServe` at once, so the goroutine must ignore that error, and `main` must wait for `Shutdown` to return before it exits.</Lang>
+<Lang only="python">uvicorn handles SIGTERM itself: it stops accepting, waits for requests in flight up to `--timeout-graceful-shutdown`, then runs the lifespan shutdown after `yield`.</Lang>
+<Lang only="typescript">`server.close()` calls back only when every connection has ended, which is why idle keep-alive sockets are closed explicitly and a timer caps the wait.</Lang>
+<Lang only="rust">Registering the handler is what makes SIGTERM reach the process at all when it is PID 1. `with_graceful_shutdown` then stops accepting and waits for every connection to finish.</Lang>
+</Depth>
+
+## [again] The same week, with honest probes
+
+Ten deploys a day. Each old pod leaves the endpoints, keeps serving for 5 seconds while the load balancers catch up, then drains and exits. No failed payments. When the database fails over, all pods leave the endpoints together and requests fail fast with no healthy backend, but nothing restarts. The moment the database is back, readiness passes and traffic returns in seconds.
+
+<Depth level={2}>
+The database outage still costs its 40 seconds; no probe can prevent that. What the probes decide is whether it costs 40 seconds or three minutes.
+</Depth>
+
+<Depth level={3}>
+Containers in one pod receive SIGTERM in no defined order. If a sidecar proxy exits before the app has drained, the app's last responses are lost. Native sidecar containers (init containers with `restartPolicy: Always`) are stopped after the main containers, which fixes that ordering.
+</Depth>
+
+## [play] Run a deploy
+
+Three pods take 30 requests a second while a rolling update replaces them. Set the probes and the shutdown, run the deploy, and every request lands on the timeline as served or failed. Then add a database outage.
+
+## [lens] How each language does it
+
+Go, Node.js and Rust leave SIGTERM to you, and each gets it wrong in its own way by default: Go and Node exit mid-request, and Rust ignores the signal as PID 1. Python's ASGI servers drain for you. In every language the probe endpoints are a few lines; deciding what each one checks is the real work.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Check what actually runs as PID 1. A shell entrypoint that starts the server without `exec`, or a process manager that does not forward signals, swallows SIGTERM whatever the application does. `exec` in the entrypoint, or a small init such as tini, fixes it.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="probes-and-pod-lifecycle" />
+
+### Probe defaults
+
+| Field | Default | Note |
+|---|---|---|
+| initialDelaySeconds | 0 | Counts from container start. Prefer a startup probe for slow starts. |
+| periodSeconds | 10 | |
+| timeoutSeconds | 1 | A slow response is a failure. |
+| successThreshold | 1 | Must be 1 for liveness and startup. |
+| failureThreshold | 3 | Consecutive failures before acting. |
+| terminationGracePeriodSeconds | 30 | Pod-wide; the preStop hook counts toward it. |

@@ -1,0 +1,25 @@
+# Terms introduced by the probes and pod lifecycle lesson.
+- id: liveness-probe
+  term: Liveness probe
+  short: A check the kubelet runs on a container. When it fails failureThreshold times in a row, the kubelet kills the container and restarts it. It should fail only when a restart would help.
+- id: readiness-probe
+  term: Readiness probe
+  short: A check the kubelet runs on a container. While it fails, the pod is marked not ready and taken out of every Service's endpoints. Nothing is restarted.
+- id: startup-probe
+  term: Startup probe
+  short: A check that runs only while a container starts. Liveness and readiness probes wait until it succeeds once; if it fails failureThreshold times, the container is restarted.
+- id: prestop-hook
+  term: preStop hook
+  short: A command, HTTP call or sleep that the kubelet runs in a container before sending it SIGTERM. Its time counts toward the grace period.
+- id: termination-grace-period
+  term: terminationGracePeriodSeconds
+  short: How long the kubelet waits, from the start of a pod's shutdown, before it sends SIGKILL to anything still running. 30 seconds by default.
+- id: crash-loop-backoff
+  term: CrashLoopBackOff
+  short: The status of a container the kubelet keeps restarting. The wait between restarts doubles from 10 seconds up to 5 minutes, and resets after 10 minutes of running.
+- id: endpoint-slice
+  term: EndpointSlice
+  short: The API object that lists the addresses of a Service's pods and whether each is ready. kube-proxy and load balancers route from it, a little behind the pods' real state.
+- id: pid-one
+  term: PID 1 in a container
+  short: The first process in a container's PID namespace. The kernel does not apply default signal actions to it, so without a handler it ignores SIGTERM and dies only at SIGKILL.
