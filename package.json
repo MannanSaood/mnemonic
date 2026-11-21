@@ -1,0 +1,29 @@
+{
+  "name": "mnemonic",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Free interactive guides to software design and systems topics.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build && pagefind --site out --output-subdir pagefind",
+    "start": "npx serve out",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "gray-matter": "4.0.3",
+    "motion": "12.43.0",
+    "next": "15.5.29",
+    "next-mdx-remote": "5.0.0",
+    "react": "19.1.10",
+    "react-dom": "19.1.10",
+    "shiki": "3.23.0",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.3",
+    "@types/react": "19.1.10",
+    "@types/react-dom": "19.1.7",
+    "pagefind": "1.3.0",
+    "typescript": "5.9.3"
+  }
+}

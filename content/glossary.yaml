@@ -1,0 +1,28 @@
+# Site-wide glossary. Use <Term id="...">text</Term> in any topic to show the definition on hover.
+- id: interface
+  term: Interface
+  short: A named set of methods. Any type that has those methods can be used where the interface is expected.
+- id: context-role
+  term: Context
+  short: In Strategy, the object that holds a strategy and calls it, without knowing which one it holds.
+- id: dependency-injection
+  term: Dependency injection
+  short: Passing an object the things it needs (here, a strategy) instead of letting it create or choose them itself.
+- id: dynamic-dispatch
+  term: Dynamic dispatch
+  short: Choosing which function to run at runtime, by looking at the actual value behind an interface or trait object.
+- id: monomorphisation
+  term: Monomorphisation
+  short: The compiler makes a separate copy of a generic function for each concrete type it is used with.
+- id: itab
+  term: itab
+  short: Go's interface table. It pairs a concrete type with the addresses of the methods an interface needs.
+- id: first-class-function
+  term: First-class function
+  short: A function that can be stored in a variable, passed as an argument and returned, like any other value.
+- id: structural-typing
+  term: Structural typing
+  short: A value fits a type if it has the right shape (fields and methods), whatever it was declared as.
+- id: open-closed
+  term: Open/closed principle
+  short: Code should be open to extension (new variants) but closed to modification (no edits to working code).

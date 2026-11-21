@@ -1,0 +1,1153 @@
+<title>Mnemonic Visual Directions</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT@9..144,300..700,0..100&family=Newsreader:ital,opsz,wght@0,6..72,400..700;1,6..72,400&family=IBM+Plex+Mono:wght@400;500;600&family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,400..800&family=Instrument+Sans:wdth,wght@75..100,400..700&family=Martian+Mono:wdth,wght@75..112.5,300..700&family=Archivo:wdth,wght@62..125,400..900&family=Atkinson+Hyperlegible+Next:wght@300..700&family=Atkinson+Hyperlegible+Mono:wght@400..600&display=swap">
+<style>
+/* Layout: a direction switcher and spec sheet on top, then one live lesson page
+   (prose + step rail on the left, sticky diagram + code on the right).
+   Each direction is a full token set for light and dark; data-dir on <html> picks one. */
+
+/* ---------- A · Margin (default) ---------- */
+:root {
+  --bg:#F5F6F8; --surface:#FFFFFF; --surface-2:#ECEEF2; --ink:#161A22; --ink-2:#5A6170; --line:#D3D8E0;
+  --accent:#1F3FBF; --accent-ink:#FFFFFF; --pain:#B4233C; --pain-bg:#F9E3E7; --good:#1C7350; --good-bg:#DCF0E6;
+  --hl:#FFEC8A; --grid:transparent; --glow:transparent;
+  --c-kw:#1F3FBF; --c-str:#8A4B08; --c-com:#7A8190; --c-type:#6B2FA0; --c-fn:#0F5E73;
+  --f-display:"Fraunces", Georgia, serif; --f-text:"Newsreader", Georgia, serif; --f-code:"IBM Plex Mono", ui-monospace, Consolas, monospace;
+  --display-vs:"SOFT" 60, "opsz" 96; --display-wt:560; --display-track:-0.01em;
+  --text-size:1.125rem; --radius:3px; --node-r:3px; --panel-shadow:none;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg:#101624; --surface:#161D2E; --surface-2:#1F2739; --ink:#ECE8DF; --ink-2:#A3A6B0; --line:#2A3348;
+  --accent:#9DB1FF; --accent-ink:#0D1020; --pain:#FF8A9A; --pain-bg:#3A1E2A; --good:#6BD8A8; --good-bg:#14302C;
+  --hl:rgba(255,190,70,.20); --c-kw:#A8B8FF; --c-str:#F0C07A; --c-com:#7A8296; --c-type:#D2AEFF; --c-fn:#8DD8E8; color-scheme:dark;
+}}
+:root[data-theme="dark"] {
+  --bg:#101624; --surface:#161D2E; --surface-2:#1F2739; --ink:#ECE8DF; --ink-2:#A3A6B0; --line:#2A3348;
+  --accent:#9DB1FF; --accent-ink:#0D1020; --pain:#FF8A9A; --pain-bg:#3A1E2A; --good:#6BD8A8; --good-bg:#14302C;
+  --hl:rgba(255,190,70,.20); --c-kw:#A8B8FF; --c-str:#F0C07A; --c-com:#7A8296; --c-type:#D2AEFF; --c-fn:#8DD8E8; color-scheme:dark;
+}
+
+/* ---------- B · Schematic ---------- */
+:root[data-dir="b"] {
+  --bg:#ECF0F1; --surface:#F8FAFA; --surface-2:#E0E7E9; --ink:#0E2234; --ink-2:#4A5F70; --line:#B5C4CB;
+  --accent:#0B6E8A; --accent-ink:#FFFFFF; --pain:#B35F00; --pain-bg:#FAE8CF; --good:#0F7558; --good-bg:#D6EEE4;
+  --hl:#CFE6EF; --grid:#D9E2E5; --glow:transparent;
+  --c-kw:#0B4F8A; --c-str:#8C5A00; --c-com:#768994; --c-type:#0B6E8A; --c-fn:#3B3F9E;
+  --f-display:"Bricolage Grotesque", "Arial Narrow", sans-serif; --f-text:"Instrument Sans", system-ui, sans-serif; --f-code:"Martian Mono", ui-monospace, Consolas, monospace;
+  --display-vs:"wdth" 75, "opsz" 96; --display-wt:720; --display-track:-0.015em;
+  --text-size:1.0625rem; --radius:0px; --node-r:0px; --panel-shadow:none;
+}
+@media (prefers-color-scheme: dark) { :root[data-dir="b"]:not([data-theme="light"]) {
+  --bg:#0E1826; --surface:#122033; --surface-2:#192A40; --ink:#E4ECF3; --ink-2:#93A7B9; --line:#25384E;
+  --accent:#6FD3F2; --accent-ink:#06192B; --pain:#FFB547; --pain-bg:#352B19; --good:#6FE0B8; --good-bg:#12343A;
+  --hl:#183452; --grid:#16253A; --c-kw:#7FD4F0; --c-str:#FFCF85; --c-com:#6A8197; --c-type:#A9E6FF; --c-fn:#B9C2FF; color-scheme:dark;
+}}
+:root[data-dir="b"][data-theme="dark"] {
+  --bg:#0E1826; --surface:#122033; --surface-2:#192A40; --ink:#E4ECF3; --ink-2:#93A7B9; --line:#25384E;
+  --accent:#6FD3F2; --accent-ink:#06192B; --pain:#FFB547; --pain-bg:#352B19; --good:#6FE0B8; --good-bg:#12343A;
+  --hl:#183452; --grid:#16253A; --c-kw:#7FD4F0; --c-str:#FFCF85; --c-com:#6A8197; --c-type:#A9E6FF; --c-fn:#B9C2FF; color-scheme:dark;
+}
+
+/* ---------- D · Schematic + Margin text ---------- */
+:root[data-dir="d"] {
+  --bg:#ECF0F1; --surface:#F8FAFA; --surface-2:#E0E7E9; --ink:#0E2234; --ink-2:#4A5F70; --line:#B5C4CB;
+  --accent:#0B6E8A; --accent-ink:#FFFFFF; --pain:#B35F00; --pain-bg:#FAE8CF; --good:#0F7558; --good-bg:#D6EEE4;
+  --hl:#CFE6EF; --grid:#DCE4E7; --glow:transparent;
+  --c-kw:#0B4F8A; --c-str:#8C5A00; --c-com:#768994; --c-type:#0B6E8A; --c-fn:#3B3F9E;
+  --f-display:"Bricolage Grotesque", "Arial Narrow", sans-serif; --f-text:"Newsreader", Georgia, serif; --f-code:"Martian Mono", ui-monospace, Consolas, monospace;
+  --display-vs:"wdth" 75, "opsz" 96; --display-wt:720; --display-track:-0.015em;
+  --text-size:1.15rem; --radius:0px; --node-r:0px; --panel-shadow:none;
+}
+@media (prefers-color-scheme: dark) { :root[data-dir="d"]:not([data-theme="light"]) {
+  --bg:#0E1826; --surface:#122033; --surface-2:#192A40; --ink:#E4ECF3; --ink-2:#93A7B9; --line:#25384E;
+  --accent:#6FD3F2; --accent-ink:#06192B; --pain:#FFB547; --pain-bg:#352B19; --good:#6FE0B8; --good-bg:#12343A;
+  --hl:#183452; --grid:#16253A; --c-kw:#7FD4F0; --c-str:#FFCF85; --c-com:#6A8197; --c-type:#A9E6FF; --c-fn:#B9C2FF; color-scheme:dark;
+}}
+:root[data-dir="d"][data-theme="dark"] {
+  --bg:#0E1826; --surface:#122033; --surface-2:#192A40; --ink:#E4ECF3; --ink-2:#93A7B9; --line:#25384E;
+  --accent:#6FD3F2; --accent-ink:#06192B; --pain:#FFB547; --pain-bg:#352B19; --good:#6FE0B8; --good-bg:#12343A;
+  --hl:#183452; --grid:#16253A; --c-kw:#7FD4F0; --c-str:#FFCF85; --c-com:#6A8197; --c-type:#A9E6FF; --c-fn:#B9C2FF; color-scheme:dark;
+}
+
+/* ---------- C · Signal ---------- */
+:root[data-dir="c"] {
+  --bg:#FAFAFC; --surface:#FFFFFF; --surface-2:#F0F0F6; --ink:#121320; --ink-2:#5C5E73; --line:#DFDFEA;
+  --accent:#4450E0; --accent-ink:#FFFFFF; --pain:#A86400; --pain-bg:#FFEFD3; --good:#0B8569; --good-bg:#DBF3EC;
+  --hl:#E8EAFF; --grid:transparent; --glow:rgba(68,80,224,.22);
+  --c-kw:#6A3FD6; --c-str:#A15C00; --c-com:#8B8DA0; --c-type:#1F6FB8; --c-fn:#4450E0;
+  --f-display:"Archivo", "Arial Black", sans-serif; --f-text:"Atkinson Hyperlegible Next", system-ui, sans-serif; --f-code:"Atkinson Hyperlegible Mono", ui-monospace, Consolas, monospace;
+  --display-vs:"wdth" 125; --display-wt:800; --display-track:-0.02em;
+  --text-size:1.0625rem; --radius:12px; --node-r:10px; --panel-shadow:0 1px 2px rgba(18,19,32,.06), 0 8px 24px rgba(18,19,32,.06);
+}
+@media (prefers-color-scheme: dark) { :root[data-dir="c"]:not([data-theme="light"]) {
+  --bg:#0F1015; --surface:#17181F; --surface-2:#20212B; --ink:#F2F2F5; --ink-2:#9A9BAA; --line:#2C2D3A;
+  --accent:#9CA7FF; --accent-ink:#0C0D14; --pain:#FFB020; --pain-bg:#33280F; --good:#5FD4B8; --good-bg:#12302B;
+  --hl:#252946; --glow:rgba(156,167,255,.45); --c-kw:#B9A4FF; --c-str:#FFC66D; --c-com:#6B6D80; --c-type:#8FD7FF; --c-fn:#9CA7FF;
+  --panel-shadow:0 0 0 1px rgba(255,255,255,.02), 0 12px 32px rgba(0,0,0,.35); color-scheme:dark;
+}}
+:root[data-dir="c"][data-theme="dark"] {
+  --bg:#0F1015; --surface:#17181F; --surface-2:#20212B; --ink:#F2F2F5; --ink-2:#9A9BAA; --line:#2C2D3A;
+  --accent:#9CA7FF; --accent-ink:#0C0D14; --pain:#FFB020; --pain-bg:#33280F; --good:#5FD4B8; --good-bg:#12302B;
+  --hl:#252946; --glow:rgba(156,167,255,.45); --c-kw:#B9A4FF; --c-str:#FFC66D; --c-com:#6B6D80; --c-type:#8FD7FF; --c-fn:#9CA7FF;
+  --panel-shadow:0 0 0 1px rgba(255,255,255,.02), 0 12px 32px rgba(0,0,0,.35); color-scheme:dark;
+}
+
+/* ---------- alternative dark palettes (override any direction, dark only) ---------- */
+@media (prefers-color-scheme: dark) { :root[data-dark="graphite"]:not([data-theme="light"]) { --bg:#151719; --surface:#1B1E21; --surface-2:#24282C; --ink:#E9E7E2; --ink-2:#9EA3A8; --line:#30353A; --accent:#5FC4D9; --accent-ink:#0B1A1F; --pain:#F2A65A; --pain-bg:#3A2A1A; --good:#7DD3A8; --good-bg:#17302A; --hl:#223840; --grid:#1D2024; --glow:rgba(95,196,217,.35); --c-kw:#7FC8E0; --c-str:#E6C07B; --c-com:#7C838A; --c-type:#9FD7C7; --c-fn:#B8B5F0; color-scheme:dark; }}
+:root[data-dark="graphite"][data-theme="dark"] { --bg:#151719; --surface:#1B1E21; --surface-2:#24282C; --ink:#E9E7E2; --ink-2:#9EA3A8; --line:#30353A; --accent:#5FC4D9; --accent-ink:#0B1A1F; --pain:#F2A65A; --pain-bg:#3A2A1A; --good:#7DD3A8; --good-bg:#17302A; --hl:#223840; --grid:#1D2024; --glow:rgba(95,196,217,.35); --c-kw:#7FC8E0; --c-str:#E6C07B; --c-com:#7C838A; --c-type:#9FD7C7; --c-fn:#B8B5F0; color-scheme:dark; }
+@media (prefers-color-scheme: dark) { :root[data-dark="warm"]:not([data-theme="light"]) { --bg:#1A1714; --surface:#211D19; --surface-2:#2A2520; --ink:#EFE8DC; --ink-2:#A89F92; --line:#3A332B; --accent:#E3A857; --accent-ink:#1A1209; --pain:#F07C6C; --pain-bg:#3D211C; --good:#9CCB84; --good-bg:#26301E; --hl:#3A2F20; --grid:#231F1A; --glow:rgba(227,168,87,.35); --c-kw:#E3A857; --c-str:#B9D08C; --c-com:#847A6D; --c-type:#8CC5D0; --c-fn:#E9C8A0; color-scheme:dark; }}
+:root[data-dark="warm"][data-theme="dark"] { --bg:#1A1714; --surface:#211D19; --surface-2:#2A2520; --ink:#EFE8DC; --ink-2:#A89F92; --line:#3A332B; --accent:#E3A857; --accent-ink:#1A1209; --pain:#F07C6C; --pain-bg:#3D211C; --good:#9CCB84; --good-bg:#26301E; --hl:#3A2F20; --grid:#231F1A; --glow:rgba(227,168,87,.35); --c-kw:#E3A857; --c-str:#B9D08C; --c-com:#847A6D; --c-type:#8CC5D0; --c-fn:#E9C8A0; color-scheme:dark; }
+@media (prefers-color-scheme: dark) { :root[data-dark="black"]:not([data-theme="light"]) { --bg:#0A0A0A; --surface:#121212; --surface-2:#1B1B1B; --ink:#EDEDED; --ink-2:#9A9A9A; --line:#272727; --accent:#7AA2F7; --accent-ink:#0A0A0A; --pain:#FFB454; --pain-bg:#2E2416; --good:#73DACA; --good-bg:#12292A; --hl:#1A2238; --grid:#151515; --glow:rgba(122,162,247,.4); --c-kw:#7AA2F7; --c-str:#E0C080; --c-com:#6E6E6E; --c-type:#9ECE6A; --c-fn:#BB9AF7; color-scheme:dark; }}
+:root[data-dark="black"][data-theme="dark"] { --bg:#0A0A0A; --surface:#121212; --surface-2:#1B1B1B; --ink:#EDEDED; --ink-2:#9A9A9A; --line:#272727; --accent:#7AA2F7; --accent-ink:#0A0A0A; --pain:#FFB454; --pain-bg:#2E2416; --good:#73DACA; --good-bg:#12292A; --hl:#1A2238; --grid:#151515; --glow:rgba(122,162,247,.4); --c-kw:#7AA2F7; --c-str:#E0C080; --c-com:#6E6E6E; --c-type:#9ECE6A; --c-fn:#BB9AF7; color-scheme:dark; }
+
+/* ---------- base ---------- */
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  background: var(--bg); color: var(--ink); font-family: var(--f-text); font-size: var(--text-size); line-height: 1.6;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 64px; transition: background-color .3s, color .3s;
+}
+body::before { content:""; position:fixed; inset:0 0 auto; height:env(safe-area-inset-top,0px); z-index:10; background:var(--bg); }
+.wrap { max-width: 1240px; margin: 0 auto; }
+button, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code, .mono { font-family: var(--f-code); font-size: .86em; }
+h1, h2, h3, .display { font-family: var(--f-display); font-variation-settings: var(--display-vs); font-weight: var(--display-wt); letter-spacing: var(--display-track); text-wrap: balance; line-height: 1.08; margin: 0; }
+.label { font-family: var(--f-code); font-size: .72rem; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); }
+
+/* ---------- top bar: direction switcher ---------- */
+.top { position: sticky; top: env(safe-area-inset-top,0px); z-index: 20; background: var(--bg); border-bottom: 1px solid var(--line); margin-inline: calc(-1 * max(16px, env(safe-area-inset-left,0px))); padding: 10px max(16px, env(safe-area-inset-left,0px)); }
+.top .wrap { display: flex; gap: 12px 20px; align-items: center; flex-wrap: wrap; }
+.brand { font-family: var(--f-display); font-variation-settings: var(--display-vs); font-weight: var(--display-wt); font-size: 1.25rem; letter-spacing: var(--display-track); margin-right: auto; }
+.brand small { font-family: var(--f-code); font-size: .7rem; letter-spacing: .06em; color: var(--ink-2); margin-left: 8px; font-weight: 400; text-transform: uppercase; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: calc(var(--radius) + 2px); padding: 2px; gap: 2px; background: var(--surface); }
+.seg button { border: 0; background: transparent; padding: 5px 12px; border-radius: var(--radius); font-size: .85rem; color: var(--ink-2); white-space: nowrap; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.seg.small button { padding: 3px 9px; font-size: .78rem; }
+.dir-switch button b { font-family: var(--f-code); font-weight: 500; margin-right: 6px; opacity: .7; }
+
+/* ---------- spec sheet ---------- */
+.intro { padding-block: 36px 20px; display: grid; gap: 8px; }
+.intro h1 { font-size: clamp(2.2rem, 5vw, 3.6rem); }
+.intro p { max-width: 62ch; margin: 0; color: var(--ink-2); }
+.choose { margin-top: 28px; padding: 18px 20px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); display: grid; gap: 10px; }
+.choose p { margin: 0; max-width: 75ch; }
+.choose-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.pick { text-align: left; display: grid; gap: 4px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg); font-size: .95rem; line-height: 1.45; }
+.pick span { color: var(--ink-2); }
+.pick[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+@media (max-width: 1000px) { .choose-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 560px) { .choose-grid { grid-template-columns: 1fr; } }
+.spec { display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; margin-block: 16px 28px; }
+.spec > section { background: var(--surface); padding: 18px 20px; min-width: 0; display: grid; gap: 10px; align-content: start; }
+.spec h3 { font-size: 1rem; font-family: var(--f-code); font-variation-settings: normal; font-weight: 500; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); }
+.type-row { display: grid; gap: 2px; border-top: 1px solid var(--line); padding-top: 8px; }
+.type-row:first-of-type { border-top: 0; padding-top: 0; }
+.type-row .sample-d { font-family: var(--f-display); font-variation-settings: var(--display-vs); font-weight: var(--display-wt); letter-spacing: var(--display-track); font-size: 2rem; line-height: 1.1; }
+.type-row .sample-t { font-family: var(--f-text); font-size: 1.05rem; line-height: 1.5; }
+.type-row .sample-c { font-family: var(--f-code); font-size: .9rem; }
+.swatches { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+.sw { display: grid; gap: 4px; font-family: var(--f-code); font-size: .62rem; color: var(--ink-2); min-width: 0; }
+.sw i { display: block; aspect-ratio: 1.4; border-radius: var(--radius); border: 1px solid var(--line); max-width: 100%; }
+.sw span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.motion-list { margin: 0; padding-left: 1.1em; display: grid; gap: 6px; font-size: .95rem; }
+.pitch { font-size: 1.05rem; margin: 0; }
+.replay { justify-self: start; border: 1px solid var(--accent); color: var(--accent); background: transparent; border-radius: var(--radius); padding: 5px 12px; font-size: .85rem; }
+
+/* ---------- lesson page ---------- */
+.frame { border: 1px solid var(--line); border-radius: calc(var(--radius) * 1.5); background: var(--bg); overflow: hidden; box-shadow: var(--panel-shadow); }
+.frame-cap { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.lbar { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.crumbs { font-size: .9rem; color: var(--ink-2); margin-right: auto; }
+.crumbs b { color: var(--ink); font-weight: 600; }
+.lens { display: inline-flex; align-items: center; gap: 6px; }
+.lens .label { font-size: .64rem; }
+
+.lesson { display: grid; grid-template-columns: minmax(0, 400px) minmax(0, 1fr); }
+.prose { padding: 28px 28px 20px; border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.rail { display: flex; gap: 4px; flex-wrap: wrap; list-style: none; margin: 0; padding: 0; }
+.rail button { border: 1px solid var(--line); background: var(--surface); width: 30px; height: 30px; border-radius: var(--radius); font-family: var(--f-code); font-size: .78rem; color: var(--ink-2); padding: 0; }
+.rail button[aria-current="step"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.rail button.seen:not([aria-current]) { color: var(--ink); border-color: var(--ink-2); }
+.step-kicker { display: flex; gap: 10px; align-items: baseline; }
+.step-title { font-size: clamp(1.7rem, 3vw, 2.3rem); }
+.step-body { display: grid; gap: 12px; }
+.step-body p { margin: 0; max-width: 60ch; }
+.step-body .deeper { border-left: 2px solid var(--accent); padding-left: 12px; color: var(--ink); }
+.step-body .deeper .label { display: block; margin-bottom: 2px; color: var(--accent); }
+.go-deeper { justify-self: start; background: none; border: 0; padding: 0; color: var(--accent); font-size: .9rem; text-decoration: underline; text-underline-offset: 3px; }
+.walk { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.walk button { width: 100%; text-align: left; display: grid; grid-template-columns: 26px 1fr; gap: 10px; align-items: start; background: transparent; border: 1px solid transparent; border-radius: var(--radius); padding: 8px 10px; font-size: .95rem; line-height: 1.45; }
+.walk button .n { font-family: var(--f-code); font-size: .78rem; color: var(--ink-2); border: 1px solid var(--line); border-radius: 50%; width: 24px; height: 24px; display: grid; place-items: center; }
+.walk button[aria-pressed="true"] { border-color: var(--line); background: var(--surface); }
+.walk button[aria-pressed="true"] .n { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.quiz { display: grid; gap: 8px; }
+.quiz button { text-align: left; border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius); padding: 10px 12px; font-size: .95rem; }
+.quiz button.right { border-color: var(--good); background: var(--good-bg); }
+.quiz button.wrong { border-color: var(--pain); background: var(--pain-bg); }
+.quiz .fb { font-size: .95rem; margin: 0; min-height: 3em; }
+.morph-ctl { display: grid; gap: 6px; }
+.morph-ctl .ends { display: flex; justify-content: space-between; }
+input[type="range"] { width: 100%; accent-color: var(--accent); }
+.nav { margin-top: auto; display: flex; justify-content: space-between; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
+.nav button { border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius); padding: 8px 14px; font-size: .9rem; }
+.nav button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.nav button:disabled { opacity: .4; cursor: default; }
+.kbd { font-family: var(--f-code); font-size: .7rem; color: var(--ink-2); align-self: center; }
+
+.visual { padding: 20px; display: grid; gap: 14px; align-content: start; min-width: 0; background: var(--bg); }
+.figure { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; position: relative; }
+.figure svg { display: block; width: 100%; height: auto; }
+.fig-cap { display: flex; justify-content: space-between; gap: 10px; padding: 8px 12px; border-top: 1px solid var(--line); font-size: .85rem; color: var(--ink-2); flex-wrap: wrap; }
+.meter { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; padding: 10px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); font-size: .92rem; }
+.meter .bar { height: 8px; border-radius: 99px; background: var(--surface-2); overflow: hidden; }
+.meter .bar i { display: block; height: 100%; width: 0; background: var(--pain); border-radius: inherit; transition: width .6s cubic-bezier(.2,.7,.2,1), background-color .3s; }
+.meter.good .bar i { background: var(--good); }
+.meter .val { font-family: var(--f-code); font-size: .82rem; font-weight: 600; color: var(--pain); white-space: nowrap; }
+.meter.good .val { color: var(--good); }
+.meter.idle { opacity: .55; }
+.meter.idle .val { color: var(--ink-2); }
+
+.code { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.code-head { display: flex; justify-content: space-between; gap: 10px; padding: 7px 12px; border-bottom: 1px solid var(--line); font-family: var(--f-code); font-size: .72rem; color: var(--ink-2); flex-wrap: wrap; }
+.code pre { margin: 0; padding: 10px 0; overflow-x: auto; font-family: var(--f-code); font-size: .8rem; line-height: 1.65; }
+.code .ln > span { white-space: pre; }
+.code .ln { display: grid; grid-template-columns: 3.2em 1fr; padding-right: 14px; min-width: max-content; transition: background-color .25s; }
+.code .ln::before { content: attr(data-n); text-align: right; padding-right: 1.2em; color: var(--ink-2); opacity: .55; user-select: none; }
+.code .ln.hl { background: var(--hl); }
+.code .ln.pain { background: var(--pain-bg); }
+.code .ln.pain::before { content: "+"; color: var(--pain); opacity: 1; font-weight: 700; }
+.code .ln.mod { background: var(--pain-bg); }
+.code .ln.mod::before { content: "~"; color: var(--pain); opacity: 1; font-weight: 700; }
+.code .ln.add { background: var(--good-bg); }
+.code .ln.add::before { content: "+"; color: var(--good); opacity: 1; font-weight: 700; }
+.tk-kw { color: var(--c-kw); } .tk-str { color: var(--c-str); } .tk-com { color: var(--c-com); font-style: italic; }
+.tk-type { color: var(--c-type); } .tk-fn { color: var(--c-fn); }
+.need { display: grid; gap: 8px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); font-size: .92rem; }
+.need .dots { display: inline-flex; gap: 4px; vertical-align: middle; margin-left: 8px; }
+.need .dots i { width: 22px; height: 6px; border-radius: 3px; background: var(--surface-2); }
+.need .dots i.on { background: var(--accent); }
+.need p { margin: 0; }
+
+/* diagram */
+.node rect.box { fill: var(--surface); stroke: var(--ink); stroke-width: 1.25; transition: stroke .25s, fill .25s; }
+.node.chip rect.box { fill: var(--surface-2); stroke: var(--line); }
+.node.iface rect.box { stroke: var(--accent); stroke-dasharray: 5 4; fill: var(--surface); }
+.node.pain rect.box { stroke: var(--pain); fill: var(--pain-bg); }
+.node.ghost rect.box { stroke: var(--pain); stroke-dasharray: 4 3; fill: var(--pain-bg); }
+.node.good rect.box { stroke: var(--good); fill: var(--good-bg); }
+.node.lit rect.box { stroke: var(--accent); fill: var(--hl); stroke-width: 2; }
+.node text { fill: var(--ink); font-family: var(--f-code); font-size: 12px; }
+.node text.title { font-family: var(--f-text); font-weight: 600; font-size: 14px; }
+.node text.sub { fill: var(--ink-2); font-size: 10.5px; }
+.node.chip text.title { font-family: var(--f-code); font-weight: 500; font-size: 11.5px; }
+.node { cursor: default; }
+.node.hov rect.box { stroke: var(--accent); stroke-width: 2; }
+.edge { fill: none; stroke: var(--ink-2); stroke-width: 1.25; }
+.edge.lit { stroke: var(--accent); stroke-width: 2; }
+.elabel { fill: var(--ink-2); font-family: var(--f-code); font-size: 10px; }
+.arrowhead { fill: var(--ink-2); }
+.pulse { fill: var(--accent); }
+.gridbg { fill: url(#grid); }
+
+/* direction-specific diagram character */
+:root[data-dir="a"] .node text.title, :root:not([data-dir]) .node text.title { font-family: var(--f-display); font-style: normal; font-weight: 600; }
+:root[data-dir="a"] .elabel { font-family: var(--f-text); font-style: italic; font-size: 12px; }
+:root[data-dir="a"] .code .ln.hl { background: linear-gradient(transparent 12%, var(--hl) 12%, var(--hl) 88%, transparent 88%); }
+:root[data-fam="s"] .node text.title { font-family: var(--f-code); text-transform: uppercase; letter-spacing: .06em; font-size: 11.5px; font-weight: 600; }
+:root[data-fam="s"] .node rect.box { stroke-width: 1; }
+:root[data-fam="s"] .elabel { text-transform: uppercase; letter-spacing: .08em; font-size: 9px; }
+:root[data-fam="s"] .code .ln.hl { box-shadow: inset 3px 0 0 var(--accent); }
+:root[data-fam="s"] .rail button { border-radius: 0; }
+:root[data-fam="s"] .step-title { text-transform: uppercase; }
+:root[data-fam="s"] .figure { background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px); background-size: 16px 16px; background-color: var(--surface); }
+:root[data-fam="s"] .node rect.box { fill: var(--surface); }
+:root[data-fam="s"] .node.chip rect.box { fill: var(--surface-2); }
+:root[data-dir="c"] .node rect.box { stroke-width: 1; stroke: var(--line); fill: var(--surface-2); }
+:root[data-dir="c"] .node.iface rect.box { stroke: var(--accent); stroke-dasharray: none; fill: var(--hl); }
+:root[data-dir="c"] .node.lit rect.box, :root[data-dir="c"] .node.hov rect.box { stroke: var(--accent); filter: drop-shadow(0 0 8px var(--glow)); }
+:root[data-dir="c"] .edge.lit { filter: drop-shadow(0 0 4px var(--glow)); }
+:root[data-dir="c"] .pulse { filter: drop-shadow(0 0 6px var(--accent)); }
+:root[data-dir="c"] .node text.title { font-family: var(--f-text); font-weight: 700; }
+:root[data-dir="c"] .code .ln.hl { box-shadow: inset 2px 0 0 var(--accent); }
+:root[data-dir="c"] .nav button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+:root[data-dir="c"] .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+
+/* reference mode */
+.ref { padding: 32px 28px; display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: 32px; }
+.ref article { display: grid; gap: 22px; min-width: 0; max-width: 68ch; }
+.ref h2 { font-size: 2.4rem; }
+.ref h3 { font-size: 1.25rem; }
+.ref p { margin: 0; }
+.ref table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+.ref th, .ref td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.ref th { font-family: var(--f-code); font-size: .7rem; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); font-weight: 500; }
+.ref .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.ref .twocol > div { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; background: var(--surface); }
+.ref aside { display: grid; gap: 8px; align-content: start; font-size: .9rem; position: sticky; top: 80px; }
+.ref aside a { color: var(--ink-2); text-decoration: none; }
+.ref aside input { width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.gl { border-bottom: 1px dotted var(--ink-2); cursor: help; }
+.table-wrap { overflow-x: auto; }
+
+/* research */
+.research { margin-top: 40px; display: grid; gap: 14px; }
+.research h2 { font-size: 1.8rem; }
+.rgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.rgrid div { background: var(--surface); padding: 14px 16px; font-size: .92rem; display: grid; gap: 4px; align-content: start; min-width: 0; }
+.rgrid b { font-family: var(--f-text); }
+.rgrid span { color: var(--ink-2); }
+.foot { color: var(--ink-2); font-size: .9rem; margin-top: 18px; max-width: 70ch; }
+
+@media (max-width: 960px) {
+  .spec { grid-template-columns: 1fr; }
+  .lesson { grid-template-columns: 1fr; }
+  .prose { border-right: 0; border-bottom: 1px solid var(--line); }
+  .rgrid { grid-template-columns: 1fr 1fr; }
+  .ref { grid-template-columns: 1fr; }
+  .ref aside { position: static; }
+}
+@media (max-width: 560px) {
+  .rgrid, .ref .twocol { grid-template-columns: 1fr; }
+  .prose, .ref { padding: 20px 16px; }
+  .visual { padding: 12px; }
+  .lbar { padding: 10px 12px; }
+  .dir-switch button { padding: 5px 8px; }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
+</style>
+
+<header class="top">
+  <div class="wrap">
+    <div class="brand">Mnemonic <small>Visual directions</small></div>
+    <div class="seg dir-switch" role="group" aria-label="Visual direction">
+      <button id="dir-a" data-dir="a" aria-pressed="true"><b>A</b>Margin</button>
+      <button id="dir-b" data-dir="b" aria-pressed="false"><b>B</b>Schematic</button>
+      <button id="dir-c" data-dir="c" aria-pressed="false"><b>C</b>Signal</button>
+      <button id="dir-d" data-dir="d" aria-pressed="false"><b>D</b>B + A text</button>
+    </div>
+    <div class="seg small" role="group" aria-label="Theme" id="themes">
+      <button id="th-light" data-th="light" aria-pressed="false">Light</button>
+      <button id="th-dark" data-th="dark" aria-pressed="false">Dark</button>
+    </div>
+    <div class="seg small" role="group" aria-label="Dark palette" id="darkpal">
+      <button id="dp-default" data-dp="default" aria-pressed="true" title="The direction's own dark colours">Own dark</button>
+      <button id="dp-graphite" data-dp="graphite" aria-pressed="false">Graphite</button>
+      <button id="dp-warm" data-dp="warm" aria-pressed="false">Warm</button>
+      <button id="dp-black" data-dp="black" aria-pressed="false">Black</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="choose">
+    <span class="label">What you are choosing</span>
+    <p>Every page on Mnemonic will share one look. This choice decides only that look: the fonts, the colours, and how the diagrams move. The lessons, the buttons and the order of steps are the same in all three. Click <b>A</b>, <b>B</b>, <b>C</b> or <b>D</b> at the top and the same Strategy lesson below changes its look; Light and Dark show both colour themes. In the top bar, <b>Own dark</b>, <b>Graphite</b>, <b>Warm</b> and <b>Black</b> try other dark colour schemes on whichever direction you are viewing.</p>
+    <div class="choose-grid">
+      <button class="pick" data-pick="a"><b>A · Margin</b><span>Feels like a well-printed technical book. Quiet and easy to read for a long time.</span></button>
+      <button class="pick" data-pick="b"><b>B · Schematic</b><span>Feels like an engineering drawing on grid paper. Precise; suits systems topics.</span></button>
+      <button class="pick" data-pick="c"><b>C · Signal</b><span>Feels like a modern dark dashboard. Glowing highlights, built for readability.</span></button>
+      <button class="pick" data-pick="d"><b>D · Schematic + Margin text</b><span>B's drawings, grid and motion, with A's book font for the lesson text. Recommended.</span></button>
+    </div>
+  </section>
+  <section class="intro">
+    <span class="label">Step 1 of the build plan · pick one direction</span>
+    <h1 id="dir-name">Margin</h1>
+    <p id="dir-pitch"></p>
+  </section>
+
+  <div class="spec">
+    <section>
+      <h3>Type</h3>
+      <div class="type-row"><span class="label" id="f-d-name"></span><span class="sample-d">Strategy, in four languages</span></div>
+      <div class="type-row"><span class="label" id="f-t-name"></span><span class="sample-t">Put each way of doing one step behind a shared interface, and let the caller choose which one to plug in.</span></div>
+      <div class="type-row"><span class="label" id="f-c-name"></span><span class="sample-c">up := &amp;Uploader{c: Zstd{Level: 3}} // 0Oo 1lI {}</span></div>
+    </section>
+    <section>
+      <h3>Colour</h3>
+      <span class="label">Light</span>
+      <div class="swatches" id="sw-light"></div>
+      <span class="label">Dark</span>
+      <div class="swatches" id="sw-dark"></div>
+    </section>
+    <section>
+      <h3>Motion</h3>
+      <p class="pitch" id="motion-name"></p>
+      <ul class="motion-list" id="motion-list"></ul>
+      <button class="replay" id="replay">Replay the morph</button>
+    </section>
+  </div>
+
+  <div class="frame-cap">
+    <span class="label">Live mockup · the Strategy lesson, all 8 steps</span>
+    <span class="label">← → keys change step</span>
+  </div>
+
+  <div class="frame">
+    <div class="lbar">
+      <div class="crumbs">Design patterns / Behavioral / <b>Strategy</b></div>
+      <div class="seg small" role="group" aria-label="Mode">
+        <button id="m-learn" data-mode="learn" aria-pressed="true">Learn</button>
+        <button id="m-ref" data-mode="ref" aria-pressed="false">Reference</button>
+      </div>
+      <div class="lens"><span class="label">Lang</span>
+        <div class="seg small" role="group" aria-label="Language" id="langs">
+          <button id="l-go" data-lang="go" aria-pressed="true">Go</button>
+          <button id="l-py" data-lang="py" aria-pressed="false">Python</button>
+          <button id="l-ts" data-lang="ts" aria-pressed="false">TS</button>
+          <button id="l-rs" data-lang="rs" aria-pressed="false">Rust</button>
+        </div>
+      </div>
+      <div class="lens"><span class="label">Depth</span>
+        <div class="seg small" role="group" aria-label="Depth" id="depths">
+          <button id="d-1" data-depth="1" aria-pressed="false">Overview</button>
+          <button id="d-2" data-depth="2" aria-pressed="true">Engineer</button>
+          <button id="d-3" data-depth="3" aria-pressed="false">Deep</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="lesson" id="learn">
+      <div class="prose">
+        <ol class="rail" id="rail" aria-label="Lesson steps"></ol>
+        <div class="step-kicker"><span class="label" id="step-kicker"></span></div>
+        <h2 class="step-title" id="step-title"></h2>
+        <div class="step-body" id="step-body"></div>
+        <div class="nav">
+          <button id="prev">← Previous</button>
+          <span class="kbd" id="pos"></span>
+          <button id="next" class="primary">Next →</button>
+        </div>
+      </div>
+      <div class="visual">
+        <div class="figure">
+          <svg id="dia" viewBox="0 0 560 275" role="img" aria-label="Roles diagram for the uploader">
+            <defs>
+              <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+              <marker id="arr-hollow" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="10" markerHeight="10" orient="auto"><path d="M1,1 L11,6 L1,11 z" style="fill:var(--surface);stroke:var(--ink-2);stroke-width:1.2"/></marker>
+            </defs>
+            <g id="edges"></g>
+            <g id="nodes"></g>
+            <rect id="pulse" class="pulse" width="10" height="10" rx="5" x="-30" y="-30"/>
+          </svg>
+          <div class="fig-cap"><span id="fig-cap"></span><span class="mono" id="fig-state"></span></div>
+        </div>
+        <div class="meter idle" id="meter"><span class="label">Change cost</span><span class="bar"><i id="meter-bar"></i></span><span class="val" id="meter-val">no change yet</span></div>
+        <div class="need" id="need" hidden></div>
+        <div class="code"><div class="code-head"><span id="code-file"></span><span id="code-note"></span></div><pre id="code"></pre></div>
+      </div>
+    </div>
+
+    <div class="ref" id="reference" hidden></div>
+  </div>
+
+  <section class="research">
+    <span class="label">What the research changed</span>
+    <h2>Borrowed from the best explainers</h2>
+    <div class="rgrid">
+      <div><b>Bartosz Ciechanowski</b><span>Every figure is an instrument with one control. → One slider drives the morph.</span></div>
+      <div><b>Josh W. Comeau</b><span>Code sits next to its effect. → Hover a box, its lines light up.</span></div>
+      <div><b>Sam Rose</b><span>A dot travelling a path shows a request. → "How it works" sends a call through the diagram.</span></div>
+      <div><b>Stripe docs</b><span>Prose left, code right, language remembered. → The language lens is global.</span></div>
+      <div><b>react.dev</b><span>Deep dives open in place. → Depth adds paragraphs, never a new page.</span></div>
+      <div><b>Red Blob Games</b><span>Manipulate the thing itself. → The morph is scrubbed, not only played.</span></div>
+      <div><b>Distill.pub</b><span>Captions argue, figures align to text. → Captions state the point of each state.</span></div>
+      <div><b>NYT / The Pudding</b><span>Sticky visual, stepped text. → Kept, but steps move by click or key, never scroll-jacking.</span></div>
+    </div>
+    <p class="foot">All nine typefaces are free under the SIL Open Font License from Google Fonts, so the static site can self-host them. Only the look changes between directions: the lesson workflow, controls and content are identical in all three.</p>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var root = document.documentElement;
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---------------- directions ---------------- */
+  var DIRS = {
+    a: {
+      name: "Margin",
+      pitch: "A well-set technical book with a pen in the margin. Fine ink lines, a deep ink-blue dark mode with warm text, a variable serif that softens at large sizes, and a highlighter that marks the line you are reading. Calm and literate; the closest to Stripe Press or a good O'Reilly page.",
+      fonts: ["Fraunces · display · SOFT 60, opsz 96", "Newsreader · text · built for long on-screen reading", "IBM Plex Mono · code · open, distinct 0/O and 1/l"],
+      light: [["paper","#F5F6F8"],["ink","#161A22"],["cobalt","#1F3FBF"],["highlight","#FFEC8A"],["carmine","#B4233C"],["green","#1C7350"]],
+      dark: [["ink night","#101624"],["warm white","#ECE8DF"],["cobalt","#9DB1FF"],["amber glow","#4A3F2C"],["carmine","#FF8A9A"],["green","#6BD8A8"]],
+      motionName: "Ink. Things are drawn, not flown in.",
+      motion: ["Edges draw on along their path (stroke reveal), 600–900 ms, ease-out.", "One thing moves at a time; boxes settle with no overshoot.", "State is shown by the highlighter, not by movement."],
+      dur: 900, ease: function (x) { return 1 - Math.pow(1 - x, 4); }, draw: true, pulse: "none"
+    },
+    b: {
+      name: "Schematic",
+      pitch: "An engineering drawing you can operate. Grid paper, condensed headings, uppercase mono labels and square corners. In dark mode it becomes a calm night-navy drawing, with bright cyan kept for lines and highlights. Precise and technical; suits the later systems tracks (memory maps, packet paths, syscalls) especially well.",
+      fonts: ["Bricolage Grotesque · display · condensed wdth 75", "Instrument Sans · text · neutral, wide apertures", "Martian Mono · code and labels · technical, adjustable width"],
+      light: [["drafting","#ECF0F1"],["navy ink","#0E2234"],["teal","#0B6E8A"],["trace","#CFE6EF"],["amber","#B35F00"],["green","#0F7558"]],
+      dark: [["night navy","#0E1826"],["white line","#E4ECF3"],["cyan","#6FD3F2"],["trace","#183452"],["amber","#FFB547"],["green","#6FE0B8"]],
+      motionName: "Mechanical. Parts slide on rails.",
+      motion: ["Boxes travel in straight lines with ease-in-out, 250–650 ms.", "Edges extend from their source like a ruler being drawn.", "A square marker moves at constant speed to trace a call."],
+      dur: 650, ease: function (x) { return x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; }, draw: true, pulse: "square"
+    },
+    c: {
+      name: "Signal",
+      pitch: "An instrument panel for code. Designed dark-first: soft raised panels, one luminous periwinkle accent, a wide display face, and hyperlegible text and code from the Braille Institute's Atkinson family. Modern and focused, with accessibility as a visible feature.",
+      fonts: ["Archivo Expanded · display · wdth 125, weight 800", "Atkinson Hyperlegible Next · text · made for low-vision readers", "Atkinson Hyperlegible Mono · code · matching letterforms"],
+      light: [["white","#FAFAFC"],["ink","#121320"],["indigo","#4450E0"],["tint","#E8EAFF"],["amber","#A86400"],["teal","#0B8569"]],
+      dark: [["graphite","#0F1015"],["white","#F2F2F5"],["periwinkle","#9CA7FF"],["tint","#252946"],["amber","#FFB020"],["teal","#5FD4B8"]],
+      motionName: "Signal. Springs and pulses.",
+      motion: ["Boxes settle on a light spring with a small overshoot, about 750 ms.", "A glowing pulse runs along edges to show a call in flight.", "Meters and counters tick up to their value."],
+      dur: 750, ease: function (x) { return 1 - Math.cos(x * Math.PI * 2.2) * Math.exp(-6 * x); }, draw: false, pulse: "dot"
+    },
+    d: {
+      name: "Schematic + Margin text",
+      pitch: "Direction B's engineering drawing, with Direction A's reading font. Diagrams, labels and code keep the grid-paper precision that suits systems topics; the lesson prose is set in Newsreader, a serif built for long on-screen reading. Dark mode is a calm night navy rather than a saturated blueprint.",
+      fonts: ["Bricolage Grotesque · display · condensed wdth 75", "Newsreader · text · from Margin, for long reading", "Martian Mono · code and labels · technical, adjustable width"],
+      light: [["drafting","#ECF0F1"],["navy ink","#0E2234"],["teal","#0B6E8A"],["trace","#CFE6EF"],["amber","#B35F00"],["green","#0F7558"]],
+      dark: [["night navy","#0E1826"],["white line","#E4ECF3"],["cyan","#6FD3F2"],["trace","#183452"],["amber","#FFB547"],["green","#6FE0B8"]],
+      motionName: "Mechanical. Parts slide on rails.",
+      motion: ["Boxes travel in straight lines with ease-in-out, 250–650 ms.", "Edges extend from their source like a ruler being drawn.", "A square marker moves at constant speed to trace a call."],
+      dur: 650, ease: function (x) { return x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; }, draw: true, pulse: "square"
+    }
+  };
+
+  /* ---------------- code ---------------- */
+  var BEFORE = [
+    "// upload.go",
+    "func (u *Uploader) Upload(data []byte) error {",
+    "    var body []byte",
+    "    switch u.codec {",
+    "    case \"gzip\":",
+    "        body = gzipBytes(data)",
+    "    case \"zstd\":",
+    "        body = zstdBytes(data)",
+    "    case \"none\":",
+    "        body = data",
+    "    default:",
+    "        return fmt.Errorf(\"unknown codec %q\", u.codec)",
+    "    }",
+    "    return u.send(body, encodingFor(u.codec))",
+    "}",
+    "",
+    "// config.go",
+    "var validCodecs = []string{\"gzip\", \"zstd\", \"none\"}",
+    "",
+    "// headers.go",
+    "func encodingFor(codec string) string {",
+    "    if codec == \"none\" { return \"identity\" }",
+    "    return codec",
+    "}"
+  ];
+  var BEFORE_MAP = { up: [2,15], g: [5,6], z: [7,8], n: [9,10], cfg: [18,18] };
+
+  var LANGS = {
+    go: {
+      file: "upload.go · main.go", iface: "Compressor", ifaceSub: "Compress · Encoding", chips: ["Gzip","Zstd","None","Brotli"], upSub: "c Compressor",
+      lines: [
+        "type Compressor interface {",
+        "    Compress(data []byte) ([]byte, error)",
+        "    Encoding() string",
+        "}",
+        "",
+        "type Uploader struct{ c Compressor }",
+        "",
+        "func (u *Uploader) Upload(data []byte) error {",
+        "    body, err := u.c.Compress(data)",
+        "    if err != nil {",
+        "        return err",
+        "    }",
+        "    return u.send(body, u.c.Encoding())",
+        "}",
+        "",
+        "// main.go: the caller picks",
+        "up := &Uploader{c: Zstd{Level: 3}}"
+      ],
+      add: ["", "// brotli.go: a new file; nothing above changes", "type Brotli struct{ Quality int }", "func (b Brotli) Compress(p []byte) ([]byte, error) { /* … */ }", "func (Brotli) Encoding() string { return \"br\" }"],
+      roles: { iface: [1,4], up: [6,14], cfg: [17,17], call: [8,8], dispatch: [9,9], send: [13,13] },
+      kw: ["func","type","struct","interface","return","if","var","nil","err","switch","case","default","range","for","package","import"],
+      com: "//",
+      need: 3, needLabel: "Common",
+      lens: "Use an interface when the variant carries state or has more than one method. When it is a single call, a plain function value is the Go way: <code>type CompressFunc func([]byte) ([]byte, error)</code>.",
+      seen: "<code>sort.Slice(x, less)</code> and <code>slices.SortFunc</code> take the comparison as a function; <code>http.Server</code> takes any <code>http.Handler</code>; <code>hash.Hash</code> implementations swap behind one interface.",
+      deep: "A call through an interface loads the method's address from the itab and makes an indirect call. It costs a few nanoseconds and usually prevents inlining. For a compressor that touches every byte, that cost is noise; in a tight inner loop it can matter."
+    },
+    py: {
+      file: "upload.py · main.py", iface: "Compress", ifaceSub: "Callable[[bytes], bytes]", chips: ["gzip","zstd","identity","brotli"], upSub: "self.compress",
+      lines: [
+        "from typing import Callable",
+        "",
+        "Compress = Callable[[bytes], bytes]",
+        "",
+        "class Uploader:",
+        "    def __init__(self, compress: Compress, encoding: str):",
+        "        self.compress = compress",
+        "        self.encoding = encoding",
+        "",
+        "    def upload(self, data: bytes) -> None:",
+        "        body = self.compress(data)",
+        "        self.send(body, self.encoding)",
+        "",
+        "# main.py: the caller picks",
+        "up = Uploader(zstd.compress, \"zstd\")"
+      ],
+      add: ["", "# brotli: no new class at all, just pass the function", "up = Uploader(brotli.compress, \"br\")"],
+      roles: { iface: [1,3], up: [5,12], cfg: [15,15], call: [10,10], dispatch: [11,11], send: [12,12] },
+      kw: ["from","import","class","def","return","self","None","if","else","for","in","as","lambda"],
+      com: "#",
+      need: 1, needLabel: "Rarely as a class",
+      lens: "Functions are first-class, so a strategy is usually just a callable passed in. Reach for a <code>Protocol</code> class only when the strategy has state or several methods.",
+      seen: "<code>sorted(items, key=…)</code>; <code>json.dumps(obj, default=…)</code>; <code>logging.Handler</code> subclasses plugged into a logger.",
+      deep: "<code>self.compress(data)</code> is an attribute lookup on the instance followed by a call. There is no interface table: any object that can be called with bytes works, and the type hint is checked only by tools such as mypy, never at runtime."
+    },
+    ts: {
+      file: "upload.ts · main.ts", iface: "Compressor", ifaceSub: "compress · encoding", chips: ["Gzip","Zstd","Identity","Brotli"], upSub: "private c",
+      lines: [
+        "interface Compressor {",
+        "  readonly encoding: string;",
+        "  compress(data: Uint8Array): Promise<Uint8Array>;",
+        "}",
+        "",
+        "class Uploader {",
+        "  constructor(private readonly c: Compressor) {}",
+        "",
+        "  async upload(data: Uint8Array): Promise<void> {",
+        "    const body = await this.c.compress(data);",
+        "    await this.send(body, this.c.encoding);",
+        "  }",
+        "}",
+        "",
+        "// main.ts: the caller picks",
+        "const up = new Uploader(new Zstd({ level: 3 }));"
+      ],
+      add: ["", "// brotli.ts: a new file; nothing above changes", "export class Brotli implements Compressor {", "  readonly encoding = \"br\";", "  async compress(data: Uint8Array) { /* … */ }", "}"],
+      roles: { iface: [1,4], up: [6,13], cfg: [16,16], call: [9,9], dispatch: [10,10], send: [11,11] },
+      kw: ["interface","class","constructor","private","readonly","async","await","const","new","return","export","implements","function","let"],
+      com: "//",
+      need: 3, needLabel: "Common",
+      lens: "Types are structural: any object with an <code>encoding</code> and a <code>compress</code> method fits, with no <code>implements</code> needed. For a single method, a function type is lighter.",
+      seen: "<code>Array.prototype.sort(compareFn)</code>; Passport.js, whose login methods are literally called strategies; pluggable loaders in bundlers.",
+      deep: "The interface exists only at compile time. At runtime <code>this.c.compress</code> is a property lookup that walks the prototype chain; V8's inline caches make it fast while the call site only ever sees one or two shapes of object."
+    },
+    rs: {
+      file: "upload.rs · main.rs", iface: "Compressor", ifaceSub: "trait", chips: ["Gzip","Zstd","Identity","Brotli"], upSub: "c: C",
+      lines: [
+        "trait Compressor {",
+        "    fn compress(&self, data: &[u8]) -> io::Result<Vec<u8>>;",
+        "    fn encoding(&self) -> &'static str;",
+        "}",
+        "",
+        "struct Uploader<C: Compressor> { c: C }",
+        "",
+        "impl<C: Compressor> Uploader<C> {",
+        "    fn upload(&self, data: &[u8]) -> io::Result<()> {",
+        "        let body = self.c.compress(data)?;",
+        "        self.send(&body, self.c.encoding())",
+        "    }",
+        "}",
+        "",
+        "// main.rs: the caller picks",
+        "let up = Uploader { c: Zstd { level: 3 } };"
+      ],
+      add: ["", "// brotli.rs: a new file; nothing above changes", "struct Brotli { quality: u32 }", "impl Compressor for Brotli { /* compress, encoding */ }"],
+      roles: { iface: [1,4], up: [6,13], cfg: [16,16], call: [9,9], dispatch: [10,10], send: [11,11] },
+      kw: ["trait","fn","struct","impl","for","let","self","mut","pub","use","return","where","dyn","Box"],
+      com: "//",
+      need: 4, needLabel: "Core idiom",
+      lens: "Use a generic <code>C: Compressor</code> when the choice is fixed at build time, and <code>Box&lt;dyn Compressor&gt;</code> when it comes from config at runtime. Closures (<code>impl Fn(&amp;[u8]) -&gt; Vec&lt;u8&gt;</code>) cover the one-method case.",
+      seen: "<code>slice::sort_by(|a, b| …)</code>; <code>HashMap&lt;K, V, S: BuildHasher&gt;</code> takes its hashing strategy as a type parameter; <code>tower::Service</code> layers.",
+      deep: "With <code>Uploader&lt;C&gt;</code> the compiler makes one copy of <code>upload</code> per codec (monomorphisation) and can inline <code>compress</code>. <code>Box&lt;dyn Compressor&gt;</code> trades that for one copy and a vtable call."
+    }
+  };
+
+  /* ---------------- diagram geometry ---------------- */
+  // [x, y, w, h] for t = 0 (before) and t = 1 (after)
+  var GEO = {
+    cfg:   { b: [12, 30, 100, 48],  a: [12, 30, 100, 48] },
+    up:    { b: [168, 18, 262, 250], a: [168, 30, 142, 56] },
+    iface: { b: [380, 30, 168, 56], a: [380, 30, 168, 56] },
+    g:     { b: [188, 90, 222, 32],  a: [296, 206, 58, 40] },
+    z:     { b: [188, 130, 222, 32], a: [360, 206, 58, 40] },
+    n:     { b: [188, 170, 222, 32], a: [424, 206, 58, 40] },
+    br:    { b: [188, 216, 222, 32], a: [488, 206, 62, 40] }
+  };
+
+  var S = { dir: "a", step: 0, t: 0, lang: "go", depth: 2, mode: "learn", walk: 0, quiz: null, seen: {0: true}, hover: null };
+  var anim = null;
+
+  function lerp(a, b, k) { return a + (b - a) * k; }
+  function clamp(x) { return Math.max(0, Math.min(1, x)); }
+  function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+  /* ---------------- tiny highlighter ---------------- */
+  function highlight(line, L) {
+    var comIdx = -1;
+    var inStr = false, q = "";
+    for (var i = 0; i < line.length; i++) {
+      var ch = line[i];
+      if (inStr) { if (ch === q && line[i - 1] !== "\\") inStr = false; continue; }
+      if (ch === "\"" || ch === "`") { inStr = true; q = ch; continue; }
+      if (line.substr(i, L.com.length) === L.com) { comIdx = i; break; }
+    }
+    var codePart = comIdx >= 0 ? line.slice(0, comIdx) : line;
+    var com = comIdx >= 0 ? line.slice(comIdx) : "";
+    var re = /("(?:[^"\\]|\\.)*")|([A-Za-z_][A-Za-z0-9_]*)(\s*\()?|([^"A-Za-z_]+)/g;
+    var out = "", m;
+    while ((m = re.exec(codePart))) {
+      if (m[1]) out += '<span class="tk-str">' + esc(m[1]) + "</span>";
+      else if (m[2]) {
+        var w = m[2];
+        if (L.kw.indexOf(w) >= 0) out += '<span class="tk-kw">' + w + "</span>";
+        else if (m[3]) out += '<span class="tk-fn">' + w + "</span>";
+        else if (/^[A-Z]/.test(w)) out += '<span class="tk-type">' + w + "</span>";
+        else out += w;
+        if (m[3]) out += esc(m[3]);
+      } else out += esc(m[0]);
+    }
+    if (com) out += '<span class="tk-com">' + esc(com) + "</span>";
+    return out || " ";
+  }
+
+  /* ---------------- steps ---------------- */
+  var STEPS = [
+    { key: "Concept", title: "Strategy" },
+    { key: "Problem", title: "A switch that keeps growing" },
+    { key: "Pain", title: "Then a change request arrives" },
+    { key: "Morph", title: "Turn each case into a type" },
+    { key: "How it works", title: "Follow one upload" },
+    { key: "Same request again", title: "Brotli, the second time" },
+    { key: "Language lens", title: "How each language writes it" },
+    { key: "Check", title: "Which situation needs it?" }
+  ];
+
+  function stepBody(i) {
+    var L = LANGS[S.lang];
+    var d = S.depth;
+    var deeper = function (lvl, html) { return d >= lvl ? '<p class="deeper"><span class="label">' + (lvl === 2 ? "Engineer" : "Deep") + "</span>" + html + "</p>" : ""; };
+    var more = d < 3 ? '<button class="go-deeper" id="go-deeper">Go one level deeper</button>' : "";
+    switch (i) {
+      case 0: return "<p><strong>Put each way of doing one step behind a shared interface, and let the caller choose which one to plug in.</strong></p>" +
+        "<p>Intent: the code that <em>uses</em> a step should not know how many ways there are to do it.</p>" +
+        deeper(2, "Four roles: the <b>context</b> (Uploader) holds a <b>strategy</b> (" + L.iface + "); <b>concrete strategies</b> implement it; the <b>client</b> picks one.") +
+        deeper(3, "In the original catalogue (Gamma et al., 1994) this is a behavioral pattern. In languages with first-class functions it often shrinks to passing a function.") + more;
+      case 1: return "<p>A service uploads build artifacts to object storage. It compresses each file first, and the codec comes from config. The code works and is tested.</p>" +
+        "<p>Read it once. Notice that the list of codecs lives in three files.</p>" +
+        deeper(2, "Each <code>case</code> is a separate algorithm sharing one function. To test zstd you must build an Uploader and go through the switch.") + more;
+      case 2: return "<p><b>Change request:</b> the web-assets bucket needs Brotli, because browsers accept <code>Content-Encoding: br</code>.</p>" +
+        "<p>The lines in amber or red must change. None of them are about Brotli's logic; they are bookkeeping spread across files.</p>" +
+        deeper(2, "Miss one place and it still compiles: the config check rejects \"brotli\", or the header says <code>brotli</code> instead of <code>br</code>.") + more;
+      case 3: return "<p>Drag the slider. The switch becomes an interface, and each case moves out into its own small type.</p>" +
+        '<div class="morph-ctl"><input type="range" id="morph" min="0" max="1000" value="' + Math.round(S.t * 1000) + '" aria-label="Morph from before to after"><div class="ends label"><span>Before: switch</span><span>After: strategy</span></div></div>' +
+        "<p>Hover a box to see its code.</p>" +
+        deeper(2, "Uploader now depends on one small method set instead of on the list of codecs. Each codec can be tested alone with a fixed input.") + more;
+      case 4: {
+        var w = ["main builds an Uploader and hands it a Zstd. The choice is made once, outside.",
+                 "Something calls <code>Upload(data)</code>. Uploader has no idea which codec it holds.",
+                 "<code>Compress(data)</code> goes through the " + L.iface + " " + (S.lang === "py" ? "callable" : S.lang === "rs" ? "trait" : "interface") + " and lands in Zstd.",
+                 "Uploader sends the result with the codec's own encoding name. No lookup table needed."];
+        var h = '<ol class="walk" id="walk">';
+        for (var k = 0; k < 4; k++) h += '<li><button data-w="' + k + '" aria-pressed="' + (S.walk === k) + '"><span class="n">' + (k + 1) + "</span><span>" + w[k] + "</span></button></li>";
+        return "<p>One call through the design, one step at a time.</p>" + h + "</ol>" + deeper(3, L.deep) + more;
+      }
+      case 5: return "<p>The same Brotli request, after the refactor. You add one new strategy. Nothing that already exists changes, so nothing that already works can break.</p>" +
+        deeper(2, "The config layer still maps the string <code>\"brotli\"</code> to the new strategy: a one-line registry entry or a constructor call in main. That is the only wiring.") + more;
+      case 6: return "<p>The idea is the same in every language. How much ceremony it needs is not.</p>" +
+        "<p>Switch the language at the top; the code and this note follow.</p>" +
+        deeper(2, "The language you choose is remembered across every lesson.") + more;
+      case 7: {
+        var opts = [
+          ["A billing service applies one tax rule per country, chosen from config when the request starts.", true, "Right. The rule varies, the caller picks it, and it does not change itself mid-request."],
+          ["A TCP connection behaves differently in LISTEN, ESTABLISHED and CLOSE_WAIT, and moves between them itself.", false, "That is State: same shape, but the object switches its own behaviour as it moves through states."],
+          ["Three exporters share open, header, rows, close, and differ only in how they write a row.", false, "That is Template Method: a fixed sequence with a few steps filled in."]
+        ];
+        var q = '<div class="quiz" id="quiz">';
+        opts.forEach(function (o, k) {
+          var cls = S.quiz === k ? (o[1] ? "right" : "wrong") : "";
+          q += '<button data-q="' + k + '" class="' + cls + '">' + o[0] + "</button>";
+        });
+        var fb = S.quiz === null ? "Pick one." : opts[S.quiz][2];
+        return "<p>Which of these is a Strategy?</p>" + q + '<p class="fb" aria-live="polite">' + fb + "</p></div>";
+      }
+    }
+  }
+
+  // what the visual shows for each step
+  function visualFor(i) {
+    switch (i) {
+      case 0: return { t: 1, br: "none", code: "after", cap: "Roles: context, strategy, concrete strategies, client", meter: null };
+      case 1: return { t: 0, br: "none", code: "before", cap: "Before: one function knows every codec", meter: null };
+      case 2: return { t: 0, br: "ghost", code: "pain", cap: "Adding Brotli touches three files", meter: { v: .8, txt: "4 lines · 3 files", good: false } };
+      case 3: return { t: null, br: "none", code: "morph", cap: "Drag to morph before → after", meter: null };
+      case 4: return { t: 1, br: "none", code: "after", cap: "One call, start to finish", meter: null };
+      case 5: return { t: 1, br: "good", code: "same", cap: "After: Brotli is one new strategy", meter: { v: .12, txt: "1 new strategy · 0 edits", good: true } };
+      case 6: return { t: 1, br: "none", code: "after", cap: "Same roles, written in " + { go: "Go", py: "Python", ts: "TypeScript", rs: "Rust" }[S.lang], meter: null, need: true };
+      case 7: return { t: 1, br: "none", code: "after", cap: "Strategy: the caller picks, the strategy never switches itself", meter: null };
+    }
+  }
+
+  /* ---------------- render: diagram ---------------- */
+  var NODES = ["cfg", "up", "iface", "g", "z", "n", "br"];
+  var nodeEls = {}, edgeEls = {};
+  var EDGES = [
+    { id: "e-cfg", from: "cfg", to: "up", label: "injects", lx: 0, ly: -8 },
+    { id: "e-up", from: "up", to: "iface", label: "holds", lx: 0, ly: -8 },
+    { id: "e-g", from: "g", to: "iface", label: "", impl: true },
+    { id: "e-z", from: "z", to: "iface", label: "implements", impl: true },
+    { id: "e-n", from: "n", to: "iface", label: "", impl: true },
+    { id: "e-br", from: "br", to: "iface", label: "", impl: true }
+  ];
+  var SVGNS = "http://www.w3.org/2000/svg";
+  function el(tag, attrs, parent) { var e = document.createElementNS(SVGNS, tag); for (var k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; }
+
+  function buildDiagram() {
+    var gN = document.getElementById("nodes"), gE = document.getElementById("edges");
+    EDGES.forEach(function (e) {
+      var g = el("g", {}, gE);
+      var p = el("path", { "class": "edge", pathLength: "1", "marker-end": e.impl ? "url(#arr-hollow)" : "url(#arr)" }, g);
+      var t = el("text", { "class": "elabel", "text-anchor": "middle" }, g);
+      t.textContent = e.label;
+      edgeEls[e.id] = { g: g, p: p, t: t };
+    });
+    NODES.forEach(function (id) {
+      var cls = "node" + (["g", "z", "n", "br"].indexOf(id) >= 0 ? " chip" : "") + (id === "iface" ? " iface" : "");
+      var g = el("g", { "class": cls, "data-id": id, tabindex: "-1" }, gN);
+      var r = el("rect", { "class": "box", rx: "3" }, g);
+      var tb = el("text", { "class": "title" }, g), sb = el("text", { "class": "sub" }, g);
+      var ta = el("text", { "class": "title" }, g), sa = el("text", { "class": "sub" }, g);
+      nodeEls[id] = { g: g, r: r, tb: tb, sb: sb, ta: ta, sa: sa };
+      g.addEventListener("mouseenter", function () { S.hover = id; g.classList.add("hov"); renderCode(); });
+      g.addEventListener("mouseleave", function () { S.hover = null; g.classList.remove("hov"); renderCode(); });
+    });
+  }
+
+  function labels() {
+    var L = LANGS[S.lang];
+    return {
+      cfg: [["config.go", "validCodecs"], ["main", "picks one"]],
+      up: [["Uploader", "switch u.codec { … }"], ["Uploader", L.upSub]],
+      iface: [["", ""], [L.iface, L.ifaceSub]],
+      g: [["case \"gzip\"", ""], [L.chips[0], ""]],
+      z: [["case \"zstd\"", ""], [L.chips[1], ""]],
+      n: [["case \"none\"", ""], [L.chips[2], ""]],
+      br: [["case \"brotli\"", ""], [L.chips[3], ""]]
+    };
+  }
+
+  function drawDiagram(t, v) {
+    var D = DIRS[S.dir];
+    var e = t; // the spring ease can overshoot past 1; positions follow it, sizes are clamped
+    var lab = labels();
+    var nodeR = getComputedStyle(root).getPropertyValue("--node-r").trim() || "3px";
+    var geo = {};
+    NODES.forEach(function (id) {
+      var G = GEO[id], b = G.b, a = G.a;
+      var x = lerp(b[0], a[0], e), y = lerp(b[1], a[1], e), w = lerp(b[2], a[2], clamp(e * 1.3)), h = lerp(b[3], a[3], clamp(e * 1.3));
+      geo[id] = { x: x, y: y, w: w, h: h };
+      var N = nodeEls[id];
+      N.r.setAttribute("x", x); N.r.setAttribute("y", y); N.r.setAttribute("width", Math.max(1, w)); N.r.setAttribute("height", Math.max(1, h));
+      N.r.setAttribute("rx", parseFloat(nodeR));
+      var before = clamp((0.55 - e) / 0.1), after = clamp((e - 0.45) / 0.1);
+      var L0 = lab[id][0], L1 = lab[id][1];
+      var chip = ["g", "z", "n", "br"].indexOf(id) >= 0;
+      // before labels: top-left for the big box, centered for chips
+      if (id === "up") {
+        N.tb.setAttribute("x", x + 14); N.tb.setAttribute("y", y + 26);
+        N.sb.setAttribute("x", x + 14); N.sb.setAttribute("y", y + 44);
+        N.tb.removeAttribute("text-anchor"); N.sb.removeAttribute("text-anchor");
+      } else {
+        N.tb.setAttribute("x", x + w / 2); N.tb.setAttribute("y", y + (L0[1] ? h / 2 - 2 : h / 2 + 4));
+        N.sb.setAttribute("x", x + w / 2); N.sb.setAttribute("y", y + h / 2 + 13);
+        N.tb.setAttribute("text-anchor", "middle"); N.sb.setAttribute("text-anchor", "middle");
+      }
+      N.ta.setAttribute("x", x + w / 2); N.ta.setAttribute("y", y + (L1[1] ? h / 2 - 2 : h / 2 + 4)); N.ta.setAttribute("text-anchor", "middle");
+      N.sa.setAttribute("x", x + w / 2); N.sa.setAttribute("y", y + h / 2 + 14); N.sa.setAttribute("text-anchor", "middle");
+      N.tb.textContent = L0[0]; N.sb.textContent = L0[1]; N.ta.textContent = L1[0]; N.sa.textContent = L1[1];
+      N.tb.setAttribute("opacity", before); N.sb.setAttribute("opacity", before);
+      N.ta.setAttribute("opacity", after); N.sa.setAttribute("opacity", after);
+      var op = 1;
+      if (id === "iface") op = clamp(e * 1.6 - .4);
+      if (id === "br") op = v.br === "none" ? 0 : 1;
+      N.g.setAttribute("opacity", op);
+      N.g.style.display = op === 0 ? "none" : "";
+      N.g.classList.toggle("ghost", id === "br" && v.br === "ghost");
+      N.g.classList.toggle("good", id === "br" && v.br === "good");
+      N.g.classList.toggle("pain", id === "up" && v.br === "ghost");
+      if (chip && id !== "br") N.g.classList.toggle("pain", false);
+    });
+    // edges
+    var drawK = D.draw ? clamp(e * 1.4 - .4) : 1;
+    var edgeOp = D.draw ? (e > .3 ? 1 : 0) : clamp(e * 2 - 1);
+    EDGES.forEach(function (E) {
+      var a = geo[E.from], b = geo[E.to], P = edgeEls[E.id], d, lx, ly;
+      if (E.impl) {
+        var sx = a.x + a.w / 2, sy = a.y, tx = Math.min(Math.max(sx, b.x + 12), b.x + b.w - 12), ty = b.y + b.h + 2;
+        d = "M" + sx + "," + sy + " C" + sx + "," + (sy - 40) + " " + tx + "," + (ty + 40) + " " + tx + "," + ty;
+        lx = (sx + tx) / 2 + 40; ly = (sy + ty) / 2 + 4;
+      } else {
+        var y1 = a.y + a.h / 2, y2 = b.y + b.h / 2;
+        d = "M" + (a.x + a.w) + "," + y1 + " L" + (b.x - 3) + "," + y2;
+        lx = (a.x + a.w + b.x) / 2; ly = (y1 + y2) / 2 - 8;
+      }
+      P.p.setAttribute("d", d);
+      var vis = E.id === "e-br" ? (v.br === "good" ? 1 : 0) : 1;
+      P.g.setAttribute("opacity", vis * edgeOp);
+      P.p.setAttribute("stroke-dasharray", "1");
+      P.p.setAttribute("stroke-dashoffset", String(1 - drawK));
+      P.p.setAttribute("marker-end", drawK > .9 ? (E.impl ? "url(#arr-hollow)" : "url(#arr)") : "none");
+      P.t.setAttribute("x", lx); P.t.setAttribute("y", ly);
+      P.t.setAttribute("opacity", clamp(e * 3 - 2));
+    });
+    document.getElementById("fig-state").textContent = "t = " + clamp(e).toFixed(2);
+  }
+
+  /* ---------------- render: code ---------------- */
+  function codeModel() {
+    var v = visualFor(S.step), L = LANGS[S.lang], mode = v.code;
+    if (mode === "morph") mode = S.t < .5 ? "before" : "after";
+    var rows = [];
+    if (mode === "before" || mode === "pain") {
+      BEFORE.forEach(function (line, k) {
+        var n = k + 1, cls = "";
+        if (mode === "pain" && n === 18) { line = "var validCodecs = []string{\"gzip\", \"zstd\", \"none\", \"brotli\"}"; cls = "mod"; }
+        rows.push({ n: n, text: line, cls: cls, L: LANGS.go });
+        if (mode === "pain" && n === 10) { rows.push({ n: "", text: "    case \"brotli\":", cls: "pain", L: LANGS.go }); rows.push({ n: "", text: "        body = brotliBytes(data)", cls: "pain", L: LANGS.go }); }
+        if (mode === "pain" && n === 21) rows.push({ n: "", text: "    if codec == \"brotli\" { return \"br\" }", cls: "pain", L: LANGS.go });
+      });
+      return { rows: rows, file: "upload.go · config.go · headers.go", note: S.lang !== "go" ? "before-code shown in Go in this mockup" : "Go", map: BEFORE_MAP, before: true };
+    }
+    L.lines.forEach(function (line, k) { rows.push({ n: k + 1, text: line, cls: "", L: L }); });
+    if (mode === "same") L.add.forEach(function (line, k) { rows.push({ n: L.lines.length + k + 1, text: line, cls: line ? "add" : "", L: L }); });
+    var map = { up: L.roles.up, iface: L.roles.iface, cfg: L.roles.cfg, g: L.roles.iface, z: L.roles.iface, n: L.roles.iface, br: mode === "same" ? [L.lines.length + 2, L.lines.length + L.add.length] : L.roles.iface };
+    return { rows: rows, file: L.file, note: { go: "Go", py: "Python", ts: "TypeScript", rs: "Rust" }[S.lang], map: map, before: false };
+  }
+
+  function litLines(M) {
+    var L = LANGS[S.lang];
+    if (S.hover && M.map[S.hover]) return M.map[S.hover];
+    if (S.step === 4) return [L.roles.cfg, L.roles.call, L.roles.dispatch, L.roles.send][S.walk];
+    return null;
+  }
+
+  function renderCode() {
+    var M = codeModel(), lit = litLines(M), html = "";
+    M.rows.forEach(function (r) {
+      var on = lit && typeof r.n === "number" && r.n >= lit[0] && r.n <= lit[1];
+      html += '<span class="ln ' + r.cls + (on ? " hl" : "") + '" data-n="' + r.n + '"><span>' + highlight(r.text, r.L) + "</span></span>";
+    });
+    document.getElementById("code").innerHTML = html;
+    document.getElementById("code-file").textContent = M.file;
+    document.getElementById("code-note").textContent = M.note;
+  }
+
+  /* ---------------- walk-through highlights + pulse ---------------- */
+  var WALK_NODES = [["cfg"], ["up"], ["iface", "z"], ["up"]];
+  var WALK_EDGES = [["e-cfg"], [], ["e-up", "e-z"], []];
+  function renderLit() {
+    NODES.forEach(function (id) { nodeEls[id].g.classList.remove("lit"); });
+    EDGES.forEach(function (E) { edgeEls[E.id].p.classList.remove("lit"); });
+    if (S.step !== 4 || S.mode !== "learn") return;
+    WALK_NODES[S.walk].forEach(function (id) { nodeEls[id].g.classList.add("lit"); });
+    WALK_EDGES[S.walk].forEach(function (id) { edgeEls[id].p.classList.add("lit"); });
+  }
+  var pulseAnim = null;
+  function runPulse() {
+    var D = DIRS[S.dir], pulse = document.getElementById("pulse");
+    if (pulseAnim) cancelAnimationFrame(pulseAnim);
+    pulse.setAttribute("x", -30); pulse.setAttribute("y", -30);
+    var paths = WALK_EDGES[S.walk];
+    if (D.pulse === "none" || reduce || !paths.length) return;
+    pulse.setAttribute("rx", D.pulse === "square" ? 1 : 5);
+    var segs = paths.map(function (id, k) { return { p: edgeEls[id].p, rev: id === "e-z" }; });
+    var start = null, per = D.pulse === "square" ? 520 : 600;
+    function frame(ts) {
+      if (start === null) start = ts;
+      var el = ts - start, k = Math.floor(el / per);
+      if (k >= segs.length) { pulse.setAttribute("x", -30); pulse.setAttribute("y", -30); return; }
+      var f = (el - k * per) / per;
+      if (D.pulse === "dot") f = 1 - Math.pow(1 - f, 2);
+      var s = segs[k], len = s.p.getTotalLength(), pt = s.p.getPointAtLength((s.rev ? 1 - f : f) * len);
+      pulse.setAttribute("x", pt.x - 5); pulse.setAttribute("y", pt.y - 5);
+      pulseAnim = requestAnimationFrame(frame);
+    }
+    pulseAnim = requestAnimationFrame(frame);
+  }
+
+  /* ---------------- meter, need ---------------- */
+  var meterIv = null;
+  function renderMeter(v) {
+    if (meterIv) { clearInterval(meterIv); meterIv = null; }
+    var m = document.getElementById("meter"), bar = document.getElementById("meter-bar"), val = document.getElementById("meter-val");
+    m.classList.toggle("idle", !v.meter); m.classList.toggle("good", !!(v.meter && v.meter.good));
+    bar.style.width = v.meter ? (v.meter.v * 100) + "%" : "0%";
+    if (!v.meter) { val.textContent = "no change yet"; return; }
+    if (DIRS[S.dir].pulse === "dot" && !reduce) {
+      // Signal: tick the number up
+      var m2 = v.meter.txt.match(/^(\d+)(.*)$/), target = +m2[1], k = 0;
+      val.textContent = "0" + m2[2];
+      meterIv = setInterval(function () { k++; val.textContent = Math.min(k, target) + m2[2]; if (k >= target) { clearInterval(meterIv); meterIv = null; } }, 90);
+    } else val.textContent = v.meter.txt;
+  }
+  function renderNeed(v) {
+    var box = document.getElementById("need"), L = LANGS[S.lang];
+    box.hidden = !v.need;
+    if (!v.need) return;
+    var dots = ""; for (var i = 1; i <= 4; i++) dots += '<i class="' + (i <= L.need ? "on" : "") + '"></i>';
+    box.innerHTML = '<p><span class="label">How much you need it here</span><span class="dots">' + dots + "</span> <b>" + L.needLabel + "</b></p><p>" + L.lens + "</p><p><span class=\"label\">Seen in</span><br>" + L.seen + "</p>";
+  }
+
+  /* ---------------- morph animation ---------------- */
+  function animateTo(target, from) {
+    var D = DIRS[S.dir];
+    if (anim) cancelAnimationFrame(anim);
+    var v = visualFor(S.step);
+    var t0 = from === undefined ? S.t : from;
+    if (reduce || t0 === target) { S.t = target; drawDiagram(target, v); renderCode(); return; }
+    var start = null;
+    function frame(ts) {
+      if (start === null) start = ts;
+      var k = clamp((ts - start) / D.dur), e = D.ease(k);
+      var val = t0 + (target - t0) * e;
+      S.t = clamp(val);
+      drawDiagram(val, v);
+      if (k < 1) anim = requestAnimationFrame(frame);
+      else { S.t = target; drawDiagram(target, v); renderCode(); }
+    }
+    anim = requestAnimationFrame(frame);
+  }
+
+  /* ---------------- step render ---------------- */
+  function renderRail() {
+    var r = document.getElementById("rail"), h = "";
+    STEPS.forEach(function (s, k) {
+      h += '<li><button data-step="' + k + '" title="' + s.key + '" aria-label="Step ' + (k + 1) + ": " + s.key + '"' + (k === S.step ? ' aria-current="step"' : "") + ' class="' + (S.seen[k] ? "seen" : "") + '">' + (k + 1) + "</button></li>";
+    });
+    r.innerHTML = h;
+  }
+  function renderStep(animate) {
+    var s = STEPS[S.step], v = visualFor(S.step);
+    S.seen[S.step] = true;
+    renderRail();
+    document.getElementById("step-kicker").textContent = "Step " + (S.step + 1) + " of 8 · " + s.key;
+    document.getElementById("step-title").textContent = s.title;
+    document.getElementById("step-body").innerHTML = stepBody(S.step);
+    document.getElementById("pos").textContent = (S.step + 1) + " / 8";
+    document.getElementById("prev").disabled = S.step === 0;
+    document.getElementById("next").disabled = S.step === 7;
+    document.getElementById("fig-cap").textContent = v.cap;
+    renderMeter(v); renderNeed(v);
+    var target = v.t === null ? S.t : v.t;
+    if (animate) animateTo(target); else { S.t = target; drawDiagram(target, v); }
+    renderCode(); renderLit();
+    if (S.step === 4) runPulse();
+    wireStep();
+  }
+  function wireStep() {
+    var m = document.getElementById("morph");
+    if (m) m.addEventListener("input", function () { if (anim) cancelAnimationFrame(anim); S.t = m.value / 1000; drawDiagram(S.t, visualFor(3)); renderCode(); });
+    var gd = document.getElementById("go-deeper");
+    if (gd) gd.addEventListener("click", function () { setDepth(Math.min(3, S.depth + 1)); });
+    var w = document.getElementById("walk");
+    if (w) w.addEventListener("click", function (ev) { var b = ev.target.closest("button[data-w]"); if (!b) return; S.walk = +b.dataset.w; renderStep(false); });
+    var q = document.getElementById("quiz");
+    if (q) q.addEventListener("click", function (ev) { var b = ev.target.closest("button[data-q]"); if (!b) return; S.quiz = +b.dataset.q; renderStep(false); });
+  }
+  function go(k) { if (k < 0 || k > 7 || k === S.step) return; S.step = k; renderStep(true); }
+
+  /* ---------------- reference mode ---------------- */
+  function renderRef() {
+    var L = LANGS[S.lang];
+    var code = L.lines.map(function (l) { return '<span class="ln" data-n=""><span>' + highlight(l, L) + "</span></span>"; }).join("");
+    document.getElementById("reference").innerHTML =
+      '<article><span class="label">Reference · Behavioral pattern</span><h2>Strategy</h2>' +
+      "<p>Put each way of doing one step behind a shared <span class=\"gl\" title=\"Glossary: a named set of methods a type promises to provide.\">interface</span>, and let the caller choose which one to plug in.</p>" +
+      '<h3>Roles</h3><div class="table-wrap"><table><thead><tr><th>Role</th><th>In the example</th><th>Job</th></tr></thead><tbody>' +
+      "<tr><td>Context</td><td><code>Uploader</code></td><td>Holds a strategy and calls it. Never chooses.</td></tr>" +
+      "<tr><td>Strategy</td><td><code>" + L.iface + "</code></td><td>The one step that varies, named.</td></tr>" +
+      "<tr><td>Concrete strategy</td><td><code>" + L.chips.slice(0, 3).join("</code>, <code>") + "</code></td><td>One way of doing the step each.</td></tr>" +
+      "<tr><td>Client</td><td><code>main</code> / config</td><td>Picks one and hands it in.</td></tr></tbody></table></div>" +
+      '<h3>Code</h3><div class="code"><div class="code-head"><span>' + L.file + "</span><span>" + { go: "Go", py: "Python", ts: "TypeScript", rs: "Rust" }[S.lang] + '</span></div><pre>' + code + "</pre></div>" +
+      '<div class="twocol"><div><span class="label">Use when</span><p>Several interchangeable ways to do one step, chosen by config or by the caller.</p></div><div><span class="label">Avoid when</span><p>Only two variants and no third in sight. An <code>if</code> is clearer; add the interface when the second variant arrives.</p></div></div>' +
+      "<h3>Look-alikes</h3><p><b>State</b> has the same shape, but the object switches its own behaviour. <b>Template Method</b> fixes the sequence and varies a few steps. <b>Decorator</b> changes behaviour by wrapping, not swapping.</p>" +
+      "<h3>Seen in</h3><p>" + L.seen + "</p></article>" +
+      '<aside><label class="label" for="ref-search">Search</label><input id="ref-search" placeholder="Search patterns, terms…"><span class="label" style="margin-top:12px">On this page</span><a href="#reference">Roles</a><a href="#reference">Code</a><a href="#reference">Use / avoid</a><a href="#reference">Look-alikes</a><a href="#reference">Seen in</a></aside>';
+  }
+
+  /* ---------------- spec sheet ---------------- */
+  function renderSpec() {
+    var D = DIRS[S.dir];
+    document.getElementById("dir-name").textContent = D.name;
+    document.getElementById("dir-pitch").textContent = D.pitch;
+    document.getElementById("f-d-name").textContent = D.fonts[0];
+    document.getElementById("f-t-name").textContent = D.fonts[1];
+    document.getElementById("f-c-name").textContent = D.fonts[2];
+    ["light", "dark"].forEach(function (th) {
+      document.getElementById("sw-" + th).innerHTML = D[th].map(function (s) { return '<span class="sw"><i style="background:' + s[1] + '"></i><span>' + s[0] + "</span><span>" + s[1] + "</span></span>"; }).join("");
+    });
+    document.getElementById("motion-name").textContent = D.motionName;
+    document.getElementById("motion-list").innerHTML = D.motion.map(function (m) { return "<li>" + m + "</li>"; }).join("");
+  }
+
+  /* ---------------- controls ---------------- */
+  function press(groupSel, attr, val) {
+    document.querySelectorAll(groupSel + " button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset[attr] === String(val))); });
+  }
+  function setDir(d) {
+    S.dir = d; root.setAttribute("data-dir", d); root.setAttribute("data-fam", d === "b" || d === "d" ? "s" : d); press(".dir-switch", "dir", d); press(".choose-grid", "pick", d);
+    try { localStorage.setItem("mn-dir", d); } catch (e) {}
+    renderSpec(); renderStep(false); if (S.mode === "ref") renderRef();
+  }
+  function setTheme(th) {
+    root.setAttribute("data-theme", th); press("#themes", "th", th);
+  }
+  function setDepth(n) { S.depth = n; press("#depths", "depth", n); renderStep(false); }
+  function setLang(l) { S.lang = l; press("#langs", "lang", l); renderStep(false); if (S.mode === "ref") renderRef(); }
+  function setMode(m) {
+    S.mode = m;
+    document.getElementById("m-learn").setAttribute("aria-pressed", String(m === "learn"));
+    document.getElementById("m-ref").setAttribute("aria-pressed", String(m === "ref"));
+    document.getElementById("learn").hidden = m !== "learn";
+    document.getElementById("reference").hidden = m !== "ref";
+    if (m === "ref") renderRef();
+  }
+
+  document.querySelector(".dir-switch").addEventListener("click", function (e) { var b = e.target.closest("button"); if (b) setDir(b.dataset.dir); });
+  document.querySelector(".choose-grid").addEventListener("click", function (e) { var b = e.target.closest("button[data-pick]"); if (b) setDir(b.dataset.pick); });
+  document.getElementById("darkpal").addEventListener("click", function (e) {
+    var b = e.target.closest("button[data-dp]"); if (!b) return;
+    var v = b.dataset.dp;
+    if (v === "default") root.removeAttribute("data-dark"); else root.setAttribute("data-dark", v);
+    document.querySelectorAll("#darkpal button").forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); });
+    setTheme("dark");
+  });
+  document.querySelectorAll("[data-th]").forEach(function (b) { b.addEventListener("click", function () { setTheme(b.dataset.th); }); });
+  document.getElementById("langs").addEventListener("click", function (e) { var b = e.target.closest("button"); if (b) setLang(b.dataset.lang); });
+  document.getElementById("depths").addEventListener("click", function (e) { var b = e.target.closest("button"); if (b) setDepth(+b.dataset.depth); });
+  document.getElementById("m-learn").addEventListener("click", function () { setMode("learn"); });
+  document.getElementById("m-ref").addEventListener("click", function () { setMode("ref"); });
+  document.getElementById("rail").addEventListener("click", function (e) { var b = e.target.closest("button[data-step]"); if (b) go(+b.dataset.step); });
+  document.getElementById("prev").addEventListener("click", function () { go(S.step - 1); });
+  document.getElementById("next").addEventListener("click", function () { go(S.step + 1); });
+  document.getElementById("replay").addEventListener("click", function () {
+    if (S.mode !== "learn") setMode("learn");
+    if (S.step !== 3) { S.step = 3; renderStep(false); }
+    S.t = 0; drawDiagram(0, visualFor(3)); renderCode();
+    animateTo(1, 0);
+    var m = document.getElementById("morph"); if (m) setTimeout(function () { m.value = 1000; }, DIRS[S.dir].dur);
+  });
+  document.addEventListener("keydown", function (e) {
+    var tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || S.mode !== "learn") return;
+    if (e.key === "ArrowRight") { go(S.step + 1); e.preventDefault(); }
+    if (e.key === "ArrowLeft") { go(S.step - 1); e.preventDefault(); }
+  });
+
+  /* ---------------- boot ---------------- */
+  buildDiagram();
+  var saved = null; try { saved = localStorage.getItem("mn-dir"); } catch (e) {}
+  root.setAttribute("data-dir", "a");
+  setDir(saved && DIRS[saved] ? saved : "a");
+  if (window.matchMedia("(prefers-color-scheme: dark)").matches) press("#themes", "th", "dark"); else press("#themes", "th", "light");
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { renderStep(false); });
+})();
+</script>

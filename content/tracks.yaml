@@ -1,0 +1,26 @@
+# Tracks shown on the home page, in order. A track goes live when it has at least one topic file.
+- id: design-patterns
+  title: Software design and design patterns
+  summary: Principles, the 23 classic patterns, and when not to use them, in Go, Python, TypeScript and Rust.
+  status: live
+  groups: [Behavioral, Creational, Structural]
+- id: go-internals
+  title: Go internals
+  summary: The scheduler, the garbage collector, interfaces and maps, as the runtime sees them.
+  status: planned
+- id: linux
+  title: Linux and the OS
+  summary: Syscalls, virtual memory, the read() path, and eBPF.
+  status: planned
+- id: networking
+  title: Networking
+  summary: TCP from handshake to close, DNS, TLS, and HTTP in practice.
+  status: planned
+- id: distributed-systems
+  title: Distributed systems
+  summary: Consensus, replication, clocks, and failure.
+  status: planned
+- id: kubernetes
+  title: Kubernetes
+  summary: Controllers, the API server, scheduling, and operators.
+  status: planned
