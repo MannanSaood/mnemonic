@@ -1,0 +1,22 @@
+# Terms introduced by the TCP timeouts and retransmission lesson.
+- id: srtt
+  term: SRTT
+  short: Smoothed round-trip time. A running average of measured round trips; each new sample moves it one eighth of the way (RFC 6298).
+- id: rttvar
+  term: RTTVAR
+  short: Round-trip time variation. A running average of how far samples land from SRTT; the RTO adds four times it, so a jittery path gets a longer timeout.
+- id: duplicate-ack
+  term: Duplicate ACK
+  short: An ACK that repeats the previous acknowledgement number. The receiver sends one for each segment that arrives after a gap, so a run of them points at a missing segment.
+- id: karn-algorithm
+  term: Karn's algorithm
+  short: Do not measure round-trip time on a segment that was sent more than once, because the ACK may belong to either copy; keep the backed-off timeout until a clean sample arrives.
+- id: exponential-backoff
+  term: Exponential backoff
+  short: Doubling the wait after each failed attempt. TCP doubles its RTO on every timeout for the same data, up to a cap.
+- id: sack
+  term: SACK (selective acknowledgement)
+  short: A TCP option (RFC 2018) in which the receiver lists blocks it holds beyond the cumulative ACK, so the sender resends only the gaps.
+- id: spurious-retransmission
+  term: Spurious retransmission
+  short: A resend of data that was only delayed, not lost. The receiver gets two copies and discards one.

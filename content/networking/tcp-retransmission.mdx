@@ -1,0 +1,483 @@
+---
+title: TCP timeouts and retransmission
+track: networking
+group: TCP
+order: 16
+summary: TCP learns a retransmission timeout from measured round trips, finds most losses sooner from duplicate ACKs, and doubles the timeout every time it has to use it.
+intent: A loss costs about one round trip when later segments reveal it, and at least the RTO floor when nothing does; set your own timeouts with that in mind.
+changeRequest: Pricing moves to a shared cluster where, at busy times, about one segment in a thousand is dropped.
+languages: [go, python, typescript, rust]
+glossary: [rto, srtt, rttvar, duplicate-ack, fast-retransmit, karn-algorithm, exponential-backoff, sack, spurious-retransmission, retransmission]
+
+prerequisites: [networking/tcp-connection-lifecycle]
+skills: [networking]
+depths: [overview, engineer, deep]
+
+playground:
+  model: tcp-retransmission
+  scenarios:
+    - try: "Press Play with nothing lost and watch the estimator."
+      notice: "SRTT settles near the 60 ms round trip and RTTVAR shrinks, but the RTO stays at 200 ms: on a short path the floor decides."
+    - try: "Lose segment 7, then lose segment 20 instead."
+      notice: "Segment 7 is resent after three duplicate ACKs, about one round trip later. Segment 20 has nothing after it, so the sender waits out the full RTO."
+    - try: "Set segment 20 to lost twice."
+      notice: "The first timeout doubles the RTO to 400 ms, the second to 800 ms. Karn's rule keeps it doubled, because ACKs of resent data give no sample."
+    - try: "Lose 7, 8 and 9 with SACK on, then off."
+      notice: "With SACK all three holes are resent at once. Without it each partial ACK reveals one hole, one round trip at a time."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 12, y: 30, w: 120, h: 52, title: pricing client, sub: 50 ms per attempt }
+      after:  { x: 12, y: 30, w: 120, h: 52, title: pricing client, sub: 300 ms per attempt }
+    - id: kernel
+      kind: context
+      before: { x: 160, y: 14, w: 250, h: 246, title: TCP, sub: "thought: a loss costs 1 RTT" }
+      after:  { x: 160, y: 30, w: 190, h: 56, title: TCP sender, sub: SRTT · RTTVAR · RTO }
+    - id: estimator
+      kind: strategy
+      appears: after
+      before: { x: 12, y: 150, w: 130, h: 60, title: "" }
+      after:  { x: 12, y: 150, w: 130, h: 60, title: RTO, sub: SRTT + 4 × RTTVAR }
+    - id: fast
+      kind: concrete
+      before: { x: 180, y: 70, w: 210, h: 34, title: lost segment → resend }
+      after:  { x: 160, y: 140, w: 190, h: 52, title: 3 dup ACKs, sub: resend in about 1 RTT }
+    - id: tail
+      kind: concrete
+      before: { x: 180, y: 116, w: 210, h: 34, title: next attempt in 50 ms }
+      after:  { x: 380, y: 30, w: 168, h: 56, title: RTO timer, sub: 200 ms or more, doubles }
+    - id: retry
+      kind: concrete
+      appears: change
+      before: { x: 180, y: 206, w: 210, h: 34, title: 3 requests · then error }
+      after:  { x: 380, y: 150, w: 168, h: 60, title: one attempt, sub: outlasts one RTO }
+  edges:
+    - { from: app, to: kernel, label: request }
+    - { from: kernel, to: estimator, label: samples }
+    - { from: estimator, to: tail, label: sets }
+    - { from: kernel, to: fast, label: gap seen }
+    - { from: tail, to: retry, label: fits in }
+
+code:
+  go:
+    before:
+      file: client.go
+      source: |
+        // client.go: price lookup on the same rack; a round trip is 1 ms
+        func (c *Client) Price(ctx context.Context, sku string) (Price, error) {
+            for attempt := 0; attempt < 3; attempt++ {
+                actx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+                p, err := c.fetch(actx, sku)
+                cancel()
+                if err == nil {
+                    return p, nil
+                }
+            }
+            return Price{}, errors.New("pricing unavailable")
+        }
+      roles: { app: [2, 12], kernel: [5, 5], tail: [4, 4] }
+      change:
+        - { after: 4, add: ['        // one lost segment can cost 200 ms or more inside TCP: this fires first'] }
+        - { after: 9, add: ['        // abandon the connection and send the same request again'] }
+    after:
+      file: client.go
+      source: |
+        // Budget: one TCP retransmission timeout (200 ms minimum on Linux) plus the work.
+        const attemptTimeout = 300 * time.Millisecond
+        const callBudget = 700 * time.Millisecond
+
+        func (c *Client) Price(ctx context.Context, sku string) (Price, error) {
+            ctx, cancel := context.WithTimeout(ctx, callBudget)
+            defer cancel()
+            var err error
+            for attempt := 0; attempt < 2; attempt++ {
+                actx, acancel := context.WithTimeout(ctx, attemptTimeout)
+                var p Price
+                p, err = c.fetch(actx, sku)
+                acancel()
+                if err == nil {
+                    return p, nil
+                }
+                retries.Inc()
+            }
+            return Price{}, err
+        }
+      roles: { app: [5, 20], kernel: [12, 12], estimator: [1, 2], tail: [10, 10], retry: [9, 18], estimate: [1, 2], fastpath: [12, 12], tailpath: [10, 10], backoff: [6, 9] }
+    again:
+      file: tcpinfo.go
+      source: |
+        // The cluster drops one segment in a thousand again. A lost tail segment now costs
+        // about 200 ms inside one attempt, not an abandoned connection and two more requests.
+        info, _ := unix.GetsockoptTCPInfo(fd, unix.IPPROTO_TCP, unix.TCP_INFO) // info.Rto, info.Rtt, info.Total_retrans
+    cost:
+      before: { text: 1 lost segment → 3 requests · error, value: 0.9 }
+      after: { text: 1 lost segment → +200 ms · 1 request, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: You set the budget
+      note: 'TCP''s retransmissions happen in the kernel; Go only sees the delay. A per-attempt `context.WithTimeout` and a whole-call one bound it. `unix.GetsockoptTCPInfo` from `golang.org/x/sys/unix` reads the kernel''s `Rto`, `Rtt` and `Total_retrans` for a connection.'
+      seenIn: '`http.Transport` retries an idempotent request once when a reused connection fails before any response arrives. gRPC-Go retry policies set `maxAttempts` and exponential backoff per method.'
+
+  python:
+    before:
+      file: client.py
+      source: |
+        # client.py: price lookup on the same rack; a round trip is 1 ms
+        def price(session: requests.Session, sku: str) -> Price:
+            for attempt in range(3):
+                try:
+                    r = session.get(f"{PRICING}/price/{sku}", timeout=0.05)
+                    return Price(**r.json())
+                except requests.Timeout:
+                    continue
+            raise PricingUnavailable(sku)
+      roles: { app: [2, 9], kernel: [6, 6], tail: [5, 5] }
+      change:
+        - { after: 5, add: ['            # one lost segment can cost 200 ms or more inside TCP: this fires first'] }
+        - { after: 7, add: ['            # drop the connection and send the same request again'] }
+    after:
+      file: client.py
+      source: |
+        ATTEMPT_TIMEOUT = 0.3  # longer than one TCP retransmission timeout (200 ms minimum on Linux)
+        CALL_BUDGET = 0.7
+
+        def price(session: requests.Session, sku: str) -> Price:
+            deadline = time.monotonic() + CALL_BUDGET
+            for attempt in range(2):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                try:
+                    r = session.get(f"{PRICING}/price/{sku}", timeout=(0.1, min(ATTEMPT_TIMEOUT, left)))
+                    return Price(**r.json())
+                except requests.Timeout:
+                    RETRIES.inc()
+            raise PricingUnavailable(sku)
+      roles: { app: [4, 15], kernel: [11, 11], estimator: [1, 1], tail: [11, 11], retry: [6, 14], estimate: [1, 1], fastpath: [11, 12], tailpath: [11, 11], backoff: [5, 9] }
+    again:
+      file: tcpinfo.py
+      source: |
+        # The cluster drops one segment in a thousand again. A lost tail segment now costs
+        # about 200 ms inside one attempt, not an abandoned connection and two more requests.
+        raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)  # struct tcp_info: rto, rtt, retransmits
+    cost:
+      before: { text: 1 lost segment → 3 requests · error, value: 0.9 }
+      after: { text: 1 lost segment → +200 ms · 1 request, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: You set the budget
+      note: '`requests` takes a connect and a read timeout. The read timeout limits each wait for bytes, not the whole response, so keep your own deadline for the call. On Linux, `getsockopt(IPPROTO_TCP, TCP_INFO)` returns the kernel''s `struct tcp_info`, RTO and RTT included.'
+      seenIn: '`urllib3.util.Retry(total=2, backoff_factor=0.2)` retries with exponential backoff. `httpx.Timeout` separates connect, read, write and pool timeouts.'
+
+  typescript:
+    before:
+      file: client.ts
+      source: |
+        // client.ts: price lookup on the same rack; a round trip is 1 ms
+        async function price(sku: string): Promise<Price> {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              const res = await fetch(`${PRICING}/price/${sku}`, { signal: AbortSignal.timeout(50) });
+              return (await res.json()) as Price;
+            } catch {
+              // timed out: try again
+            }
+          }
+          throw new Error("pricing unavailable");
+        }
+      roles: { app: [2, 12], kernel: [6, 6], tail: [5, 5] }
+      change:
+        - { after: 5, add: ['      // one lost segment can cost 200 ms or more inside TCP: this fires first'] }
+        - { after: 8, add: ['      // the aborted request is sent again on another connection'] }
+    after:
+      file: client.ts
+      source: |
+        const ATTEMPT_MS = 300; // longer than one TCP retransmission timeout (200 ms minimum on Linux)
+        const BUDGET_MS = 700;
+
+        async function price(sku: string): Promise<Price> {
+          const budget = AbortSignal.timeout(BUDGET_MS);
+          let last: unknown;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              const signal = AbortSignal.any([budget, AbortSignal.timeout(ATTEMPT_MS)]);
+              const res = await fetch(`${PRICING}/price/${sku}`, { signal });
+              return (await res.json()) as Price;
+            } catch (err) {
+              last = err;
+              retries.inc();
+              if (budget.aborted) break;
+            }
+          }
+          throw new Error("pricing unavailable", { cause: last });
+        }
+      roles: { app: [4, 19], kernel: [10, 10], estimator: [1, 1], tail: [9, 9], retry: [7, 17], estimate: [1, 1], fastpath: [10, 11], tailpath: [9, 9], backoff: [5, 7] }
+    again:
+      file: client.ts
+      source: |
+        // The cluster drops one segment in a thousand again. A lost tail segment now costs
+        // about 200 ms inside one attempt. Node exposes no TCP_INFO; on the host, run:
+        // ss -ti 'dport = :8443'   → rto, rtt, retrans for each connection
+    cost:
+      before: { text: 1 lost segment → 3 requests · error, value: 0.9 }
+      after: { text: 1 lost segment → +200 ms · 1 request, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: You set the budget
+      note: '`AbortSignal.timeout(ms)` bounds one attempt and `AbortSignal.any` combines it with the budget for the whole call. Aborting a `fetch` closes its connection, so a retry pays for a new handshake. Node has no `TCP_INFO` API; read it on the host with `ss -ti`.'
+      seenIn: 'undici''s `RetryAgent` retries idempotent requests with backoff. `got` takes a `retry` limit and a `timeout` object with separate `connect`, `send` and `response` phases.'
+
+  rust:
+    before:
+      file: client.rs
+      source: |
+        // client.rs: price lookup on the same rack; a round trip is 1 ms
+        async fn price(client: &reqwest::Client, sku: &str) -> Result<Price, PricingError> {
+            for _attempt in 0..3 {
+                let call = client.get(format!("{PRICING}/price/{sku}")).send();
+                if let Ok(Ok(res)) = timeout(Duration::from_millis(50), call).await {
+                    return Ok(res.json().await?);
+                }
+            }
+            Err(PricingError::Unavailable)
+        }
+      roles: { app: [2, 10], kernel: [4, 4], tail: [5, 5] }
+      change:
+        - { after: 5, add: ['            // one lost segment can cost 200 ms or more inside TCP: the 50 ms timer wins'] }
+        - { after: 7, add: ['        // the dropped future closes the connection; the request goes again'] }
+    after:
+      file: client.rs
+      source: |
+        const ATTEMPT: Duration = Duration::from_millis(300); // longer than one TCP RTO (200 ms minimum on Linux)
+        const BUDGET: Duration = Duration::from_millis(700);
+
+        async fn price(client: &reqwest::Client, sku: &str) -> Result<Price, PricingError> {
+            let deadline = Instant::now() + BUDGET;
+            for _attempt in 0..2 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                let call = client.get(format!("{PRICING}/price/{sku}")).send();
+                match timeout(ATTEMPT.min(left), call).await {
+                    Ok(Ok(res)) => return Ok(res.json().await?),
+                    _ => metrics::counter!("pricing_retries").increment(1),
+                }
+            }
+            Err(PricingError::Unavailable)
+        }
+      roles: { app: [4, 18], kernel: [11, 11], estimator: [1, 1], tail: [12, 12], retry: [6, 16], estimate: [1, 1], fastpath: [11, 13], tailpath: [12, 12], backoff: [5, 7] }
+    again:
+      file: client.rs
+      source: |
+        // The cluster drops one segment in a thousand again. A lost tail segment now costs
+        // about 200 ms inside one attempt. socket2 has no TCP_INFO helper: call
+        // libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_INFO, ..) or run ss -ti on the host.
+    cost:
+      before: { text: 1 lost segment → 3 requests · error, value: 0.9 }
+      after: { text: 1 lost segment → +200 ms · 1 request, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: You set the budget
+      note: '`tokio::time::timeout` bounds an attempt; dropping the future closes the connection, so a retry pays a new handshake. reqwest''s `ClientBuilder::timeout` bounds a whole request and `connect_timeout` the handshake. `TCP_INFO` is reachable through `libc::getsockopt`.'
+      seenIn: 'tower''s `timeout` and `retry` layers wrap any service. The `backoff` and `tokio-retry` crates provide exponential backoff with jitter.'
+
+walk:
+  - text: Every ACK for data sent once gives a round-trip sample. SRTT and RTTVAR follow the samples, and RTO is SRTT plus four times RTTVAR, but never below the floor. On a 1 ms path, Linux's 200 ms floor decides.
+    nodes: [kernel, estimator]
+    edges: [kernel>estimator]
+    role: estimate
+  - text: A segment is lost in the middle of a response. The segments after it each bring back a duplicate ACK, and the third one makes TCP resend at once, about one round trip after the loss.
+    nodes: [kernel, fast]
+    edges: [kernel>fast]
+    role: fastpath
+  - text: The last segment is lost. Nothing follows it, so no duplicate ACKs come back. The repair waits for the RTO, 200 ms or more, which is why the attempt timeout must be longer than that.
+    nodes: [estimator, tail]
+    edges: [estimator>tail]
+    role: tailpath
+  - text: If the resend is lost too, the RTO doubles to 400 ms. The whole-call budget decides when to stop waiting and try once more on a fresh connection.
+    nodes: [tail, retry, app]
+    edges: [tail>retry]
+    role: backoff
+
+checks:
+  overview:
+    question: Which two signals make TCP resend a segment?
+    options:
+      - text: Its retransmission timer running out, or three duplicate ACKs.
+        correct: true
+        why: Right. The timer is the fallback; duplicate ACKs from later segments find most losses sooner.
+      - text: A negative acknowledgement from the receiver naming the missing segment.
+        why: TCP has no negative acknowledgement. The receiver only repeats the number of the next byte it wants, and SACK reports what did arrive.
+      - text: The application calling write again with the same data.
+        why: The kernel keeps a copy of unacknowledged data and resends it by itself. The application never sees a TCP retransmission.
+  engineer:
+    question: Services on a 1 ms network show latency steps near 200 ms on a small fraction of requests. Most responses fit in one or two segments. What is the likely cause?
+    options:
+      - text: Lost final segments. With nothing sent after them, no duplicate ACKs come back, so TCP waits for an RTO, which Linux by default never sets below 200 ms.
+        correct: true
+        why: Right. Check `ss -ti` for retransmits and the rto value. Tail loss probes shorten some of these waits, but the RTO floor still shows up as a step, and a client timeout below it turns each one into a retry.
+      - text: Garbage collection pauses in the server.
+        why: Pauses add delay, but not in a step that sits at the kernel's minimum RTO across services written in different languages.
+      - text: DNS lookups timing out and being retried.
+        why: Resolver retries take seconds by default, not 200 ms, and they happen before the connection, not inside a response.
+  deep:
+    question: Without timestamps, why does TCP not take a round-trip sample from the ACK of a segment it sent twice?
+    options:
+      - text: The ACK may answer either copy, so the sample could be far too long or far too short.
+        correct: true
+        why: Right. That is Karn's algorithm. TCP also keeps the backed-off RTO until a segment sent only once is acknowledged. With the timestamp option, the echoed timestamp says which copy was answered.
+      - text: A resent segment takes a different route, so its round trip is not typical.
+        why: TCP does not choose routes, and a resend usually follows the same path. The problem is ambiguity, not the path.
+      - text: The ACK of a resent segment is always a duplicate ACK and carries no timing.
+        why: It is usually a new cumulative ACK, often a large jump. It is ignored for timing because the sender cannot tell which transmission it answers.
+
+reference:
+  roles:
+    - role: RTT sample
+      example: ACK time minus send time
+      job: One measurement of the path, taken only from data sent once.
+    - role: SRTT and RTTVAR
+      example: ⅞ and ¾ running averages
+      job: The path's typical round trip and how much it varies.
+    - role: RTO
+      example: SRTT + 4 × RTTVAR, at least 200 ms on Linux
+      job: How long to wait before assuming the oldest unacknowledged data is lost. Doubles on each timeout.
+    - role: Duplicate ACK counter
+      example: three in a row
+      job: Finds a loss from the segments after it, without waiting for the timer.
+    - role: SACK scoreboard
+      example: blocks the receiver holds
+      job: Tells the sender exactly which segments to resend.
+  useWhen:
+    - Set request timeouts above the kernel's minimum RTO plus the work, or every lost segment becomes an application retry.
+    - Read `ss -ti` (rto, rtt, retrans) when latency shows steps at 200 ms, 400 ms or 1 s.
+    - Keep retries few, bounded by a whole-call budget, and only for idempotent requests.
+  avoidWhen:
+    - Do not lower the minimum RTO on paths that leave your data center; a timer shorter than real delay spikes causes spurious resends.
+    - Do not read retransmissions alone as a broken network. A small rate is normal; a jump in timeouts, not fast retransmits, is the signal.
+  tradeoffs:
+    - A higher RTO floor avoids needless resends on jittery paths but makes every tail loss slower.
+    - Fast retransmit needs three segments after the loss, so small responses rarely benefit from it.
+    - Backoff protects a congested path and makes a run of losses on one connection very slow.
+  lookalikes:
+    - name: Application retries
+      how: A retry above TCP sends a new request on a new or different connection. TCP's own retransmission resends bytes on the same connection and the application never sees it.
+    - name: Tail loss probe (RFC 8985)
+      how: Linux sends a probe about two smoothed round trips after the last segment, so many tail losses are repaired by fast recovery instead of the RTO.
+    - name: QUIC loss detection
+      how: The same ideas, with a new packet number on every resend, so round-trip samples are never ambiguous.
+---
+
+## [concept] TCP timeouts and retransmission
+
+**TCP resends data it believes was lost. It decides by waiting a <Term id="rto">retransmission timeout</Term> learned from measured round trips, or sooner, when <Term id="duplicate-ack">duplicate ACKs</Term> show that later data arrived and one segment did not.**
+
+The timer is the fallback. It is never shorter than a floor, 200 ms on Linux, and it doubles every time it fires for the same data. Duplicate ACKs are the fast path, and they need segments after the loss to exist.
+
+<Depth level={2}>
+RFC 6298 keeps two numbers per connection. <Term id="srtt">SRTT</Term> is a running average of round-trip samples; <Term id="rttvar">RTTVAR</Term> is a running average of how far each sample is from it. The timeout is SRTT plus four times RTTVAR, so a steady path gets a timeout close to its round trip and a jittery one gets a wide margin. Then the floor applies: the RFC says 1 second, Linux uses 200 ms.
+</Depth>
+
+<Depth level={3}>
+The update order matters: RTTVAR first, using the old SRTT (RTTVAR = ¾ RTTVAR + ¼ |SRTT − R|), then SRTT = ⅞ SRTT + ⅛ R. Before any sample the RTO is 1 second. Each timeout doubles it (RFC 6298 rule 5.5), and <Term id="karn-algorithm">Karn's algorithm</Term> keeps it doubled, because the ACK of data sent twice gives no usable sample.
+</Depth>
+
+## [problem] A client that retries after 50 ms
+
+A checkout service asks the pricing service for each item's price. Both run in the same rack, the round trip is about 1 ms and responses take a few milliseconds. The client gives each attempt 50 ms and tries three times.
+
+On a clean network that is generous. In months of testing, no attempt ever timed out.
+
+<Depth level={2}>
+The reasoning behind 50 ms: if a packet is lost, TCP resends it, and that should cost about one more round trip. Fifty round trips of slack feels like plenty.
+</Depth>
+
+<Depth level={3}>
+The reasoning is right for one kind of loss and wrong for the other. A loss followed by more data is found by duplicate ACKs within a round trip. A loss with nothing after it waits for the timer, and the timer cannot go below its floor however short the path.
+</Depth>
+
+## [pain] One segment in a thousand
+
+**Change request:** pricing moves to a shared cluster where, at busy times, about one segment in a thousand is dropped.
+
+Most responses are one or two segments. When the last one is lost, no later segment produces a duplicate ACK, so the server's TCP waits its RTO, at least 200 ms. The client's 50 ms timer fires first. It abandons the connection, sends the request again on a new one, and the server does the work twice. A network that lost 0.1% of its packets now shows up as errors and duplicate load.
+
+<Depth level={2}>
+On the host, `ss -ti` shows the evidence: `rto:204` on connections whose `rtt` is about 1 ms, and a growing `retrans` count. The latency histogram has a step just above 200 ms.
+</Depth>
+
+<Depth level={3}>
+Modern Linux softens this with a tail loss probe (RFC 8985): about two smoothed round trips after the last segment, it resends that segment to provoke an ACK, which often turns the tail loss into a fast recovery. When the probe is lost too, when a resend is lost, or on stacks without probes, the RTO and its floor decide. Client timeouts have to survive that case.
+</Depth>
+
+## [morph] From one round trip to two kinds of loss
+
+Drag the slider. The single box labelled "TCP resends" opens into the estimator, the duplicate-ACK fast path and the timer path, and the client's per-attempt timeout moves above one RTO.
+
+Hover a box to see its code.
+
+<Depth level={2}>
+The rule of thumb: each attempt gets at least the RTO floor plus the expected work, and the whole call gets a budget that allows one more attempt. Retries are for servers that fail, not for single lost packets, which TCP repairs on its own.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Cancelling a context in the middle of an HTTP/1.1 request closes that connection, so a retry also pays for a new handshake (and TLS, if any). With HTTP/2 only the stream is reset and the connection survives.</Lang>
+<Lang only="python">`requests`' read timeout restarts every time bytes arrive, so a response that trickles in can take far longer than the number you pass. The explicit deadline above bounds the whole call.</Lang>
+<Lang only="typescript">An aborted `fetch` destroys its socket instead of returning it to undici's pool. The retry goes out on a fresh connection, with a fresh handshake.</Lang>
+<Lang only="rust">Dropping the `send()` future when `timeout` fires drops the connection with it. reqwest's pool never sees it again, and the retry dials a new one.</Lang>
+</Depth>
+
+## [walk] Follow one lost segment
+
+One response, through the estimator and both repair paths. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Term id="sack">SACK</Term> (RFC 2018) lets the receiver list the blocks it holds beyond the cumulative ACK. With several losses in one window, the sender can resend every hole in one round trip; without it, each partial ACK reveals only the next hole.
+</Depth>
+
+## [again] The same drop rate, with a budget above one RTO
+
+The cluster drops one segment in a thousand again. A lost tail segment now adds about 200 ms to one attempt, inside its 300 ms limit. The server does the work once, the client sees a slow response instead of an error, and the retry counter stays flat unless a server really fails.
+
+<Depth level={2}>
+Count retries per attempt outcome. A rise in attempt timeouts with flat server latency points at the network; a rise in server latency points at the server.
+</Depth>
+
+<Depth level={3}>
+If 200 ms tails are not acceptable, the fix is in the transport, not in the client's timer: fewer losses, a smaller minimum RTO on paths that stay inside the data center (`ip route ... rto_min`), or hedged requests that send a second copy to another replica after the 99th-percentile latency.
+</Depth>
+
+## [play] Drop a segment, watch the timer learn
+
+A sender streams 20 segments over a path whose round trip and jitter you set. Every clean round trip updates SRTT, RTTVAR and RTO, shown with the real numbers in the formula.
+
+Lose a segment in the middle, then the last one. Lose a resend to make the timer back off, delay a segment past the timer, and compare SACK on and off.
+
+## [lens] How each language bounds a slow response
+
+TCP's retransmissions are invisible to every language: they happen in the kernel and show up only as delay. What each language gives you is a way to bound an attempt, a way to bound the call, and sometimes a way to read the kernel's numbers.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+In all four, timing out an HTTP/1.1 request closes its connection. A retry is never free: it costs a new handshake on top of the request.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="tcp-retransmission" />
+
+### Reading `ss -ti`
+
+`ss -ti` prints each connection's `rtt:` as SRTT/RTTVAR in milliseconds, its current `rto:`, and `retrans:` as current/total retransmissions. An `rto` far above the `rtt` on a short path is the floor at work. A `backoff:` field appears while the timer is backed off after repeated timeouts.
