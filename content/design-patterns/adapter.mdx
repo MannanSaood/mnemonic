@@ -1,0 +1,559 @@
+---
+title: Adapter
+track: design-patterns
+group: Structural
+order: 30
+summary: Wrap an object whose interface does not fit, so that it looks like the interface your code already uses.
+intent: Use a class you cannot or should not change, such as a vendor SDK, through the interface the rest of your code expects, with all the translation in one place.
+changeRequest: Gulf subscriptions must renew through Acme too, not only Gulf checkouts.
+languages: [go, python, typescript, rust]
+glossary: [interface, adaptee, minor-unit, idempotent-retry, structural-typing, open-closed]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: adapter
+  scenarios:
+    - try: "Predict what the ¥1,250 customer pays, then run the five payments through the first adapter."
+      notice: "Only 1 of 6 checks passes. The adapter only renames, so ¥1,250 becomes ¥12 and a KWD 12.500 renewal becomes KWD 125.000."
+    - try: "Fix the amount, then the result codes."
+      notice: "Each fix is one line in the adapter. The checkout and renewals code above it never changes."
+    - try: "Fix the error mapping before the retry. Watch the €99 order."
+      notice: "Mapping the timeout hides the HTTP 500, but checkout's own retry now charges the customer twice. The adapter has to add idempotency, which Acme does not have."
+    - try: "Get to 6 of 6 and read your result."
+      notice: "Four kinds of work, from converting units to adding missing behaviour, all in one file. Without the adapter, each caller would carry its own copy."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: main, sub: per region }
+      after:  { x: 12, y: 30, w: 80, h: 44, title: main, sub: per region }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: Checkout, sub: "if gulf: call Acme inline" }
+      after:  { x: 120, y: 30, w: 110, h: 44, title: Checkout, sub: holds a gateway }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 270, y: 22, w: 200, h: 52, title: "" }
+      after:  { x: 270, y: 22, w: 200, h: 52, title: PaymentGateway, sub: { go: Charge, python: charge, typescript: charge, rust: charge } }
+    - id: stripe
+      kind: concrete
+      before: { x: 188, y: 80, w: 222, h: 32, title: { go: c.gateway.Charge, python: self.gateway.charge, typescript: this.gateway.charge, rust: self.gateway.charge } }
+      after:  { x: 222, y: 190, w: 90, h: 44, title: Stripe, sub: fits as is }
+    - id: adapter
+      kind: concrete
+      before: { x: 188, y: 124, w: 222, h: 64, title: inline translation, sub: "÷100 · codes · errors" }
+      after:  { x: 332, y: 190, w: 132, h: 44, title: { go: AcmeAdapter, python: AcmeAdapter, typescript: AcmeAdapter, rust: impl Gateway }, sub: { go: translates, python: translates, typescript: translates, rust: for acme::Client } }
+    - id: acme
+      kind: concrete
+      before: { x: 446, y: 132, w: 106, h: 48, title: Acme SDK, sub: legacy }
+      after:  { x: 484, y: 190, w: 72, h: 44, title: Acme SDK, sub: adaptee }
+    - id: renewals
+      kind: client
+      appears: change
+      before: { x: 12, y: 200, w: 130, h: 48, title: Renewals, sub: needs Acme too }
+      after:  { x: 120, y: 110, w: 110, h: 44, title: Renewals, sub: holds a gateway }
+  edges:
+    - { from: client, to: context, label: injects }
+    - { from: context, to: strategy, label: calls }
+    - { from: renewals, to: strategy }
+    - { from: stripe, to: strategy, kind: implements }
+    - { from: adapter, to: strategy, kind: implements, label: implements }
+    - { from: adapter, to: acme }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: checkout.go · renewals.go
+      source: |
+        // checkout.go
+        func (c *Checkout) Pay(o Order) (Receipt, error) {
+            if o.Region != "gulf" {
+                return c.gateway.Charge(o.Total, o.Currency, o.ID)
+            }
+            // Acme wants major units as a string and has its own result codes
+            res, err := c.acme.MakePayment(acme.Payment{
+                Amount:      fmt.Sprintf("%.2f", float64(o.Total)/100),
+                Curr:        o.Currency,
+                MerchantRef: o.ID,
+            })
+            if err != nil {
+                return Receipt{}, fmt.Errorf("acme: %w", err)
+            }
+            switch res.ResultCode {
+            case "00":
+                return Receipt{ID: res.TxnRef, Status: Succeeded}, nil
+            case "05", "51":
+                return Receipt{ID: res.TxnRef, Status: Declined}, nil
+            }
+            return Receipt{}, fmt.Errorf("acme: result %s", res.ResultCode)
+        }
+
+        // renewals.go
+        func (r *Renewals) Renew(s Subscription) (Receipt, error) {
+            return r.gateway.Charge(s.Price, s.Currency, s.InvoiceID)
+        }
+      roles: { context: [2, 22], stripe: [3, 5], adapter: [6, 21], acme: [7, 11], renewals: [25, 27] }
+      change:
+        - { after: 25, add: ['    if s.Region == "gulf" {', '        res, err := r.acme.MakePayment(acme.Payment{', '            Amount:      fmt.Sprintf("%.2f", float64(s.Price)/100),', '            Curr:        s.Currency,', '            MerchantRef: s.InvoiceID,', '        })', '        if err != nil {', '            return Receipt{}, fmt.Errorf("acme: %w", err)', '        }', '        switch res.ResultCode {', '        case "00":', '            return Receipt{ID: res.TxnRef, Status: Succeeded}, nil', '        case "05", "51":', '            return Receipt{ID: res.TxnRef, Status: Declined}, nil', '        }', '        return Receipt{}, fmt.Errorf("acme: result %s", res.ResultCode)', '    }'] }
+    after:
+      file: acme_adapter.go · main.go
+      source: |
+        type PaymentGateway interface {
+            Charge(amount int64, currency, ref string) (Receipt, error)
+        }
+
+        // AcmeAdapter makes the Acme SDK look like a PaymentGateway.
+        type AcmeAdapter struct{ client *acme.Client }
+
+        func (a AcmeAdapter) Charge(amount int64, currency, ref string) (Receipt, error) {
+            res, err := a.client.MakePayment(acme.Payment{
+                Amount:      majorUnits(amount, currency), // "1250" for JPY, "12.500" for KWD
+                Curr:        currency,
+                MerchantRef: ref,
+            })
+            if err != nil {
+                return Receipt{}, fmt.Errorf("acme: %w", err)
+            }
+            switch res.ResultCode {
+            case "00":
+                return Receipt{ID: res.TxnRef, Status: Succeeded}, nil
+            case "05", "51":
+                return Receipt{ID: res.TxnRef, Status: Declined}, nil
+            }
+            return Receipt{}, fmt.Errorf("acme: result %s", res.ResultCode)
+        }
+
+        // main.go: the region picks the gateway; Checkout never knows
+        gulf := &Checkout{gateway: AcmeAdapter{client: acme.New(apiKey)}}
+      roles: { strategy: [1, 3], adapter: [5, 24], acme: [9, 13], client: [27, 27], call: [1, 3], translate: [9, 13], back: [14, 23] }
+    again:
+      file: main.go
+      source: |
+        // renewals.go: unchanged. Renewals already takes a PaymentGateway.
+        // main.go: Gulf renewals get the same adapter
+        gulfRenewals := &Renewals{gateway: AcmeAdapter{client: acmeClient}}
+    cost:
+      before: { text: 17 lines copied · 2 files know Acme, value: 0.9 }
+      after: { text: 1 line of wiring · 1 file knows Acme, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Go interfaces are satisfied implicitly, so define `PaymentGateway` where it is used, small. If the vendor type already has a method with the right name and signature, it fits with no adapter at all. Write one when the names, units or errors differ, which with a vendor SDK they usually do.'
+      seenIn: '`http.HandlerFunc`, which the docs call an adapter: it lets an ordinary function be an `http.Handler`. `strings.NewReader` and `bytes.NewReader` let a string or a byte slice be an `io.Reader`.'
+
+  python:
+    before:
+      file: checkout.py · renewals.py
+      source: |
+        # checkout.py
+        def pay(self, order: Order) -> Receipt:
+            if order.region != "gulf":
+                return self.gateway.charge(order.total, order.currency, order.id)
+            # Acme wants major units as a string and has its own result codes
+            try:
+                res = self.acme.make_payment(
+                    amount=f"{order.total / 100:.2f}", curr=order.currency, merchant_ref=order.id)
+            except acme.AcmeError as e:
+                raise GatewayError("acme") from e
+            if res.result_code == "00":
+                return Receipt(res.txn_ref, Status.SUCCEEDED)
+            if res.result_code in ("05", "51"):
+                return Receipt(res.txn_ref, Status.DECLINED)
+            raise GatewayError(f"acme: result {res.result_code}")
+
+        # renewals.py
+        def renew(self, sub: Subscription) -> Receipt:
+            return self.gateway.charge(sub.price, sub.currency, sub.invoice_id)
+      roles: { context: [2, 15], stripe: [3, 4], adapter: [5, 15], acme: [7, 8], renewals: [18, 19] }
+      change:
+        - { after: 18, add: ['    if sub.region == "gulf":', '        try:', '            res = self.acme.make_payment(', '                amount=f"{sub.price / 100:.2f}", curr=sub.currency, merchant_ref=sub.invoice_id)', '        except acme.AcmeError as e:', '            raise GatewayError("acme") from e', '        if res.result_code == "00":', '            return Receipt(res.txn_ref, Status.SUCCEEDED)', '        if res.result_code in ("05", "51"):', '            return Receipt(res.txn_ref, Status.DECLINED)', '        raise GatewayError(f"acme: result {res.result_code}")'] }
+    after:
+      file: acme_adapter.py · main.py
+      source: |
+        class PaymentGateway(Protocol):
+            def charge(self, amount: int, currency: str, ref: str) -> Receipt: ...
+
+        class AcmeAdapter:
+            """Makes the Acme SDK look like a PaymentGateway."""
+            def __init__(self, client: acme.Client):
+                self.client = client
+
+            def charge(self, amount: int, currency: str, ref: str) -> Receipt:
+                try:
+                    res = self.client.make_payment(
+                        amount=major_units(amount, currency), curr=currency, merchant_ref=ref)
+                except acme.AcmeError as e:
+                    raise GatewayError("acme") from e
+                if res.result_code == "00":
+                    return Receipt(res.txn_ref, Status.SUCCEEDED)
+                if res.result_code in ("05", "51"):
+                    return Receipt(res.txn_ref, Status.DECLINED)
+                raise GatewayError(f"acme: result {res.result_code}")
+
+        # main.py: the region picks the gateway; Checkout never knows
+        gulf = Checkout(gateway=AcmeAdapter(acme.Client(api_key)))
+      roles: { strategy: [1, 2], adapter: [4, 19], acme: [10, 12], client: [22, 22], call: [1, 2], translate: [10, 12], back: [13, 19] }
+    again:
+      file: main.py
+      source: |
+        # renewals.py: unchanged. Renewals already takes a PaymentGateway.
+        # main.py: Gulf renewals get the same adapter
+        gulf_renewals = Renewals(gateway=AcmeAdapter(acme_client))
+    cost:
+      before: { text: 11 lines copied · 2 files know Acme, value: 0.85 }
+      after: { text: 1 line of wiring · 1 file knows Acme, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A `Protocol` checks shape, not ancestry, so `AcmeAdapter` never inherits from `PaymentGateway`. When the mismatch is only one function, a small wrapper function or a `lambda` is the whole adapter. Avoid patching methods onto the vendor class at runtime: it works until the SDK updates.'
+      seenIn: '`io.TextIOWrapper` makes a binary stream look like a text file. `socket.makefile()` makes a socket look like a file object. `logging.LoggerAdapter` is named after the pattern.'
+
+  typescript:
+    before:
+      file: checkout.ts · renewals.ts
+      source: |
+        // checkout.ts
+        async pay(order: Order): Promise<Receipt> {
+          if (order.region !== "gulf") {
+            return this.gateway.charge(order.total, order.currency, order.id);
+          }
+          // Acme wants major units as a string and has its own result codes
+          const res = await this.acme.makePayment({
+            amount: (order.total / 100).toFixed(2),
+            curr: order.currency,
+            merchantRef: order.id,
+          });
+          if (res.resultCode === "00") return { id: res.txnRef, status: "succeeded" };
+          if (res.resultCode === "05" || res.resultCode === "51") return { id: res.txnRef, status: "declined" };
+          throw new GatewayError(`acme: result ${res.resultCode}`);
+        }
+
+        // renewals.ts
+        async renew(sub: Subscription): Promise<Receipt> {
+          return this.gateway.charge(sub.price, sub.currency, sub.invoiceId);
+        }
+      roles: { context: [2, 15], stripe: [3, 5], adapter: [6, 14], acme: [7, 11], renewals: [18, 20] }
+      change:
+        - { after: 18, add: ['  if (sub.region === "gulf") {', '    const res = await this.acme.makePayment({', '      amount: (sub.price / 100).toFixed(2),', '      curr: sub.currency,', '      merchantRef: sub.invoiceId,', '    });', '    if (res.resultCode === "00") return { id: res.txnRef, status: "succeeded" };', '    if (res.resultCode === "05" || res.resultCode === "51") return { id: res.txnRef, status: "declined" };', '    throw new GatewayError(`acme: result ${res.resultCode}`);', '  }'] }
+    after:
+      file: acme-adapter.ts · main.ts
+      source: |
+        interface PaymentGateway {
+          charge(amount: number, currency: string, ref: string): Promise<Receipt>;
+        }
+
+        // Makes the Acme SDK look like a PaymentGateway.
+        export class AcmeAdapter implements PaymentGateway {
+          constructor(private readonly client: AcmeClient) {}
+
+          async charge(amount: number, currency: string, ref: string): Promise<Receipt> {
+            const res = await this.client.makePayment({
+              amount: majorUnits(amount, currency), // "1250" for JPY, "12.500" for KWD
+              curr: currency,
+              merchantRef: ref,
+            });
+            if (res.resultCode === "00") return { id: res.txnRef, status: "succeeded" };
+            if (res.resultCode === "05" || res.resultCode === "51") return { id: res.txnRef, status: "declined" };
+            throw new GatewayError(`acme: result ${res.resultCode}`);
+          }
+        }
+
+        // main.ts: the region picks the gateway; Checkout never knows
+        const gulf = new Checkout(new AcmeAdapter(new AcmeClient(apiKey)));
+      roles: { strategy: [1, 3], adapter: [5, 19], acme: [10, 14], client: [22, 22], call: [1, 3], translate: [10, 14], back: [15, 17] }
+    again:
+      file: main.ts
+      source: |
+        // renewals.ts: unchanged. Renewals already takes a PaymentGateway.
+        // main.ts: Gulf renewals get the same adapter
+        const gulfRenewals = new Renewals(new AcmeAdapter(acmeClient));
+    cost:
+      before: { text: 10 lines copied · 2 files know Acme, value: 0.85 }
+      after: { text: 1 line of wiring · 1 file knows Acme, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'With structural typing, an object literal with a `charge` method of the right type is already a `PaymentGateway`, so a small adapter can be a function that returns one. A class is worth it when the adapter holds a client, a cache or config. Keep the vendor''s types out of your interface, or every caller ends up importing the SDK.'
+      seenIn: 'Node''s `util.promisify` makes a callback API return promises. `Readable.toWeb()` and `Readable.fromWeb()` convert between Node streams and web streams. ORMs and SDKs that ship one adapter per database or cloud behind one interface.'
+
+  rust:
+    before:
+      file: checkout.rs · renewals.rs
+      source: |
+        // checkout.rs
+        fn pay(&self, order: &Order) -> Result<Receipt, PayError> {
+            if order.region != Region::Gulf {
+                return self.gateway.charge(order.total, &order.currency, &order.id);
+            }
+            // Acme wants major units as a string and has its own result codes
+            let amount = format!("{:.2}", order.total as f64 / 100.0);
+            let res = self.acme
+                .make_payment(acme::Payment { amount, curr: order.currency.clone(), merchant_ref: order.id.clone() })
+                .map_err(PayError::Acme)?;
+            match res.result_code.as_str() {
+                "00" => Ok(Receipt::succeeded(res.txn_ref)),
+                "05" | "51" => Ok(Receipt::declined(res.txn_ref)),
+                code => Err(PayError::AcmeResult(code.to_owned())),
+            }
+        }
+
+        // renewals.rs
+        fn renew(&self, sub: &Subscription) -> Result<Receipt, PayError> {
+            self.gateway.charge(sub.price, &sub.currency, &sub.invoice_id)
+        }
+      roles: { context: [2, 16], stripe: [3, 5], adapter: [6, 15], acme: [8, 10], renewals: [19, 21] }
+      change:
+        - { after: 19, add: ['    if sub.region == Region::Gulf {', '        let amount = format!("{:.2}", sub.price as f64 / 100.0);', '        let res = self.acme', '            .make_payment(acme::Payment { amount, curr: sub.currency.clone(), merchant_ref: sub.invoice_id.clone() })', '            .map_err(PayError::Acme)?;', '        return match res.result_code.as_str() {', '            "00" => Ok(Receipt::succeeded(res.txn_ref)),', '            "05" | "51" => Ok(Receipt::declined(res.txn_ref)),', '            code => Err(PayError::AcmeResult(code.to_owned())),', '        };', '    }'] }
+    after:
+      file: acme_gateway.rs · main.rs
+      source: |
+        trait PaymentGateway {
+            fn charge(&self, amount: i64, currency: &str, reference: &str) -> Result<Receipt, GatewayError>;
+        }
+
+        // The trait is ours, so we may implement it for Acme's type directly.
+        impl PaymentGateway for acme::Client {
+            fn charge(&self, amount: i64, currency: &str, reference: &str) -> Result<Receipt, GatewayError> {
+                let res = self
+                    .make_payment(acme::Payment {
+                        amount: major_units(amount, currency), // "1250" for JPY, "12.500" for KWD
+                        curr: currency.to_owned(),
+                        merchant_ref: reference.to_owned(),
+                    })
+                    .map_err(GatewayError::from_acme)?;
+                match res.result_code.as_str() {
+                    "00" => Ok(Receipt::succeeded(res.txn_ref)),
+                    "05" | "51" => Ok(Receipt::declined(res.txn_ref)),
+                    code => Err(GatewayError::Result(code.to_owned())),
+                }
+            }
+        }
+
+        // main.rs: the region picks the gateway; Checkout never knows
+        let gulf = Checkout { gateway: Box::new(acme::Client::new(api_key)) };
+      roles: { strategy: [1, 3], adapter: [5, 21], acme: [8, 14], client: [24, 24], call: [1, 3], translate: [8, 14], back: [15, 19] }
+    again:
+      file: main.rs
+      source: |
+        // renewals.rs: unchanged. Renewals already takes a PaymentGateway.
+        // main.rs: Gulf renewals get the same gateway
+        let gulf_renewals = Renewals { gateway: Box::new(acme_client.clone()) };
+    cost:
+      before: { text: 11 lines copied · 2 files know Acme, value: 0.85 }
+      after: { text: 1 line of wiring · 1 file knows Acme, value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Because `PaymentGateway` is your own trait, Rust lets you implement it for Acme''s type with no wrapper struct. The orphan rule only forbids implementing a foreign trait for a foreign type; then you need a newtype, such as `struct AcmeGateway(acme::Client)`. Use a newtype too when the adapter needs its own state. For plain value conversions, `From` and `TryFrom` are the idiom.'
+      seenIn: '`std::io::Cursor` makes a byte buffer usable as `Read`, `Write` and `Seek`. `tokio_util::compat` adapts between the `futures` and `tokio` I/O traits. `From` impls convert one crate''s error type into another''s for `?`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: '`main` builds the Gulf Checkout with an Acme adapter. The other regions get Stripe, which fits the interface as it is.'
+    nodes: [client, context]
+    edges: [client>context]
+    role: client
+  - text: Checkout calls charge on its PaymentGateway. It has no idea the payment goes to Acme.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: call
+  - text: The adapter translates the request. Amounts go from minor units to Acme's major-unit string, by the currency's number of decimals, and the order id becomes Acme's merchant reference.
+    nodes: [adapter, acme]
+    edges: [adapter>acme]
+    role: translate
+  - text: It translates the reply back. Acme's result codes become our statuses, and Acme's exceptions become our GatewayError. Checkout only ever sees our types.
+    nodes: [adapter, strategy]
+    edges: [adapter>strategy]
+    role: back
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these situations calls for an Adapter?
+    options:
+      - text: Your code stores files through a BlobStore interface with put and get. The new cloud vendor's SDK has upload_object and download_object with different arguments and errors.
+        correct: true
+        why: Right. The vendor's class works, but its interface does not match the one your code uses. An adapter makes it fit without changing either side.
+      - text: You want every BlobStore call retried three times and timed, whichever vendor is behind it.
+        why: That is Decorator. The interface stays the same and behaviour is added around it.
+      - text: The vendor SDK needs eight calls to set up a client, and you want the team to call one function instead.
+        why: That is Facade. It offers a simpler interface over a complicated subsystem. An adapter matches one existing interface to another.
+  engineer:
+    question: Acme takes amounts as a decimal string in major units. Where should the conversion from your minor units happen?
+    options:
+      - text: Inside the adapter, using each currency's number of decimals.
+        correct: true
+        why: Right. Only the adapter knows Acme's format, and the conversion depends on the currency (0 decimals for JPY, 3 for KWD). Callers keep passing minor units, as they do for every other gateway.
+      - text: In Checkout, just before it calls the gateway, when the region is Gulf.
+        why: That puts Acme's format back into Checkout, the knowledge the adapter exists to hold. Renewals would need the same code, and so would the next caller.
+      - text: Change the Order type to store major units as a decimal string everywhere.
+        why: That changes every caller and every other gateway to suit one vendor. The adapter should bend to your interface, not the other way round.
+  deep:
+    question: When can you skip writing a separate adapter type?
+    options:
+      - text: When the vendor type already fits structurally (Go, TypeScript), or you can implement your own trait on it directly (Rust), and no state needs to be held.
+        correct: true
+        why: Right. Go and TypeScript check shape, not declarations. Rust allows impl LocalTrait for ForeignType; only a foreign trait on a foreign type needs a newtype. A type is still worth it when the adapter holds state, such as a client or a lookup cache.
+      - text: Never. The catalogue defines Adapter as a class that inherits the target and wraps the adaptee.
+        why: The catalogue describes class and object adapters for C++ and Smalltalk. Its point is the translation, not the inheritance. Languages with structural typing or trait impls often need less ceremony.
+      - text: When the vendor SDK is written in the same language as your service.
+        why: The language does not matter. What matters is whether the names, types, units and errors match your interface.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Target
+      example: { go: "PaymentGateway (interface)", python: "PaymentGateway (Protocol)", typescript: "PaymentGateway (interface)", rust: "PaymentGateway (trait)" }
+      job: The interface your code already uses.
+    - role: Client
+      example: Checkout, Renewals
+      job: Calls the target. Never sees the vendor.
+    - role: Adaptee
+      example: Acme SDK
+      job: Useful code with the wrong interface. You do not change it.
+    - role: Adapter
+      example: { go: AcmeAdapter, python: AcmeAdapter, typescript: AcmeAdapter, rust: "impl PaymentGateway for acme::Client" }
+      job: Implements the target by calling the adaptee, translating arguments, results and errors both ways.
+  useWhen:
+    - A class you cannot or should not change (a vendor SDK, a legacy module) has the wrong interface for your code.
+    - Several vendors must sit behind one interface, each with its own quirks.
+    - You want tests to use a fake behind your own interface instead of mocking a vendor SDK.
+  avoidWhen:
+    - You own both sides and can change one of them to match. Change it.
+    - The vendor's interface is already the one you want. Use it directly.
+    - The mismatch is so deep that the adapter would reimplement half the vendor. Rethink the interface instead.
+  tradeoffs:
+    - One more type and one more call per operation.
+    - The adapter can hide features of the vendor that your interface has no room for.
+    - An adapter is only as good as its translation. Units, codes and errors are where the bugs live, so test it against the vendor's sandbox.
+    - It is not transparent. The adapter is not an Acme client, so code that needs the vendor type cannot use it.
+  lookalikes:
+    - name: Decorator
+      how: Keeps the interface the same and adds behaviour. An adapter changes the interface.
+    - name: Facade
+      how: Defines a new, simpler interface over a whole subsystem. An adapter matches one existing interface.
+    - name: Proxy
+      how: Has the same interface as the object it stands in for. An adapter has a different one.
+    - name: Bridge
+      how: Similar structure, but designed up front so two sides can vary independently. An adapter is usually added after the fact, to make existing classes fit.
+---
+
+## [concept] Adapter
+
+**Wrap an object whose <Term id="interface">interface</Term> does not fit, so that it looks like the interface your code already uses.**
+
+Your code is written against its own interface. A vendor SDK or a legacy module does the right job with the wrong names, types, units and errors. The adapter sits between them and translates in both directions, so neither side has to change.
+
+<Depth level={2}>
+Four roles. The **target** is the interface your code uses (`PaymentGateway`). The **client** calls it (`Checkout`). The **<Term id="adaptee">adaptee</Term>** is the class with the wrong interface (the Acme SDK). The **adapter** implements the target by calling the adaptee. How much work it does varies: sometimes it only renames, often it converts units, maps result codes and errors, and sometimes it supplies behaviour the adaptee lacks.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue describes two forms. A class adapter inherits from both the target and the adaptee, through multiple inheritance. An object adapter holds an adaptee and forwards to it. The object form can adapt an adaptee and all its subclasses, and is the only form available in Go, Python by convention, TypeScript and Rust. The catalogue also notes the spectrum of work an adapter does, from renaming operations to supporting a different set of operations, and describes two-way adapters for when two systems must each see the same object through their own interface.
+</Depth>
+
+## [problem] A checkout that speaks two dialects
+
+A shop charges through a `PaymentGateway` interface, and Stripe fits it. The Gulf stores must use a regional acquirer, Acme, whose legacy SDK has its own method names, takes amounts as decimal strings in major units, and has its own result codes. Someone made it work with a branch in Checkout.
+
+Read it once. Checkout now knows two things it should not: which region uses Acme, and how to talk to Acme.
+
+<Depth level={2}>
+Testing the Gulf path means mocking Acme's SDK inside Checkout's tests. Every Checkout change runs next to Acme-specific code it has nothing to do with.
+</Depth>
+
+<Depth level={3}>
+There is also a bug waiting. `%.2f` of the amount divided by 100 is right for euros and wrong for currencies with zero or three decimals. Kuwaiti dinars have three, so a KWD 12.500 payment goes out as KWD 125.00. The playground below shows what that costs.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** Gulf subscriptions must renew through Acme too, not only Gulf checkouts.
+
+The marked lines must change. Renewals gets a copy of the whole translation, and now two files know Acme's dialect.
+
+<Depth level={2}>
+The copies will drift. Fix the decimal bug in Checkout and the renewals copy still has it. Add a result code to one and the other treats it as an error. Each new caller of the gateway makes another copy.
+</Depth>
+
+<Depth level={3}>
+Error handling drifts too. Checkout's tests expect Acme's exceptions to be wrapped in one way; Renewals' copy may wrap them another way, or not at all, and the retry logic above them behaves differently for the same timeout.
+</Depth>
+
+## [morph] Move the translation into one adapter
+
+Drag the slider. The inline translation leaves Checkout and becomes a type that implements `PaymentGateway` by calling Acme. Checkout goes back to holding one gateway.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Now Acme looks like every other gateway. Checkout and Renewals do not know it exists, the region choice moves to `main`, and the adapter can be tested on its own against Acme's sandbox. Adding Acme to the system extended it without modifying the callers: the <Term id="open-closed">open/closed principle</Term>.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The adapter is a struct with one field, the Acme client, and one method. Go checks that `AcmeAdapter` satisfies `PaymentGateway` where it is assigned to the `gateway` field, with no `implements` keyword.</Lang>
+<Lang only="python">`PaymentGateway` is a `Protocol`. A type checker accepts `AcmeAdapter` because it has a `charge` method of the right signature, not because of inheritance.</Lang>
+<Lang only="typescript">`implements PaymentGateway` is optional with <Term id="structural-typing">structural typing</Term>, but it makes the compiler check the class at its definition instead of where it is first used.</Lang>
+<Lang only="rust">There is no wrapper struct here. `PaymentGateway` is a local trait, so `impl PaymentGateway for acme::Client` is allowed, and the adapter is that impl block.</Lang>
+</Depth>
+
+## [walk] Follow one payment through the adapter
+
+One Gulf payment, from Checkout to Acme and back. Step through it with the numbered buttons.
+
+<Depth level={3}>
+Converting by a currency's <Term id="minor-unit">minor unit</Term> needs a table, such as ISO 4217's exponent per currency. Never derive it from formatting, and never use floating point for money in production. The sketch above formats a string from integer minor units, which is exact.
+</Depth>
+
+## [again] Renewals, the second time
+
+The same request after the refactor. Renewals already takes a `PaymentGateway`, so the Gulf renewals get the same adapter in one line of wiring. No Acme code is copied, and a fix to the translation reaches every caller at once.
+
+<Depth level={2}>
+Adapters also absorb behaviour the vendor lacks. Acme has no idempotency keys, so a retry after a timeout charges the customer again. The adapter can send your key as Acme's merchant reference and look it up before charging: an <Term id="idempotent-retry">idempotent retry</Term> that every caller gets for free.
+</Depth>
+
+<Depth level={3}>
+Test the adapter with contract tests: the same suite your Stripe implementation passes, run against Acme's sandbox. A gateway that passes the suite can be swapped in safely; one that does not shows you exactly which translation is wrong.
+</Depth>
+
+## [play] Build the adapter, run the contract suite
+
+The first adapter only renames, following Acme's docs, whose examples are in euros. Five payments run through it: euros, yen, dinars, a declined card and a timeout.
+
+Fix it one decision at a time, without touching the callers or the vendor.
+
+## [lens] How each language writes it
+
+How much ceremony an adapter needs depends on how the language checks interfaces. Go and TypeScript check shape, and Rust lets you implement your own trait on a vendor's type, so the adapter is often just the translation code.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="adapter" />
+
+### An adapter is a translation, not a rename
+
+The work an adapter does runs along a scale: rename a method, convert units, map result codes, map errors, and supply behaviour the vendor lacks. The further along the scale, the more the adapter needs its own tests. Run your interface's contract tests against every implementation, and keep the vendor's types out of the interface so that callers never import the SDK.

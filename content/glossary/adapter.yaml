@@ -1,0 +1,10 @@
+# Terms introduced by the Adapter lesson.
+- id: adaptee
+  term: Adaptee
+  short: In Adapter, the existing class with the wrong interface, such as a vendor SDK. The adapter calls it; nobody changes it.
+- id: minor-unit
+  term: Minor unit
+  short: The smallest unit of a currency, as integer amounts are counted. Most currencies have 2 decimals, the yen has 0 and the Kuwaiti dinar 3 (ISO 4217).
+- id: idempotent-retry
+  term: Idempotent retry
+  short: A retry that cannot repeat the effect. The caller sends a key with the request, and the server returns the first result instead of acting again.
