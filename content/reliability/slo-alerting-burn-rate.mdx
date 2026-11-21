@@ -1,0 +1,580 @@
+---
+title: "Alerting on SLOs: burn rate and multiple windows"
+track: reliability
+group: SLOs
+order: 5
+summary: Page when the error budget is burning fast enough to matter, measured over a long window for significance and a short one to confirm it is still happening; open a ticket for slow burns; and stay quiet for blips.
+intent: Every page should mean the SLO is in real danger, arrive within minutes of a big incident, and stop soon after it ends.
+changeRequest: On-call got 23 pages last month and 20 were noise. Make the SLO alert page only when the SLO is actually at risk.
+languages: [go, python, typescript, rust]
+glossary: [burn-rate, multiwindow-alert, alert-precision, alert-recall, recording-rule, error-budget, slo]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [reliability/slis-and-slos, reliability/error-budgets]
+skills: [observability, sre]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: slo-alerting-burn-rate
+  scenarios:
+    - try: "Predict, then press Run the alert rules over the month."
+      notice: "The threshold rule pages 23 times, 20 of them for blips. The 1-hour burn-rate rule misses the slow leak that spent 30% of the budget. The multiwindow rule pages twice and opens one ticket."
+    - try: "On the one-window rule, pick 6 h and 2×."
+      notice: "It now catches everything with no false pages, but it pages for the leak instead of filing a ticket, and keeps firing for six hours after each incident."
+    - try: "Switch traffic to 10 requests an hour."
+      notice: "Every rule pages for single failed requests, and the real partial outage produces too few requests to see at all."
+    - try: "Place blips on several more days."
+      notice: "The threshold rule's page count climbs with every blip. The burn-rate rules ignore them: a 5-minute blip spends a fraction of a percent of the budget."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: metrics
+      kind: client
+      before: { x: 12, y: 104, w: 108, h: 56, title: Checkout, sub: requests_total }
+      after:  { x: 12, y: 30, w: 108, h: 52, title: Checkout, sub: requests_total }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 250, h: 236, title: Alert rules, sub: generated }
+      after:  { x: 12, y: 150, w: 108, h: 56, title: Rule generator, sub: SLO 99.9% }
+    - id: record
+      kind: concrete
+      before: { x: 160, y: 80, w: 210, h: 48, title: 10 min error rate, sub: ≥ 0.1% }
+      after:  { x: 140, y: 90, w: 122, h: 56, title: Recording rules, sub: 5m … 3d ratios }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 284, y: 90, w: 116, h: 56, title: "" }
+      after:  { x: 284, y: 90, w: 116, h: 56, title: Burn rate, sub: ratio ÷ 0.1% }
+    - id: long
+      kind: concrete
+      appears: after
+      before: { x: 424, y: 18, w: 126, h: 48, title: "" }
+      after:  { x: 424, y: 18, w: 126, h: 48, title: Long window, sub: 1h · 6h · 3d }
+    - id: short
+      kind: concrete
+      appears: after
+      before: { x: 424, y: 94, w: 126, h: 48, title: "" }
+      after:  { x: 424, y: 94, w: 126, h: 48, title: Short window, sub: 5m · 30m · 6h }
+    - id: page
+      kind: concrete
+      before: { x: 160, y: 170, w: 210, h: 48, title: Page, sub: every breach }
+      after:  { x: 424, y: 180, w: 60, h: 56, title: Page, sub: fast }
+    - id: ticket
+      kind: concrete
+      appears: change
+      before: { x: 490, y: 180, w: 60, h: 56, title: Ticket, sub: slow }
+      after:  { x: 490, y: 180, w: 60, h: 56, title: Ticket, sub: slow }
+  edges:
+    - { from: metrics, to: context, label: scraped }
+    - { from: context, to: record, label: emits }
+    - { from: record, to: strategy, label: ÷ budget }
+    - { from: strategy, to: long, label: "significant?" }
+    - { from: strategy, to: short, label: "still burning?" }
+    - { from: short, to: page, label: and }
+    - { from: long, to: ticket, label: slow burn }
+    - { from: record, to: page, label: fires }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: slorules.go
+      source: |
+        // slorules.go: one SLO in, Prometheus alerting rules out
+        func alertRules(service string, slo float64) []Rule {
+            return []Rule{{
+                Alert: title(service) + "HighErrorRate",
+                // page whenever the last 10 minutes miss the SLO
+                Expr:   fmt.Sprintf("%s:error_ratio:rate10m >= %.4g", service, 1-slo),
+                Labels: map[string]string{"severity": "page"},
+            }}
+        }
+      roles: { context: [2, 9], record: [6, 6], page: [7, 7], metrics: [6, 6] }
+      change:
+        - { after: 6, add: ['        For:    "1h", // only page if it lasts an hour'] }
+    after:
+      file: slorules.go
+      source: |
+        // slorules.go: one SLO in, Prometheus rules out
+        type window struct {
+            Long, Short time.Duration
+            Spend       float64 // share of the 30-day budget spent when the long window fires
+            Severity    string
+        }
+
+        var windows = []window{
+            {time.Hour, 5 * time.Minute, 0.02, "page"},
+            {6 * time.Hour, 30 * time.Minute, 0.05, "page"},
+            {72 * time.Hour, 6 * time.Hour, 0.10, "ticket"},
+        }
+
+        const period = 30 * 24 * time.Hour
+
+        // 0.02 × 720 h / 1 h = 14.4
+        func burnRate(w window) float64 { return w.Spend * float64(period) / float64(w.Long) }
+
+        func recordingRules(service string) []Rule {
+            var rules []Rule
+            for _, d := range []string{"5m", "30m", "1h", "6h", "3d"} {
+                rules = append(rules, Rule{
+                    Record: fmt.Sprintf("%s:error_ratio:rate%s", service, d),
+                    Expr:   fmt.Sprintf(`sum(rate(%s_requests_total{code="5xx"}[%s])) / sum(rate(%s_requests_total[%s]))`, service, d, service, d),
+                })
+            }
+            return rules
+        }
+
+        func alertRules(service string, slo float64) []Rule {
+            var rules []Rule
+            for _, w := range windows {
+                threshold := fmt.Sprintf("%.4g", burnRate(w)*(1-slo)) // 14.4 × 0.1% = 1.44%
+                rules = append(rules, Rule{
+                    Alert: title(service) + "ErrorBudgetBurn",
+                    Expr: fmt.Sprintf("%s:error_ratio:rate%v > %s and %s:error_ratio:rate%v > %s",
+                        service, model.Duration(w.Long), threshold, service, model.Duration(w.Short), threshold),
+                    Labels: map[string]string{"severity": w.Severity},
+                })
+            }
+            return rules
+        }
+      roles: { metrics: [24, 24], context: [19, 42], record: [19, 28], strategy: [16, 17], long: [3, 4], short: [3, 3], page: [9, 10], ticket: [11, 11], windows: [8, 12], burn: [14, 17], fire: [30, 42] }
+    again:
+      file: slorules_test.go
+      source: |
+        // slorules_test.go: the parameters come from the table, for every service
+        func TestBurnRates(t *testing.T) {
+            for i, want := range []float64{14.4, 6, 1} {
+                if got := burnRate(windows[i]); math.Abs(got-want) > 1e-9 {
+                    t.Errorf("window %d: burn rate %v, want %v", i, got, want)
+                }
+            }
+            page := alertRules("checkout", 0.999)[0]
+            if !strings.Contains(page.Expr, "rate1h > 0.0144 and checkout:error_ratio:rate5m > 0.0144") {
+                t.Errorf("unexpected page rule %q", page.Expr)
+            }
+        }
+    cost:
+      before: { text: 15-min outage · 35% of budget · no page, value: 0.9 }
+      after: { text: paged in 1 min · quiet 30 min later, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Useful
+      note: 'The rules run in Prometheus, not in your service; the language only generates them. Go owns this niche: Sloth and Pyrra, the common SLO rule generators, are Go programs, and `prometheus/common/model.Duration` prints `72h` as `3d`. Format thresholds with fixed precision: `1 - 0.999` is `0.0010000000000000009` in a float64.'
+      seenIn: 'Sloth (`sloth generate`). Pyrra''s `ServiceLevelObjective` resource. `prometheus/common/model.Duration`. The `prometheus-operator` `PrometheusRule` resource the output is often wrapped in.'
+
+  python:
+    before:
+      file: slo_rules.py
+      source: |
+        # slo_rules.py: one SLO in, Prometheus alerting rules out
+        def alert_rules(service: str, slo: float) -> list[dict]:
+            return [{
+                "alert": f"{service.title()}HighErrorRate",
+                # page whenever the last 10 minutes miss the SLO
+                "expr": f"{service}:error_ratio:rate10m >= {1 - slo:.4g}",
+                "labels": {"severity": "page"},
+            }]
+      roles: { context: [2, 8], record: [6, 6], page: [7, 7], metrics: [6, 6] }
+      change:
+        - { after: 6, add: ['        "for": "1h",  # only page if it lasts an hour'] }
+    after:
+      file: slo_rules.py
+      source: |
+        # slo_rules.py: one SLO in, Prometheus rules out
+        WINDOWS = [  # long, short, share of the 30-day budget spent when it fires, severity
+            ("1h", "5m", 0.02, "page"),
+            ("6h", "30m", 0.05, "page"),
+            ("3d", "6h", 0.10, "ticket"),
+        ]
+        HOURS = {"5m": 5 / 60, "30m": 0.5, "1h": 1, "6h": 6, "3d": 72}
+        PERIOD_HOURS = 30 * 24
+
+        def burn_rate(long: str, spend: float) -> float:
+            return spend * PERIOD_HOURS / HOURS[long]  # 0.02 × 720 h / 1 h = 14.4
+
+        def recording_rules(service: str) -> list[dict]:
+            return [{"record": f"{service}:error_ratio:rate{w}",
+                     "expr": f'sum(rate({service}_requests_total{{code="5xx"}}[{w}]))'
+                             f" / sum(rate({service}_requests_total[{w}]))"}
+                    for w in HOURS]
+
+        def alert_rules(service: str, slo: float) -> list[dict]:
+            rules = []
+            for long, short, spend, severity in WINDOWS:
+                threshold = f"{burn_rate(long, spend) * (1 - slo):.4g}"  # 14.4 × 0.1% = 1.44%
+                rules.append({
+                    "alert": f"{service.title()}ErrorBudgetBurn",
+                    "expr": f"{service}:error_ratio:rate{long} > {threshold}"
+                            f" and {service}:error_ratio:rate{short} > {threshold}",
+                    "labels": {"severity": severity},
+                })
+            return rules
+      roles: { metrics: [15, 15], context: [13, 29], record: [13, 17], strategy: [10, 11], long: [2, 6], short: [2, 6], page: [3, 4], ticket: [5, 5], windows: [2, 6], burn: [10, 11], fire: [19, 29] }
+    again:
+      file: test_slo_rules.py
+      source: |
+        # test_slo_rules.py: the parameters come from the table, for every service
+        def test_burn_rates_for_a_30_day_window():
+            assert [round(burn_rate(long, spend), 6) for long, _, spend, _ in WINDOWS] == [14.4, 6.0, 1.0]
+
+        def test_three_nines_pages_at_1_44_percent():
+            page = alert_rules("checkout", 0.999)[0]
+            assert "rate1h > 0.0144 and checkout:error_ratio:rate5m > 0.0144" in page["expr"]
+    cost:
+      before: { text: 15-min outage · 35% of budget · no page, value: 0.9 }
+      after: { text: paged in 1 min · quiet 30 min later, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Useful
+      note: 'The rules run in Prometheus; Python only writes them, usually with `yaml.safe_dump` into a rules file or a `PrometheusRule` manifest. Format thresholds with a fixed precision (`:.4g`): `1 - 0.999` is `0.0010000000000000009`. If the service reports through OpenTelemetry, the Collector''s Prometheus exporter produces the same counters.'
+      seenIn: '`yaml.safe_dump`. `prometheus_client` for the counters. `opentelemetry-exporter-prometheus`. OpenSLO specs, which several generators read.'
+
+  typescript:
+    before:
+      file: slo-rules.ts
+      source: |
+        // slo-rules.ts: one SLO in, Prometheus alerting rules out
+        export const alertRules = (service: string, slo: number) => [{
+          alert: `${capitalize(service)}HighErrorRate`,
+          // page whenever the last 10 minutes miss the SLO
+          expr: `${service}:error_ratio:rate10m >= ${Number((1 - slo).toPrecision(4))}`,
+          labels: { severity: "page" },
+        }];
+      roles: { context: [2, 7], record: [5, 5], page: [6, 6], metrics: [5, 5] }
+      change:
+        - { after: 5, add: ['  for: "1h", // only page if it lasts an hour'] }
+    after:
+      file: slo-rules.ts
+      source: |
+        // slo-rules.ts: one SLO in, Prometheus rules out
+        const WINDOWS = [ // share of the 30-day budget spent when the long window fires
+          { long: "1h", short: "5m", spend: 0.02, severity: "page" },
+          { long: "6h", short: "30m", spend: 0.05, severity: "page" },
+          { long: "3d", short: "6h", spend: 0.1, severity: "ticket" },
+        ] as const;
+        const HOURS: Record<string, number> = { "5m": 5 / 60, "30m": 0.5, "1h": 1, "6h": 6, "3d": 72 };
+        const PERIOD_HOURS = 30 * 24;
+
+        // 0.02 × 720 h / 1 h = 14.4
+        export const burnRate = (long: string, spend: number) => (spend * PERIOD_HOURS) / HOURS[long];
+
+        export const recordingRules = (service: string) => Object.keys(HOURS).map((w) => ({
+          record: `${service}:error_ratio:rate${w}`,
+          expr: `sum(rate(${service}_requests_total{code="5xx"}[${w}])) / sum(rate(${service}_requests_total[${w}]))`,
+        }));
+
+        export const alertRules = (service: string, slo: number) => WINDOWS.map((w) => {
+          const threshold = Number((burnRate(w.long, w.spend) * (1 - slo)).toPrecision(4)); // 14.4 × 0.1% = 1.44%
+          return {
+            alert: `${capitalize(service)}ErrorBudgetBurn`,
+            expr: `${service}:error_ratio:rate${w.long} > ${threshold} and ${service}:error_ratio:rate${w.short} > ${threshold}`,
+            labels: { severity: w.severity },
+          };
+        });
+      roles: { metrics: [15, 15], context: [13, 25], record: [13, 16], strategy: [10, 11], long: [2, 5], short: [2, 5], page: [3, 4], ticket: [5, 5], windows: [2, 8], burn: [10, 11], fire: [18, 25] }
+    again:
+      file: slo-rules.test.ts
+      source: |
+        // slo-rules.test.ts: the parameters come from the table, for every service
+        test("burn rates for a 30-day window", () => {
+          assert.deepEqual([["1h", 0.02], ["6h", 0.05], ["3d", 0.1]].map(([w, s]) => Number(burnRate(w as string, s as number).toFixed(6))), [14.4, 6, 1]);
+        });
+
+        test("three nines pages at 1.44%", () => {
+          const [page] = alertRules("checkout", 0.999);
+          assert.match(page.expr, /rate1h > 0\.0144 and checkout:error_ratio:rate5m > 0\.0144/);
+        });
+    cost:
+      before: { text: 15-min outage · 35% of budget · no page, value: 0.9 }
+      after: { text: paged in 1 min · quiet 30 min later, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Useful
+      note: 'The rules run in Prometheus; TypeScript only writes them, often inside infrastructure code (a CDK or Pulumi program that emits the `PrometheusRule` resource) with `js-yaml` for the file. `toPrecision` fixes the float noise in `1 - 0.999`. `prom-client` exposes the counters the rules read.'
+      seenIn: '`js-yaml`. `prom-client`. Pulumi and CDK for Kubernetes, which can emit `PrometheusRule` objects from TypeScript.'
+
+  rust:
+    before:
+      file: slo_rules.rs
+      source: |
+        // slo_rules.rs: one SLO in, Prometheus alerting rules out
+        pub fn alert_rules(service: &str, slo: f64) -> Vec<Rule> {
+            vec![Rule::alert(
+                format!("{}HighErrorRate", title(service)),
+                // page whenever the last 10 minutes miss the SLO
+                format!("{service}:error_ratio:rate10m >= {:.4}", 1.0 - slo),
+                "page",
+            )]
+        }
+      roles: { context: [2, 9], record: [6, 6], page: [7, 7], metrics: [6, 6] }
+      change:
+        - { line: 8, replace: '    ).with_for("1h")] // only page if it lasts an hour' }
+    after:
+      file: slo_rules.rs
+      source: |
+        // slo_rules.rs: one SLO in, Prometheus rules out
+        pub struct Window { long: &'static str, short: &'static str, spend: f64, severity: &'static str }
+
+        pub const WINDOWS: [Window; 3] = [ // share of the 30-day budget spent when the long window fires
+            Window { long: "1h", short: "5m", spend: 0.02, severity: "page" },
+            Window { long: "6h", short: "30m", spend: 0.05, severity: "page" },
+            Window { long: "3d", short: "6h", spend: 0.10, severity: "ticket" },
+        ];
+        const HOURS: [(&str, f64); 5] = [("5m", 5.0 / 60.0), ("30m", 0.5), ("1h", 1.0), ("6h", 6.0), ("3d", 72.0)];
+        const PERIOD_HOURS: f64 = 30.0 * 24.0;
+
+        // 0.02 × 720 h / 1 h = 14.4
+        pub fn burn_rate(w: &Window) -> f64 {
+            w.spend * PERIOD_HOURS / HOURS.iter().find(|(k, _)| *k == w.long).unwrap().1
+        }
+
+        pub fn recording_rules(service: &str) -> Vec<Rule> {
+            HOURS.iter().map(|(w, _)| Rule::record(
+                format!("{service}:error_ratio:rate{w}"),
+                format!(r#"sum(rate({service}_requests_total{{code="5xx"}}[{w}])) / sum(rate({service}_requests_total[{w}]))"#),
+            )).collect()
+        }
+
+        pub fn alert_rules(service: &str, slo: f64) -> Vec<Rule> {
+            WINDOWS.iter().map(|w| {
+                let threshold = format!("{:.4}", burn_rate(w) * (1.0 - slo)); // 14.4 × 0.1% = 1.44%
+                Rule::alert(
+                    format!("{}ErrorBudgetBurn", title(service)),
+                    format!("{service}:error_ratio:rate{} > {threshold} and {service}:error_ratio:rate{} > {threshold}", w.long, w.short),
+                    w.severity,
+                )
+            }).collect()
+        }
+      roles: { metrics: [20, 20], context: [17, 33], record: [17, 22], strategy: [12, 15], long: [2, 8], short: [2, 8], page: [5, 6], ticket: [7, 7], windows: [4, 8], burn: [12, 15], fire: [24, 33] }
+    again:
+      file: tests/slo_rules.rs
+      source: |
+        // tests/slo_rules.rs: the parameters come from the table, for every service
+        #[test]
+        fn burn_rates_for_a_30_day_window() {
+            let burns: Vec<f64> = WINDOWS.iter().map(burn_rate).collect();
+            for (got, want) in burns.iter().zip([14.4, 6.0, 1.0]) {
+                assert!((got - want).abs() < 1e-9, "burn rate {got}, want {want}");
+            }
+        }
+
+        #[test]
+        fn three_nines_pages_at_1_44_percent() {
+            let page = &alert_rules("checkout", 0.999)[0];
+            assert!(page.expr.contains("rate1h > 0.0144 and checkout:error_ratio:rate5m > 0.0144"));
+        }
+    cost:
+      before: { text: 15-min outage · 35% of budget · no page, value: 0.9 }
+      after: { text: paged in 1 min · quiet 30 min later, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Useful
+      note: 'The rules run in Prometheus; Rust only writes them, typically with `serde` and `serde_yaml`. `{:.4}` prints a fixed four decimals, which hides the float noise in `1.0 - 0.999`. The counters come from the `prometheus` or `metrics` crates, or from OpenTelemetry through the Collector.'
+      seenIn: '`serde_yaml`. `prometheus` and `metrics-exporter-prometheus` for the counters. `kube` with a `PrometheusRule` custom resource type.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Recording rules turn the request counters into error ratios over 5 minutes, 30 minutes, 1 hour, 6 hours and 3 days. Every alert reads these.
+    nodes: [metrics, context, record]
+    edges: [metrics>context, context>record]
+    role: record
+  - text: Burn rate is the error ratio divided by the budget's rate, 0.1%. At 1× the budget lasts exactly 30 days; at 14.4× it lasts about two days, and one hour spends 2% of it.
+    nodes: [record, strategy]
+    edges: [record>strategy]
+    role: burn
+  - text: Each condition pairs a long window, which says the burn is big enough to matter, with a short one, 1/12 as long, which says it is still happening.
+    nodes: [strategy, long, short]
+    edges: [strategy>long, strategy>short]
+    role: windows
+  - text: A total outage crosses 14.4× on both 1 h and 5 min within a minute. When errors stop, the 5-minute window clears in 5 minutes and the 30-minute one in half an hour, so the page resets. A 0.3% leak never pages; the 3-day rule files a ticket.
+    nodes: [short, page, long, ticket]
+    edges: [short>page, long>ticket]
+    role: fire
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: With an SLO of 99.9% over 30 days, what does a burn rate of 1 mean?
+    options:
+      - text: Errors at exactly 0.1%, which would use the whole budget by the end of the 30 days.
+        correct: true
+        why: Right. Burn rate is the error rate divided by the rate the SLO allows. At 2× the budget lasts 15 days; at 1,000× (every request failing) about 43 minutes.
+      - text: One error per minute.
+        why: Burn rate is relative to the allowed error rate, not a count. One error a minute is a burn of 1 only if you serve 1,000 requests a minute.
+      - text: The service is down for one hour.
+        why: A total outage is a burn rate of 1,000 at 99.9%; it would spend the month's budget in about 43 minutes.
+  engineer:
+    question: An alert fires when the 1-hour burn rate exceeds 14.4. Why add the condition that the 5-minute burn rate exceeds 14.4 too?
+    options:
+      - text: So the alert stops about 5 minutes after the errors stop, instead of firing for most of an hour.
+        correct: true
+        why: Right. The 1-hour average remembers the incident for an hour. The short window confirms the burn is still happening, so the page resets quickly and nobody chases a fixed problem.
+      - text: So the alert fires sooner.
+        why: The long window still has to cross 14.4×, so detection time is the same. The short window improves the reset.
+      - text: To catch slow leaks the 1-hour window misses.
+        why: A slow leak has a low burn rate on every window. Catching it takes a lower threshold on a long window, like 1× over 3 days.
+  deep:
+    question: You want to page when 2% of a 30-day budget is spent in one hour, for an SLO of 99.9%. Above what 1-hour error rate should the alert fire?
+    options:
+      - text: "1.44%"
+        correct: true
+        why: Right. Spending 2% of 720 hours' budget in 1 hour is a burn rate of 0.02 × 720 / 1 = 14.4, and 14.4 × 0.1% = 1.44%.
+      - text: "0.144%"
+        why: That is a burn rate of 1.44, which spends 0.2% of the budget an hour.
+      - text: "14.4%"
+        why: That is a burn rate of 144, which would spend 20% of the budget in an hour.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Recording rules
+      example: checkout:error_ratio:rate1h
+      job: Precompute error ratios over each window, so alert rules are cheap and consistent.
+    - role: Burn rate
+      example: error ratio ÷ (1 − SLO)
+      job: How fast the budget is being spent, relative to spending it exactly over the SLO window.
+    - role: Long window
+      example: 1 h at 14.4×, 6 h at 6×, 3 d at 1×
+      job: Makes sure enough budget has burned to be worth someone's attention.
+    - role: Short window
+      example: 5 min, 30 min, 6 h (1/12 of the long one)
+      job: Confirms the burn is still happening, so alerts reset soon after recovery.
+    - role: Severity
+      example: page for fast burns, ticket for slow ones
+      job: Wakes someone only when the budget will be gone in hours or days.
+  useWhen:
+    - Any service with an SLO and enough traffic that one failure is a small share of the budget.
+    - Replacing alerts on causes (CPU, queue length) with alerts on what users feel.
+    - Many services: pick the parameters once, generate rules for all of them.
+  avoidWhen:
+    - Low-traffic services, where one failed request is a burn rate of 100. Add synthetic traffic, group services, or lengthen the windows.
+    - Extreme targets. At 99.999% a total outage spends the month's budget in 26 seconds; design for small blast radius instead of fast alerts.
+    - Very low targets. At 90% even a total outage burns at 10× and spends only 1.4% in an hour, so the 2% rule never fires.
+  tradeoffs:
+    - More windows and thresholds mean more to reason about. Generate them; never hand-tune per service.
+    - Long windows cost more to evaluate, which is why ratios are recorded first.
+    - When several conditions fire for one incident, suppress the ticket while the page is firing, or on-call gets three notifications.
+    - Detection time scales with severity. A total outage pages in under a minute; a 2% error rate takes about 43 minutes.
+  lookalikes:
+    - name: Threshold alert at the SLO
+      how: Fires whenever a short window misses the target. High recall, very low precision; it can page 144 times a day while the SLO is met.
+    - name: "Duration clause (for: 1h)"
+      how: Requires the condition to hold for a time. Detection no longer scales with severity, and a flapping error rate resets the timer and never fires.
+    - name: Anomaly detection
+      how: Alerts on change from normal, not on budget spent. Useful for causes, noisy for paging.
+---
+
+## [concept] Alerting on SLOs: burn rate and multiple windows
+
+**Page on how fast the error budget is burning. A <Term id="burn-rate">burn rate</Term> of 1 spends the budget exactly over the SLO window; page when a long window shows a high burn and a short window shows it is still going on.**
+
+A good alert has high <Term id="alert-precision">precision</Term> (every page matters) and high <Term id="alert-recall">recall</Term> (every incident that matters pages), detects fast and resets fast. Thresholds on the error rate cannot do all four. Burn rates over two windows can.
+
+<Depth level={2}>
+The Site Reliability Workbook's starting point for a 99.9% SLO over 30 days: page when 1 hour and 5 minutes both burn above 14.4× (2% of the budget in an hour), page when 6 hours and 30 minutes both burn above 6× (5% in six hours), and open a ticket when 3 days and 6 hours both burn above 1× (10% in three days). That is a <Term id="multiwindow-alert">multiwindow, multi-burn-rate alert</Term>.
+</Depth>
+
+<Depth level={3}>
+Every threshold comes from one formula: burn rate = budget share × SLO period ÷ alert window. 0.02 × 720 h ÷ 1 h = 14.4. The time to fire is roughly (1 − SLO) ÷ error ratio × window × burn rate, so a total outage crosses 14.4× on a 1-hour window in under a minute, and a 2% error rate takes about 43 minutes.
+</Depth>
+
+## [problem] An alert that fires whenever the SLO is missed
+
+A rule generator in the platform repo reads each service's SLO and writes one Prometheus alert: page when the error ratio over the last 10 minutes reaches the SLO's allowed rate. For checkout's 99.9%, that is 0.1%. It catches every outage within seconds.
+
+<Depth level={2}>
+It also pages for anything that touches 0.1% for ten minutes: a deploy's brief error burst, a dependency's hiccup, a bad client. A 10-minute window at exactly the SLO rate spends 0.02% of the month's budget. The rule could page 144 times a day while the SLO is met.
+</Depth>
+
+<Depth level={3}>
+The rule reads a <Term id="recording-rule">recording rule</Term> over 10 minutes. That part is fine; recorded ratios are how every version of this alert should work. The problem is the threshold and the single window.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** on-call got 23 pages last month and 20 were noise. Make the SLO alert page only when the SLO is actually at risk.
+
+The marked line is the usual fix: `for: 1h`, page only if the condition holds for an hour. The noise stops. The next month a bad config push fails every checkout for 15 minutes, spending 35% of the budget, and nobody is paged: the condition held for 15 minutes, not 60. A leak that flaps between 0.08% and 0.15% resets the timer every few minutes and never pages either.
+
+<Depth level={2}>
+A duration does not scale with severity. A total outage and a 0.2% error rate both wait the same hour, and a total outage for that hour spends 140% of a 30-day budget.
+</Depth>
+
+<Depth level={3}>
+What the on-call wanted was precision, and what `for:` traded away was recall and detection time. The way to get precision without losing either is to tie the threshold to budget spent: a big burn should fire fast, a small one slowly, a tiny one never.
+</Depth>
+
+## [morph] Alert on burn rate, over two windows
+
+Drag the slider. The single threshold becomes a table of windows and budget shares. The generator turns each row into a burn rate, a threshold and an alert whose long and short windows must both be burning.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Generate the rules from one table and apply it to every service. The workbook warns against tuning windows per service: with a hundred services it becomes toil nobody can reason about. Change the table, regenerate, and every service changes together.
+</Depth>
+
+<Depth level={3}>
+Alerting at a lower burn for longer windows means one incident can satisfy several rules. A 10% spend in five minutes is also 5% in six hours and 2% in one hour. Route them to one notification with inhibition (Alertmanager's `inhibit_rules`), or on-call gets three.
+</Depth>
+
+## [walk] Follow one outage through the rules
+
+A total outage, from the counters to the page and back. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`model.Duration` from `prometheus/common` formats durations the way PromQL writes them, so `72*time.Hour` becomes `3d` in the generated rule, not `72h0m0s`.</Lang>
+<Lang only="python">The doubled braces in the f-string produce PromQL's literal `{code="5xx"}`. Single braces would be read as a Python expression.</Lang>
+<Lang only="typescript">`as const` keeps the severity a literal type, so a typo like `"pgae"` in the table fails to compile against an Alertmanager route type.</Lang>
+<Lang only="rust">The raw string `r#"…"#` keeps PromQL's quotes readable, and the doubled braces escape `format!`'s own placeholders.</Lang>
+</Depth>
+
+## [again] The same outage again
+
+The same 15-minute total outage with the generated rules: the page fires about a minute in, after roughly 2% of the budget, and stops about half an hour after recovery, when the 6-hour rule's 30-minute window clears. The blips that made up the 20 noisy pages never get near 14.4×. The 3-day leak opens a ticket about a day in, before it has spent 10%. The test pins the thresholds to the table.
+
+<Depth level={2}>
+Count pages per incident and false pages per month as health metrics for the alerting itself. If a rule pages and nobody needs to act, change the table, not the people.
+</Depth>
+
+<Depth level={3}>
+For services with a few requests an hour, a single failure is a 10% hourly error rate, a burn of 100, and 13.9% of the budget. The workbook's options: synthetic traffic, grouping related low-traffic services into one SLO, changing the product so one failure matters less, or a lower target.
+</Depth>
+
+## [play] One month, three rules
+
+A month of errors for a service with a 99.9% SLO. Place incidents on the days, then run three alert rules over the same data and count pages, false pages, misses and time to detect.
+
+## [lens] How each language does it
+
+The alert rules run in Prometheus, whatever the service is written in. Languages meet this lesson twice: in the counters each Prometheus client or OpenTelemetry SDK exports, and in the code that generates the rules.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Keep the generator in one place, with tests that pin the thresholds. The rules are code: review them, version them, and roll them out like any other change.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="slo-alerting-burn-rate" />
+
+### The workbook's table for 99.9% over 30 days
+
+| Severity | Long window | Short window | Burn rate | Budget spent when it fires |
+|---|---|---|---|---|
+| Page | 1 hour | 5 minutes | 14.4 | 2% |
+| Page | 6 hours | 30 minutes | 6 | 5% |
+| Ticket | 3 days | 6 hours | 1 | 10% |
+
+For another target, keep the burn rates and multiply by its allowed error rate: at 99.5% the first page fires above 14.4 × 0.5% = 7.2% errors.

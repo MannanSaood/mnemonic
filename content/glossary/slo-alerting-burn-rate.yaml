@@ -1,0 +1,15 @@
+- id: burn-rate
+  term: Burn rate
+  short: How fast a service spends its error budget, relative to the SLO. The error rate divided by the allowed error rate; at 1 the budget lasts exactly the SLO window, at 14.4 a 30-day budget lasts about two days.
+- id: multiwindow-alert
+  term: Multiwindow, multi-burn-rate alert
+  short: An SLO alert that fires when both a long window (for significance) and a short window (to confirm it is still happening) exceed a burn rate, with several such pairs for fast and slow burns.
+- id: alert-precision
+  term: Alert precision
+  short: The share of alerts that were about events worth acting on. Low precision means pages nobody needs.
+- id: alert-recall
+  term: Alert recall
+  short: The share of events worth acting on that produced an alert. Low recall means incidents nobody hears about.
+- id: recording-rule
+  term: Recording rule
+  short: A Prometheus rule that evaluates a query on a schedule and stores the result as a new time series, so alerts and dashboards read a cheap precomputed value.
