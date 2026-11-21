@@ -168,7 +168,7 @@ Like roadmap.sh (https://roadmap.sh), but tailored to a goal and with depth.
   and a design-question method. Its source data (Python tuples, with diagram specs and code)
   is in `reference/design-patterns-guide-source/` and can be converted into MDX for the
   design track. That content was fact-checked; keep the fixes.
-- `reference/round-guides-source/`: study material on Go internals, testing, debugging,
+- `reference/` (local only): study notes on Go internals, testing, debugging,
   shipping and compatibility, Linux (syscalls, virtual memory, the read() path, eBPF),
   networking, Kubernetes and automation. It is raw material for future tracks.
 - `reference/books/Design_Patterns_Book.pdf`: *Design Patterns: Elements of Reusable
