@@ -1,0 +1,10 @@
+# Terms introduced by code-craft/refactoring-safely
+- id: refactoring
+  term: Refactoring
+  short: A change to the structure of code that does not change what it does, made in small named steps such as Extract Function or Rename Variable.
+- id: code-smell
+  term: Code smell
+  short: A surface sign that the structure may be hurting, such as duplication, a long function or a long parameter list. It is a reason to look, not proof of a problem.
+- id: parallel-change
+  term: Parallel change
+  short: Changing an interface in three releases (expand, migrate, contract). Add the new form beside the old one, move the callers over, then remove the old form. Also called expand and contract.

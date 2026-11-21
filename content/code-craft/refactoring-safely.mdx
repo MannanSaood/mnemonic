@@ -1,0 +1,598 @@
+---
+title: Refactoring safely
+track: code-craft
+group: Changing code
+order: 14
+summary: Change the structure, keep the behaviour, in steps small enough that a red test points at one of them.
+intent: Make the change easy first, in small verified steps, then make the easy change on its own.
+changeRequest: Add a silver tier that gets 2% off.
+languages: [go, python, typescript, rust]
+glossary: [refactoring, code-smell, parallel-change, abstract-syntax-tree]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [testing/tdd-red-green-refactor]
+skills: [refactoring, design]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: refactoring-safely
+  scenarios:
+    - try: "Predict which step slips, then apply the plan one step at a time with a test run after each."
+      notice: "The tests go red right after step 4, and step 4 is the only suspect. Revert one step, apply it again, and carry on."
+    - try: "Reset. Run the tests after steps 1, 2 and 3, then apply 4, 5 and 6 and run them once."
+      notice: "Red, with three suspects and a bigger diff. Reverting to the last green run throws three steps away."
+    - try: "Reset and click Big rewrite."
+      notice: "One test run, red, and every one of the six steps is a suspect. The diff to read is over 30 lines."
+    - try: "After a big rewrite and revert, apply step by step again without fixing anything."
+      notice: "The same slip happens again. Only a red run with one suspect tells you which step to redo carefully."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: tests
+      kind: client
+      before: { x: 12, y: 110, w: 100, h: 50, title: Tests, sub: 6 cases }
+      after:  { x: 12, y: 110, w: 100, h: 50, title: Tests, sub: green each step }
+    - id: fn
+      kind: context
+      before: { x: 135, y: 18, w: 410, h: 240, title: { go: Calc, python: calc, typescript: calc, rust: calc }, sub: one function does it all }
+      after:  { x: 135, y: 110, w: 140, h: 50, title: { go: OrderTotal, python: order_total, typescript: orderTotal, rust: order_total }, sub: three steps }
+    - id: line
+      kind: concrete
+      before: { x: 155, y: 60, w: 170, h: 40, title: loop body, sub: magic 10 and 0.9 }
+      after:  { x: 310, y: 18, w: 160, h: 42, title: { go: lineTotal, python: line_total, typescript: lineTotal, rust: line_total }, sub: bulk rate }
+    - id: ship
+      kind: concrete
+      before: { x: 155, y: 120, w: 170, h: 40, title: shipping rule, sub: t < 50 }
+      after:  { x: 310, y: 76, w: 160, h: 42, title: shipping, sub: under 50 pays }
+    - id: rate
+      kind: strategy
+      before: { x: 155, y: 180, w: 170, h: 40, title: gold rule, sub: tier check inline }
+      after:  { x: 310, y: 140, w: 160, h: 46, title: { go: DiscountRate, python: discount_rate, typescript: discountRate, rust: discount_rate }, sub: on Customer }
+    - id: silver
+      kind: concrete
+      appears: change
+      before: { x: 360, y: 180, w: 160, h: 40, title: silver tier }
+      after:  { x: 310, y: 210, w: 160, h: 40, title: silver tier }
+  edges:
+    - { from: tests, to: fn, label: check }
+    - { from: fn, to: line }
+    - { from: fn, to: ship }
+    - { from: fn, to: rate, label: asks }
+    - { from: silver, to: rate, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: orders.go
+      source: |
+        func Calc(o Order) float64 {
+            t := 0.0
+            for _, l := range o.Lines {
+                p := float64(l.Qty) * l.Price
+                if l.Qty >= 10 {
+                    p = p * 0.9
+                }
+                t += p
+            }
+            if o.Customer.Tier == "gold" {
+                t = t * 0.95
+            }
+            if t < 50 {
+                t += 4.99
+            }
+            return math.Round(t*100) / 100
+        }
+      roles: { fn: [1, 17], line: [3, 9], rate: [10, 12], ship: [13, 15] }
+      change:
+        - { line: 1, replace: 'func OrderTotal(o Order) float64 { // renamed while here' }
+        - { line: 10, replace: '    if rate, ok := tierRates[o.Customer.Tier]; ok { // new: silver; gold moved here' }
+        - { line: 11, replace: '        t = t * rate' }
+        - { line: 13, replace: '    if t <= freeShippingFrom { // tidied while here' }
+        - { line: 14, replace: '        t += shippingFee' }
+        - { after: 17, add: ['', '// One commit: a feature, a rename, a new map, two constants.', '// CI: "an order of exactly 50.00 ships free" fails. Which edit did it?'] }
+    after:
+      file: orders.go · customer.go
+      source: |
+        const (
+            bulkQty          = 10
+            bulkRate         = 0.9
+            freeShippingFrom = 50.0
+            shippingFee      = 4.99
+        )
+
+        func OrderTotal(o Order) float64 {
+            total := 0.0
+            for _, l := range o.Lines {
+                total += lineTotal(l)
+            }
+            total *= o.Customer.DiscountRate()
+            total += shipping(total)
+            return math.Round(total*100) / 100
+        }
+
+        func lineTotal(l Line) float64 {
+            gross := float64(l.Qty) * l.Price
+            if l.Qty >= bulkQty {
+                return gross * bulkRate
+            }
+            return gross
+        }
+
+        func shipping(subtotal float64) float64 {
+            if subtotal < freeShippingFrom {
+                return shippingFee
+            }
+            return 0
+        }
+
+        // customer.go
+        func (c Customer) DiscountRate() float64 {
+            if c.Tier == "gold" {
+                return 0.95
+            }
+            return 1
+        }
+      roles: { names: [1, 16], fn: [8, 16], line: [18, 24], ship: [26, 31], rate: [33, 39] }
+    again:
+      file: customer.go
+      source: |
+        // customer.go: the whole feature, in the one place that knows about tiers
+        func (c Customer) DiscountRate() float64 {
+            switch c.Tier {
+            case "gold":
+                return 0.95
+            case "silver":
+                return 0.98
+            }
+            return 1
+        }
+    cost:
+      before: { text: 1 commit · 5 edits · 1 red test, no suspect, value: 0.8 }
+      after: { text: 1 function · 2 lines, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The compiler is the first safety net: a missed call site after a rename or a changed signature does not build. `gopls` offers rename, extract function, extract variable and inline call as code actions, and works on the type-checked program, not on text. `gofmt -r ''pattern -> replacement''` rewrites expressions across a tree. None of this checks behaviour, so float arithmetic and boundaries still need tests.'
+      seenIn: '`gopls rename` refuses a rename that would make the program fail to type-check, such as a name collision. `go vet` runs after each step in many editors, catching printf and copy-lock mistakes that a move can introduce.'
+
+  python:
+    before:
+      file: orders.py
+      source: |
+        def calc(o):
+            t = 0
+            for l in o.lines:
+                p = l.qty * l.price
+                if l.qty >= 10:
+                    p = p * 0.9
+                t = t + p
+            if o.customer.tier == "gold":
+                t = t * 0.95
+            if t < 50:
+                t = t + 4.99
+            return round(t, 2)
+      roles: { fn: [1, 12], line: [3, 7], rate: [8, 9], ship: [10, 11] }
+      change:
+        - { line: 1, replace: 'def order_total(o):  # renamed while here' }
+        - { line: 8, replace: '    if (rate := TIER_RATES.get(o.customer.tier)) is not None:  # new: silver; gold moved here' }
+        - { line: 9, replace: '        t = t * rate' }
+        - { line: 10, replace: '    if t <= FREE_SHIPPING_FROM:  # tidied while here' }
+        - { line: 11, replace: '        t = t + SHIPPING_FEE' }
+        - { after: 12, add: ['', '# One commit: a feature, a rename, a new dict, two constants.', '# CI: "an order of exactly 50.00 ships free" fails. Which edit did it?'] }
+    after:
+      file: orders.py · customer.py
+      source: |
+        BULK_QTY = 10
+        BULK_RATE = 0.9
+        FREE_SHIPPING_FROM = 50
+        SHIPPING_FEE = 4.99
+
+        def order_total(order: Order) -> float:
+            total = 0.0
+            for line in order.lines:
+                total += line_total(line)
+            total *= order.customer.discount_rate()
+            total += shipping(total)
+            return round(total, 2)
+
+        def line_total(line: Line) -> float:
+            gross = line.qty * line.price
+            return gross * BULK_RATE if line.qty >= BULK_QTY else gross
+
+        def shipping(subtotal: float) -> float:
+            return SHIPPING_FEE if subtotal < FREE_SHIPPING_FROM else 0
+
+        # customer.py
+        class Customer:
+            def discount_rate(self) -> float:
+                return 0.95 if self.tier == "gold" else 1
+      roles: { names: [1, 12], fn: [6, 12], line: [14, 16], ship: [18, 19], rate: [21, 24] }
+    again:
+      file: customer.py
+      source: |
+        # customer.py: the whole feature, in the one place that knows about tiers
+        class Customer:
+            RATES = {"gold": 0.95, "silver": 0.98}
+
+            def discount_rate(self) -> float:
+                return self.RATES.get(self.tier, 1)
+    cost:
+      before: { text: 1 commit · 5 edits · 1 red test, no suspect, value: 0.8 }
+      after: { text: 1 class · 2 lines, value: 0.12 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Nothing checks a rename before the code runs, and names can hide in `getattr`, strings, templates and mocks. Tools such as Rope, PyCharm and Pylance rename what static analysis can see; type hints checked by mypy or pyright widen that. The test suite is the real safety net, which is why it must run after every step. Watch "obvious" equivalences: on Python 3.12, `sum()` over floats uses compensated summation, so replacing this loop with `sum(...)` can change the last digit of a total.'
+      seenIn: 'Rope is the refactoring library behind several editors'' Python rename and extract. Ruff''s `--fix` applies safe automatic rewrites and marks the ones that could change behaviour as unsafe fixes.'
+
+  typescript:
+    before:
+      file: orders.ts
+      source: |
+        function calc(o: Order): number {
+          let t = 0;
+          for (const l of o.lines) {
+            let p = l.qty * l.price;
+            if (l.qty >= 10) p = p * 0.9;
+            t = t + p;
+          }
+          if (o.customer.tier === "gold") t = t * 0.95;
+          if (t < 50) t = t + 4.99;
+          return Math.round(t * 100) / 100;
+        }
+      roles: { fn: [1, 11], line: [3, 7], rate: [8, 8], ship: [9, 9] }
+      change:
+        - { line: 1, replace: 'function orderTotal(o: Order): number { // renamed while here' }
+        - { line: 8, replace: '  t = t * (TIER_RATES.get(o.customer.tier) ?? 1); // new: silver; gold moved here' }
+        - { line: 9, replace: '  if (t <= FREE_SHIPPING_FROM) t = t + SHIPPING_FEE; // tidied while here' }
+        - { after: 11, add: ['', '// One commit: a feature, a rename, a new map, two constants.', '// CI: "an order of exactly 50.00 ships free" fails. Which edit did it?'] }
+    after:
+      file: orders.ts · customer.ts
+      source: |
+        const BULK_QTY = 10;
+        const BULK_RATE = 0.9;
+        const FREE_SHIPPING_FROM = 50;
+        const SHIPPING_FEE = 4.99;
+
+        export function orderTotal(order: Order): number {
+          let total = 0;
+          for (const line of order.lines) total += lineTotal(line);
+          total *= order.customer.discountRate();
+          total += shipping(total);
+          return Math.round(total * 100) / 100;
+        }
+
+        function lineTotal(line: Line): number {
+          const gross = line.qty * line.price;
+          return line.qty >= BULK_QTY ? gross * BULK_RATE : gross;
+        }
+
+        function shipping(subtotal: number): number {
+          return subtotal < FREE_SHIPPING_FROM ? SHIPPING_FEE : 0;
+        }
+
+        // customer.ts
+        export class Customer {
+          constructor(readonly tier: string) {}
+          discountRate(): number {
+            return this.tier === "gold" ? 0.95 : 1;
+          }
+        }
+      roles: { names: [1, 12], fn: [6, 12], line: [14, 17], ship: [19, 21], rate: [23, 29] }
+    again:
+      file: customer.ts
+      source: |
+        // customer.ts: the whole feature, in the one place that knows about tiers
+        const TIER_RATES = new Map([["gold", 0.95], ["silver", 0.98]]);
+
+        export class Customer {
+          constructor(readonly tier: string) {}
+          discountRate(): number {
+            return TIER_RATES.get(this.tier) ?? 1;
+          }
+        }
+    cost:
+      before: { text: 1 commit · 4 edits · 1 red test, no suspect, value: 0.8 }
+      after: { text: 1 class · 2 lines, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The TypeScript language server offers rename, extract function, extract constant, inline variable and move to file, and works on the type-checked program, so a rename updates every typed reference. Types make the compiler a second safety net after the tests, until an `any` or a string key hides a reference from it. Codemods (ts-morph, jscodeshift) script the same moves across a large codebase.'
+      seenIn: 'TypeScript 5.2 added the "Move to file" refactoring next to "Move to a new file". `tsc --noEmit` after each step catches call sites a rename missed outside the editor''s open project.'
+
+  rust:
+    before:
+      file: orders.rs
+      source: |
+        fn calc(o: &Order) -> f64 {
+            let mut t = 0.0;
+            for l in &o.lines {
+                let mut p = l.qty as f64 * l.price;
+                if l.qty >= 10 {
+                    p *= 0.9;
+                }
+                t += p;
+            }
+            if o.customer.tier == "gold" {
+                t *= 0.95;
+            }
+            if t < 50.0 {
+                t += 4.99;
+            }
+            (t * 100.0).round() / 100.0
+        }
+      roles: { fn: [1, 17], line: [3, 9], rate: [10, 12], ship: [13, 15] }
+      change:
+        - { line: 1, replace: 'fn order_total(o: &Order) -> f64 { // renamed while here' }
+        - { line: 10, replace: '    if let Some(rate) = TIER_RATES.get(o.customer.tier.as_str()) { // new: silver; gold moved here' }
+        - { line: 11, replace: '        t *= rate;' }
+        - { line: 13, replace: '    if t <= FREE_SHIPPING_FROM { // tidied while here' }
+        - { line: 14, replace: '        t += SHIPPING_FEE;' }
+        - { after: 17, add: ['', '// One commit: a feature, a rename, a new map, two constants.', '// CI: "an order of exactly 50.00 ships free" fails. Which edit did it?'] }
+    after:
+      file: orders.rs · customer.rs
+      source: |
+        const BULK_QTY: u32 = 10;
+        const BULK_RATE: f64 = 0.9;
+        const FREE_SHIPPING_FROM: f64 = 50.0;
+        const SHIPPING_FEE: f64 = 4.99;
+
+        pub fn order_total(order: &Order) -> f64 {
+            let mut total = 0.0;
+            for line in &order.lines {
+                total += line_total(line);
+            }
+            total *= order.customer.discount_rate();
+            total += shipping(total);
+            (total * 100.0).round() / 100.0
+        }
+
+        fn line_total(line: &Line) -> f64 {
+            let gross = line.qty as f64 * line.price;
+            if line.qty >= BULK_QTY { gross * BULK_RATE } else { gross }
+        }
+
+        fn shipping(subtotal: f64) -> f64 {
+            if subtotal < FREE_SHIPPING_FROM { SHIPPING_FEE } else { 0.0 }
+        }
+
+        // customer.rs
+        impl Customer {
+            pub fn discount_rate(&self) -> f64 {
+                if self.tier == "gold" { 0.95 } else { 1.0 }
+            }
+        }
+      roles: { names: [1, 14], fn: [6, 14], line: [16, 19], ship: [21, 23], rate: [25, 30] }
+    again:
+      file: customer.rs
+      source: |
+        // customer.rs: the whole feature, in the one place that knows about tiers
+        impl Customer {
+            pub fn discount_rate(&self) -> f64 {
+                match self.tier.as_str() {
+                    "gold" => 0.95,
+                    "silver" => 0.98,
+                    _ => 1.0,
+                }
+            }
+        }
+    cost:
+      before: { text: 1 commit · 5 edits · 1 red test, no suspect, value: 0.8 }
+      after: { text: 1 function · 1 line, value: 0.1 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'The compiler and borrow checker catch most structural mistakes in a move or an extract, and rust-analyzer offers extract function, extract variable, inline and rename as assists. That safety stops at types and lifetimes. The slip in this lesson, `<` becoming `<=`, compiles fine; only a test at the boundary sees it.'
+      seenIn: 'rust-analyzer''s "Extract into function" works out which variables to pass by value or by reference. `cargo clippy --fix` applies lint suggestions that Clippy marks as machine-applicable, one class of small safe rewrite.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Rename the function and its variables, and name the numbers. Run the tests. Nothing has moved, but every later step is easier to read and to check.
+    nodes: [tests, fn]
+    edges: [tests>fn]
+    role: names
+  - text: { go: 'Extract `lineTotal` from the loop body. The loop now reads as "add up the line totals". Run the tests: green, commit.', python: 'Extract `line_total` from the loop body. The loop now reads as "add up the line totals". Run the tests: green, commit.', typescript: 'Extract `lineTotal` from the loop body. The loop now reads as "add up the line totals". Run the tests: green, commit.', rust: 'Extract `line_total` from the loop body. The loop now reads as "add up the line totals". Run the tests: green, commit.' }
+    nodes: [fn, line]
+    edges: [fn>line]
+    role: line
+  - text: Extract the shipping rule. Copy the comparison exactly, `<` and not `<=`. Run the tests; the boundary test at exactly 50.00 is the one that would catch a slip here.
+    nodes: [fn, ship]
+    edges: [fn>ship]
+    role: ship
+  - text: Move the gold rule to the customer, next to the tier it reads. Run the tests, commit. The change request now has one obvious place to go.
+    nodes: [fn, rate]
+    edges: [fn>rate]
+    role: rate
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: While renaming variables in a function, you spot an off-by-one bug and fix it in the same edit. Is that commit a refactoring?
+    options:
+      - text: No. The fix changes behaviour. Make it a separate commit, with a test that shows the bug.
+        correct: true
+        why: Right. A refactoring commit should be one that nobody needs to review for behaviour. Mixing in a fix means every line must be read as a possible behaviour change.
+      - text: Yes. It is all tidying the same function.
+        why: A refactoring is defined by keeping behaviour the same, not by touching the same lines. The bug fix makes the output different.
+      - text: Yes, as long as the tests still pass.
+        why: If the tests still pass after a bug fix, they did not cover the bug. Passing tests do not make a behaviour change into a refactoring.
+  engineer:
+    question: You applied five refactorings, then ran the tests, and one fails. What is the cheapest next move?
+    options:
+      - text: Revert to the last green commit and redo the steps one at a time, running the tests after each.
+        correct: true
+        why: Right. Each step is small and named, so redoing them is quick, and the first red run points at one step. Debugging the combined diff means reasoning about five changes at once.
+      - text: Read the combined diff until you find the change that broke it.
+        why: It can work, but you are searching all five changes by eye for something that looked harmless when you wrote it. That is the slow way to find it.
+      - text: Update the failing test to the new value, since refactorings do not change behaviour.
+        why: The test says behaviour did change. Changing the test hides a real regression, here a customer paying shipping they should not.
+  deep:
+    question: A library you publish has an exported function with a misleading name. You rename it with your IDE across the whole repository. Is that a pure refactoring?
+    options:
+      - text: Not for code outside the repository. Its callers break. Add the new name, keep the old one as a deprecated alias, and remove it in a later major release.
+        correct: true
+        why: Right. That is a parallel change (expand, migrate, contract). Inside one repository a tool rename is safe because the tool sees every caller; a published API has callers it cannot see.
+      - text: Yes. The IDE renamed every call site, so behaviour is unchanged.
+        why: Every call site the IDE could see. Users of the library compile against the old name and break on upgrade.
+      - text: Yes, if the library is in a dynamic language, because callers look names up at runtime.
+        why: Runtime lookup makes it worse. The callers fail when they run, not when they build.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Smell
+      example: magic numbers, a long function, a rule inline where a type should own it
+      job: Tells you where to look and which move might help. It is the trigger, not the goal.
+    - role: Small step
+      example: Extract Function, Rename Variable, Inline Function, Move Function
+      job: One named move from the catalogue, small enough to check in seconds and to redo if it goes wrong.
+    - role: Test run
+      example: the six order-total cases
+      job: Confirms behaviour after every step. A red run points at the step just taken.
+    - role: Commit
+      example: one per green step
+      job: A save point you can return to with no thought, and a history that bisects cleanly.
+  useWhen:
+    - A change request is hard to make because of how the code is shaped. Refactor first, then make the change.
+    - You find yourself explaining the same function to every new team member.
+    - Code you are about to change has smells and tests that cover it, or tests you can add first.
+  avoidWhen:
+    - There are no tests and no cheap way to add them. Write characterization tests first, or limit yourself to tool-driven moves the compiler checks.
+    - The code is about to be deleted or replaced. Tidying it is waste.
+    - The deadline is today and the change is small. Make the change, note the smell, and come back.
+  tradeoffs:
+    - Small steps feel slow. They are slower than a rewrite that works first time and much faster than one that does not.
+    - Refactoring touches code other people are editing. Short-lived branches and small commits keep merge conflicts small.
+    - Tests that check how code is structured (mocks of private helpers, assertions on call order) break on every refactoring and make it expensive. Tests that check behaviour survive it.
+  lookalikes:
+    - name: Rewrite
+      how: Replaces the code wholesale and verifies at the end. Behaviour drift is found late and all at once.
+    - name: Characterization tests
+      how: Tests that record what legacy code does today, so that you have something to refactor against. They come before refactoring when no tests exist.
+    - name: Parallel change
+      how: The refactoring discipline applied to an interface with callers you cannot change in one commit. Expand, migrate, contract.
+---
+
+## [concept] Refactoring safely
+
+**Change the structure, keep the behaviour, in steps small enough that a red test points at one of them.**
+
+<Term id="refactoring">Refactoring</Term> means changing how code is built without changing what it does. It is done as a series of small named moves, such as Extract Function, Rename Variable, Inline Function and Move Function, with the tests run after each. If a step changes behaviour by mistake, the next test run says so and points at the step you just took.
+
+<Depth level={2}>
+The most useful refactoring is done just before a change: make the change easy, then make the easy change. Keep the two in separate commits. A refactoring commit should need no review for behaviour, and a feature commit should be small enough to review for nothing else.
+
+A <Term id="code-smell">code smell</Term> tells you where to start: magic numbers, a long function, a rule written inline where a type should own it, the same condition in three places. The catalogue tells you which move fixes which smell. The tests tell you whether you got it right.
+</Depth>
+
+<Depth level={3}>
+The names in this lesson come from Martin Fowler's catalogue at refactoring.com, from the second edition of *Refactoring* (2018). Some were renamed from the first edition: Extract Method became Extract Function, Replace Magic Number with Symbolic Constant became Replace Magic Literal, and Rename Function is now part of Change Function Declaration. Steve McConnell's *Code Complete* adds the safety rules this lesson uses: keep a list of steps, change one thing at a time, retest after each, and keep a version to go back to.
+</Depth>
+
+## [problem] A pricing function nobody wants to touch
+
+An order-total function works and has six tests. It is sixteen lines, with one-letter names, the bulk rate and shipping threshold as bare numbers, and the gold-tier discount written inline. It has been stable for two years.
+
+<Depth level={2}>
+It is not bad code. It is short, it is tested, and anyone can read it in a minute. The smells only matter because a change is coming that touches the discount rule.
+</Depth>
+
+<Depth level={3}>
+Money is a float here. That is a real problem, but changing the representation is a behaviour change (totals can differ in the last cent), so it does not belong in a refactoring. Note it, and do it later as its own change with its own tests.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** add a silver tier that gets 2% off.
+
+The developer adds the tier and, while in there, renames the function, moves the rates into a map and names the shipping constants. One commit. CI goes red: an order of exactly 50.00 no longer ships free. The commit has several edits, a feature among them, and nothing says which edit did it.
+
+<Depth level={2}>
+The slip is `<` becoming `<=` while the shipping line was being tidied. It reads as the same rule. Found in a diff that also contains a new feature, it takes far longer than it would have alone, because every line is a suspect and the feature legitimately changes totals too.
+</Depth>
+
+<Depth level={3}>
+`git bisect` cannot help inside one commit. It can only point at commits, so its resolution is exactly the size of your steps.
+</Depth>
+
+## [morph] Make the change easy first
+
+Drag the slider. The same function after four small refactorings, each followed by a green test run and a commit: names and constants, Extract Function twice, Move Function to put the discount on the customer. No behaviour has changed. The silver tier is not there yet.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The order matters. Renames and constants first, because they make everything after easier to read. Extracts next. Moves last, once you can see which data each piece reads. If a step needs more than a minute or two of thought, it is probably two steps.
+</Depth>
+
+<Depth level={3}>
+Tool-driven refactorings are safer than hand edits because they work on the parsed program, its <Term id="abstract-syntax-tree">abstract syntax tree</Term> and symbol table, rather than on text. A rename changes the symbol and every reference to it, and skips a string or a different variable with the same spelling. Extract Function computes which variables flow in and out. Tools still cannot check a comparison you retyped by hand.
+</Depth>
+
+## [walk] Follow the steps
+
+Four steps, each one small, each followed by a test run. Step through them with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">After each step: `go build ./... && go test ./...`. The build alone catches a missed reference; the tests catch a changed result.</Lang>
+<Lang only="python">After each step: `pytest -x`. With no compiler, the tests are the only check that a renamed name was renamed everywhere it is used.</Lang>
+<Lang only="typescript">After each step: `tsc --noEmit` and the test runner. The type check catches a missed reference; the tests catch a changed result.</Lang>
+<Lang only="rust">After each step: `cargo test`. It builds first, so a missed reference or a borrow problem fails before any test runs.</Lang>
+</Depth>
+
+## [again] The silver tier, the second time
+
+The same request, after the refactor. The tier rule lives in one method on the customer, so the feature is two lines there, in a commit of its own. If a test goes red now, the feature did it.
+
+<Depth level={2}>
+Not every refactoring pays off on the next change. Refactor the code you are about to change, in the direction the change needs. Tidying code nobody is changing is a cost with no return yet.
+</Depth>
+
+<Depth level={3}>
+For moves too big for one commit, such as changing a widely used signature, use a <Term id="parallel-change">parallel change</Term>: add the new form beside the old, migrate callers in small commits, then delete the old form. Every commit in between is green and deployable.
+</Depth>
+
+## [play] Refactor it yourself
+
+The legacy order-total function, its six tests and a six-step plan. One step slips. Apply the plan one step at a time or all at once, run the tests when you choose, and revert to the last green run when they fail. The playground counts what each approach cost you.
+
+## [lens] How each language writes it
+
+Every language can be refactored safely with tests. They differ in how much the compiler and the editor catch before the tests run.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="refactoring-safely" />
+
+### The loop
+
+1. Find the smell nearest to the change you need to make.
+2. Pick one move from the catalogue that addresses it.
+3. Make the move, with the editor's tool if it has one.
+4. Run the tests. Green: commit. Red: revert, do not debug.
+5. Repeat until the change is easy, then make it in its own commit.
+
+| Smell | Move from the catalogue |
+|---|---|
+| Bare numbers with a meaning | Replace Magic Literal |
+| Loop body or block that needs a comment | Extract Function |
+| Helper used once that adds nothing | Inline Function |
+| Rule that reads another type's data | Move Function |
+| Name that misleads | Rename Variable, Change Function Declaration |
