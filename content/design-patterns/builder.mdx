@@ -1,0 +1,571 @@
+---
+title: Builder
+track: design-patterns
+group: Creational
+order: 22
+summary: Build a complex object through named steps and one final build() that checks the whole thing, so callers never pass a long row of arguments and never hold a half-built object.
+intent: Every value should sit next to its name, and an object should not exist until it is complete and valid.
+changeRequest: Platform requires a priority class on every production Deployment.
+languages: [go, python, typescript, rust]
+glossary: [telescoping-constructor, typestate, keyword-argument, immutable-object]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: builder
+  scenarios:
+    - try: "Predict how many pods the reviewed call runs, then press kubectl apply."
+      notice: "8080. Replicas and port are both integers, CPU and memory are both strings, so both pairs swapped without a compiler error. The memory limit is half a byte."
+    - try: "Fix the positional call by swapping arguments. Try it first without the parameter names, the way a reviewer sees it."
+      notice: "You need the signature to know which value is which. The call site alone does not say."
+    - try: "Switch to the named design and build the original values."
+      notice: "Each wrong value now sits next to its name, and build() refuses three of them before the object exists. Nothing reaches the cluster."
+    - try: "In the named design, fix everything except the port, then build."
+      notice: "Validation passes, because port 3 is a legal port. Names make that mistake visible in review; validation cannot know what you meant."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: 23 callers, sub: positional args }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: deploy, sub: named steps }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: NewDeployment, sub: { go: "7 args, 2 constructors", python: "__init__, 7 args", typescript: "constructor, 7 args", rust: "new(), 7 args" } }
+      after:  { x: 150, y: 24, w: 200, h: 60, title: { go: DeploymentBuilder, python: Deployment fields, typescript: DeploymentSpec, rust: DeploymentBuilder }, sub: { go: one method per field, python: keyword-only, typescript: one property per field, rust: one method per field } }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 400, y: 24, w: 150, h: 60, title: "" }
+      after:  { x: 400, y: 24, w: 150, h: 60, title: { go: Build(), python: __post_init__, typescript: deployment(), rust: build() }, sub: checks it all once }
+    - id: product
+      kind: concrete
+      appears: after
+      before: { x: 400, y: 120, w: 150, h: 48, title: "" }
+      after:  { x: 400, y: 120, w: 150, h: 48, title: Deployment, sub: complete · valid }
+    - id: image
+      kind: concrete
+      before: { x: 188, y: 62, w: 222, h: 30, title: "args 1-2: strings" }
+      after:  { x: 150, y: 204, w: 72, h: 40, title: Image }
+    - id: scale
+      kind: concrete
+      before: { x: 188, y: 100, w: 222, h: 30, title: "args 3-4: two ints" }
+      after:  { x: 228, y: 204, w: 72, h: 40, title: Scale, sub: replicas · port }
+    - id: resources
+      kind: concrete
+      before: { x: 188, y: 138, w: 222, h: 30, title: "args 5-6: strings" }
+      after:  { x: 306, y: 204, w: 72, h: 40, title: Resources, sub: cpu · memory }
+    - id: probe
+      kind: concrete
+      before: { x: 188, y: 176, w: 222, h: 30, title: "arg 7: probe" }
+      after:  { x: 384, y: 204, w: 72, h: 40, title: Probe }
+    - id: priority
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 218, w: 222, h: 30, title: "arg 8: priority" }
+      after:  { x: 462, y: 204, w: 72, h: 40, title: Priority }
+  edges:
+    - { from: client, to: context, label: calls }
+    - { from: image, to: context }
+    - { from: scale, to: context, label: named step }
+    - { from: resources, to: context }
+    - { from: probe, to: context }
+    - { from: priority, to: context }
+    - { from: context, to: strategy, label: then }
+    - { from: strategy, to: product, label: returns }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: deployment.go · deploy.go
+      source: |
+        // deployment.go
+        func NewDeployment(name, image string, replicas, port int, cpu, memory string) *Deployment {
+            return NewDeploymentWithProbe(name, image, replicas, port, cpu, memory, "")
+        }
+
+        func NewDeploymentWithProbe(name, image string, replicas, port int,
+            cpu, memory, probe string) *Deployment {
+            d := &Deployment{Name: name, Image: image, Replicas: replicas, Port: port}
+            d.Resources = Resources{CPU: cpu, Memory: memory}
+            if probe != "" {
+                d.Readiness = &Probe{Path: probe, Port: port}
+            }
+            return d
+        }
+
+        // checkout/deploy.go: one of 23 call sites
+        d := NewDeploymentWithProbe("checkout-api", "shop/checkout:2.3", 3, 8080, "500m", "256Mi", "/healthz")
+
+        // billing/deploy.go
+        d := NewDeployment("billing-worker", "shop/billing:1.9", 2, 9090, "250m", "128Mi")
+      roles: { context: [2, 14], image: [2, 2], scale: [2, 2], resources: [2, 2], probe: [6, 7], client: [16, 20] }
+      change:
+        - { line: 2, replace: 'func NewDeployment(name, image string, replicas, port int, cpu, memory, priority string) *Deployment {' }
+        - { line: 3, replace: '    return NewDeploymentWithProbe(name, image, replicas, port, cpu, memory, "", priority)' }
+        - { line: 7, replace: '    cpu, memory, probe, priority string) *Deployment {' }
+        - { after: 9, add: ['    d.PriorityClass = priority'] }
+        - { line: 17, replace: 'd := NewDeploymentWithProbe("checkout-api", "shop/checkout:2.3", 3, 8080, "500m", "256Mi", "/healthz", "critical")' }
+        - { line: 20, replace: 'd := NewDeployment("billing-worker", "shop/billing:1.9", 2, 9090, "250m", "128Mi", "standard")' }
+    after:
+      file: deployment.go · deploy.go
+      source: |
+        type DeploymentBuilder struct{ d Deployment }
+
+        func NewDeployment(name string) *DeploymentBuilder {
+            return &DeploymentBuilder{d: Deployment{Name: name, Replicas: 1}}
+        }
+
+        func (b *DeploymentBuilder) Image(ref string) *DeploymentBuilder { b.d.Image = ref; return b }
+        func (b *DeploymentBuilder) Replicas(n int) *DeploymentBuilder  { b.d.Replicas = n; return b }
+        func (b *DeploymentBuilder) Port(p int) *DeploymentBuilder      { b.d.Port = p; return b }
+        func (b *DeploymentBuilder) CPU(q string) *DeploymentBuilder    { b.d.CPU = q; return b }
+        func (b *DeploymentBuilder) Memory(q string) *DeploymentBuilder { b.d.Memory = q; return b }
+        func (b *DeploymentBuilder) ReadinessProbe(path string) *DeploymentBuilder {
+            b.d.Readiness = &Probe{Path: path}
+            return b
+        }
+
+        func (b *DeploymentBuilder) Build() (Deployment, error) {
+            if err := b.d.validate(); err != nil { // image set, replicas 1..50, real quantities
+                return Deployment{}, err
+            }
+            return b.d, nil
+        }
+
+        // checkout/deploy.go
+        d, err := NewDeployment("checkout-api").
+            Image("shop/checkout:2.3").
+            Replicas(3).Port(8080).
+            CPU("500m").Memory("256Mi").
+            ReadinessProbe("/healthz").
+            Build()
+      roles: { context: [1, 15], start: [3, 5], image: [7, 7], scale: [8, 9], resources: [10, 11], probe: [12, 15], strategy: [17, 22], validate: [17, 22], product: [21, 21], client: [24, 30], steps: [25, 29], use: [30, 30] }
+    again:
+      file: deployment.go
+      source: |
+        // One new step. Call sites that need a priority add one line; the rest do not change.
+        func (b *DeploymentBuilder) PriorityClass(name string) *DeploymentBuilder {
+            b.d.PriorityClass = name
+            return b
+        }
+    cost:
+      before: { text: 6 lines · 23 call sites, value: 0.9 }
+      after: { text: 1 new step · 0 call sites forced, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Go has no named or default arguments, so long constructors hurt. Three answers are common: a builder like this one, functional options (`NewServer(addr, WithTimeout(5*time.Second))`), or a struct literal with field names plus a `Validate()` method. Zero values complicate validation: an unset `int` is `0`, which is why Kubernetes'' own `DeploymentSpec.Replicas` is a `*int32`.'
+      seenIn: '`grpc.NewClient(target, grpc.WithTransportCredentials(…))` uses functional options. `zap.NewProductionConfig()` returns a config you adjust and then `Build()` into a logger. `strings.Builder` builds a string piece by piece.'
+
+  python:
+    before:
+      file: deployment.py · deploy.py
+      source: |
+        # deployment.py
+        class Deployment:
+            def __init__(self, name, image, replicas, port, cpu, memory, probe=None):
+                self.name = name
+                self.image = image
+                self.replicas = replicas
+                self.port = port
+                self.resources = {"cpu": cpu, "memory": memory}
+                self.readiness = Probe(probe, port) if probe else None
+
+        # checkout/deploy.py: one of 23 call sites
+        d = Deployment("checkout-api", "shop/checkout:2.3", 3, 8080, "500m", "256Mi", "/healthz")
+
+        # billing/deploy.py
+        d = Deployment("billing-worker", "shop/billing:1.9", 2, 9090, "250m", "128Mi")
+      roles: { context: [2, 9], image: [5, 5], scale: [6, 7], resources: [8, 8], probe: [9, 9], client: [11, 15] }
+      change:
+        - { line: 3, replace: '    def __init__(self, name, image, replicas, port, cpu, memory, priority, probe=None):' }
+        - { after: 8, add: ['        self.priority_class = priority'] }
+        - { line: 12, replace: 'd = Deployment("checkout-api", "shop/checkout:2.3", 3, 8080, "500m", "256Mi", "critical", "/healthz")' }
+        - { line: 15, replace: 'd = Deployment("billing-worker", "shop/billing:1.9", 2, 9090, "250m", "128Mi", "standard")' }
+    after:
+      file: deployment.py · deploy.py
+      source: |
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True, kw_only=True)
+        class Deployment:
+            name: str
+            image: str
+            replicas: int = 1
+            port: int
+            cpu: str
+            memory: str
+            readiness_path: str | None = None
+
+            def __post_init__(self):
+                if not 1 <= self.replicas <= 50:
+                    raise ValueError(f"replicas {self.replicas} is outside 1..50")
+                check_quantities(cpu=self.cpu, memory=self.memory)
+
+        # checkout/deploy.py
+        d = Deployment(
+            name="checkout-api", image="shop/checkout:2.3",
+            replicas=3, port=8080,
+            cpu="500m", memory="256Mi",
+            readiness_path="/healthz",
+        )
+      roles: { context: [3, 11], start: [19, 20], image: [6, 6], scale: [7, 8], resources: [9, 10], probe: [11, 11], strategy: [13, 16], validate: [13, 16], product: [3, 4], client: [18, 24], steps: [20, 23], use: [19, 24] }
+    again:
+      file: deployment.py
+      source: |
+        # deployment.py: one new field in Deployment. Call sites that omit it keep working.
+            priority_class: str = "standard"
+    cost:
+      before: { text: 4 lines · 23 call sites, value: 0.9 }
+      after: { text: 1 new field · 0 call sites forced, value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: 'Keyword arguments already put each name next to its value, and `kw_only=True` (Python 3.10+) makes them mandatory. Validate in `__post_init__` and freeze the dataclass, and you have what a builder gives you elsewhere. Write a real builder only when construction is spread over several steps or functions.'
+      seenIn: '`requests.Request(method, url, headers=…, params=…).prepare()` builds a `PreparedRequest`. SQLAlchemy''s `select(User).where(…).order_by(…)` builds a query step by step.'
+
+  typescript:
+    before:
+      file: deployment.ts · deploy.ts
+      source: |
+        // deployment.ts
+        export class Deployment {
+          constructor(
+            readonly name: string, readonly image: string,
+            readonly replicas: number, readonly port: number,
+            readonly cpu: string, readonly memory: string,
+            readonly probePath?: string,
+          ) {}
+        }
+
+        // checkout/deploy.ts: one of 23 call sites
+        const d = new Deployment("checkout-api", "shop/checkout:2.3", 3, 8080, "500m", "256Mi", "/healthz");
+
+        // billing/deploy.ts
+        const d = new Deployment("billing-worker", "shop/billing:1.9", 2, 9090, "250m", "128Mi");
+      roles: { context: [2, 9], image: [4, 4], scale: [5, 5], resources: [6, 6], probe: [7, 7], client: [11, 15] }
+      change:
+        - { after: 6, add: ['    readonly priorityClass: string,'] }
+        - { line: 12, replace: 'const d = new Deployment("checkout-api", "shop/checkout:2.3", 3, 8080, "500m", "256Mi", "critical", "/healthz");' }
+        - { line: 15, replace: 'const d = new Deployment("billing-worker", "shop/billing:1.9", 2, 9090, "250m", "128Mi", "standard");' }
+    after:
+      file: deployment.ts · deploy.ts
+      source: |
+        export interface DeploymentSpec {
+          name: string;
+          image: string;
+          replicas?: number;
+          port: number;
+          cpu: string;
+          memory: string;
+          readinessPath?: string;
+        }
+
+        export function deployment(spec: DeploymentSpec): Readonly<DeploymentSpec> {
+          const d = { replicas: 1, ...spec };
+          if (d.replicas < 1 || d.replicas > 50) throw new RangeError(`replicas ${d.replicas} is outside 1..50`);
+          checkQuantities(d.cpu, d.memory);
+          return Object.freeze(d);
+        }
+
+        // checkout/deploy.ts
+        const d = deployment({
+          name: "checkout-api", image: "shop/checkout:2.3",
+          replicas: 3, port: 8080,
+          cpu: "500m", memory: "256Mi",
+          readinessPath: "/healthz",
+        });
+      roles: { context: [1, 9], start: [19, 20], image: [3, 3], scale: [4, 5], resources: [6, 7], probe: [8, 8], strategy: [11, 16], validate: [11, 16], product: [15, 15], client: [18, 24], steps: [20, 23], use: [19, 24] }
+    again:
+      file: deployment.ts
+      source: |
+        // deployment.ts: one new optional property in DeploymentSpec. No call site breaks.
+          priorityClass?: string;
+    cost:
+      before: { text: 3 lines · 23 call sites, value: 0.85 }
+      after: { text: 1 new property · 0 call sites forced, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'An options object gives you names at the call site, and the type checker enforces required properties. Keep a fluent builder for things assembled across several calls, like queries. In the old positional class, a new required `string` parameter inserted before `probePath` would quietly receive `"/healthz"` at call sites nobody updated.'
+      seenIn: '`new Request(url, { method, headers, body })` takes an options object. Knex and Kysely build SQL with chained calls such as `db.selectFrom("orders").where(…).select(…)`.'
+
+  rust:
+    before:
+      file: deployment.rs · deploy.rs
+      source: |
+        // deployment.rs
+        impl Deployment {
+            pub fn new(name: &str, image: &str, replicas: u32, port: u16,
+                       cpu: &str, memory: &str, probe: Option<&str>) -> Self {
+                Deployment {
+                    name: name.into(), image: image.into(), replicas, port,
+                    resources: Resources { cpu: cpu.into(), memory: memory.into() },
+                    readiness: probe.map(|p| Probe { path: p.into(), port }),
+                }
+            }
+        }
+
+        // checkout/deploy.rs: one of 23 call sites
+        let d = Deployment::new("checkout-api", "shop/checkout:2.3", 3, 8080, "500m", "256Mi", Some("/healthz"));
+
+        // billing/deploy.rs
+        let d = Deployment::new("billing-worker", "shop/billing:1.9", 2, 9090, "250m", "128Mi", None);
+      roles: { context: [2, 11], image: [3, 3], scale: [3, 3], resources: [4, 4], probe: [8, 8], client: [13, 17] }
+      change:
+        - { line: 4, replace: '               cpu: &str, memory: &str, priority: &str, probe: Option<&str>) -> Self {' }
+        - { after: 7, add: ['            priority_class: priority.into(),'] }
+        - { line: 14, replace: 'let d = Deployment::new("checkout-api", "shop/checkout:2.3", 3, 8080, "500m", "256Mi", "critical", Some("/healthz"));' }
+        - { line: 17, replace: 'let d = Deployment::new("billing-worker", "shop/billing:1.9", 2, 9090, "250m", "128Mi", "standard", None);' }
+    after:
+      file: deployment.rs · deploy.rs
+      source: |
+        #[derive(Default)]
+        pub struct DeploymentBuilder {
+            name: String, image: Option<String>, replicas: u32, port: Option<u16>,
+            cpu: Option<String>, memory: Option<String>, readiness: Option<String>,
+        }
+
+        impl DeploymentBuilder {
+            pub fn image(mut self, r: &str) -> Self { self.image = Some(r.into()); self }
+            pub fn replicas(mut self, n: u32) -> Self { self.replicas = n; self }
+            pub fn port(mut self, p: u16) -> Self { self.port = Some(p); self }
+            pub fn cpu(mut self, q: &str) -> Self { self.cpu = Some(q.into()); self }
+            pub fn memory(mut self, q: &str) -> Self { self.memory = Some(q.into()); self }
+            pub fn readiness_probe(mut self, path: &str) -> Self { self.readiness = Some(path.into()); self }
+
+            pub fn build(self) -> Result<Deployment, BuildError> {
+                let image = self.image.ok_or(BuildError::Missing("image"))?;
+                let port = self.port.ok_or(BuildError::Missing("port"))?;
+                check_replicas(self.replicas)?;
+                let resources = Resources::parse(self.cpu, self.memory)?;
+                Ok(Deployment { name: self.name, image, replicas: self.replicas, port, resources, readiness: self.readiness })
+            }
+        }
+
+        // checkout/deploy.rs: Deployment::builder(name) starts with replicas = 1
+        let d = Deployment::builder("checkout-api")
+            .image("shop/checkout:2.3")
+            .replicas(3).port(8080)
+            .cpu("500m").memory("256Mi")
+            .readiness_probe("/healthz")
+            .build()?;
+      roles: { context: [1, 13], start: [24, 25], image: [8, 8], scale: [9, 10], resources: [11, 12], probe: [13, 13], strategy: [15, 21], validate: [15, 21], product: [20, 20], client: [24, 30], steps: [26, 29], use: [30, 30] }
+    again:
+      file: deployment.rs
+      source: |
+        // One new method in DeploymentBuilder. Call sites that do not need it do not change.
+            pub fn priority_class(mut self, name: &str) -> Self { self.priority = Some(name.into()); self }
+    cost:
+      before: { text: 4 lines · 23 call sites, value: 0.9 }
+      after: { text: 1 new step · 0 call sites forced, value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Rust has no named arguments, default arguments or overloading, so builders are everywhere. Methods that take `self` by value chain neatly and stop anyone from using a builder after `build()`. For required fields, a typestate builder can turn a missing `.image()` into a compile error.'
+      seenIn: '`std::process::Command::new("git").arg("log").spawn()`. `std::thread::Builder::new().name(…).stack_size(…).spawn(…)`. `reqwest::Client::builder().timeout(…).build()?`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'The deploy script starts with the one value that has no sensible default: `NewDeployment("checkout-api")`.', python: 'The deploy script calls `Deployment(name="checkout-api", …)`. Every argument after it must be passed by name.', typescript: 'The deploy script calls `deployment({ name: "checkout-api", … })`. The type checker knows which properties are required.', rust: 'The deploy script starts with the one value that has no sensible default: `Deployment::builder("checkout-api")`.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: start
+  - text: Each value is set by name. Replicas and port can no longer trade places unnoticed, and fields that keep their defaults are simply left out.
+    nodes: [context, image, scale, resources, probe]
+    edges: [image>context, scale>context, resources>context, probe>context]
+    role: steps
+  - text: { go: '`Build()` checks the whole object at once: image set, replicas in range, real quantities. Any problem returns an error and no Deployment.', python: '`__post_init__` runs at the end of construction and raises if anything is wrong, so no invalid `Deployment` object is ever returned.', typescript: '`deployment()` fills defaults, checks the object, and throws before returning anything invalid.', rust: '`build()` consumes the builder and checks the whole object. Any problem returns `Err` and no `Deployment`.' }
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: validate
+  - text: The caller gets a complete, valid Deployment, or an error. A half-built Deployment never exists anywhere in the program.
+    nodes: [strategy, product]
+    edges: [strategy>product]
+    role: use
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these situations calls for a Builder?
+    options:
+      - text: An HTTP client takes a base URL plus an optional timeout, retry policy, proxy, TLS settings and default headers. Most callers set two or three of them.
+        correct: true
+        why: Right. Many optional settings, a few required ones, and a finished client that should be valid from the start.
+      - text: A service creates an S3 or a GCS client depending on which cloud it runs in.
+        why: That is a choice of class, which a factory handles. Builder is about assembling one object with many parts.
+      - text: Each new nightly job starts as a copy of a template job, with two fields changed.
+        why: That is Prototype. You start from an existing object and copy it, instead of assembling one from scratch.
+  engineer:
+    question: Your builder validates cpu and memory in build(). A teammate adds a Resources(cpu, memory string) step to save a line at call sites. What is the risk?
+    options:
+      - text: It brings back positional arguments of the same type, so a swapped pair compiles and reads plausibly in review again.
+        correct: true
+        why: Right. The builder's benefit is that every value sits next to its name. A step that takes two same-typed values gives that up for the pair.
+      - text: None. build() validates, so the order of arguments cannot matter.
+        why: Validation catches impossible values, such as half a byte of memory. It cannot catch two plausible values in the wrong places, such as cpu "1" and memory "2Gi" against cpu "2" and memory "1Gi".
+      - text: Go and Rust do not allow a method to take two arguments of the same type.
+        why: They do. The compiler only checks types, which is exactly why the swap goes unnoticed.
+  deep:
+    question: How can a Rust builder make a missing .image() a compile error instead of an Err from build()?
+    options:
+      - text: Track the field in the builder's type. DeploymentBuilder<NoImage> has no build method, and .image() returns a DeploymentBuilder<HasImage>, which does.
+        correct: true
+        why: Right. This is the typestate pattern. A zero-sized marker type parameter costs nothing at runtime, and calling build() too early does not type-check.
+      - text: Mark the image field with #[must_use].
+        why: '#[must_use] warns when a returned value is ignored. It says nothing about whether a method was called.'
+      - text: Make build() a const fn, so the checks run at compile time.
+        why: A const fn can run at compile time only with constant inputs. A builder filled from config at runtime still needs runtime checks, or types that rule the mistake out.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Builder
+      example: { go: DeploymentBuilder, python: "Deployment (kw-only dataclass)", typescript: "DeploymentSpec (options object)", rust: DeploymentBuilder }
+      job: Collects the values, one named step or field at a time.
+    - role: build()
+      example: { go: "Build()", python: "__post_init__", typescript: "deployment()", rust: "build()" }
+      job: Checks the whole object once and returns it, or fails.
+    - role: Product
+      example: Deployment
+      job: The finished object. Complete, valid, and usually immutable.
+    - role: Director (optional)
+      example: "a helper such as webServiceDefaults(b)"
+      job: Runs a fixed sequence of steps, so common configurations are written once.
+  useWhen:
+    - A constructor needs more than three or four arguments, especially several of the same type.
+    - Many fields are optional and most callers set only a few.
+    - An object must be valid as a whole, with rules that span fields, and should never be seen half built.
+    - The object should be immutable once created, but is assembled step by step.
+  avoidWhen:
+    - The language has named and default arguments and construction is one call. Use them instead.
+    - The object has two or three required fields. A plain constructor is clearer.
+  tradeoffs:
+    - A second type to write and keep in sync with the product.
+    - Required fields are easy to forget unless build() checks them, or the type system does.
+    - In Go, zero values make "not set" and "set to zero" look the same.
+  lookalikes:
+    - name: Abstract Factory
+      how: Returns finished products right away, one per call, chosen by family. A builder assembles one product over several calls.
+    - name: Factory Method
+      how: Decides which class to create. A builder decides how one object is put together.
+    - name: Prototype
+      how: Starts from a copy of an existing object. A builder starts from nothing.
+    - name: Fluent interface
+      how: Method chaining as a style. Many builders are fluent, but a fluent API is not necessarily building anything.
+---
+
+## [concept] Builder
+
+**Build a complex object through named steps and one final build() that checks the whole thing, so callers never pass a long row of arguments and never hold a half-built object.**
+
+Every value sits next to its name. The object does not exist until it is complete and valid.
+
+<Depth level={2}>
+Two problems usually lead here. A <Term id="telescoping-constructor">telescoping constructor</Term> takes a long row of positional arguments, and same-typed ones can swap without the compiler noticing. A mutable object filled in by setters exists before it is ready, so code can see it half built. A builder fixes both. It gathers values by name and only hands over an <Term id="immutable-object">immutable object</Term> once `build()` has checked it.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue meant something broader: separate how an object is constructed from how it is represented, so the same construction steps can produce different results. Its example is an RTF reader driving interchangeable converters to plain text, TeX or a text widget, with a director running the steps. The everyday form today, a fluent builder for one object with many optional parts, was popularised later by Joshua Bloch's *Effective Java*. Both share the core move: construction becomes a sequence of named steps behind one interface.
+</Depth>
+
+## [problem] A constructor with seven arguments
+
+A platform team's deploy tooling creates Kubernetes Deployments from code. One constructor takes every setting; a second one, with a probe, was added later. Twenty-three services call one or the other.
+
+Read the call sites. Without the signature open next to them, you cannot tell which number is the replica count.
+
+<Depth level={2}>
+Replicas and port are both integers. CPU and memory are both strings. Swap either pair and the code compiles, the tests that do not deploy pass, and the reviewer sees a plausible row of values.
+</Depth>
+
+<Depth level={3}>
+Kubernetes accepts many wrong values too. A memory limit of `500m` is a legal quantity: half a byte, because lowercase `m` means milli. A CPU request of `256Mi` is legal as well, and asks for hundreds of millions of cores. The cluster reports these as Pending pods or killed containers, long after the code was merged.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** platform requires a priority class on every production Deployment.
+
+Both constructors grow a parameter, and every one of the 23 call sites has to change, even the ones for services that will use the default.
+
+<Depth level={2}>
+The order of parameters becomes a hazard of its own. A required parameter has to go before the optional probe, so the new value lands in the middle of the row. In Python and TypeScript, a call site that nobody updated now passes `"/healthz"` as the priority class, and both are strings, so nothing complains.
+</Depth>
+
+<Depth level={3}>
+The usual escape is another constructor, `NewDeploymentWithProbeAndPriority`. Each new optional setting doubles the number of possible combinations, and the family of constructors grows to match.
+</Depth>
+
+## [morph] Give every value a name
+
+Drag the slider. The row of positional arguments turns into named steps, and one `build()` at the end checks the whole object.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Defaults move into the builder, so callers only mention what they change. Rules that span fields, such as "a probe needs a port", live in one place. And because the product only comes out of `build()`, there is no moment when a Deployment exists without an image.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go has no named arguments, so the builder supplies them as methods. Each step returns the same `*DeploymentBuilder` to allow chaining. `Build` returns a copy of the struct, so changing the builder afterwards does not change a Deployment already built, apart from shared pointers such as the probe.</Lang>
+<Lang only="python">Python already has names at the call site through <Term id="keyword-argument">keyword arguments</Term>. `kw_only=True` makes every field keyword-only, and it is what lets `port` follow the defaulted `replicas` without a `TypeError` at class definition.</Lang>
+<Lang only="typescript">The options object gives names at the call site, and the type checker requires `name`, `image`, `port`, `cpu` and `memory`. `Object.freeze` makes the result read-only at runtime, while `Readonly<…>` does the same at compile time.</Lang>
+<Lang only="rust">Each step takes `self` by value and returns it, so the chain moves one builder along. After `build(self)` the builder is gone: the compiler rejects any later use of it.</Lang>
+</Depth>
+
+## [walk] Follow one Deployment being built
+
+One Deployment from the first call to a finished object. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Chained calls on a pointer receiver mutate one builder in place. The builder usually lives on the stack or is freed right after `Build`; the cost is a few stores, nothing to measure.</Lang>
+<Lang only="python">A frozen dataclass sets its fields through `object.__setattr__` inside the generated `__init__`, then runs `__post_init__`. After that, assigning a field raises `FrozenInstanceError`.</Lang>
+<Lang only="typescript">The spread `{ replicas: 1, ...spec }` creates one new object, so the caller's spec is not modified. `Object.freeze` is shallow: nested objects would need freezing too.</Lang>
+<Lang only="rust">Moving the builder through each call is free in practice: the optimiser usually builds it in place. A <Term id="typestate">typestate</Term> version adds a marker type parameter per required field, which also costs nothing at runtime.</Lang>
+</Depth>
+
+## [again] Priority class, the second time
+
+The same request after the refactor. The builder gets one new step and a default. Services that need a priority add one line at their call site; the other call sites do not change and cannot shift.
+
+<Depth level={2}>
+If production must always set it, add the rule to `build()`: in production, a missing priority class is an error. The rule lives in one place, and the error names the missing field instead of shifting arguments.
+</Depth>
+
+<Depth level={3}>
+Common configurations can be captured as functions that run a fixed sequence of steps, such as `webServiceDefaults(b)` setting probes and resources for every HTTP service. That is the director role from the original catalogue, in its modern small form.
+</Depth>
+
+## [play] Review one Deployment, then ship it
+
+A call that creates the checkout Deployment passed code review. Predict what it does, apply it to a simulated cluster, then fix it in two designs and see which mistakes each one can stop.
+
+## [lens] How each language writes it
+
+How much you need a builder depends on what the language gives you for free. Rust has no named or default arguments, so builders are everywhere. Python has both, so it rarely needs one.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="builder" />
+
+### Builder, options object or keyword arguments?
+
+All three put a name next to every value. Use keyword arguments where the language has them, and an options object where it has object literals and a type checker. Reach for a real builder when the language has neither, when the object is assembled across several functions, or when the steps themselves matter, as in a query builder.

@@ -1,0 +1,13 @@
+# Terms introduced by the Builder lesson.
+- id: telescoping-constructor
+  term: Telescoping constructor
+  short: A family of constructors, or one long one, that takes more and more positional arguments as options are added. Same-typed arguments can swap without a compiler error.
+- id: typestate
+  term: Typestate
+  short: Encoding an object's state in its type, so calling a method in the wrong state, such as build() before a required field is set, does not compile.
+- id: keyword-argument
+  term: Keyword argument
+  short: An argument passed by parameter name, such as replicas=3, so its meaning is visible at the call site and its position does not matter.
+- id: immutable-object
+  term: Immutable object
+  short: An object whose fields cannot change after it is created. Anyone holding it can rely on it staying exactly as it was built.
