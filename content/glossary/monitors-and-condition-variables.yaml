@@ -1,0 +1,19 @@
+# Terms introduced by the monitors-and-condition-variables lesson.
+- id: monitor
+  term: Monitor
+  short: A lock bundled with the state it guards and one or more condition variables, so threads can wait inside it for the state to change. Java objects and Python's threading.Condition work this way.
+- id: condition-variable
+  term: Condition variable
+  short: A wait set tied to a lock. wait() releases the lock and sleeps in one step, and takes the lock back before returning. signal wakes one waiter, broadcast wakes all.
+- id: spurious-wakeup
+  term: Spurious wakeup
+  short: A wait() that returns although nobody signalled. POSIX threads and Rust's Condvar allow it, so code must recheck its condition after every wakeup.
+- id: lost-wakeup
+  term: Lost wakeup
+  short: A thread sleeps forever because the signal meant for it went nowhere, either sent before it waited or delivered to a different thread that could not use it.
+- id: wait-set
+  term: Wait set
+  short: The threads currently asleep on a condition variable, waiting to be signalled.
+- id: mesa-semantics
+  term: Mesa semantics
+  short: Signalling only marks a waiter runnable; it must compete for the lock and may find the condition false again. Almost every real condition variable works this way.

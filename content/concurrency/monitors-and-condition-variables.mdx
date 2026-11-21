@@ -1,0 +1,565 @@
+---
+title: Monitors and condition variables
+track: concurrency
+group: Synchronisation
+order: 13
+summary: A condition variable lets a thread sleep until shared state changes. Waking up only means look again, so the check goes in a while loop, and the right thread must be the one that hears.
+intent: Write a wait that cannot act on a stale condition or sleep forever, and know when signal is enough and when you need broadcast or a second condition.
+changeRequest: Thumbnail generation is behind, so each host now runs two worker threads on the upload queue instead of one.
+languages: [go, python, typescript, rust]
+glossary: [monitor, condition-variable, wait-set, spurious-wakeup, lost-wakeup, mesa-semantics]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [concurrency]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: monitors-and-condition-variables
+  scenarios:
+    - try: "With if: step C1 until it waits, P1 through its unlock, C2 all the way round, then C1."
+      notice: "C1 was woken for the job, but C2 got the lock first and took it. With if, C1 never looks again and takes from an empty queue."
+    - try: "Switch to while and play the same schedule. Then wake a waiting thread with the spurious wakeup button."
+      notice: "C1 checks again, finds nothing and goes back to sleep. A wakeup for nothing costs one check instead of a crash."
+    - try: "With while and signal, let both consumers wait, fill the queue, and keep going until P1 waits too."
+      notice: "C1's signal wakes C2, not the waiting producer. C2 finds the queue empty and sleeps, and now all three sleep with nobody left to signal."
+    - try: "Run 1,000 random schedules for each of the four combinations."
+      notice: "if crashes in most runs whichever wake you use, while with signal ends with everyone asleep in hundreds of runs, and only while with broadcast is clean."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: producer
+      kind: client
+      before: { x: 12, y: 40, w: 120, h: 52, title: uploader, sub: { go: Put, python: put(), typescript: put(), rust: put() } }
+      after:  { x: 12, y: 40, w: 120, h: 52, title: uploader, sub: { go: Put, python: put(), typescript: put(), rust: put() } }
+    - id: workers
+      kind: client
+      before: { x: 12, y: 180, w: 120, h: 52, title: workers × 2, sub: { go: Take, python: take(), typescript: take(), rust: take() } }
+      after:  { x: 12, y: 180, w: 120, h: 52, title: workers × 2, sub: { go: Take, python: take(), typescript: take(), rust: take() } }
+    - id: queue
+      kind: context
+      before: { x: 160, y: 20, w: 240, h: 230, title: job queue, sub: "you think: wait returns when a job is there" }
+      after:  { x: 196, y: 110, w: 168, h: 52, title: job queue, sub: { go: "[]Job, cap n", python: "deque, capacity n", typescript: "Job[]", rust: "VecDeque, cap n" } }
+    - id: lock
+      kind: concrete
+      appears: after
+      before: { x: 196, y: 24, w: 168, h: 48, title: "" }
+      after:  { x: 196, y: 24, w: 168, h: 48, title: { go: sync.Mutex, python: threading.Lock, typescript: one thread, rust: Mutex }, sub: guards the queue }
+    - id: notfull
+      kind: strategy
+      appears: after
+      before: { x: 420, y: 40, w: 128, h: 52, title: "" }
+      after:  { x: 420, y: 40, w: 128, h: 52, title: { go: notFull, python: not_full, typescript: no limit, rust: not_full }, sub: { go: uploader waits, python: uploader waits, typescript: put never waits, rust: uploader waits } }
+    - id: notempty
+      kind: strategy
+      appears: after
+      before: { x: 420, y: 180, w: 128, h: 52, title: "" }
+      after:  { x: 420, y: 180, w: 128, h: 52, title: { go: notEmpty, python: not_empty, typescript: waiters, rust: not_empty }, sub: workers wait }
+  edges:
+    - { from: producer, to: queue, label: put }
+    - { from: workers, to: queue, label: take }
+    - { from: lock, to: queue, label: guards }
+    - { from: workers, to: notempty, label: wait }
+    - { from: producer, to: notfull, label: wait }
+    - { from: producer, to: notempty, label: signal }
+    - { from: workers, to: notfull, label: signal }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: jobs.go
+      source: |
+        // jobs.go
+        type JobQueue struct {
+            mu    sync.Mutex
+            cond  *sync.Cond // sync.NewCond(&q.mu)
+            items []Job
+            cap   int
+        }
+
+        func (q *JobQueue) Put(j Job) {
+            q.mu.Lock()
+            defer q.mu.Unlock()
+            if len(q.items) >= q.cap {
+                q.cond.Wait()
+            }
+            q.items = append(q.items, j)
+            q.cond.Signal()
+        }
+
+        func (q *JobQueue) Take() Job {
+            q.mu.Lock()
+            defer q.mu.Unlock()
+            if len(q.items) == 0 {
+                q.cond.Wait()
+            }
+            j := q.items[0]
+            q.items = q.items[1:]
+            q.cond.Signal()
+            return j
+        }
+      roles: { queue: [2, 7], producer: [9, 17], workers: [19, 29] }
+      change:
+        - { line: 22, replace: "    if len(q.items) == 0 { // woken, but another worker may have taken the job" }
+        - { line: 25, replace: "    j := q.items[0] // panic: index out of range [0] with length 0" }
+        - { line: 27, replace: "    q.cond.Signal() // may wake the other worker instead of the waiting Put" }
+    after:
+      file: jobs.go
+      source: |
+        // jobs.go
+        type JobQueue struct {
+            mu       sync.Mutex
+            notFull  *sync.Cond // both made with sync.NewCond(&q.mu)
+            notEmpty *sync.Cond
+            items    []Job
+            cap      int
+        }
+
+        func (q *JobQueue) Put(j Job) {
+            q.mu.Lock()
+            defer q.mu.Unlock()
+            for len(q.items) >= q.cap {
+                q.notFull.Wait()
+            }
+            q.items = append(q.items, j)
+            q.notEmpty.Signal()
+        }
+
+        func (q *JobQueue) Take() Job {
+            q.mu.Lock()
+            defer q.mu.Unlock()
+            for len(q.items) == 0 {
+                q.notEmpty.Wait()
+            }
+            j := q.items[0]
+            q.items = q.items[1:]
+            q.notFull.Signal()
+            return j
+        }
+      roles: { queue: [2, 8], lock: [3, 3], notfull: [4, 4], notempty: [5, 5], producer: [10, 18], workers: [20, 30], wait: [23, 25], put: [16, 17], recheck: [23, 23], notify: [28, 28] }
+    again:
+      file: the same busy day
+      source: |
+        // 1 uploader, 8 workers per host, capacity 64, one day
+        // worker panics: 0    uploader stuck in Put: 0
+        // wakeups that found the job gone: checked again and waited
+    cost:
+      before: { text: "workers panic on an empty queue · the uploader can sleep forever", value: 0.9 }
+      after: { text: "0 panics · 0 stuck · one extra check per wakeup", value: 0.08 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: '`sync.Cond` exists, and its Wait "cannot return unless awoken by Broadcast or Signal", so Go has no spurious wakeups. The job can still be gone when the woken goroutine gets the lock, and the docs say to wait in a `for` loop. They also say many simple uses are better served by channels: a buffered `make(chan Job, n)` is this whole bounded queue, with no lock or condition to get wrong.'
+      seenIn: 'A buffered `chan Job` is the idiomatic bounded queue. `sync.Cond` has no timeout and no context, which is one reason it is rare. Use it when many goroutines wait on a state change that is not a single value.'
+
+  python:
+    before:
+      file: jobs.py
+      source: |
+        # jobs.py
+        class JobQueue:
+            def __init__(self, capacity: int) -> None:
+                self._items: deque[Job] = deque()
+                self._capacity = capacity
+                self._cv = threading.Condition()
+
+            def put(self, job: Job) -> None:
+                with self._cv:
+                    if len(self._items) >= self._capacity:
+                        self._cv.wait()
+                    self._items.append(job)
+                    self._cv.notify()
+
+            def take(self) -> Job:
+                with self._cv:
+                    if not self._items:
+                        self._cv.wait()
+                    job = self._items.popleft()
+                    self._cv.notify()
+                    return job
+      roles: { queue: [2, 6], producer: [8, 13], workers: [15, 21] }
+      change:
+        - { line: 17, replace: "            if not self._items:  # woken, but another worker may have taken the job" }
+        - { line: 19, replace: "            job = self._items.popleft()  # IndexError: pop from an empty deque" }
+        - { line: 20, replace: "            self._cv.notify()  # may wake the other worker, not the waiting uploader" }
+    after:
+      file: jobs.py
+      source: |
+        # jobs.py
+        class JobQueue:
+            def __init__(self, capacity: int) -> None:
+                self._items: deque[Job] = deque()
+                self._capacity = capacity
+                lock = threading.Lock()
+                self._not_full = threading.Condition(lock)
+                self._not_empty = threading.Condition(lock)
+
+            def put(self, job: Job) -> None:
+                with self._not_full:
+                    while len(self._items) >= self._capacity:
+                        self._not_full.wait()
+                    self._items.append(job)
+                    self._not_empty.notify()
+
+            def take(self) -> Job:
+                with self._not_empty:
+                    while not self._items:
+                        self._not_empty.wait()
+                    job = self._items.popleft()
+                    self._not_full.notify()
+                    return job
+      roles: { queue: [2, 8], lock: [6, 6], notfull: [7, 7], notempty: [8, 8], producer: [10, 15], workers: [17, 23], wait: [18, 20], put: [14, 15], recheck: [19, 19], notify: [22, 22] }
+    again:
+      file: the same busy day
+      source: |
+        # 1 uploader, 8 worker threads per host, capacity 64, one day
+        # IndexError: 0    uploader stuck in put(): 0
+        # wakeups that found the job gone: checked again and waited
+    cost:
+      before: { text: "workers die with IndexError · the uploader can sleep forever", value: 0.9 }
+      after: { text: "0 crashes · 0 stuck · one extra check per wakeup", value: 0.08 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`threading.Condition` is a monitor. `with cv:` takes its lock; `wait()` releases it, sleeps, and takes it back before returning. `notify()` does not release the lock, so a woken thread runs only after the notifier leaves the `with` block, and another thread may get there first. `wait_for(predicate)` is the while loop written for you.'
+      seenIn: '`queue.Queue` is this exact design: one mutex shared by the `not_empty`, `not_full` and `all_tasks_done` conditions. `asyncio.Condition` does the same for coroutines.'
+
+  typescript:
+    before:
+      file: jobs.ts
+      source: |
+        // jobs.ts
+        export class JobQueue {
+          private items: Job[] = [];
+          private waiters: (() => void)[] = []; // takers parked on an empty queue
+
+          async take(): Promise<Job> {
+            if (this.items.length === 0) {
+              await new Promise<void>((resolve) => this.waiters.push(resolve));
+            }
+            return this.items.shift()!;
+          }
+
+          put(job: Job): void {
+            this.items.push(job);
+            this.waiters.shift()?.();
+          }
+        }
+      roles: { queue: [2, 4], workers: [6, 11], producer: [13, 16] }
+      change:
+        - { line: 7, replace: "    if (this.items.length === 0) { // resolved, but another worker may run first" }
+        - { line: 10, replace: "    return this.items.shift()!; // undefined: the ! hid it from the compiler" }
+    after:
+      file: jobs.ts
+      source: |
+        // jobs.ts
+        export class JobQueue {
+          private items: Job[] = [];
+          private waiters: (() => void)[] = []; // takers parked on an empty queue
+
+          async take(): Promise<Job> {
+            while (this.items.length === 0) {
+              await new Promise<void>((resolve) => this.waiters.push(resolve));
+            }
+            return this.items.shift()!;
+          }
+
+          put(job: Job): void {
+            this.items.push(job);
+            this.waiters.shift()?.();
+          }
+        }
+      roles: { queue: [2, 4], notempty: [4, 4], workers: [6, 11], wait: [7, 9], recheck: [7, 7], producer: [13, 16], put: [13, 15], notify: [15, 15] }
+    again:
+      file: the same busy day
+      source: |
+        // 2 async workers per process, uploads arriving all day
+        // jobs that came out undefined: 0
+        // wakeups that found the job gone: checked again and waited
+    cost:
+      before: { text: "a worker gets undefined and fails later, far from the cause", value: 0.7 }
+      after: { text: "0 undefined jobs · one extra check per wakeup", value: 0.06 }
+    lens:
+      need: 1
+      needLabel: Rarely
+      note: 'There are no threads to block, so there is no condition variable. A parked taker is a pending Promise whose `resolve` you keep. The same bug exists anyway: resolving only queues the waiter''s continuation, and code queued before it, such as another worker resuming, can take the job first. So the check still goes in a loop. Between worker_threads, `Atomics.wait` returns "ok" when notified whether or not the value changed.'
+      seenIn: 'Async queue libraries keep arrays of pending resolvers like this one. `Atomics.wait` and `Atomics.notify` between workers, and `Atomics.waitAsync` where blocking is not allowed.'
+
+  rust:
+    before:
+      file: jobs.rs
+      source: |
+        // jobs.rs
+        pub struct JobQueue {
+            items: Mutex<VecDeque<Job>>,
+            changed: Condvar,
+            cap: usize,
+        }
+
+        impl JobQueue {
+            pub fn put(&self, job: Job) {
+                let mut items = self.items.lock().unwrap();
+                if items.len() >= self.cap {
+                    items = self.changed.wait(items).unwrap();
+                }
+                items.push_back(job);
+                self.changed.notify_one();
+            }
+
+            pub fn take(&self) -> Job {
+                let mut items = self.items.lock().unwrap();
+                if items.is_empty() {
+                    items = self.changed.wait(items).unwrap();
+                }
+                let job = items.pop_front().unwrap();
+                self.changed.notify_one();
+                job
+            }
+        }
+      roles: { queue: [2, 6], producer: [9, 16], workers: [18, 26] }
+      change:
+        - { line: 20, replace: "        if items.is_empty() { // woken, but another thread may have taken the job" }
+        - { line: 23, replace: "        let job = items.pop_front().unwrap(); // panics: called unwrap() on None" }
+        - { line: 24, replace: "        self.changed.notify_one(); // may wake the other worker, not the waiting put" }
+    after:
+      file: jobs.rs
+      source: |
+        // jobs.rs
+        pub struct JobQueue {
+            items: Mutex<VecDeque<Job>>,
+            not_full: Condvar,
+            not_empty: Condvar,
+            cap: usize,
+        }
+
+        impl JobQueue {
+            pub fn put(&self, job: Job) {
+                let items = self.items.lock().unwrap();
+                let mut items = self.not_full.wait_while(items, |q| q.len() >= self.cap).unwrap();
+                items.push_back(job);
+                self.not_empty.notify_one();
+            }
+
+            pub fn take(&self) -> Job {
+                let items = self.items.lock().unwrap();
+                let mut items = self.not_empty.wait_while(items, |q| q.is_empty()).unwrap();
+                let job = items.pop_front().expect("wait_while returned, so the queue is not empty");
+                self.not_full.notify_one();
+                job
+            }
+        }
+      roles: { queue: [2, 7], lock: [3, 3], notfull: [4, 4], notempty: [5, 5], producer: [10, 15], workers: [17, 23], wait: [19, 19], put: [13, 14], recheck: [19, 19], notify: [21, 21] }
+    again:
+      file: the same busy day
+      source: |
+        // 1 uploader, 8 worker threads per host, capacity 64, one day
+        // worker panics: 0    uploader stuck in put: 0
+        // spurious wakeups: absorbed by wait_while
+    cost:
+      before: { text: "workers panic on None · the uploader can sleep forever", value: 0.9 }
+      after: { text: "0 panics · 0 stuck · one extra check per wakeup", value: 0.08 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`Condvar` pairs with a `Mutex`: `wait` takes the guard, releases the lock while asleep and hands the guard back. The docs warn that `wait` is susceptible to spurious wakeups and that the predicate must be checked every time it returns. `wait_while` runs that loop for you. `notify_one` and `notify_all` are not buffered: with nobody waiting, the notification is simply gone, so the state itself must live in the mutex.'
+      seenIn: '`std::sync::mpsc::sync_channel(n)` and crossbeam''s `bounded(n)` give you a bounded queue ready-made. `tokio::sync::Notify` plays the same role for async tasks.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'A worker calls Take on an empty queue. Holding the lock, it sees no job and calls `notEmpty.Wait()`, which releases the lock and parks the goroutine as one step.', python: 'A worker calls `take()` on an empty queue. Holding the lock, it sees no job and calls `not_empty.wait()`, which releases the lock and puts the thread to sleep as one step.', typescript: 'A worker calls `take()` on an empty queue. It parks: it pushes its Promise''s `resolve` onto `waiters` and awaits.', rust: 'A worker calls `take()` on an empty queue. `wait_while` sees the predicate hold, releases the lock and puts the thread to sleep as one step.' }
+    nodes: [workers, notempty]
+    edges: [workers>notempty]
+    role: wait
+  - text: { go: 'The uploader puts a job and signals `notEmpty`. Only workers ever wait there, so whoever wakes can use a job.', python: 'The uploader puts a job and notifies `not_empty`. Only workers ever wait there, so whoever wakes can use a job.', typescript: '`put` pushes the job and resolves the first parked worker. That only queues the worker''s continuation; it runs later.', rust: 'The uploader pushes a job and calls `not_empty.notify_one()`. Only workers ever wait there, so whoever wakes can use a job.' }
+    nodes: [producer, notempty]
+    edges: [producer>notempty]
+    role: put
+  - text: The woken worker must take the lock back before it can go on. In between, the second worker, which was not asleep, took the job. When the first worker gets the lock, the loop checks again, finds the queue empty and waits again. No crash, one wasted check.
+    nodes: [workers, queue, lock]
+    edges: [workers>queue, lock>queue]
+    role: recheck
+  - text: { go: 'Every Take that removes a job signals `notFull`, which only the uploader waits on. A worker can never use up the uploader''s wakeup.', python: 'Every `take()` that removes a job notifies `not_full`, which only the uploader waits on. A worker can never use up the uploader''s wakeup.', typescript: 'This queue has no limit, so `put` never waits. A bounded version adds a second array of parked putters, resolved by `take`, the same split as two conditions.', rust: 'Every `take()` that removes a job notifies `not_full`, which only the uploader waits on. A worker can never use up the uploader''s wakeup.' }
+    nodes: [workers, notfull]
+    edges: [workers>notfull]
+    role: notify
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Why should a thread call wait() inside a while loop that checks its condition?
+    options:
+      - text: When wait() returns, the condition may be false again. Another thread may have changed it first, or the wakeup was spurious.
+        correct: true
+        why: Right. A wakeup is a hint to look again, not a promise. The loop looks again and waits once more if it has to.
+      - text: Because wait() can return before it has taken the lock back.
+        why: wait() always holds the lock again when it returns. The problem is what other threads did while it was waiting for the lock.
+      - text: Because one wait() call can miss the signal, so the loop waits twice to be sure.
+        why: The loop does not catch missed signals. It catches wakeups that arrive when the condition no longer holds.
+  engineer:
+    question: One uploader and two workers share one condition variable, with while loops and signal (wake one). Sometimes all three sleep forever. Why?
+    options:
+      - text: A worker's signal can wake the other worker instead of the waiting uploader. That worker finds nothing, waits again, and nobody is left to wake the uploader.
+        correct: true
+        why: Right. With one condition for two predicates, signal may reach a thread that cannot use it. Use broadcast, or one condition per predicate such as not_full and not_empty.
+      - text: The while loops spin and use up the CPU, starving the uploader.
+        why: A waiting thread sleeps and uses no CPU. The loop runs once per wakeup.
+      - text: signal() does nothing if called while holding the lock.
+        why: Signalling while holding the lock is normal and works. In Python it is required.
+  deep:
+    question: What does wait() do with the lock, and why must that be a single step?
+    options:
+      - text: It releases the lock and joins the wait set atomically, so a signal sent just after the release cannot fall into a gap and be lost.
+        correct: true
+        why: Right. If releasing and sleeping were two steps, a thread could change the state and signal in between, and the waiter would sleep through the only wakeup it was going to get.
+      - text: It keeps the lock while asleep so that nobody can change the state.
+        why: Then nobody could ever make the condition true, and every wait would deadlock.
+      - text: It releases the lock, then starts listening; the gap is harmless because signals are stored until someone waits.
+        why: Signals are not stored. A signal with nobody in the wait set does nothing, which is exactly how a gap would lose it.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Lock
+      example: { go: "sync.Mutex", python: "threading.Lock", typescript: "(one thread)", rust: "Mutex<VecDeque<Job>>" }
+      job: Guards the shared state. Every check and change of the condition happens while holding it.
+    - role: Condition variable
+      example: { go: "sync.Cond", python: "threading.Condition", typescript: "array of resolvers", rust: "Condvar" }
+      job: A wait set tied to the lock. wait releases the lock and sleeps in one step.
+    - role: Predicate
+      example: queue not empty
+      job: The state the waiter needs. Checked in a loop, before and after every wait.
+    - role: Signal or broadcast
+      example: notify(), notify_all()
+      job: Tells waiters to look again. Sent after changing the state, while holding the lock or just after.
+  useWhen:
+    - Threads must sleep until shared state reaches some condition, and a ready-made queue, channel or semaphore does not fit.
+    - Building your own synchroniser, such as a bounded buffer, a barrier or a latch.
+  avoidWhen:
+    - A bounded queue or channel already does the job. queue.Queue, a buffered Go channel and sync_channel are tested versions of this code.
+    - The only thing to wait for is one event. A future, a channel close or an event object is simpler.
+  tradeoffs:
+    - Broadcast is always safe with while loops, but wakes every waiter to find work for one. One condition per predicate wakes only threads that can act.
+    - Signal is cheaper, and correct only when every waiter waits for the same thing and any one of them can use the change.
+    - Condition variables have no memory. State lives in variables under the lock; the signal only says look again.
+  lookalikes:
+    - name: Semaphore
+      how: A counter of permits. Unlike a signal, a release with nobody waiting is remembered.
+    - name: Channel or blocking queue
+      how: The monitor pattern packaged up, with the loops and wakeups already right.
+    - name: Event
+      how: A flag that stays set once set, so a late waiter does not miss it.
+---
+
+## [concept] Waiting for state to change
+
+**A condition variable lets a thread sleep, inside a lock, until another thread changes the shared state.** `wait()` gives up the lock and sleeps in one step, and takes the lock back before it returns.
+
+Waking up only means "look again". By the time the woken thread holds the lock, the state may have changed back.
+
+<Depth level={2}>
+A <Term id="monitor">monitor</Term> is a lock bundled with the state it guards and one or more <Term id="condition-variable">condition variables</Term>. Each condition has a <Term id="wait-set">wait set</Term> of sleeping threads. Signal wakes one of them, broadcast wakes all. The pattern always has the same shape: take the lock, loop while the condition is false calling wait, act, signal whoever might now be able to proceed, release the lock.
+</Depth>
+
+<Depth level={3}>
+Real condition variables use <Term id="mesa-semantics">Mesa semantics</Term>: signal marks a waiter runnable and the signaller keeps going. The woken thread then competes for the lock like anyone else, and a thread that was never asleep can get there first. The alternative, Hoare semantics, hands the lock straight to the woken thread so the condition still holds, but it costs extra context switches and almost no library offers it. POSIX threads and Rust's `Condvar` also allow a <Term id="spurious-wakeup">spurious wakeup</Term>, a return from wait with no signal at all.
+</Depth>
+
+## [problem] A queue for thumbnail jobs
+
+An upload service puts a thumbnail job on an in-memory queue for every image, and a worker thread takes jobs off it. The queue is bounded so a burst of uploads cannot use up memory: when it is full, the uploader waits. When it is empty, the worker waits. One condition variable covers both.
+
+With one uploader and one worker, it works. Each side waits only when it must, and the other side's notify always wakes it.
+
+<Depth level={2}>
+The mental model is that `wait()` returns when the thing you were waiting for has happened. With one thread on each side that is close enough: when the worker wakes, nobody else could have taken the job. The `if` around `wait()` reads naturally: if there is nothing, wait for something, then take it.
+</Depth>
+
+<Depth level={3}>
+The single condition is also safe with one thread per side. Whoever notifies, the only possible waiter is the other side, which is exactly the thread that can use the change.
+</Depth>
+
+## [pain] A second worker per host
+
+**What happened:** thumbnails fell behind, so each host started a second worker thread. Within an hour, workers began dying with an empty-queue error, and on some hosts uploads stopped entirely while the queue sat full.
+
+The marked lines are two bugs. The `if` lets a woken worker take from the queue without looking: if the other worker took the job while this one waited for the lock, it takes from an empty queue. And with two workers sharing one condition with the uploader, a worker's notify can wake the other worker instead of the uploader waiting on a full queue.
+
+<Depth level={2}>
+The second bug is a <Term id="lost-wakeup">lost wakeup</Term>. The uploader waits on a full queue. A worker takes the job and notifies, which wakes the other worker, asleep because the queue was empty. That worker checks, finds it empty again, and waits. The first worker comes back for more and waits too. Now all three sleep, the uploader was never told there is room, and nobody is left to tell it.
+</Depth>
+
+<Depth level={3}>
+The crash needs a narrow interleaving: a worker that was not asleep reaching the lock between the notify and the woken worker's return from wait. The stall needs the wait set to hold a worker ahead of the uploader when a worker notifies. Both depend on timing, which is why one worker per host never showed them.
+</Depth>
+
+## [morph] From "wait until" to "wait, then look again"
+
+Drag the slider. The queue you imagined, where `wait()` returns when a job is there, becomes the real monitor: a lock, the queue, and two wait sets, one for the uploader and one for the workers.
+
+The code changes in two ways. Every `if` around `wait()` becomes `while`, so a woken thread looks again. And the single condition splits in two, `not_full` for the uploader and `not_empty` for the workers, both on the same lock, so each notify reaches a thread that can use it.
+
+<Depth level={2}>
+Broadcast instead of signal on the one shared condition also fixes the stall, because the uploader is always among those woken. It is a reasonable quick fix, but every take wakes every sleeping thread, and all but one go straight back to sleep. Two conditions wake only the side that can act. Keep the `while` either way; it is what makes any wakeup safe.
+</Depth>
+
+<Depth level={3}>
+Why `wait()` must release the lock and join the wait set as one step: if a thread released the lock and then, separately, went to sleep, another thread could change the state and signal in the gap. The signal would find an empty wait set and do nothing, and the waiter would sleep through the only wakeup it was going to get. That is the classic lost wakeup, and it is also why the state must be checked and changed only under the lock: a signal is not remembered, only the state is.
+</Depth>
+
+## [walk] Follow one job
+
+One job travels from the uploader to a worker while the second worker competes for it. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`sync.Cond` keeps waiters in a ticket list, and `Signal` wakes the goroutine that has waited longest. `Wait` unlocks `c.L`, parks, and locks `c.L` again before returning, so the loop's check runs under the lock.</Lang>
+<Lang only="python">CPython's `Condition` keeps a deque of per-waiter locks. `wait()` adds a fresh lock to the deque, releases the condition's lock and blocks on its own lock; `notify()` releases the first n waiters' locks. That is why waiters wake in FIFO order and why notify must be called while holding the lock.</Lang>
+<Lang only="typescript">Resolving a Promise schedules the code after its `await` as a microtask. Anything already queued ahead of it, such as another worker resuming from its own await, runs first and can take the job.</Lang>
+<Lang only="rust">On Linux, std's `Condvar` is built on a futex. A futex wait can return without a matching wake, which is one source of the spurious wakeups the docs warn about. `wait_while` hides them by checking the predicate in a loop.</Lang>
+</Depth>
+
+## [again] The same busy day, again
+
+Two workers per host, the same stream of uploads. When a woken worker finds its job already taken, the loop sends it back to sleep. When a worker takes a job, it wakes the uploader through `not_full`, which no worker ever waits on. Nothing crashes and nothing sleeps forever.
+
+<Depth level={2}>
+Scale the workers to eight and nothing changes. The queue's correctness no longer depends on how many threads sit on each side, which is the property the original code quietly lacked.
+</Depth>
+
+<Depth level={3}>
+Signalling before or after releasing the lock are both correct with Mesa semantics. Signalling inside the lock is simpler to reason about and required by Python. Signalling just after the unlock can save the woken thread from waking only to block on the lock, but it is rarely worth the harder reasoning; measure first.
+</Depth>
+
+## [play] Step the threads yourself
+
+One producer and two consumers share a queue that holds one job, one lock and one condition variable. You decide which thread runs its next line, and you can wake a waiting thread with no signal at all.
+
+Predict first. Then make a consumer crash with `if`, fix it with `while`, put all three threads to sleep with signal, and run 1,000 random schedules of each combination.
+
+## [lens] How each language meets it
+
+Python and Rust give you the raw monitor and expect you to write the loop, or use `wait_for` and `wait_while`. Go has `sync.Cond` but steers you to channels. Node has no threads to block, but the same bug appears with Promises.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+The rule is the same everywhere: the state lives in variables under the lock, the wait is in a loop on that state, and a signal only means look again. When a ready-made blocking queue or channel fits, use it; it is this code, already right.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="monitors-and-condition-variables" />
+
+### The other lost wakeup
+
+The playground shows a signal that reaches the wrong thread. The older form of the bug is a signal sent before anyone waits. A thread checks a flag without the lock, sees it false, and is about to call wait; another thread sets the flag and signals into an empty wait set; the first thread then waits forever. The cure is the rule in this lesson: check and change the state only while holding the lock, so the check and the wait happen with nothing in between.
