@@ -130,3 +130,37 @@ assert the outcomes the lesson promises (for example "forgetting X makes Y fail"
 4. Facts you checked, and anything you were unsure of.
 5. Shared changes you need (kit, CSS, skills, glossary in the shared file), if any.
 6. Output of `npm run check <file>`, `npm run typecheck` and `npm test` (pass/fail lines).
+
+## 6. Systems tracks (Go internals, Linux, networking, distributed systems, ...)
+
+The nine steps stay the same, so readers meet one workflow everywhere. Read them like this:
+- **Concept:** the one-sentence model of the mechanism, and a roles diagram of its parts
+  (for example G, M and P; process, page table and page cache; client, leader and followers).
+- **Problem:** realistic production code written with the naive mental model (an HTTP handler
+  that makes a blocking syscall, a cache that reads files assuming they are in memory, a client
+  with no timeout). It works in testing.
+- **Pain:** the production symptom that the naive model cannot explain (latency spike, page
+  fault storm, a request that hangs forever on a lost packet, a split brain), with the marked
+  lines that matter. The cost meter shows the cost of the symptom (ms of latency, faults,
+  stuck requests, lost writes).
+- **Morph:** the diagram morphs from the naive model to the real mechanism (before: what you
+  thought happens; after: what the runtime, kernel or protocol actually does). The code
+  morphs from the naive version to the version that works with the mechanism.
+- **How it works:** one operation traced through the real mechanism, step by step.
+- **Same request again:** the same symptom with the corrected code: now it costs little.
+- **Try it:** the playground drives a simulation of the mechanism itself (a scheduler with Ps
+  and run queues, a page table and page cache, a lossy link with timers, a cluster with a
+  partition). The reader breaks it (block a goroutine in a syscall, evict pages, drop packets,
+  kill the leader) and watches the mechanism respond.
+- **Language lens:** how each of Go, Python, TypeScript (Node.js) and Rust meets the mechanism
+  (goroutines vs asyncio vs the Node event loop vs tokio; how each reads a file; which socket
+  timeouts each exposes). Code in all four languages is still required.
+- **Check:** one question per depth.
+
+Use `content/outlines/<track>.yaml` for lesson ids, titles, prerequisites and skills, and the
+lesson's section in `reference/notes/<category>.md` (local only) for depth content, check ideas,
+the playground idea and facts to verify. Notes are working material: write the lesson fresh.
+Everything flagged "verify" must be checked against current official docs (go.dev, kernel.org
+docs, man7.org, RFCs, Raft paper) before it is stated. Books in `reference/books/<category>/`
+are for checking only. Set `group` to a short section name for the track page (for example
+"Scheduler", "Memory", "Files", "TCP", "Replication").
