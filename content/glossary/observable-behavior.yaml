@@ -1,0 +1,10 @@
+# Terms introduced by testing/observable-behavior
+- id: observable-behaviour
+  term: Observable behaviour
+  short: What a caller can see and relies on to reach its goal, such as a return value, a state it can read, or a call that leaves the system.
+- id: implementation-detail
+  term: Implementation detail
+  short: Anything about how the code reaches its result that a caller does not need, such as helper classes, private functions and the order of internal calls.
+- id: false-positive-test
+  term: False alarm
+  short: A test that fails although the behaviour is still correct, usually after a refactoring. Also called a false positive.
