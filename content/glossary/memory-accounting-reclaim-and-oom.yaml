@@ -1,0 +1,19 @@
+# Terms introduced by the memory accounting, reclaim and OOM lesson.
+- id: memory-cgroup
+  term: Memory cgroup
+  short: A group of processes whose memory the kernel counts together and limits, through files such as memory.max, memory.high and memory.events in cgroup v2.
+- id: anonymous-memory
+  term: Anonymous memory
+  short: Memory with no file behind it, such as heaps and stacks. It can only be reclaimed by writing it to swap.
+- id: reclaim
+  term: Reclaim
+  short: The kernel taking pages back to satisfy an allocation. It drops clean page cache first, writes dirty pages, and swaps anonymous pages if it may.
+- id: oom-killer
+  term: OOM killer
+  short: The kernel code that kills a process when memory is exhausted and reclaim cannot free enough. It picks the process with the highest badness score.
+- id: oom-score-adj
+  term: oom_score_adj
+  short: A per-process value from -1000 to 1000, added to the OOM badness score as a share of the available memory. -1000 means never kill.
+- id: overcommit
+  term: Overcommit
+  short: Linux lets processes allocate more memory than exists and only finds pages when they are touched. Allocation rarely fails; the OOM killer acts later instead.

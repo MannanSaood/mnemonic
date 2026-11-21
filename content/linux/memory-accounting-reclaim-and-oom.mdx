@@ -1,0 +1,459 @@
+---
+title: Memory accounting, reclaim, swap and the OOM killer
+track: linux
+group: Files and memory
+order: 13
+summary: A container's memory is its heap plus the page cache it touched. At the limit the kernel drops cache first, swaps if allowed, and only then kills the process with the highest score.
+intent: Know what counts toward a memory limit, what the kernel takes back first, and who it kills when that is not enough.
+changeRequest: Let the report service run four reports at once instead of one.
+languages: [go, python, typescript, rust]
+glossary: [memory-cgroup, anonymous-memory, reclaim, oom-killer, oom-score-adj, overcommit, page-cache]
+
+prerequisites: [linux/page-faults-minor-and-major, linux/kernel-memory-allocators]
+skills: [linux, memory, performance]
+depths: [overview, engineer, deep]
+
+playground:
+  model: memory-accounting-reclaim-and-oom
+  scenarios:
+    - try: "Press +64 MiB on the API four times."
+      notice: "memory.current reaches 1024 MiB and stays there. Each new allocation succeeds because reclaim drops page cache; memory.events max counts it."
+    - try: "Keep allocating until the cache is gone, then make the worker allocate."
+      notice: "The worker asked, and the API died: it had the most memory. Exit status 137."
+    - try: "Restart, set the API's oom_score_adj to -1000 and repeat."
+      notice: "The API survives; the next largest process is killed instead."
+    - try: "Restart with memory.high on and grow the worker past 896 MiB."
+      notice: "The worker is put to sleep on each allocation instead of being killed. Slow, measurable, and still alive."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 118, h: 48, title: report handler, sub: loads whole file }
+      after:  { x: 12, y: 30, w: 118, h: 48, title: report handler, sub: streams rows }
+    - id: context
+      kind: context
+      before: { x: 160, y: 14, w: 260, h: 246, title: container, sub: usage = our heap }
+      after:  { x: 160, y: 30, w: 160, h: 52, title: memory cgroup, sub: memory.max 1 GiB }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 350, y: 30, w: 196, h: 52, title: "" }
+      after:  { x: 350, y: 30, w: 196, h: 52, title: reclaim, sub: cache → swap → kill }
+    - id: anon
+      kind: concrete
+      before: { x: 180, y: 72, w: 220, h: 32, title: heap · 600 MB a report }
+      after:  { x: 12, y: 130, w: 140, h: 44, title: anon (heap), sub: swap or nothing }
+    - id: cache
+      kind: concrete
+      before: { x: 180, y: 114, w: 220, h: 32, title: usage 95% · a leak? }
+      after:  { x: 172, y: 130, w: 150, h: 44, title: page cache, sub: charged, dropped first }
+    - id: killer
+      kind: concrete
+      before: { x: 180, y: 156, w: 220, h: 32, title: exit 137 }
+      after:  { x: 350, y: 130, w: 196, h: 44, title: OOM killer, sub: most memory + adj }
+    - id: change
+      kind: concrete
+      appears: change
+      before: { x: 180, y: 212, w: 220, h: 32, title: 4 reports at once }
+      after:  { x: 12, y: 214, w: 534, h: 44, title: 4 streamed reports, sub: a few MiB each · the cache recycles itself }
+  edges:
+    - { from: client, to: context, label: charges }
+    - { from: context, to: strategy, label: at the limit }
+    - { from: strategy, to: cache, label: drops }
+    - { from: strategy, to: anon, label: swaps }
+    - { from: strategy, to: killer, label: if not enough }
+    - { from: change, to: context }
+
+code:
+  go:
+    before:
+      file: report.go
+      source: |
+        var reports = make(chan struct{}, 1)
+
+        func (s *Server) Report(w http.ResponseWriter, r *http.Request) {
+            reports <- struct{}{}
+            defer func() { <-reports }()
+            data, err := os.ReadFile(s.exportPath(r)) // 300 MB
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            rows := parseCSV(data) // and again, as structs
+            writeSummary(w, summarize(rows))
+        }
+      roles: { client: [3, 13], context: [1, 1], anon: [6, 11], cache: [6, 6], killer: [11, 11], change: [1, 1] }
+      change:
+        - { line: 1, replace: 'var reports = make(chan struct{}, 4) // 4 × (300 MB + rows) > the 1 GiB limit' }
+    after:
+      file: report.go
+      source: |
+        // Pod spec: memory limit 1Gi, env GOMEMLIMIT=900MiB.
+        var reports = make(chan struct{}, 4)
+
+        func (s *Server) Report(w http.ResponseWriter, r *http.Request) {
+            reports <- struct{}{}
+            defer func() { <-reports }()
+            f, err := os.Open(s.exportPath(r))
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            defer f.Close()
+            var sum Summary
+            rd := csv.NewReader(bufio.NewReaderSize(f, 1<<20))
+            for {
+                rec, err := rd.Read()
+                if err == io.EOF {
+                    break
+                }
+                if err != nil {
+                    http.Error(w, err.Error(), http.StatusBadRequest)
+                    return
+                }
+                sum.Add(rec) // one row at a time
+            }
+            writeSummary(w, sum)
+        }
+      roles: { client: [4, 27], context: [1, 2], strategy: [14, 14], anon: [24, 24], cache: [14, 14], killer: [2, 2], change: [2, 2], alloc: [16, 16], charge: [14, 14], reclaim: [14, 16], kill: [2, 6], gc: [1, 1] }
+    again:
+      file: report.go
+      source: |
+        // four reports at once: a few MiB of heap each. The page cache
+        // fills with export files and is reclaimed as the reports move on.
+    cost:
+      before: { text: OOMKilled · exit 137 · all requests dropped, value: 0.95 }
+      after: { text: a few MiB of heap per report, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'The Go runtime does not read `memory.max`. By default the GC lets the heap grow to twice the live data (`GOGC=100`). Set `GOMEMLIMIT` (Go 1.19+) a little below the container limit and the GC runs more often as the heap nears it. It is a soft limit: it cannot save a program whose live data really exceeds it.'
+      seenIn: '`runtime/debug.SetMemoryLimit` is the same knob from code. Libraries such as `automemlimit` set it from the cgroup limit at startup. `runtime/metrics` reports the heap goal and total mapped memory.'
+
+  python:
+    before:
+      file: report.py
+      source: |
+        # gunicorn.conf.py
+        workers = 1
+
+        @app.get("/report")
+        def report():
+            with open(export_path(request), newline="") as f:
+                rows = list(csv.reader(f))  # the whole file as Python objects
+            return summarize(rows)
+      roles: { client: [4, 8], context: [1, 2], anon: [7, 7], cache: [6, 6], killer: [7, 7], change: [2, 2] }
+      change:
+        - { line: 2, replace: 'workers = 4  # 4 × the whole file as objects > the 1 GiB limit' }
+    after:
+      file: report.py
+      source: |
+        # gunicorn.conf.py
+        workers = 4
+
+        @app.get("/report")
+        def report():
+            total = Summary()
+            with open(export_path(request), newline="") as f:
+                for row in csv.reader(f):  # one row at a time
+                    total.add(row)
+            return total.as_json()
+      roles: { client: [4, 10], context: [1, 2], strategy: [7, 7], anon: [9, 9], cache: [7, 7], killer: [2, 2], change: [2, 2], alloc: [8, 9], charge: [7, 7], reclaim: [7, 8], kill: [1, 2], gc: [9, 9] }
+    again:
+      file: report.py
+      source: |
+        # four workers, each holding one row at a time. The page cache
+        # fills with export files and is reclaimed as the reports move on.
+    cost:
+      before: { text: OOMKilled · exit 137 · all requests dropped, value: 0.95 }
+      after: { text: a few MiB per worker, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'CPython has no memory limit of its own and does not read the cgroup. A list of parsed rows costs several times the file size in objects. Gunicorn workers are separate processes: without `memory.oom.group`, the kernel kills the largest worker and the master starts a new one.'
+      seenIn: '`resource.setrlimit(resource.RLIMIT_AS, ...)` turns runaway growth into a `MemoryError` inside the process, before the OOM killer. `tracemalloc` shows where the heap went.'
+
+  typescript:
+    before:
+      file: report.ts
+      source: |
+        const reports = pLimit(1);
+
+        app.get("/report", (req, res) => reports(async () => {
+          const text = await readFile(exportPath(req), "utf8"); // 300 MB string
+          const rows = parseCsv(text);
+          res.json(summarize(rows));
+        }));
+      roles: { client: [3, 7], context: [1, 1], anon: [4, 5], cache: [4, 4], killer: [5, 5], change: [1, 1] }
+      change:
+        - { line: 1, replace: 'const reports = pLimit(4); // 4 × (300 MB string + rows) > the 1 GiB limit' }
+    after:
+      file: report.ts
+      source: |
+        const reports = pLimit(4);
+
+        app.get("/report", (req, res) => reports(async () => {
+          const total = new Summary();
+          const lines = createInterface({ input: createReadStream(exportPath(req)) });
+          for await (const line of lines) {
+            total.add(parseCsvLine(line)); // one row at a time
+          }
+          res.json(total);
+        }));
+      roles: { client: [3, 10], context: [1, 1], strategy: [5, 5], anon: [7, 7], cache: [5, 5], killer: [1, 1], change: [1, 1], alloc: [6, 7], charge: [5, 5], reclaim: [5, 6], kill: [1, 1], gc: [7, 7] }
+    again:
+      file: report.ts
+      source: |
+        // four reports at once: a stream buffer and one line each. The page
+        // cache fills with export files and is reclaimed as the reports move on.
+    cost:
+      before: { text: OOMKilled · exit 137 · all requests dropped, value: 0.95 }
+      after: { text: a few MiB per report, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'V8 caps its old space with `--max-old-space-size`; recent Node versions size the default from the container limit. Hitting that cap is a JavaScript heap out of memory crash, not an OOM kill. Buffers, strings read from files and native add-ons live partly outside it and still count toward `memory.max`.'
+      seenIn: '`process.memoryUsage()` separates `heapUsed`, `external` and `rss`. `fs.createReadStream` and `readline` keep memory flat however big the file is.'
+
+  rust:
+    before:
+      file: report.rs
+      source: |
+        static REPORTS: Semaphore = Semaphore::const_new(1);
+
+        async fn report(Query(q): Query<ReportQuery>) -> Result<Json<Summary>, AppError> {
+            let _permit = REPORTS.acquire().await?;
+            let data = tokio::fs::read(export_path(&q)).await?; // 300 MB Vec<u8>
+            let rows = parse_csv(&data)?;
+            Ok(Json(summarize(&rows)))
+        }
+      roles: { client: [3, 8], context: [1, 1], anon: [5, 6], cache: [5, 5], killer: [6, 6], change: [1, 1] }
+      change:
+        - { line: 1, replace: 'static REPORTS: Semaphore = Semaphore::const_new(4); // 4 × (300 MB + rows) > 1 GiB' }
+    after:
+      file: report.rs
+      source: |
+        static REPORTS: Semaphore = Semaphore::const_new(4);
+
+        async fn report(Query(q): Query<ReportQuery>) -> Result<Json<Summary>, AppError> {
+            let _permit = REPORTS.acquire().await?;
+            let file = tokio::fs::File::open(export_path(&q)).await?;
+            let mut lines = BufReader::new(file).lines();
+            let mut total = Summary::default();
+            while let Some(line) = lines.next_line().await? {
+                total.add(&parse_csv_line(&line)?); // one row at a time
+            }
+            Ok(Json(total))
+        }
+      roles: { client: [3, 12], context: [1, 1], strategy: [6, 6], anon: [9, 9], cache: [6, 6], killer: [1, 1], change: [1, 1], alloc: [8, 9], charge: [6, 6], reclaim: [6, 8], kill: [1, 4], gc: [9, 9] }
+    again:
+      file: report.rs
+      source: |
+        // four reports at once: an 8 KiB buffer and one line each. The page
+        // cache fills with export files and is reclaimed as the reports move on.
+    cost:
+      before: { text: OOMKilled · exit 137 · all requests dropped, value: 0.95 }
+      after: { text: a few KiB per report, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Rust has no GC and no runtime limit. A failed allocation aborts the process, but under overcommit `Vec::with_capacity` usually succeeds and the kill comes later, when the pages are touched. Memory is returned as soon as values drop, so peak usage is what you size for.'
+      seenIn: '`Vec::try_reserve` reports allocation failure as an error instead of aborting. jemalloc and mimalloc keep freed memory for reuse, so RSS can stay above live data; both expose stats to tell the two apart.'
+
+walk:
+  - text: A report reads the next row. Its buffer and the row are anonymous memory, and every page touched is charged to the container's memory cgroup.
+    nodes: [client, anon]
+    edges: [client>context]
+    role: alloc
+  - text: The file reads go through the page cache, and those pages are charged to the same cgroup. memory.current counts both, so it climbs toward the limit even while the heap stays small.
+    nodes: [context, cache]
+    edges: [client>context]
+    role: charge
+  - text: When a charge would cross memory.max, the allocating thread reclaims. Clean page cache goes first, since it can be read again from disk. The allocation then succeeds.
+    nodes: [strategy, cache]
+    edges: [context>strategy, strategy>cache]
+    role: reclaim
+  - text: Only if cache and swap cannot free enough does the OOM killer run. It picks the process with the most memory plus its oom_score_adj. Streaming and the semaphore keep four reports far from that.
+    nodes: [strategy, killer]
+    edges: [strategy>killer]
+    role: kill
+  - text: The runtime's own limit is a second guard. With a limit below memory.max, the garbage collector works harder before the kernel has to step in.
+    nodes: [anon]
+    edges: [strategy>anon]
+    role: gc
+
+checks:
+  overview:
+    question: A container's memory usage sits at 95% of its limit for days, and nothing is killed. What is the likely explanation?
+    options:
+      - text: Most of it is page cache from files the service read. The kernel drops it whenever the heap needs room.
+        correct: true
+        why: Right. memory.current counts page cache. Check memory.stat (anon against file) before you call it a leak.
+      - text: The service leaks memory and will be killed soon.
+        why: A leak shows up as anon growing. A full cache with flat anon is the kernel using memory that would otherwise sit idle.
+      - text: The limit is not enforced until usage reaches 100% for a minute.
+        why: memory.max is enforced on every charge. Usage stays near it because reclaim keeps making room.
+  engineer:
+    question: A pod is OOMKilled with exit code 137. The node had 20 GB free. Why was it killed?
+    options:
+      - text: The container reached its own memory limit (memory.max), and reclaim inside that cgroup could not free enough.
+        correct: true
+        why: Right. The OOM killer ran inside the container's memory cgroup. Free memory elsewhere on the node does not matter to it.
+      - text: The node ran out of memory and the kernel killed the biggest pod.
+        why: With 20 GB free the node was fine. 137 is 128 + SIGKILL, from a kill inside the container's cgroup.
+      - text: Kubernetes evicted the pod for using more than its request.
+        why: An eviction is a graceful termination with a reason of Evicted. OOMKilled comes from the kernel's OOM killer.
+  deep:
+    question: In a cgroup at its limit, process A (600 MiB, oom_score_adj 0) and process B (100 MiB, oom_score_adj 0) run. B makes the allocation that cannot be satisfied. Which one is killed, and how could you change that?
+    options:
+      - text: A, because the victim is chosen by memory use plus oom_score_adj. Raising B's oom_score_adj (or lowering A's) changes the choice.
+        correct: true
+        why: Right. oom_badness counts resident memory, swap entries and page tables, then adds oom_score_adj scaled to the available memory. Who asked does not matter.
+      - text: B, because the process whose allocation fails is the one killed.
+        why: That is only the case with the global sysctl oom_kill_allocating_task set, and it does not apply to cgroup OOMs. Normally the highest score loses.
+      - text: Both, because the kernel always kills every process in a cgroup at once.
+        why: Only when memory.oom.group is set. Kubernetes sets it on cgroup v2 since 1.28; plain cgroups default to killing one process.
+
+reference:
+  roles:
+    - role: Memory cgroup
+      example: the pod's container
+      job: Counts anon memory, page cache and kernel memory charged to it, and enforces memory.high and memory.max.
+    - role: Reclaim
+      example: drop cache, then swap
+      job: Frees pages when a charge would cross a limit. Runs in the allocating task (direct reclaim) or in kswapd.
+    - role: OOM killer
+      example: kills the API, exit 137
+      job: Runs when reclaim fails. Kills the task with the highest badness, or the whole group with memory.oom.group.
+    - role: oom_score_adj
+      example: -1000 for the API
+      job: Lets you choose who dies first. -1000 exempts a process.
+  useWhen:
+    - Read memory.stat before calling a full container a leak. Rising anon is a leak; rising file is cache.
+    - Set memory.high a little below memory.max to get throttling and a signal before a kill.
+    - Tell the runtime about the limit (GOMEMLIMIT, --max-old-space-size, JVM MaxRAMPercentage) so its GC works within it.
+  avoidWhen:
+    - Do not set every process to -1000. The OOM killer then has no victim inside the group.
+    - Do not drop caches to make dashboards look better. It costs disk reads and frees nothing the kernel would not free on demand.
+  tradeoffs:
+    - Reclaiming hot cache makes reads go back to disk, so latency rises before anything is killed.
+    - Swap avoids kills but turns memory pressure into major faults; Kubernetes runs pods without swap by default.
+    - memory.high trades a kill for a slowdown that can be just as bad for a latency-sensitive service.
+    - Page cache is charged to the cgroup that first read the file, which can surprise shared-file workloads.
+  lookalikes:
+    - name: Kubernetes eviction
+      how: The kubelet terminating pods when the node runs low. Graceful, decided in user space, reason Evicted.
+    - name: Runtime out-of-memory errors
+      how: Node's heap limit crash, Java's OutOfMemoryError, Python's MemoryError. The runtime refuses, before the kernel is involved.
+    - name: Global OOM
+      how: The whole machine out of memory. The same killer, choosing across all processes on the node.
+---
+
+## [concept] Memory accounting, reclaim, swap and the OOM killer
+
+**A container's memory is its processes' <Term id="anonymous-memory">anonymous memory</Term> plus the <Term id="page-cache">page cache</Term> it touched. At the limit, the kernel drops cache first, swaps if it may, and only then kills.**
+
+The <Term id="oom-killer">OOM killer</Term> picks the process with the most memory, adjusted by <Term id="oom-score-adj">oom_score_adj</Term>. Who made the last allocation does not matter.
+
+<Depth level={2}>
+In cgroup v2, a <Term id="memory-cgroup">memory cgroup</Term> exposes the numbers as files. `memory.current` is the total charged. `memory.stat` splits it, with `anon` and `file` as the two lines to read first. `memory.max` is the hard limit: at it, the allocating task <Term id="reclaim">reclaims</Term>, and if that fails, the OOM killer runs inside the group. `memory.high` is a softer line: above it the group is throttled and pushed to reclaim, and it never invokes the OOM killer. `memory.events` counts each of these moments.
+</Depth>
+
+<Depth level={3}>
+The kernel scores each candidate in `oom_badness()`: resident pages plus swap entries plus page-table pages, plus `oom_score_adj` times the available memory divided by 1000. In a cgroup OOM, the available memory is the group's limit. `-1000` makes a task exempt. With `memory.oom.group` set, the whole group is killed together.
+</Depth>
+
+## [problem] A report service that reads whole files
+
+A report endpoint loads a 300 MB CSV export into memory, parses it into rows and summarizes them. A semaphore lets one report run at a time. The container's limit is 1 GiB, and the dashboards show memory usage near 95% all day.
+
+The team has learned to ignore that graph. Nothing ever got killed.
+
+<Depth level={2}>
+The 95% is mostly page cache from export files. It counts toward `memory.current`, and the kernel drops it whenever a report needs heap. The graph shows the cache doing its job.
+</Depth>
+
+<Depth level={3}>
+Under <Term id="overcommit">overcommit</Term>, reading a 300 MB file into a buffer rarely fails at the allocation. The pages are charged one by one as they are touched, so the limit is hit in the middle of the copy, not at the `malloc`.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** let the report service run four reports at once instead of one.
+
+One number changes. Four reports need four copies of the file plus four sets of rows, well over 1 GiB of heap. The kernel drops all the cache, finds nothing more to free, and kills the service with SIGKILL. Kubernetes shows `OOMKilled`, exit code 137, and every request in flight fails.
+
+<Depth level={2}>
+The node had plenty of free memory. The kill was inside the container's own cgroup. `memory.events` in that cgroup shows the story: `max` counted many times (reclaim made room), then `oom` and `oom_kill` once.
+</Depth>
+
+<Depth level={3}>
+Before the kill there was a slower phase. Once the cold cache was gone, reclaim took pages the service was still reading, and those reads went back to the disk. Pressure stall information (`memory.pressure`) shows that phase as time tasks spent waiting on memory.
+</Depth>
+
+## [morph] From "usage is our heap" to the memory cgroup
+
+Drag the slider. The container stops being one number. It becomes a memory cgroup that charges heap and page cache, a reclaim path that takes back cache first, and an OOM killer that comes last.
+
+The code stops holding whole files. It streams rows, so four reports need a few MiB of heap, and the page cache they create is reclaimed as they move on.
+
+<Depth level={2}>
+Two settings close the gap between the runtime and the kernel. Tell the runtime about the limit (`GOMEMLIMIT`, `--max-old-space-size`, the JVM's `MaxRAMPercentage`), so its collector works before the kernel has to. And set `memory.high` a little below `memory.max` if you would rather slow down than die.
+</Depth>
+
+<Depth level={3}>
+Since Kubernetes 1.28, on cgroup v2, the kubelet sets `memory.oom.group` on each container, so an OOM kills every process in the container at once. Kubernetes 1.32 added the `singleProcessOOMKill` kubelet option to go back to killing one process. The playground models the plain kernel default: one process per kill.
+</Depth>
+
+## [walk] Follow one allocation to the limit
+
+One row of one report, through the memory cgroup. Step through it with the numbered buttons.
+
+<Depth level={3}>
+Reclaim works on LRU lists of pages, kept per cgroup, separately for anonymous and file pages. Since Linux 6.1 the multi-generation LRU is available as an alternative to the older active and inactive lists. Reclaim that runs in the allocating task is direct reclaim, and its time is added to that allocation's latency. `vm.swappiness` (0 to 200, default 60) sets how the kernel weighs swapping anonymous pages against dropping file pages.
+</Depth>
+
+## [again] Four reports, the second time
+
+The same four reports at once. Each holds a read buffer and one row, a few MiB in all. `memory.current` still sits near the limit, because the export files fill the page cache, but `anon` stays flat and nothing is killed.
+
+<Depth level={2}>
+Size the limit for the heap you need at peak plus the cache that keeps you fast. If the hot files no longer fit, the service still runs; it just reads from disk more often.
+</Depth>
+
+<Depth level={3}>
+Page cache is charged to the cgroup that first brought the page in. If a sidecar reads the same files first, the cache counts against the sidecar's container, not yours.
+</Depth>
+
+## [play] Fill the container
+
+A container with a 1 GiB limit, three processes and the page cache charged to it. Grow each process's heap, read log files into the cache, turn on swap or `memory.high`, and set `oom_score_adj`. The real `memory.events` counters update as you go.
+
+Find out what goes first, who dies, and how to choose a different victim.
+
+## [lens] How each runtime sees the limit
+
+None of these runtimes enforces the cgroup limit for you. Some can be told about it.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Go has `GOMEMLIMIT`, a soft target for its GC. Node's V8 heap has a hard cap that ends in a JavaScript out-of-memory crash, not a kernel kill. Python and Rust have no limit of their own, so the kernel's limit is the only one.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="memory-accounting-reclaim-and-oom" />
+
+### Reading a container's memory
+
+Inside the container's cgroup directory: `memory.current` and `memory.max` for the total and the limit, `memory.stat` for `anon` against `file`, `memory.events` for how often reclaim, throttling and kills happened, and `memory.pressure` for time lost waiting. `/proc/<pid>/oom_score` shows each process's current score, and `dmesg` logs every kill with the cgroup and the scores. On the host, `free` reports `available`, which counts reclaimable cache as usable.
