@@ -1,0 +1,566 @@
+---
+title: Desired state and the reconcile loop
+track: kubernetes
+group: Control loops
+order: 3
+summary: You declare what should exist; controllers compare it with what does exist on every pass and act on the difference, so a lost event or a restarted controller costs one pass, not a permanent error.
+intent: Keep a cluster right by comparing desired with observed state on every pass, instead of reacting to a stream of events that is never complete.
+changeRequest: At month end, run eight invoice workers instead of three, and keep them running through node failures.
+languages: [go, python, typescript, rust]
+glossary: [desired-state, reconcile-loop, level-triggered, edge-triggered, informer, owner-reference, resource-version, idempotent-operation]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [kubernetes, distributed-systems]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: desired-state-and-reconcile
+  scenarios:
+    - try: "Click a pod to delete it."
+      notice: "Both sides replace it within a few seconds. When every event arrives, reacting to events and reconciling look the same."
+    - try: "Stop the controllers, delete two pods, raise replicas to 4, then start them again."
+      notice: "The loop re-lists, sees one pod against four wanted, and creates three. The script reads replicas = 4 as its new baseline and runs one pod from then on."
+    - try: "Kill a node and switch to 50×."
+      notice: "Nothing happens for 50 s, then the node turns NotReady, and 300 s later its pod is evicted. Only then does the loop replace it. The evicted pod never reports DELETED, so the script waits until the node returns."
+    - try: "Scale to 6, drop the watch, scale to 2, reconnect."
+      notice: "The loop deletes four pods on its re-list. The script never heard the change and keeps paying for six."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 118, h: 52, title: deploy script, sub: create 3 then watch }
+      after:  { x: 12, y: 30, w: 118, h: 52, title: kubectl apply, sub: writes the spec }
+    - id: context
+      kind: context
+      before: { x: 156, y: 18, w: 266, h: 236, title: Event handler, sub: acts on each event }
+      after:  { x: 330, y: 30, w: 216, h: 52, title: Reconcile, sub: observe · diff · act }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 156, y: 30, w: 150, h: 52, title: "" }
+      after:  { x: 156, y: 30, w: 150, h: 52, title: Desired state, sub: "spec.replicas: 3" }
+    - id: observed
+      kind: concrete
+      before: { x: 176, y: 76, w: 226, h: 40, title: on DELETED }
+      after:  { x: 156, y: 176, w: 150, h: 52, title: Informer cache, sub: list + watch }
+    - id: api
+      kind: concrete
+      before: { x: 176, y: 130, w: 226, h: 40, title: create one pod }
+      after:  { x: 330, y: 176, w: 216, h: 52, title: API server, sub: create / delete pods }
+    - id: change
+      kind: concrete
+      appears: change
+      before: { x: 176, y: 196, w: 226, h: 40, title: month end · 8 workers }
+      after:  { x: 12, y: 176, w: 118, h: 52, title: "replicas: 8", sub: one field }
+  edges:
+    - { from: client, to: strategy, label: writes }
+    - { from: context, to: strategy, label: reads }
+    - { from: observed, to: context, label: wakes }
+    - { from: context, to: api, label: acts }
+    - { from: api, to: observed, label: events }
+    - { from: change, to: strategy }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: workers.go
+      source: |
+        // workers.go: start the invoice workers, then replace any that die
+        func keepWorkers(ctx context.Context, cs kubernetes.Interface, want int) error {
+            pods := cs.CoreV1().Pods("billing")
+            for i := 0; i < want; i++ {
+                if _, err := pods.Create(ctx, workerPod(), metav1.CreateOptions{}); err != nil {
+                    return err
+                }
+            }
+            w, err := pods.Watch(ctx, metav1.ListOptions{LabelSelector: "app=invoice-worker"})
+            if err != nil {
+                return err
+            }
+            defer w.Stop()
+            for ev := range w.ResultChan() {
+                if ev.Type == watch.Deleted { // a worker died: start one more
+                    pods.Create(ctx, workerPod(), metav1.CreateOptions{})
+                }
+            }
+            return nil // the watch ended
+        }
+      roles: { client: [2, 8], context: [14, 18], observed: [14, 15], api: [16, 16], change: [14, 18] }
+      change:
+        - { line: 14, replace: '    for ev := range merge(w.ResultChan(), cfg.ResultChan()) { // pods, and now the config' }
+        - { after: 17, add: ['        if n := monthEndReplicas(ev); n > want { // the config changed: create the difference', '            for ; want < n; want++ {', '                pods.Create(ctx, workerPod(), metav1.CreateOptions{})', '            }', '        }'] }
+    after:
+      file: reconciler.go
+      source: |
+        // reconciler.go: compare desired with observed, fix the difference
+        func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+            var pool billingv1.WorkerPool
+            if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
+                return ctrl.Result{}, client.IgnoreNotFound(err)
+            }
+            var pods corev1.PodList
+            if err := r.List(ctx, &pods, client.InNamespace(req.Namespace),
+                client.MatchingLabels{"pool": pool.Name}); err != nil {
+                return ctrl.Result{}, err
+            }
+            active := activePods(pods.Items) // skips pods already being deleted
+            diff := int(pool.Spec.Replicas) - len(active)
+            for i := 0; i < diff; i++ {
+                if err := r.Create(ctx, r.workerPod(&pool)); err != nil { // sets the owner reference
+                    return ctrl.Result{}, err // requeued with backoff
+                }
+            }
+            for _, p := range newestFirst(active)[:max(0, -diff)] {
+                if err := r.Delete(ctx, &p); client.IgnoreNotFound(err) != nil {
+                    return ctrl.Result{}, err
+                }
+            }
+            pool.Status.Replicas = int32(len(active))
+            return ctrl.Result{}, r.Status().Update(ctx, &pool) // a stale resourceVersion fails and is retried
+        }
+
+        func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
+            return ctrl.NewControllerManagedBy(mgr).
+                For(&billingv1.WorkerPool{}).
+                Owns(&corev1.Pod{}). // a pod event queues the pool that owns it
+                Complete(r)
+        }
+      roles: { client: [3, 6], context: [2, 26], strategy: [3, 6], observed: [7, 12], api: [14, 23], change: [13, 13], wake: [28, 33], desired: [3, 6], observe: [7, 13], act: [14, 23], status: [24, 25] }
+    again:
+      file: reconciler_test.go
+      source: |
+        // reconciler_test.go: the night the watch dropped, replayed
+        func TestPoolRecoversWithoutEvents(t *testing.T) {
+            c := fake.NewClientBuilder().WithScheme(scheme).
+                WithObjects(pool("invoices", 8)). // month end: 8 wanted
+                WithObjects(workerPods("invoices", 2)...). // 2 left after the lost events
+                Build()
+            r := &PoolReconciler{Client: c}
+            _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key("invoices")})
+            require.NoError(t, err)
+            require.Len(t, activePodsOf(t, c, "invoices"), 8) // one pass, no event history needed
+        }
+    cost:
+      before: { text: 2 of 8 workers until someone notices, value: 0.8 }
+      after: { text: back to 8 on the next pass, value: 0.12 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Kubernetes is written in Go, and so are most controllers. controller-runtime (with kubebuilder or operator-sdk) gives you the manager, the shared informer cache, the rate-limited work queue and leader election; you write `Reconcile`. client-go underneath has the informers and work queues the built-in controllers use.'
+      seenIn: 'Every controller in kube-controller-manager (ReplicaSet, Deployment, Job, node lifecycle). controller-runtime and kubebuilder. Operators such as cert-manager and Argo CD.'
+
+  python:
+    before:
+      file: workers.py
+      source: |
+        # workers.py: start the invoice workers, then replace any that die
+        def keep_workers(v1: client.CoreV1Api, want: int) -> None:
+            for _ in range(want):
+                v1.create_namespaced_pod("billing", worker_pod())
+            w = watch.Watch()
+            for ev in w.stream(v1.list_namespaced_pod, "billing", label_selector="app=invoice-worker"):
+                if ev["type"] == "DELETED":  # a worker died: start one more
+                    v1.create_namespaced_pod("billing", worker_pod())
+      roles: { client: [2, 4], context: [5, 8], observed: [6, 7], api: [8, 8], change: [6, 8] }
+      change:
+        - { after: 8, add: ['        elif (n := month_end_replicas(ev)) and n > want:  # the config changed', '            for _ in range(n - want):', '                v1.create_namespaced_pod("billing", worker_pod())', '            want = n'] }
+    after:
+      file: reconciler.py
+      source: |
+        # reconciler.py: compare desired with observed, fix the difference
+        def reconcile(pool: dict) -> None:
+            name, ns = pool["metadata"]["name"], pool["metadata"]["namespace"]
+            want = pool["spec"]["replicas"]
+            pods = v1.list_namespaced_pod(ns, label_selector=f"pool={name}").items
+            active = [p for p in pods if p.metadata.deletion_timestamp is None]
+            diff = want - len(active)
+            for _ in range(diff):
+                v1.create_namespaced_pod(ns, worker_pod(pool))  # sets the owner reference
+            for p in newest_first(active)[: max(0, -diff)]:
+                v1.delete_namespaced_pod(p.metadata.name, ns)
+            crd.patch_namespaced_custom_object_status(
+                GROUP, "v1", ns, "workerpools", name, {"status": {"replicas": len(active)}})
+
+
+        def run() -> None:
+            while True:
+                try:
+                    for pool in list_pools():  # after any gap: re-list, trust nothing remembered
+                        reconcile(pool)
+                    w = watch.Watch()
+                    for _ev in w.stream(v1.list_namespaced_pod, "billing", label_selector="pool", timeout_seconds=60):
+                        for pool in list_pools():
+                            reconcile(pool)  # an event is only a wake-up
+                except ApiException as e:
+                    log.warning("reconcile failed, retrying in 5 s: %s", e)
+                    time.sleep(5)
+      roles: { client: [3, 4], context: [2, 13], strategy: [3, 4], observed: [5, 6], api: [8, 11], change: [7, 7], wake: [16, 27], desired: [3, 4], observe: [5, 7], act: [8, 11], status: [12, 13] }
+    again:
+      file: test_reconciler.py
+      source: |
+        # test_reconciler.py: the night the watch dropped, replayed
+        def test_pool_recovers_without_events(fake_cluster):
+            fake_cluster.add_pool("invoices", replicas=8)  # month end: 8 wanted
+            fake_cluster.add_pods("invoices", 2)  # 2 left after the lost events
+            reconcile(fake_cluster.get_pool("invoices"))
+            assert len(fake_cluster.active_pods("invoices")) == 8  # one pass, no event history needed
+    cost:
+      before: { text: 2 of 8 workers until someone notices, value: 0.8 }
+      after: { text: back to 8 on the next pass, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Python is common for small operators. kopf runs handlers for create, update, resume and delete, and adds timers and daemons for periodic passes; make each handler converge on the spec rather than apply a delta. With the official `kubernetes` client you write the list, watch and re-list loop yourself, as here.'
+      seenIn: '`kopf` (Kubernetes Operator Pythonic Framework). The official `kubernetes` client''s `watch.Watch().stream`.'
+
+  typescript:
+    before:
+      file: workers.ts
+      source: |
+        // workers.ts: start the invoice workers, then replace any that die
+        async function keepWorkers(kc: KubeConfig, want: number): Promise<void> {
+          const core = kc.makeApiClient(CoreV1Api);
+          for (let i = 0; i < want; i++) {
+            await core.createNamespacedPod({ namespace: "billing", body: workerPod() });
+          }
+          await new Watch(kc).watch(
+            "/api/v1/namespaces/billing/pods",
+            { labelSelector: "app=invoice-worker" },
+            (type) => {
+              if (type === "DELETED") { // a worker died: start one more
+                void core.createNamespacedPod({ namespace: "billing", body: workerPod() });
+              }
+            },
+            (err) => console.error("watch ended", err),
+          );
+        }
+      roles: { client: [2, 6], context: [7, 16], observed: [10, 11], api: [12, 12], change: [10, 14] }
+      change:
+        - { line: 10, replace: '    (type, obj) => {' }
+        - { after: 13, add: ['      const n = monthEndReplicas(obj); // the config changed: create the difference', '      for (; want < n; want++) void core.createNamespacedPod({ namespace: "billing", body: workerPod() });'] }
+    after:
+      file: reconciler.ts
+      source: |
+        // reconciler.ts: compare desired with observed, fix the difference
+        async function reconcile(name: string): Promise<void> {
+          const pool = (await custom.getNamespacedCustomObject({ group: GROUP, version: "v1", namespace: NS, plural: "workerpools", name })) as WorkerPool;
+          const pods = podInformer.list(NS).filter((p) => p.metadata?.labels?.pool === name);
+          const active = pods.filter((p) => !p.metadata?.deletionTimestamp);
+          const diff = pool.spec.replicas - active.length;
+          for (let i = 0; i < diff; i++) {
+            await core.createNamespacedPod({ namespace: NS, body: workerPod(pool) }); // sets the owner reference
+          }
+          for (const p of newestFirst(active).slice(0, Math.max(0, -diff))) {
+            await core.deleteNamespacedPod({ namespace: NS, name: p.metadata!.name! });
+          }
+          await setStatus(pool, { replicas: active.length });
+        }
+
+        const podInformer = makeInformer(kc, `/api/v1/namespaces/${NS}/pods`,
+          () => core.listNamespacedPod({ namespace: NS, labelSelector: "pool" }));
+        for (const ev of [ADD, UPDATE, DELETE] as const) {
+          podInformer.on(ev, (pod) => queue.add(pod.metadata?.labels?.pool)); // an event is only a wake-up
+        }
+        podInformer.on(ERROR, () => setTimeout(() => podInformer.start(), 5_000)); // restarting re-lists
+        await podInformer.start();
+      roles: { client: [3, 3], context: [2, 14], strategy: [3, 3], observed: [4, 5], api: [7, 12], change: [6, 6], wake: [16, 22], desired: [3, 3], observe: [4, 6], act: [7, 12], status: [13, 13] }
+    again:
+      file: reconciler.test.ts
+      source: |
+        // reconciler.test.ts: the night the watch dropped, replayed
+        test("a pool recovers without events", async () => {
+          const cluster = new FakeCluster();
+          cluster.addPool("invoices", { replicas: 8 }); // month end: 8 wanted
+          cluster.addPods("invoices", 2); // 2 left after the lost events
+          await reconcile("invoices");
+          assert.equal(cluster.activePods("invoices").length, 8); // one pass, no event history needed
+        });
+    cost:
+      before: { text: 2 of 8 workers until someone notices, value: 0.8 }
+      after: { text: back to 8 on the next pass, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Node.js controllers are less common but straightforward. `@kubernetes/client-node` has `Watch` and `makeInformer`; the informer lists, watches and caches, and you restart it on its error event. There is no built-in work queue, so de-duplicate wake-ups per object yourself and run one reconcile per object at a time.'
+      seenIn: '`@kubernetes/client-node` informers. Small in-house operators and admission webhooks written in TypeScript.'
+
+  rust:
+    before:
+      file: workers.rs
+      source: |
+        // workers.rs: start the invoice workers, then replace any that die
+        async fn keep_workers(client: Client, want: usize) -> anyhow::Result<()> {
+            let pods: Api<Pod> = Api::namespaced(client, "billing");
+            for _ in 0..want {
+                pods.create(&PostParams::default(), &worker_pod()).await?;
+            }
+            let wp = WatchParams::default().labels("app=invoice-worker");
+            let mut events = pods.watch(&wp, "0").await?.boxed();
+            while let Some(ev) = events.try_next().await? {
+                if let WatchEvent::Deleted(_) = ev { // a worker died: start one more
+                    pods.create(&PostParams::default(), &worker_pod()).await?;
+                }
+            }
+            Ok(()) // the watch ended
+        }
+      roles: { client: [2, 6], context: [9, 13], observed: [9, 10], api: [11, 11], change: [9, 13] }
+      change:
+        - { after: 12, add: ['        if let Some(n) = month_end_replicas(&ev) { // the config changed: create the difference', '            for _ in want..n { pods.create(&PostParams::default(), &worker_pod()).await?; }', '        }'] }
+    after:
+      file: reconciler.rs
+      source: |
+        // reconciler.rs: compare desired with observed, fix the difference
+        async fn reconcile(pool: Arc<WorkerPool>, ctx: Arc<Ctx>) -> Result<Action, Error> {
+            let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &pool.namespace().unwrap());
+            let lp = ListParams::default().labels(&format!("pool={}", pool.name_any()));
+            let active: Vec<Pod> = pods.list(&lp).await?.items.into_iter()
+                .filter(|p| p.metadata.deletion_timestamp.is_none())
+                .collect();
+            let diff = pool.spec.replicas as i64 - active.len() as i64;
+            for _ in 0..diff.max(0) {
+                pods.create(&PostParams::default(), &worker_pod(&pool)).await?; // sets the owner reference
+            }
+            for p in newest_first(active).iter().take((-diff).max(0) as usize) {
+                pods.delete(&p.name_any(), &DeleteParams::default()).await?;
+            }
+            Ok(Action::requeue(Duration::from_secs(300))) // look again later, events or not
+        }
+
+        fn error_policy(_pool: Arc<WorkerPool>, _err: &Error, _ctx: Arc<Ctx>) -> Action {
+            Action::requeue(Duration::from_secs(5))
+        }
+
+        // main: watch pools and the pods they own; any event queues the owning pool
+        Controller::new(pools, watcher::Config::default())
+            .owns(pods, watcher::Config::default())
+            .run(reconcile, error_policy, ctx)
+            .for_each(|_| async {})
+            .await;
+      roles: { client: [2, 2], context: [2, 16], strategy: [8, 8], observed: [3, 7], api: [9, 14], change: [8, 8], wake: [22, 27], desired: [2, 2], observe: [3, 8], act: [9, 14], status: [15, 20] }
+    again:
+      file: tests/reconciler.rs
+      source: |
+        // tests/reconciler.rs: the night the watch dropped, replayed
+        #[tokio::test]
+        async fn pool_recovers_without_events() {
+            let cluster = FakeCluster::start().await;
+            let pool = cluster.add_pool("invoices", 8).await; // month end: 8 wanted
+            cluster.add_pods("invoices", 2).await; // 2 left after the lost events
+            reconcile(pool, cluster.ctx()).await.unwrap();
+            assert_eq!(cluster.active_pods("invoices").await.len(), 8); // one pass, no event history needed
+        }
+    cost:
+      before: { text: 2 of 8 workers until someone notices, value: 0.8 }
+      after: { text: back to 8 on the next pass, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'kube-rs is the Rust client, and its `kube::runtime::Controller` is a full reconcile loop: it watches the main object and owned objects, de-duplicates wake-ups per object, and schedules the next run from the `Action` your reconcile returns. Errors go to your `error_policy`, which picks the retry delay.'
+      seenIn: '`kube-rs` (a CNCF project) and its `Controller`, `watcher` and `reflector`. Operators written in Rust for databases and networking.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A pod owned by the invoices pool is deleted. The informer's watch reports it, the cache updates, and the pool's name goes on the work queue. The event carries no instructions; it only says to look.
+    nodes: [api, observed, context]
+    edges: [api>observed, observed>context]
+    role: wake
+  - text: Reconcile reads the pool. Someone set spec.replicas to 8 for month end, possibly while this controller was not even running. It does not matter when.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: desired
+  - text: It lists the pool's pods from the cache and skips any already being deleted. 5 are active, 8 are wanted, so the gap is 3.
+    nodes: [context, observed]
+    edges: [observed>context]
+    role: observe
+  - text: It creates 3 pods, each with an owner reference to the pool. If a create fails, it returns the error and the queue retries later with backoff.
+    nodes: [context, api]
+    edges: [context>api]
+    role: act
+  - text: It records what it observed in the status and returns. The new pods' events wake it again, it finds 8 of 8, and does nothing. Running it twice is safe.
+    nodes: [context, api, observed]
+    edges: [context>api, api>observed]
+    role: status
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: A WorkerPool declares replicas 3. You delete one of its pods. What happens?
+    options:
+      - text: The controller sees 2 pods where 3 are wanted and creates one.
+        correct: true
+        why: Right. The spec still says 3. The controller compares that with the 2 it observes and closes the gap.
+      - text: Nothing. You deleted it, so the cluster now wants 2.
+        why: Deleting a pod changes what exists, not what is wanted. To run 2, you change spec.replicas.
+      - text: The pod restarts on the same node.
+        why: A deleted pod is gone for good. A new pod with a new name is created and scheduled, perhaps on another node.
+  engineer:
+    question: Your controller was down for ten minutes during a deploy, and missed every event in that time. What happens when it starts again?
+    options:
+      - text: It lists the current state, compares it with each spec, and fixes any gap. Nothing is lost.
+        correct: true
+        why: Right. A level-triggered controller does not need the events it missed, because their results are visible in the current state.
+      - text: The API server replays the missed events to it, in order.
+        why: A watch can resume from a recent resourceVersion, but old history is compacted away and a resume may fail with 410 Gone. Controllers do not depend on replay; they re-list.
+      - text: The changes made in those ten minutes are lost until someone edits the objects again.
+        why: That is what happens to an edge-triggered script. A reconcile loop needs only the present state.
+  deep:
+    question: The ReplicaSet controller creates 2 pods, and before its informer cache shows them, another event wakes it for the same ReplicaSet. Why does it not create 2 more?
+    options:
+      - text: It records how many creates and deletes it expects to observe, and skips a pass until the cache has caught up with them.
+        correct: true
+        why: Right. These expectations protect against acting on a stale cache. Without them, a fast loop over a lagging cache overshoots.
+      - text: The API server rejects the second set of creates because of resourceVersion.
+        why: resourceVersion protects updates to one object. Creating new pods with generated names does not conflict with anything.
+      - text: Events for one object are always delivered after the cache is fully up to date.
+        why: The cache is updated by the same watch, but a wake-up can come from the owner or another pod before the new pods arrive. The controller has to allow for that.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Spec
+      example: "spec.replicas: 8"
+      job: The desired state. You (or another controller) write it; the controller only reads it.
+    - role: Status
+      example: "status.replicas: 5"
+      job: The observed state, written by the controller. Useful for people and other controllers; never trusted as the truth by the controller itself.
+    - role: Informer
+      example: the pod cache
+      job: Lists once, then watches. Keeps a local copy of objects, re-lists when the watch breaks, and turns changes into wake-ups.
+    - role: Work queue
+      example: "billing/invoices"
+      job: Holds names of objects to reconcile. De-duplicates them, and retries failures with rate-limited backoff.
+    - role: Reconcile
+      example: Reconcile(ctx, req)
+      job: Reads desired and observed state, and acts on the difference. Idempotent, so it is safe to run at any time and any number of times.
+  useWhen:
+    - Something must stay true over time, such as a number of replicas, a DNS record, or a certificate that must not expire.
+    - Failures and restarts are normal, and you would rather repair the state on the next pass than keep a perfect history of events.
+    - You extend Kubernetes with your own resource: an operator is a reconcile loop for that resource.
+  avoidWhen:
+    - A Deployment, StatefulSet, Job or CronJob already does it. Write a controller only for what the built-in ones do not.
+    - The work is a one-off action with no state to keep true, such as sending an email when something happens. That is an event handler, and it needs idempotency keys rather than reconciliation.
+  tradeoffs:
+    - A pass lists and compares everything it owns, so it costs more than handling one event. Informer caches make that read local and cheap.
+    - The loop converges eventually, not at once. A node failure takes about 50 s to be noticed and 5 more minutes before its pods are evicted.
+    - Two controllers that want different things for the same field fight forever, each undoing the other. Nothing reports it as an error.
+    - Reconcile must be idempotent and must not assume the order of events, since wake-ups are merged, repeated and reordered.
+  lookalikes:
+    - name: Event-driven handler
+      how: Acts on each event. Fine when events are complete and ordered, which a network and restarting processes do not guarantee.
+    - name: Cron job that fixes drift
+      how: A reconcile loop with only a timer for a wake-up. Correct, but slow to react; controllers add watches for speed and keep periodic passes as a safety net.
+    - name: Terraform apply
+      how: The same compare-and-act idea, run once by a person instead of continuously by a controller.
+---
+
+## [concept] Desired state and the reconcile loop
+
+**In Kubernetes you write down the <Term id="desired-state">desired state</Term>, and controllers keep comparing it with what they observe and act on the difference. Each pass of the <Term id="reconcile-loop">reconcile loop</Term> looks at the whole present state, so it does not matter what happened in between.**
+
+You do not say "start a pod on node 2". You say "three replicas". If a pod dies, the controller counts two and starts a third. If someone asks for eight, it counts three and starts five. The same code handles both.
+
+<Depth level={2}>
+Controllers are <Term id="level-triggered">level-triggered</Term>. They act on the present gap, not on remembered events, so a missed event is repaired on the next pass. Events still matter: they are how a controller knows to look again soon. But an event is a wake-up, never an instruction.
+</Depth>
+
+<Depth level={3}>
+The split between spec and status is the contract. You write the spec; the controller writes the status from what it observed. Every built-in workload controller (ReplicaSet, Deployment, Job, StatefulSet) runs this loop inside kube-controller-manager, each watching its own kind of object, and they cooperate only through objects in the API server.
+</Depth>
+
+## [problem] A script that keeps the workers running
+
+The billing team runs invoice workers on Kubernetes. A small script starts three worker pods, then watches pods and starts a new one each time a worker is deleted. In testing it works: delete a worker and a new one appears within seconds.
+
+<Depth level={2}>
+The script is <Term id="edge-triggered">edge-triggered</Term>. It is correct only if it sees every event exactly once, and it remembers its own idea of how many workers exist instead of counting them.
+</Depth>
+
+<Depth level={3}>
+A watch is a long-lived HTTP stream. It ends when the API server restarts, when a load balancer times out an idle connection, or when the script's own pod is rescheduled. Anything that happens before it reconnects is invisible to it, unless it lists again.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** at month end, run eight invoice workers instead of three, and keep them running through node failures.
+
+The team adds a watch on the config and creates the difference when the number goes up. On the night of month end the watch connection drops during an API server upgrade, and the config change arrives while the script is reconnecting, so the five extra workers are never created. Later a node fails, and its worker is evicted without a DELETED event. In the morning two workers are running, the queue is six hours behind, and nothing in the script's logs looks wrong.
+
+<Depth level={2}>
+Every fix adds another event to handle: reconnects, config changes, evictions, pods stuck terminating. Each one needs its own code path, and the script still cannot tell what it missed. The state it remembers drifts away from the state that exists.
+</Depth>
+
+<Depth level={3}>
+Resuming a watch from the last resourceVersion it saw helps only for short gaps. The API server keeps a limited window of history; ask for something older and it answers 410 Gone, and the only way back is a full list. That list is the comparison the script never made.
+</Depth>
+
+## [morph] Compare, then act
+
+Drag the slider. The script's event handlers become one function that reads the spec, counts the pods, and closes the gap. The watch becomes an <Term id="informer">informer</Term> whose events only say "look again".
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The month-end change is now one field: replicas 8. It does not matter whether the controller was running when it changed, or how many events were lost. On its next pass it sees 8 wanted and however many exist, and acts. Errors return to the work queue, which retries with <Term id="exponential-backoff">exponential backoff</Term>.
+</Depth>
+
+<Depth level={3}>
+The pods carry an <Term id="owner-reference">owner reference</Term> to the pool, which lets the controller map a pod event to its owner and lets the garbage collector delete the pods with the pool. Status updates carry the object's <Term id="resource-version">resourceVersion</Term>: if someone else changed the object since it was read, the update fails with a conflict and the pass runs again on fresh data.
+</Depth>
+
+## [walk] Follow one pass
+
+The pool wants 8 pods and has 5. Follow one pass from the wake-up to the status update. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">controller-runtime de-duplicates requests on the work queue, so ten pod events in a burst become one Reconcile. It never runs two passes for the same object at once.</Lang>
+<Lang only="python">The watch stream ends after `timeout_seconds`, and the loop re-lists. That turns a long-lived watch into a periodic full pass for free.</Lang>
+<Lang only="typescript">An informer's error handler is not optional: without a restart, a broken watch leaves the cache frozen and the controller silent.</Lang>
+<Lang only="rust">`Controller` merges wake-ups for the same object and runs `reconcile` again when the returned `Action` says so, so a periodic pass needs no extra code.</Lang>
+</Depth>
+
+## [again] The same night, with a reconcile loop
+
+The node fails and the watch drops in the same upgrade. When the controller reconnects it re-lists, sees 8 wanted, counts what is running, and creates the difference. When the node's pods are finally evicted, it counts fewer and creates more. By morning eight workers are running, and the only trace is a few lines of log.
+
+<Depth level={2}>
+Running the pass twice does nothing the second time, because it is an <Term id="idempotent-operation">idempotent operation</Term>: it states a target, not a step. That is why it can be triggered by any event, by a timer, or by a restart, and why duplicated or reordered events are harmless.
+</Depth>
+
+<Depth level={3}>
+The cache can lag the API server. Right after creating pods, a second wake-up may see the old count and create them again. The ReplicaSet controller guards against this with expectations: it records the creates and deletes it made and skips passes until the cache has observed them. controller-runtime leaves this to you; generated names and checking for pods already pending are the usual answers.
+</Depth>
+
+## [play] Lose some events
+
+Two copies of the same cluster get exactly the same trouble. The top one is kept alive by the event script, the bottom one by a reconcile loop. Delete pods, change replicas, kill nodes, stop the controllers and drop the watch, and see which one is right afterwards.
+
+## [lens] How each language does it
+
+Go is where Kubernetes controllers live: client-go and controller-runtime give you informers, work queues and leader election. Rust has kube-rs with a complete `Controller`. Python has kopf and the official client. TypeScript has informers in `@kubernetes/client-node` and leaves the queue to you.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Whatever the language, the same rules hold. Read state at the start of every pass. Act on the difference. Make every write safe to repeat. Return errors so the pass runs again, rather than logging them and moving on.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="desired-state-and-reconcile" />
+
+### Why a dead node takes minutes
+
+A node that stops reporting is not declared dead at once. The node lifecycle controller marks it NotReady after `node-monitor-grace-period` (50 seconds by default) and taints it. Every pod carries a default toleration of 300 seconds for that taint, so its pods are evicted about five minutes later. Only then do they stop counting toward their ReplicaSet, and only then are replacements created. Shorter values react faster and evict more pods during brief network blips.

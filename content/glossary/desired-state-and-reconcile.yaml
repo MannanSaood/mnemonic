@@ -1,0 +1,22 @@
+# Terms introduced by the desired state and reconcile loop lesson.
+- id: desired-state
+  term: Desired state
+  short: What you declare an object should look like, in its spec, such as three replicas of a pod. Controllers work to make the cluster match it; the status records what they observed.
+- id: reconcile-loop
+  term: Reconcile loop
+  short: A controller's core function. It reads the desired state and the observed state, and creates, updates or deletes objects to close the gap. It runs again on every wake-up and after every error.
+- id: level-triggered
+  term: Level-triggered
+  short: Acting on the current state, whatever events led to it. A missed event does no lasting harm, because the next pass sees the result anyway.
+- id: edge-triggered
+  term: Edge-triggered
+  short: Acting on each change as it is reported. Correct only if every event arrives exactly once; a lost or repeated event leaves a permanent error.
+- id: informer
+  term: Informer
+  short: A client-side cache of one kind of object, kept current by listing once and then watching for changes. It re-lists when the watch breaks, and notifies handlers on add, update and delete.
+- id: owner-reference
+  term: Owner reference
+  short: A field in an object's metadata naming the object that owns it, such as the ReplicaSet that created a pod. Controllers use it to find their objects, and the garbage collector deletes owned objects with their owner.
+- id: resource-version
+  term: resourceVersion
+  short: A version string the API server puts on every object. An update that carries a stale one is rejected with a conflict, so two writers cannot silently overwrite each other.
