@@ -1,0 +1,529 @@
+---
+title: "B+-trees: lookup and splits"
+track: databases
+group: Indexes
+order: 10
+summary: An index is a wide, shallow tree of pages. A lookup reads one page per level, three or four even for a billion rows. Where inserts land depends on the key, and that decides how often pages split.
+intent: Know what a lookup and an insert cost in pages, and pick primary keys that append at the right edge instead of splitting pages all over the index.
+changeRequest: Backfill 300 million historical orders into the orders table while it keeps taking live traffic.
+languages: [go, python, typescript, rust]
+glossary: [b-plus-tree, database-page, fan-out, separator-key, page-split, fillfactor, uuidv7]
+
+prerequisites: [databases/pages-and-slotted-layout]
+skills: [indexing, storage-engines]
+depths: [overview, engineer, deep]
+
+playground:
+  model: b-tree-lookup-and-splits
+  scenarios:
+    - try: "Press +1 nine times and watch index A."
+      notice: "The ninth key overflows the only leaf. It splits in two, a root page appears above them, and the tree is now two levels tall."
+    - try: "Press +100 three times. Compare Leaves / last 100 for UUIDv7 and UUIDv4."
+      notice: "About 15 leaf pages for the time-ordered keys, about 50 for the random ones. Every UUIDv4 insert goes to a different page."
+    - try: "Switch the split rule to Always split in half, then press +1000."
+      notice: "The UUIDv7 index ends up 50% full and a level taller than the UUIDv4 one. Ascending keys never return to a left page, so a half split wastes half of it for good."
+    - try: "With 1,000 or more rows, press Look up a key, then Range scan."
+      notice: "The lookup reads one page per level. The range scan descends once and then walks the leaf chain sideways."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 104, h: 48, title: order svc, sub: uuid4 ids }
+      after:  { x: 12, y: 111, w: 104, h: 48, title: order svc, sub: INSERT }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 260, h: 236, title: orders_pkey, sub: "pictured as: a sorted list" }
+      after:  { x: 140, y: 20, w: 116, h: 48, title: root page, sub: separators }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 140, y: 111, w: 116, h: 48, title: "" }
+      after:  { x: 140, y: 111, w: 116, h: 48, title: internal, sub: ~300 children }
+    - id: leaf1
+      kind: concrete
+      before: { x: 160, y: 72, w: 220, h: 32, title: insert · O(1) }
+      after:  { x: 290, y: 20, w: 120, h: 44, title: leaf 17, sub: split · cold }
+    - id: leaf2
+      kind: concrete
+      before: { x: 160, y: 120, w: 220, h: 32, title: insert · O(1) }
+      after:  { x: 290, y: 111, w: 120, h: 44, title: leaf 402, sub: split · cold }
+    - id: edge
+      kind: concrete
+      before: { x: 160, y: 168, w: 220, h: 32, title: insert · O(1) }
+      after:  { x: 290, y: 202, w: 120, h: 44, title: right edge, sub: hot · in cache }
+    - id: v7
+      kind: concrete
+      appears: change
+      before: { x: 424, y: 202, w: 124, h: 44, title: uuidv7 ids }
+      after:  { x: 430, y: 202, w: 118, h: 44, title: uuidv7 ids, sub: always largest }
+  edges:
+    - { from: client, to: context, label: INSERT }
+    - { from: context, to: strategy, label: descend }
+    - { from: strategy, to: leaf1 }
+    - { from: strategy, to: leaf2, label: random key }
+    - { from: strategy, to: edge }
+    - { from: v7, to: edge, label: append }
+
+code:
+  go:
+    before:
+      file: orders.go
+      source: |
+        // orders.go
+        const schema = `
+        CREATE TABLE orders (
+            id          uuid PRIMARY KEY,
+            customer_id bigint NOT NULL,
+            total_cents bigint NOT NULL,
+            created_at  timestamptz NOT NULL DEFAULT now()
+        )`
+
+        func (s *Store) CreateOrder(ctx context.Context, customerID, totalCents int64) (uuid.UUID, error) {
+            id := uuid.New() // version 4: 122 random bits
+            _, err := s.db.ExecContext(ctx,
+                `INSERT INTO orders (id, customer_id, total_cents) VALUES ($1, $2, $3)`,
+                id, customerID, totalCents)
+            return id, err
+        }
+      roles: { client: [10, 16], context: [2, 8], leaf2: [11, 11], leaf1: [4, 4], edge: [4, 4] }
+      change:
+        - { line: 4, replace: '    id          uuid PRIMARY KEY WITH (fillfactor = 70),' }
+    after:
+      file: orders.go
+      source: |
+        // orders.go: ids that sort by creation time append at the right edge of orders_pkey
+        const schema = `
+        CREATE TABLE orders (
+            id          uuid PRIMARY KEY,
+            customer_id bigint NOT NULL,
+            total_cents bigint NOT NULL,
+            created_at  timestamptz NOT NULL DEFAULT now()
+        )`
+
+        func (s *Store) CreateOrder(ctx context.Context, customerID, totalCents int64) (uuid.UUID, error) {
+            id, err := uuid.NewV7() // version 7: 48-bit millisecond timestamp first, then random bits
+            if err != nil {
+                return uuid.Nil, err
+            }
+            _, err = s.db.ExecContext(ctx,
+                `INSERT INTO orders (id, customer_id, total_cents) VALUES ($1, $2, $3)`,
+                id, customerID, totalCents)
+            return id, err
+        }
+      roles: { client: [10, 19], context: [2, 8], strategy: [4, 4], v7: [11, 11], edge: [11, 11], descend: [15, 17], leaf: [16, 16], split: [4, 4], append: [11, 11] }
+    again:
+      file: migration.go
+      source: |
+        // migration.go: on PostgreSQL 18 the database can make the id itself
+        const migration = `ALTER TABLE orders ALTER COLUMN id SET DEFAULT uuidv7()`
+        // then: INSERT INTO orders (customer_id, total_cents) VALUES ($1, $2) RETURNING id
+    cost:
+      before: { text: a cold random leaf per insert · index ~30% larger, value: 0.85 }
+      after: { text: inserts hit the cached right edge · leaves ~90% full, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: One function
+      note: '`github.com/google/uuid` has `uuid.NewV7()` since v1.6.0. It returns an error because it reads the clock and crypto/rand. Both pgx and `database/sql` with the pgx stdlib driver send a `uuid.UUID` as a uuid value; storing ids as text instead doubles the key size and halves the fan-out.'
+      seenIn: '`uuid.New()` (v4), `uuid.NewV7()`, `conn.CopyFrom` in pgx for the backfill itself.'
+
+  python:
+    before:
+      file: orders.py
+      source: |
+        # orders.py
+        import uuid
+        import psycopg
+
+        SCHEMA = """
+        CREATE TABLE orders (
+            id          uuid PRIMARY KEY,
+            customer_id bigint NOT NULL,
+            total_cents bigint NOT NULL,
+            created_at  timestamptz NOT NULL DEFAULT now()
+        )"""
+
+
+        def create_order(conn: psycopg.Connection, customer_id: int, total_cents: int) -> uuid.UUID:
+            order_id = uuid.uuid4()  # version 4: 122 random bits
+            conn.execute(
+                "INSERT INTO orders (id, customer_id, total_cents) VALUES (%s, %s, %s)",
+                (order_id, customer_id, total_cents),
+            )
+            return order_id
+      roles: { client: [14, 20], context: [5, 11], leaf2: [15, 15], leaf1: [7, 7], edge: [7, 7] }
+      change:
+        - { line: 7, replace: '    id          uuid PRIMARY KEY WITH (fillfactor = 70),' }
+    after:
+      file: orders.py
+      source: |
+        # orders.py: ids that sort by creation time append at the right edge of orders_pkey
+        import uuid
+        import psycopg
+
+        SCHEMA = """
+        CREATE TABLE orders (
+            id          uuid PRIMARY KEY,
+            customer_id bigint NOT NULL,
+            total_cents bigint NOT NULL,
+            created_at  timestamptz NOT NULL DEFAULT now()
+        )"""
+
+
+        def create_order(conn: psycopg.Connection, customer_id: int, total_cents: int) -> uuid.UUID:
+            order_id = uuid.uuid7()  # Python 3.14+: millisecond timestamp first, then random bits
+            conn.execute(
+                "INSERT INTO orders (id, customer_id, total_cents) VALUES (%s, %s, %s)",
+                (order_id, customer_id, total_cents),
+            )
+            return order_id
+      roles: { client: [14, 20], context: [5, 11], strategy: [7, 7], v7: [15, 15], edge: [15, 15], descend: [16, 19], leaf: [17, 17], split: [7, 7], append: [15, 15] }
+    again:
+      file: migration.py
+      source: |
+        # migration.py: on PostgreSQL 18 the database can make the id itself (works on any Python)
+        conn.execute("ALTER TABLE orders ALTER COLUMN id SET DEFAULT uuidv7()")
+        row = conn.execute("INSERT INTO orders (customer_id, total_cents) VALUES (%s, %s) RETURNING id", (42, 1999)).fetchone()
+    cost:
+      before: { text: a cold random leaf per insert · index ~30% larger, value: 0.85 }
+      after: { text: inserts hit the cached right edge · leaves ~90% full, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: One function
+      note: '`uuid.uuid7()` arrived in Python 3.14. On 3.12 or 3.13, let PostgreSQL 18 fill the column with `DEFAULT uuidv7()` and read it back with `RETURNING id`, or use a package that implements RFC 9562. psycopg 3 adapts `uuid.UUID` to the uuid type both ways.'
+      seenIn: '`uuid.uuid4()`, `uuid.uuid7()` (3.14), `cursor.copy()` in psycopg 3 for the backfill itself.'
+
+  typescript:
+    before:
+      file: orders.ts
+      source: |
+        // orders.ts
+        import { randomUUID } from "node:crypto";
+        import type { Pool } from "pg";
+
+        export const schema = `
+        CREATE TABLE orders (
+          id          uuid PRIMARY KEY,
+          customer_id bigint NOT NULL,
+          total_cents bigint NOT NULL,
+          created_at  timestamptz NOT NULL DEFAULT now()
+        )`;
+
+        export async function createOrder(db: Pool, customerId: string, totalCents: number): Promise<string> {
+          const id = randomUUID(); // version 4: 122 random bits
+          await db.query(
+            "INSERT INTO orders (id, customer_id, total_cents) VALUES ($1, $2, $3)",
+            [id, customerId, totalCents],
+          );
+          return id;
+        }
+      roles: { client: [13, 20], context: [5, 11], leaf2: [14, 14], leaf1: [7, 7], edge: [7, 7] }
+      change:
+        - { line: 7, replace: '  id          uuid PRIMARY KEY WITH (fillfactor = 70),' }
+    after:
+      file: orders.ts
+      source: |
+        // orders.ts: ids that sort by creation time append at the right edge of orders_pkey
+        import { v7 as uuidv7 } from "uuid";
+        import type { Pool } from "pg";
+
+        export const schema = `
+        CREATE TABLE orders (
+          id          uuid PRIMARY KEY,
+          customer_id bigint NOT NULL,
+          total_cents bigint NOT NULL,
+          created_at  timestamptz NOT NULL DEFAULT now()
+        )`;
+
+        export async function createOrder(db: Pool, customerId: string, totalCents: number): Promise<string> {
+          const id = uuidv7(); // millisecond timestamp first, then random bits
+          await db.query(
+            "INSERT INTO orders (id, customer_id, total_cents) VALUES ($1, $2, $3)",
+            [id, customerId, totalCents],
+          );
+          return id;
+        }
+      roles: { client: [13, 20], context: [5, 11], strategy: [7, 7], v7: [14, 14], edge: [14, 14], descend: [15, 18], leaf: [16, 16], split: [7, 7], append: [14, 14] }
+    again:
+      file: migration.ts
+      source: |
+        // migration.ts: on PostgreSQL 18 the database can make the id itself
+        await db.query("ALTER TABLE orders ALTER COLUMN id SET DEFAULT uuidv7()");
+        const { rows } = await db.query("INSERT INTO orders (customer_id, total_cents) VALUES ($1, $2) RETURNING id", [customerId, 1999]);
+    cost:
+      before: { text: a cold random leaf per insert · index ~30% larger, value: 0.85 }
+      after: { text: inserts hit the cached right edge · leaves ~90% full, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: One function
+      note: '`crypto.randomUUID()` only makes version 4. The `uuid` package exports `v7` (since version 10). node-postgres sends the id as a string and PostgreSQL casts it to uuid; bigint columns come back as strings too, which is why `customerId` is a string here.'
+      seenIn: '`crypto.randomUUID()`, `v7` from the `uuid` package, `pg-copy-streams` for the backfill itself.'
+
+  rust:
+    before:
+      file: orders.rs
+      source: |
+        // orders.rs
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        pub const SCHEMA: &str = "
+        CREATE TABLE orders (
+            id          uuid PRIMARY KEY,
+            customer_id bigint NOT NULL,
+            total_cents bigint NOT NULL,
+            created_at  timestamptz NOT NULL DEFAULT now()
+        )";
+
+        pub async fn create_order(db: &PgPool, customer_id: i64, total_cents: i64) -> sqlx::Result<Uuid> {
+            let id = Uuid::new_v4(); // version 4: 122 random bits
+            sqlx::query("INSERT INTO orders (id, customer_id, total_cents) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(customer_id)
+                .bind(total_cents)
+                .execute(db)
+                .await?;
+            Ok(id)
+        }
+      roles: { client: [13, 22], context: [5, 11], leaf2: [14, 14], leaf1: [7, 7], edge: [7, 7] }
+      change:
+        - { line: 7, replace: '    id          uuid PRIMARY KEY WITH (fillfactor = 70),' }
+    after:
+      file: orders.rs
+      source: |
+        // orders.rs: ids that sort by creation time append at the right edge of orders_pkey
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        pub const SCHEMA: &str = "
+        CREATE TABLE orders (
+            id          uuid PRIMARY KEY,
+            customer_id bigint NOT NULL,
+            total_cents bigint NOT NULL,
+            created_at  timestamptz NOT NULL DEFAULT now()
+        )";
+
+        pub async fn create_order(db: &PgPool, customer_id: i64, total_cents: i64) -> sqlx::Result<Uuid> {
+            let id = Uuid::now_v7(); // millisecond timestamp first, then random bits
+            sqlx::query("INSERT INTO orders (id, customer_id, total_cents) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(customer_id)
+                .bind(total_cents)
+                .execute(db)
+                .await?;
+            Ok(id)
+        }
+      roles: { client: [13, 22], context: [5, 11], strategy: [7, 7], v7: [14, 14], edge: [14, 14], descend: [15, 20], leaf: [15, 15], split: [7, 7], append: [14, 14] }
+    again:
+      file: migration.rs
+      source: |
+        // migration.rs: on PostgreSQL 18 the database can make the id itself
+        sqlx::query("ALTER TABLE orders ALTER COLUMN id SET DEFAULT uuidv7()").execute(db).await?;
+        let id: Uuid = sqlx::query_scalar("INSERT INTO orders (customer_id, total_cents) VALUES ($1, $2) RETURNING id").bind(42_i64).bind(1999_i64).fetch_one(db).await?;
+    cost:
+      before: { text: a cold random leaf per insert · index ~30% larger, value: 0.85 }
+      after: { text: inserts hit the cached right edge · leaves ~90% full, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: One function
+      note: 'The `uuid` crate gates each version behind a feature: enable `v7` for `Uuid::now_v7()`. sqlx encodes `Uuid` as the uuid type once its own `uuid` feature is on; without it, `.bind(id)` does not compile, which is better than silently sending text.'
+      seenIn: '`Uuid::new_v4()`, `Uuid::now_v7()`, `PgConnection::copy_in_raw` for the backfill itself.'
+
+walk:
+  - text: The INSERT reaches orders_pkey. The database reads the root page and binary-searches its separator keys to pick one child, then does the same on the internal page below it.
+    nodes: [client, context, strategy]
+    edges: [client>context, context>strategy]
+    role: descend
+  - text: A UUIDv4 key sorts to a random place, here leaf 402. In a table bigger than memory that leaf is probably not cached, so the insert first waits for a page read.
+    nodes: [strategy, leaf2]
+    edges: [strategy>leaf2]
+    role: leaf
+  - text: Leaf 402 is full. Half its entries move to a new page, the new page's first key is copied into the parent as a separator, and both pages are written. If the parent overflows it splits too; only a root split adds a level.
+    nodes: [strategy, leaf1, leaf2]
+    edges: [strategy>leaf1, strategy>leaf2]
+    role: split
+  - text: A UUIDv7 key is larger than every key so far, so it always lands on the rightmost leaf, which stays in memory. When that page fills, the left half stays about 90% full and the new page takes the rest.
+    nodes: [v7, edge, strategy]
+    edges: [v7>edge, strategy>edge]
+    role: append
+
+checks:
+  overview:
+    question: A bigint primary key index has 1 billion entries, and each 8 KB page holds about 366 of them. About how many pages does looking up one id read?
+    options:
+      - text: "4"
+        correct: true
+        why: Right. Each level multiplies the reach by about 366. One level covers 366 entries, two cover 134 thousand, three cover 49 million, and four cover 18 billion. The top levels are nearly always cached, so it is often one or two disk reads.
+      - text: About 30, one per step of a binary search
+        why: That is a binary tree with two children per node. A B+-tree node is a whole page with hundreds of children, so each level divides the search space by hundreds.
+      - text: It depends on where the id is in the table
+        why: Every leaf is at the same depth. Any key, small or large, old or new, costs one page per level.
+  engineer:
+    question: An orders table with a UUIDv4 primary key outgrows memory, and insert latency climbs while select latency stays flat. What is the most likely cause?
+    options:
+      - text: Each insert lands on a random leaf that is usually not cached, so it waits for a page read and dirties another page
+        correct: true
+        why: Right. Lookups read only the few hot top pages plus one leaf. Random inserts need every leaf to be hot, so once the index is bigger than memory almost every insert is a cache miss, plus splits and extra WAL.
+      - text: The tree gets one level taller for every million rows
+        why: Height grows with the logarithm of the row count, base a few hundred. Going from 4 to 5 levels takes hundreds of times more rows.
+      - text: Comparing 16-byte UUIDs is much slower than comparing 8-byte integers
+        why: The comparison is a few nanoseconds either way. The cost is the page I/O, not the CPU.
+  deep:
+    question: A B+-tree splits every full page exactly in half, and the keys arrive in ascending order. How full do the leaves end up, and what do PostgreSQL and InnoDB do about it?
+    options:
+      - text: About half full, because no key ever lands on a left page again. Both engines keep the left page nearly full when the split is at the right edge
+        correct: true
+        why: Right. PostgreSQL fills the left page to the fillfactor (90 by default for B-trees) when it extends the index at the right; InnoDB leaves pages about 15/16 full for sequential inserts.
+      - text: About 69% full, the same as random inserts
+        why: That is the average for random keys, where new keys keep landing in every page and refill them. Ascending keys never revisit a page once it is split.
+      - text: 100% full, because splits always happen at the last key
+        why: A plain half split moves half the entries out. Only an engine that detects right-edge inserts keeps the left page full.
+
+reference:
+  roles:
+    - role: Root page
+      example: the top of orders_pkey
+      job: The single entry point. Its separators split the whole key range into a few hundred children.
+    - role: Internal page
+      example: the level below the root
+      job: Holds separator keys and child page numbers. Routes a search, holds no rows.
+    - role: Leaf page
+      example: leaf 402
+      job: Holds the sorted index entries (key and row pointer), and links to its right neighbour for range scans.
+    - role: Separator key
+      example: the first key of a new right page
+      job: Copied into the parent on a split, so a search knows which child covers a key.
+  useWhen:
+    - Equality and range lookups on a key, sorted output, uniqueness checks. That is almost every primary key and most secondary indexes.
+    - Primary keys that grow over time (identity columns, UUIDv7, timestamps first), which keep inserts at the right edge.
+  avoidWhen:
+    - A random primary key on a write-heavy table larger than memory. Make the key time-ordered, or keep a random public id in a secondary unique index.
+    - Write-mostly data that is rarely read by key, where an LSM tree or an append-only log costs far less per write.
+  tradeoffs:
+    - Every index is one more tree each insert has to descend and maybe split.
+    - A lower fillfactor leaves room for inserts in the middle of the key range and makes the index bigger.
+    - Time-ordered ids show creation time to anyone who sees them, and the right edge is one hot page under heavy concurrent inserts.
+  lookalikes:
+    - name: B-tree (without the plus)
+      how: Stores entries in internal nodes too. Database "B-tree" indexes are B+-trees in practice; PostgreSQL's nbtree keeps entries in the leaves only.
+    - name: LSM tree
+      how: Buffers writes in memory and writes sorted runs, so inserts never split pages. Reads may check several runs.
+    - name: Hash index
+      how: Equality lookups only, no ranges and no sort order.
+---
+
+## [concept] B+-trees: lookup and splits
+
+**An index is a sorted tree of pages, hundreds of entries wide and only three or four levels deep. A lookup reads one page per level. An insert goes to the one leaf where its key sorts, and splits that page when it is full.**
+
+A <Term id="b-plus-tree">B+-tree</Term> is built from fixed-size <Term id="database-page">pages</Term>, 8 KB in PostgreSQL. Leaf pages hold the index entries in key order: the key and a pointer to the row. Internal pages above them hold only <Term id="separator-key">separator keys</Term> and child page numbers. Each page has hundreds of children, a high <Term id="fan-out">fan-out</Term>, so the tree is very shallow.
+
+<Depth level={2}>
+Count it once. A bigint entry in a PostgreSQL index takes about 20 bytes with its line pointer, so a page holds roughly 400, and about 366 when filled to 90%. A root with 366 leaves below it covers 134 thousand rows. Three levels cover 49 million, and four levels cover 18 billion. The root and the second level are touched by every lookup and stay in the buffer cache, so a lookup costs one or two page reads that might miss.
+</Depth>
+
+<Depth level={3}>
+PostgreSQL's B-tree (nbtree) follows Lehman and Yao: every page has a right-link to its sibling and a high key that bounds what it may hold. A reader that arrives at a page just after a concurrent split sees a key above the high key and follows the right-link, so searches never lock the whole path. Over 99% of the pages in a typical index are leaves, which is why the internal levels fit in memory so easily.
+</Depth>
+
+## [problem] Orders with random UUIDs
+
+An order service gives each order a UUID primary key, generated in the application with version 4: 122 random bits. It is a sensible choice. Ids can be made before the insert, they do not leak how many orders exist, and they never collide across services.
+
+Read the code once. Nothing about it looks expensive. The INSERT touches one row and the primary key index.
+
+<Depth level={2}>
+The index is the part to watch. Every row adds one entry to orders_pkey, and the entry has to go into the leaf page where its key sorts. A random key sorts to a random leaf. While the whole index fits in memory, that is invisible: every leaf is already cached.
+</Depth>
+
+<Depth level={3}>
+A random insert also leaves pages fuller in some places than others. With random keys, B-tree leaves settle at about 69% full on average (ln 2, a classic result), because every page that splits starts as two half-full pages and fills up again slowly.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** backfill 300 million historical orders into the orders table while it keeps taking live traffic.
+
+The backfill starts fast and slows down hour by hour. Live checkouts slow down with it. Selects by id are still fast. The marked line is the fix someone proposes: leave 30% free space in each index page, so fewer inserts cause a split.
+
+<Depth level={2}>
+The fillfactor helps a little with splits and does nothing about the real cost. Once orders_pkey is bigger than memory, each random key needs a leaf that was evicted long ago. Every insert reads a page from disk, dirties it, and pushes another useful page out of the cache. A lower fillfactor makes the index bigger, so even fewer leaves fit in memory.
+</Depth>
+
+<Depth level={3}>
+Each split also writes two pages and updates the parent, and after a checkpoint PostgreSQL logs the full image of every page the first time it is modified (full_page_writes). Random keys modify many different pages per checkpoint, so they also multiply the WAL volume, which the replicas have to replay.
+</Depth>
+
+## [morph] Let new keys land in one place
+
+Drag the slider. The flat list turns into a tree of pages, and the new ids find the right edge.
+
+The fix is the key, not the index. A <Term id="uuidv7">UUIDv7</Term> starts with a 48-bit millisecond timestamp and ends with random bits. It is still a UUID, still made in the application, and it sorts by creation time. Every new key is larger than the ones before it, so every insert goes to the rightmost leaf, which is always in memory.
+
+<Depth level={2}>
+A bigint identity column has the same effect. Pick UUIDv7 when ids are created outside the database or must not be guessable in sequence. The random bits after the timestamp still keep ids from different servers unique, and keys made in the same millisecond on different servers land on the same one or two pages.
+</Depth>
+
+<Depth level={3}>
+Ascending keys also change how a page splits. A textbook B+-tree splits a full page in half, which with ascending keys would leave every left page half empty forever. PostgreSQL fills leaf pages to the <Term id="fillfactor">fillfactor</Term> when it extends the index at the right (90% by default), and InnoDB leaves sequentially filled pages about 15/16 full. PostgreSQL also remembers the rightmost leaf and tries it first for the next insert, skipping the descent.
+</Depth>
+
+## [walk] Follow one insert down the tree
+
+One random insert, then one time-ordered insert. Use the numbered buttons.
+
+<Depth level={2}>
+A <Term id="page-split">page split</Term> is the only way a B+-tree grows sideways, and a root split is the only way it grows taller. That is why every leaf is always at the same depth and every lookup costs the same number of pages.
+</Depth>
+
+<Depth level={3}>
+PostgreSQL never merges half-empty pages. VACUUM can remove a leaf only once it is completely empty, and never the rightmost page of a level. An index that had many rows deleted from the middle of its key range keeps its size until a REINDEX rebuilds it.
+</Depth>
+
+## [again] The same request, with the database making the id
+
+On PostgreSQL 18 the database can generate the id itself with `uuidv7()`. The column default changes once, and inserts read the new id back with `RETURNING id`. The backfill keeps its original ids in their original order, so it should also insert in id order to keep appending at the right edge.
+
+<Depth level={2}>
+If the old ids are UUIDv4 and must stay, the backfill can still be cheap: load the rows sorted by id with COPY into a table without the index, then build the index once. CREATE INDEX sorts the entries and writes the pages bottom-up, full to the fillfactor, without a single split.
+</Depth>
+
+<Depth level={3}>
+UUIDv7 ids have millisecond resolution. Ids generated in the same millisecond by different processes interleave in the low random bits, so their inserts may touch a couple of pages near the right edge. PostgreSQL's `uuidv7()` also puts sub-millisecond timestamp bits after the millisecond, so ids made close together still sort in creation order.
+</Depth>
+
+## [play] Insert rows and watch the pages
+
+Two indexes take the same number of inserts. Pick a key type for each, insert, and watch which pages each insert writes. The tree is shrunk to 8 keys per page so splits show up quickly.
+
+Start with the right-edge split rule, then switch to the textbook rule and see what it does to ascending keys.
+
+## [lens] How each language makes a time-ordered id
+
+The index does not care which language made the key, only how it sorts. Each language has a standard random UUID generator and, recently, a UUIDv7 one. What differs is where the v7 function lives and how the driver sends the value.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Send ids as the uuid type, never as text. A uuid key is 16 bytes; the same id as text is 36 characters plus a header, so fewer entries fit per page and the tree is wider and sometimes a level taller.
+</Depth>
+
+<Depth level={3}>
+In-memory B-trees exist in every language's ecosystem as ordered maps: Rust's `std::collections::BTreeMap` and Go's `github.com/google/btree`. They use small nodes tuned for CPU caches instead of 8 KB disk pages, but split and search the same way.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="b-tree-lookup-and-splits" />
+
+### What the tree costs in pages
+
+A point lookup reads one page per level. A range scan descends once and then follows the leaf chain sideways, one page per few hundred entries. An insert reads the same path as a lookup and writes one leaf, plus two pages and a parent on a split. Whether those pages are already in memory depends on where the keys land, which is the whole difference between a random and a time-ordered key.

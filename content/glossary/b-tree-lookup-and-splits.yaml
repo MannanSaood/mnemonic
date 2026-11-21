@@ -1,0 +1,22 @@
+# Terms introduced by databases/b-tree-lookup-and-splits.
+- id: b-plus-tree
+  term: B+-tree
+  short: A balanced tree of pages that keeps entries sorted in its leaves, with only separator keys above them. Every leaf is at the same depth.
+- id: database-page
+  term: Page (database)
+  short: The fixed-size block a database reads, caches and writes as one unit. 8 KB in PostgreSQL, 16 KB by default in InnoDB.
+- id: fan-out
+  term: Fan-out
+  short: How many children one internal page points to. Hundreds per page is what keeps a B+-tree three or four levels deep.
+- id: separator-key
+  term: Separator key
+  short: A key in an internal page that tells a search which child covers a range of keys. A split copies one into the parent.
+- id: page-split
+  term: Page split
+  short: Moving part of a full page's entries to a new page and adding a separator for it to the parent. A split of the root adds a level.
+- id: fillfactor
+  term: Fillfactor
+  short: How full an index or table page is packed when it is built or extended, leaving the rest for later inserts. PostgreSQL B-trees default to 90.
+- id: uuidv7
+  term: UUIDv7
+  short: A UUID that starts with a 48-bit Unix timestamp in milliseconds and ends with random bits, so ids sort by creation time (RFC 9562).
