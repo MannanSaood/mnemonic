@@ -1,0 +1,25 @@
+# Terms introduced by the Caching strategies lesson.
+- id: cache-aside
+  term: Cache-aside
+  short: The application checks the cache, and on a miss reads the database and puts the result in the cache itself. Also called lazy loading or look-aside.
+- id: read-through
+  term: Read-through cache
+  short: A cache that loads missing entries itself, through a loader function you give it. Concurrent misses for one key usually share one load.
+- id: write-through
+  term: Write-through cache
+  short: Every write goes to the cache and the database together, so a read after a write finds the new value in the cache.
+- id: write-back
+  term: Write-back cache
+  short: Writes go to the cache only and reach the database later, in batches. Fast writes, but data in the cache can be lost before it is written.
+- id: cache-stampede
+  term: Cache stampede
+  short: Many requests miss the same key at once, usually when a hot entry expires, and all of them query the database. Also called a thundering herd or dog-piling.
+- id: single-flight
+  term: Single-flight
+  short: Request coalescing. Concurrent requests for the same key wait for one load already in progress instead of each starting their own.
+- id: cache-lease
+  term: Lease (cache)
+  short: A token given to the client that is about to fill a missing key. Invalidating the key revokes the lease, so a fill that started before a write is refused.
+- id: early-refresh
+  term: Early refresh
+  short: Reloading an entry shortly before it expires, in the background or by a randomly chosen reader, so readers never see the miss. Probabilistic early expiration (XFetch) is one form.

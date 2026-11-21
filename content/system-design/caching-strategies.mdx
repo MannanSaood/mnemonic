@@ -1,0 +1,578 @@
+---
+title: "Caching: where, how, and how it goes stale"
+track: system-design
+group: Building blocks
+order: 4
+summary: A cache trades freshness for speed. Choose how it is filled and invalidated, then guard the two ways it fails a hot key, the stampede on expiry and the refill that stores an old value after a write.
+intent: A price change should reach readers in a moment, and a popular entry expiring should cost the database one query, not sixty.
+changeRequest: Flash sales start next week. Price changes must show on product pages within seconds, not within the hour.
+languages: [go, python, typescript, rust]
+glossary: [cache-aside, read-through, write-through, write-back, time-to-live, cache-stampede, single-flight, cache-lease, early-refresh]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [system-design/scale-from-zero]
+skills: [caching, scalability]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: caching-strategies
+  scenarios:
+    - try: "Predict, then press Run 40 seconds with the defaults."
+      notice: "Every 5 seconds the database takes 60 queries for one row, while the hit ratio still reads about 95%. After each price change the cache serves the old price until it expires."
+    - try: "Set On write to Delete key and turn on Single-flight. Run again."
+      notice: "One query per expiry, and no stale reads at all."
+    - try: "Now set TTL 15 s and switch on Second write lands during a refill."
+      notice: "A refill that read the old price stores it after the delete. The cache serves it for 15 seconds."
+    - try: "Turn on Leases and run once more."
+      notice: "The stale fill is refused, the next reader loads the new price, and the stale reads drop to zero."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 40, w: 110, h: 52, title: Product page, sub: 200 reads/s }
+      after:  { x: 12, y: 40, w: 110, h: 52, title: Product page, sub: 200 reads/s }
+    - id: writer
+      kind: client
+      before: { x: 12, y: 190, w: 110, h: 52, title: Price admin, sub: sets prices }
+      after:  { x: 12, y: 190, w: 110, h: 52, title: Price admin, sub: sets prices }
+    - id: context
+      kind: context
+      before: { x: 146, y: 18, w: 150, h: 236, title: Price cache, sub: get · load · set TTL }
+      after:  { x: 146, y: 30, w: 130, h: 56, title: Price cache, sub: cache-aside }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 146, y: 118, w: 130, h: 60, title: "" }
+      after:  { x: 146, y: 118, w: 130, h: 60, title: Lease, sub: one fill, revocable }
+    - id: cache
+      kind: concrete
+      before: { x: 320, y: 30, w: 110, h: 52, title: Redis, sub: "price:42" }
+      after:  { x: 320, y: 30, w: 110, h: 52, title: Redis, sub: "price:42 · lease" }
+    - id: db
+      kind: concrete
+      before: { x: 320, y: 160, w: 110, h: 52, title: Database, sub: prices }
+      after:  { x: 320, y: 160, w: 110, h: 52, title: Database, sub: prices }
+    - id: herd
+      kind: concrete
+      appears: change
+      before: { x: 450, y: 96, w: 100, h: 56, title: 60 q / expiry, sub: every 5 s }
+      after:  { x: 450, y: 96, w: 100, h: 56, title: 1 load, sub: per miss }
+  edges:
+    - { from: client, to: context, label: get }
+    - { from: context, to: cache, label: GET · fill }
+    - { from: context, to: strategy, label: on miss }
+    - { from: strategy, to: db, label: load once }
+    - { from: writer, to: db, label: UPDATE + DEL }
+    - { from: db, to: herd, label: load }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: price_cache.go
+      source: |
+        // price_cache.go: cache-aside, one hour TTL
+        func (c *PriceCache) Get(ctx context.Context, sku string) (Price, error) {
+            key := "price:" + sku
+            if v, err := c.rdb.Get(ctx, key).Result(); err == nil {
+                return decode(v)
+            }
+            p, err := c.db.Price(ctx, sku)
+            if err != nil {
+                return Price{}, err
+            }
+            c.rdb.Set(ctx, key, encode(p), time.Hour) // a price change shows up within the hour
+            return p, nil
+        }
+      roles: { client: [2, 2], context: [2, 13], cache: [4, 6], db: [7, 7], herd: [7, 11] }
+      change:
+        - { line: 11, replace: '    c.rdb.Set(ctx, key, encode(p), 5*time.Second) // prices must update within seconds' }
+    after:
+      file: price_cache.go
+      source: |
+        // price_cache.go: cache-aside with a lease, so a fill that lost a race is refused
+        var fill = redis.NewScript(`
+        if redis.call('GET', KEYS[2]) == ARGV[1] then
+          redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+          return 1
+        end
+        return 0`)
+
+        func (c *PriceCache) Get(ctx context.Context, sku string) (Price, error) {
+            key, lease := "price:"+sku, "lease:price:"+sku
+            if v, err := c.rdb.Get(ctx, key).Result(); err == nil {
+                return decode(v)
+            }
+            v, err, _ := c.flight.Do(key, func() (any, error) { // one load per key per process
+                token := uuid.NewString()
+                c.rdb.SetNX(ctx, lease, token, 10*time.Second) // the lease: invalidations revoke it
+                p, err := c.db.Price(ctx, sku)
+                if err != nil {
+                    return nil, err
+                }
+                fill.Run(ctx, c.rdb, []string{key, lease}, token, encode(p), 300) // refused if revoked
+                return p, nil
+            })
+            if err != nil {
+                return Price{}, err
+            }
+            return v.(Price), nil
+        }
+
+        func (c *PriceCache) Update(ctx context.Context, sku string, p Price) error {
+            if err := c.db.SetPrice(ctx, sku, p); err != nil {
+                return err
+            }
+            return c.rdb.Del(ctx, "price:"+sku, "lease:price:"+sku).Err() // invalidate value and lease
+        }
+      roles: { strategy: [2, 7], fill: [2, 7], client: [9, 9], context: [9, 28], miss: [10, 13], cache: [11, 11], lease: [14, 16], herd: [14, 14], load: [17, 20], db: [17, 17], writer: [30, 35], invalidate: [31, 34] }
+    again:
+      file: price_cache_test.go
+      source: |
+        // price_cache_test.go: a write during a refill must not leave the old price behind
+        func TestWriteDuringRefill(t *testing.T) {
+            db := newSlowDB(Price(100), 50*time.Millisecond) // every read takes 50 ms
+            c := newPriceCache(t, db)
+            go c.Get(t.Context(), "sku-42") // starts a refill that reads 100
+            time.Sleep(10 * time.Millisecond)
+            c.Update(t.Context(), "sku-42", Price(99)) // lands while that refill is in flight
+            time.Sleep(100 * time.Millisecond)         // the refill finishes and tries to fill
+            if p, _ := c.Get(t.Context(), "sku-42"); p != Price(99) {
+                t.Fatalf("cache served %v after the write", p)
+            }
+        }
+    cost:
+      before: { text: TTL 5 s · 60 queries per expiry · still 5 s stale, value: 0.7 }
+      after: { text: 1 load per miss · fresh after every write, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`golang.org/x/sync/singleflight` is the standard way to coalesce loads in one process: `Group.Do(key, fn)` runs `fn` once and hands its result to every caller waiting on the same key. It does nothing across processes, which is what the Redis lease is for.'
+      seenIn: '`golang.org/x/sync/singleflight`. go-redis `SetNX` and `NewScript`. groupcache, which fills from peers with single-flight built in.'
+
+  python:
+    before:
+      file: price_cache.py
+      source: |
+        # price_cache.py: cache-aside, one hour TTL
+        async def get_price(sku: str) -> Price:
+            key = f"price:{sku}"
+            if (cached := await redis.get(key)) is not None:
+                return Price.decode(cached)
+            price = await db.price(sku)
+            await redis.set(key, price.encode(), ex=3600)  # a price change shows up within the hour
+            return price
+      roles: { client: [2, 2], context: [2, 8], cache: [4, 5], db: [6, 6], herd: [6, 7] }
+      change:
+        - { line: 7, replace: '    await redis.set(key, price.encode(), ex=5)  # prices must update within seconds' }
+    after:
+      file: price_cache.py
+      source: |
+        # price_cache.py: cache-aside with a lease, so a fill that lost a race is refused
+        FILL = redis.register_script("""
+        if redis.call('GET', KEYS[2]) == ARGV[1] then
+          redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+          return 1
+        end
+        return 0
+        """)
+        _loading: dict[str, asyncio.Task[Price]] = {}
+
+        async def get_price(sku: str) -> Price:
+            key, lease = f"price:{sku}", f"lease:price:{sku}"
+            if (cached := await redis.get(key)) is not None:
+                return Price.decode(cached)
+            if key not in _loading:  # one load per key per process
+                _loading[key] = asyncio.create_task(_load(sku, key, lease))
+                _loading[key].add_done_callback(lambda _: _loading.pop(key, None))
+            return await _loading[key]
+
+        async def _load(sku: str, key: str, lease: str) -> Price:
+            token = uuid.uuid4().hex
+            await redis.set(lease, token, nx=True, ex=10)  # the lease: invalidations revoke it
+            price = await db.price(sku)
+            await FILL(keys=[key, lease], args=[token, price.encode(), 300])  # refused if revoked
+            return price
+
+        async def update_price(sku: str, price: Price) -> None:
+            await db.set_price(sku, price)
+            await redis.delete(f"price:{sku}", f"lease:price:{sku}")  # invalidate value and lease
+      roles: { strategy: [2, 8], fill: [2, 8], client: [11, 11], context: [11, 18], miss: [12, 14], cache: [13, 13], herd: [15, 17], lease: [20, 22], load: [23, 23], db: [23, 23], writer: [27, 29], invalidate: [28, 29] }
+    again:
+      file: test_price_cache.py
+      source: |
+        # test_price_cache.py: a write during a refill must not leave the old price behind
+        async def test_write_during_refill(slow_db):  # price 100, every read takes 50 ms
+            refill = asyncio.create_task(get_price("sku-42"))  # reads 100
+            await asyncio.sleep(0.01)
+            await update_price("sku-42", Price(99))  # lands while that refill is in flight
+            await refill                             # the refill finishes and tries to fill
+            assert await get_price("sku-42") == Price(99)
+    cost:
+      before: { text: TTL 5 s · 60 queries per expiry · still 5 s stale, value: 0.7 }
+      after: { text: 1 load per miss · fresh after every write, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Python has no single-flight in the standard library; in asyncio, sharing one `Task` per key is the idiom, as here. `functools.lru_cache` has no TTL and no invalidation by key; `cachetools.TTLCache` adds a TTL but needs a lock when threads share it. redis-py''s `set(..., nx=True, ex=10)` is one atomic `SET`.'
+      seenIn: '`cachetools.TTLCache` and `cachetools.cached`. `functools.lru_cache`. redis-py `register_script`. `asyncio.Task` shared by awaiters.'
+
+  typescript:
+    before:
+      file: price-cache.ts
+      source: |
+        // price-cache.ts: cache-aside, one hour TTL
+        export async function getPrice(sku: string): Promise<Price> {
+          const key = `price:${sku}`;
+          const cached = await redis.get(key);
+          if (cached !== null) return decode(cached);
+          const price = await db.price(sku);
+          await redis.set(key, encode(price), "EX", 3600); // a price change shows up within the hour
+          return price;
+        }
+      roles: { client: [2, 2], context: [2, 9], cache: [4, 5], db: [6, 6], herd: [6, 7] }
+      change:
+        - { line: 7, replace: '  await redis.set(key, encode(price), "EX", 5); // prices must update within seconds' }
+    after:
+      file: price-cache.ts
+      source: |
+        // price-cache.ts: cache-aside with a lease, so a fill that lost a race is refused
+        const FILL = `
+        if redis.call('GET', KEYS[2]) == ARGV[1] then
+          redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+          return 1
+        end
+        return 0`;
+        const loading = new Map<string, Promise<Price>>();
+
+        export async function getPrice(sku: string): Promise<Price> {
+          const key = `price:${sku}`, lease = `lease:price:${sku}`;
+          const cached = await redis.get(key);
+          if (cached !== null) return decode(cached);
+          let p = loading.get(key); // one load per key per process
+          if (!p) {
+            p = load(sku, key, lease).finally(() => loading.delete(key));
+            loading.set(key, p);
+          }
+          return p;
+        }
+
+        async function load(sku: string, key: string, lease: string): Promise<Price> {
+          const token = randomUUID();
+          await redis.set(lease, token, "EX", 10, "NX"); // the lease: invalidations revoke it
+          const price = await db.price(sku);
+          await redis.eval(FILL, 2, key, lease, token, encode(price), 300); // refused if revoked
+          return price;
+        }
+
+        export async function updatePrice(sku: string, price: Price): Promise<void> {
+          await db.setPrice(sku, price);
+          await redis.del(`price:${sku}`, `lease:price:${sku}`); // invalidate value and lease
+        }
+      roles: { strategy: [2, 7], fill: [2, 7], client: [10, 10], context: [10, 20], miss: [11, 13], cache: [12, 12], herd: [14, 18], lease: [22, 24], load: [25, 25], db: [25, 25], writer: [30, 33], invalidate: [31, 32] }
+    again:
+      file: price-cache.test.ts
+      source: |
+        // price-cache.test.ts: a write during a refill must not leave the old price behind
+        test("a write during a refill", async () => {
+          slowDb.reset(100, 50); // price 100, every read takes 50 ms
+          const refill = getPrice("sku-42"); // reads 100
+          await sleep(10);
+          await updatePrice("sku-42", 99); // lands while that refill is in flight
+          await refill; // the refill finishes and tries to fill
+          assert.equal(await getPrice("sku-42"), 99);
+        });
+    cost:
+      before: { text: TTL 5 s · 60 queries per expiry · still 5 s stale, value: 0.7 }
+      after: { text: 1 load per miss · fresh after every write, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A `Map` of promises is single-flight in Node: one event loop, so no lock is needed. The `lru-cache` package does the same through `fetch()` with a `fetchMethod`, and can serve a stale value while it refreshes (`allowStale`). Every Node process still has its own map, so the lease lives in Redis.'
+      seenIn: '`lru-cache` (`fetchMethod`, `ttl`, `allowStale`). ioredis `set(..., "EX", 10, "NX")` and `eval`. `crypto.randomUUID`.'
+
+  rust:
+    before:
+      file: price_cache.rs
+      source: |
+        // price_cache.rs: cache-aside, one hour TTL
+        impl PriceCache {
+            pub async fn get(&self, sku: &str) -> Result<Price, Error> {
+                let key = format!("price:{sku}");
+                let mut redis = self.redis.clone();
+                if let Some(v) = redis.get::<_, Option<String>>(&key).await? {
+                    return Price::decode(&v);
+                }
+                let price = self.db.price(sku).await?;
+                let _: () = redis.set_ex(&key, price.encode(), 3600).await?; // a price change shows up within the hour
+                Ok(price)
+            }
+        }
+      roles: { client: [3, 3], context: [2, 13], cache: [6, 8], db: [9, 9], herd: [9, 10] }
+      change:
+        - { line: 10, replace: '        let _: () = redis.set_ex(&key, price.encode(), 5).await?; // prices must update within seconds' }
+    after:
+      file: price_cache.rs
+      source: |
+        // price_cache.rs: cache-aside with a lease, so a fill that lost a race is refused
+        static FILL: LazyLock<Script> = LazyLock::new(|| Script::new(r#"
+        if redis.call('GET', KEYS[2]) == ARGV[1] then
+          redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+          return 1
+        end
+        return 0"#));
+
+        impl PriceCache {
+            pub async fn get(&self, sku: &str) -> Result<Price, Arc<Error>> {
+                let key = format!("price:{sku}");
+                // moka runs one init per key at a time; concurrent callers wait for its result
+                self.local.try_get_with(key.clone(), async {
+                    let mut redis = self.redis.clone();
+                    if let Some(v) = redis.get::<_, Option<String>>(&key).await? {
+                        return Price::decode(&v);
+                    }
+                    let (lease, token) = (format!("lease:{key}"), Uuid::new_v4().to_string());
+                    let _: Option<String> = redis::cmd("SET").arg(&lease).arg(&token).arg("NX").arg("EX").arg(10)
+                        .query_async(&mut redis).await?; // the lease: invalidations revoke it
+                    let price = self.db.price(sku).await?;
+                    let _: i32 = FILL.key(&key).key(&lease).arg(&token).arg(price.encode()).arg(300)
+                        .invoke_async(&mut redis).await?; // refused if revoked
+                    Ok(price)
+                }).await
+            }
+
+            pub async fn update(&self, sku: &str, price: Price) -> Result<(), Error> {
+                self.db.set_price(sku, &price).await?;
+                let mut redis = self.redis.clone();
+                let _: () = redis.del(&[format!("price:{sku}"), format!("lease:price:{sku}")]).await?;
+                self.local.invalidate(&format!("price:{sku}")).await; // and this process's copy
+                Ok(())
+            }
+        }
+      roles: { strategy: [2, 7], fill: [2, 7], client: [10, 10], context: [10, 26], herd: [12, 13], miss: [14, 17], cache: [15, 15], lease: [18, 20], load: [21, 21], db: [21, 21], writer: [28, 34], invalidate: [29, 32] }
+    again:
+      file: tests/price_cache.rs
+      source: |
+        // tests/price_cache.rs: a write during a refill must not leave the old price behind
+        #[tokio::test]
+        async fn write_during_refill() {
+            let cache = price_cache(SlowDb::new(Price(100), Duration::from_millis(50))).await;
+            let refill = tokio::spawn({ let c = cache.clone(); async move { c.get("sku-42").await } });
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cache.update("sku-42", Price(99)).await.unwrap(); // lands while that refill is in flight
+            refill.await.unwrap().unwrap();                   // the refill finishes and tries to fill
+            assert_eq!(cache.get("sku-42").await.unwrap(), Price(99));
+        }
+    cost:
+      before: { text: TTL 5 s · 60 queries per expiry · still 5 s stale, value: 0.7 }
+      after: { text: 1 load per miss · fresh after every write, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`moka` is the common in-process cache: `try_get_with` coalesces concurrent loads of a key, and `time_to_live` or `time_to_idle` bound how long entries stay. Here it is the single-flight, so give it a short TTL; otherwise it is a second cache layer with its own staleness. The lease still lives in Redis, shared by every process.'
+      seenIn: '`moka::future::Cache` (`try_get_with`, `invalidate`, `time_to_live`). The `redis` crate''s `Script` and `cmd`. `cached` for memoised functions.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: A product page asks for the price of sku-42. The key has just expired, so the GET misses.
+    nodes: [client, context, cache]
+    edges: [client>context, context>cache]
+    role: miss
+  - text: The first request in this process starts the load and takes a lease in Redis. Every other request for sku-42 here waits for that one load, so the expiry costs one query, not sixty.
+    nodes: [context, strategy, herd]
+    edges: [context>strategy]
+    role: lease
+  - text: The loader reads the price from the database. It is 105.
+    nodes: [strategy, db]
+    edges: [strategy>db]
+    role: load
+  - text: While the load is in flight, an admin sets the price to 99. The database changes, then the writer deletes both the cached value and the lease.
+    nodes: [writer, db, cache]
+    edges: [writer>db]
+    role: invalidate
+  - text: The loader tries to store 105. The fill script finds its lease gone and refuses. The next reader misses again and loads 99.
+    nodes: [strategy, cache]
+    edges: [context>cache]
+    role: fill
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: What does a cache give up in exchange for speed?
+    options:
+      - text: Freshness. It can answer with a copy that is older than the source.
+        correct: true
+        why: Right. Every caching choice is about how old an answer may be, and how you find out the source changed.
+      - text: Durability. Data in the cache is lost when it restarts.
+        why: Only for a write-back cache, where the cache holds writes that have not reached the database. A read cache loses nothing the database does not still have.
+      - text: Nothing, if the hit ratio is high enough.
+        why: A high hit ratio says nothing about whether the hits are current.
+  engineer:
+    question: A popular key expires every 5 seconds, and each time the database briefly takes dozens of identical queries. What fixes the spikes?
+    options:
+      - text: Let concurrent misses share one load (single-flight), or refresh the entry just before it expires.
+        correct: true
+        why: Right. The spike is every reader that arrives during the load starting its own. Coalescing makes them wait for one; early refresh means nobody misses.
+      - text: Raise the TTL to one minute.
+        why: The spikes become rarer but stay the same size, and the prices stay stale for longer.
+      - text: Give the cache more memory.
+        why: The key is not being evicted for lack of space. It expires on purpose.
+  deep:
+    question: The app reads through a cache-aside path and deletes the key after every price update. Yet sometimes the old price sticks for a whole TTL. How?
+    options:
+      - text: A reader loaded the old row before the update, and stored it in the cache after the delete.
+        correct: true
+        why: Right. The delete ran while the cache was empty, so it removed nothing, and the late fill put the old value back. Leases or versioned fills refuse such a fill.
+      - text: The delete reached Redis before the database committed.
+        why: That ordering can cause it too, which is why you delete after the commit. But the code here deletes after the update, and the race still happens.
+      - text: Redis evicted the new value under memory pressure.
+        why: Eviction removes values. It cannot bring back an older one.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Cache
+      example: Redis, memcached, or an in-process map
+      job: Holds copies close to the reader, each with a TTL and a size limit.
+    - role: Loader
+      example: { go: "singleflight.Group.Do", python: "one asyncio.Task per key", typescript: "a Map of promises", rust: "moka try_get_with" }
+      job: Fetches a missing entry from the source once, however many readers are waiting.
+    - role: Invalidation
+      example: delete the key after the database commit
+      job: Tells the cache the source changed, so the next read loads the truth.
+    - role: Lease or version
+      example: a token checked by the fill script
+      job: Refuses a fill that read the source before the latest write.
+  useWhen:
+    - Data read far more often than it changes, where a slightly old answer is acceptable for a bounded time.
+    - Expensive reads (joins, remote calls, rendering) that many users ask for.
+    - Shielding a database from read load, as long as you know what happens when the cache is empty.
+  avoidWhen:
+    - Reads that must reflect the latest write, such as a balance before a payment. Read the source.
+    - Data that changes as often as it is read; the cache only adds misses and invalidations.
+    - When a cold cache would overload the database and you have no plan to warm it or shed load.
+  tradeoffs:
+    - A long TTL means few misses and long staleness; a short TTL means fresh data and frequent misses. Invalidation on write lets you keep a long TTL as a backstop.
+    - Delete on write is safer than set on write. Two writers that set can land in the wrong order; two deletes cannot.
+    - Write-through keeps reads after writes fast, but writes pay for the cache too, and cached data nobody reads wastes memory.
+    - Once the database is sized for a 95% hit ratio, the cache is part of your capacity. Losing it is an outage, not a slowdown.
+  lookalikes:
+    - name: Memoisation
+      how: Caches a pure function's results in one process. No invalidation problem, because the inputs fully decide the output.
+    - name: CDN or HTTP cache
+      how: The same trade-offs one layer out, controlled by Cache-Control headers instead of code.
+    - name: Read replica
+      how: Another copy of the data that lags the primary, kept current by replication instead of by the application.
+    - name: Materialised view
+      how: A precomputed query result that the database keeps up to date for you.
+---
+
+## [concept] Caching: where, how, and how it goes stale
+
+**A cache keeps a copy of data close to the reader. It answers fast because it does not ask the source, and that is also why it can be wrong.**
+
+A cache can live in the browser, a CDN, a reverse proxy, the application's memory, a shared store such as Redis, or the database's own buffer pool. Wherever it is, it needs two answers: how entries get in, and how they leave when the source changes. Entries leave by <Term id="time-to-live">TTL</Term>, by eviction when memory runs out, or by invalidation.
+
+<Depth level={2}>
+Getting in: with <Term id="cache-aside">cache-aside</Term> the application loads on a miss and fills the cache; with a <Term id="read-through">read-through</Term> cache the cache calls a loader you give it. Writing: with <Term id="write-through">write-through</Term> every write updates the cache too; with <Term id="write-back">write-back</Term> writes land in the cache and reach the database later. The most common setup is cache-aside reads, database writes, and deleting the key after each write.
+</Depth>
+
+<Depth level={3}>
+A hot key fails in two ways. When it expires, every reader during the load misses at once, a <Term id="cache-stampede">cache stampede</Term>. And when a write lands while a refill is in flight, the refill can store the value it read before the write. <Term id="single-flight">Single-flight</Term> loading and <Term id="early-refresh">early refresh</Term> answer the first; a <Term id="cache-lease">lease</Term> or a version check answers the second.
+</Depth>
+
+## [problem] Product prices in Redis for an hour
+
+The product page reads each price through Redis. On a miss it reads the database and stores the price for an hour. Price changes are rare and nobody minds if one takes a while to show. The hit ratio is 99.9% and the database is quiet.
+
+<Depth level={2}>
+The hour is doing two jobs: it keeps the database quiet, and it is the only way a price change ever reaches the page. Nothing deletes the key when a price changes.
+</Depth>
+
+<Depth level={3}>
+The database is now sized for that hit ratio. If Redis were flushed or restarted, every page view would go to the database at once, about a thousand times its usual load for this table.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** flash sales start next week. Price changes must show on product pages within seconds, not within the hour.
+
+The marked line drops the TTL to 5 seconds. Prices now update within 5 seconds, mostly. But the database graph turns into a comb. Every 5 seconds each popular price expires, and for the few hundred milliseconds it takes to load it again, every page view misses and queries the database for the same row. At 200 views a second and a 300 ms load, that is 60 queries per product per expiry.
+
+<Depth level={2}>
+The hit ratio still looks fine, above 90%, because the misses are bunched into short windows. Averages hide stampedes; look at queries per second per key. And a price changed a second after a refill is still stale for almost 5 seconds.
+</Depth>
+
+<Depth level={3}>
+Shortening the TTL trades staleness for load linearly: halve the TTL, double the misses. Only invalidation on write breaks that trade, by telling the cache exactly when the source changed.
+</Depth>
+
+## [morph] Invalidate on write, load once, and refuse late fills
+
+Drag the slider. The TTL goes back to a long backstop, the price update deletes the key, misses share one load per key, and the load holds a lease so that a fill which lost a race with a write is refused.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Delete after the database commit, never before: deleting first lets a reader refill the old row before the commit lands. Delete rather than set, so two writers racing cannot leave the older value. Keep a TTL anyway, as the backstop for a delete that never arrives.
+</Depth>
+
+<Depth level={3}>
+The lease is the trick from the 2013 NSDI paper on scaling memcache: a miss hands out a token, a delete revokes it, and a fill with a revoked token is ignored. Redis has no leases built in, so the code builds one from a `SET NX` key and a fill script that checks it. The same lease can also stop a stampede across processes: a reader that sees someone else's lease waits briefly and retries instead of loading.
+</Depth>
+
+## [walk] Follow one miss and one write
+
+One expired price, one load, and a price change that lands in the middle of it. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`singleflight.Group.Do` returns a third value, `shared`, which is true when the result went to more than one caller. Errors are shared too, so one failed load fails every waiting request.</Lang>
+<Lang only="python">The done callback removes the task when it finishes, so the next miss after a failure starts a new load instead of re-raising the old exception forever.</Lang>
+<Lang only="typescript">`.finally()` deletes the promise from the map whether the load succeeded or failed, and every waiter receives the same resolution or rejection.</Lang>
+<Lang only="rust">`try_get_with` stores the value only when the future returns `Ok`, and returns the error to every waiting caller as an `Arc`, because one error is shared by many.</Lang>
+</Depth>
+
+## [again] The same flash sale again
+
+Prices change and the next page view shows the new one, because the write deleted the key. Each expiry of a hot price costs one database query per process, not sixty. A refill that read the old price just before a change is refused. The test above starts a slow refill, updates the price in the middle of it, and checks that the cache answers with the new price.
+
+<Depth level={2}>
+Measure per key, not on average: misses per second, loads per second, and the age of what you serve. An alert on the age of served prices catches a stuck entry that a hit ratio never will.
+</Depth>
+
+<Depth level={3}>
+If you can afford a background job, refresh hot keys before they expire instead. Probabilistic early expiration (XFetch) does it without a job: each reader recomputes early with a probability that rises as expiry nears and with how long the load takes, so one reader usually refreshes before anyone misses.
+</Depth>
+
+## [play] Break a cache on purpose
+
+One hot price read 200 times a second for 40 seconds, changed twice. Choose how the cache is filled and invalidated, run it, and compare runs. Then make the second price change land in the middle of a refill.
+
+## [lens] How each language does it
+
+Each language has an in-process way to coalesce loads and an in-process cache. None of them helps across processes; that is the shared cache's job, and the lease lives there.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+An in-process cache in front of Redis is a second layer with its own staleness. Keep its TTL short, or broadcast invalidations to every process. Redis 6 and later can do the second for you with client-side caching: it tracks which keys a client read and sends it invalidation messages.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="caching-strategies" />
+
+### Where the race comes from
+
+The stale fill needs three steps in one order: a reader misses and reads the old row; a writer updates the row and deletes the key, which is not there; the reader stores the old row. Each step is correct alone. Leases, version numbers stored with the value, or a short TTL as a backstop each shorten or close the window; nothing but checking at fill time closes it completely.
