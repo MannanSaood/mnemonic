@@ -1,0 +1,22 @@
+# Terms introduced by the branch prediction lesson.
+- id: branch-predictor
+  term: Branch predictor
+  short: Hardware in the fetch stage that guesses whether each conditional branch is taken, and where it goes, before the condition is computed, so the pipeline can keep fetching.
+- id: branch-misprediction
+  term: Branch misprediction
+  short: A wrong guess by the branch predictor. The core discards every instruction it started on the wrong path and refetches from the right one, which costs roughly 15 to 20 cycles on current desktop and server cores.
+- id: saturating-counter
+  term: Saturating counter (2-bit)
+  short: A predictor entry that counts 0 to 3 and predicts taken at 2 or 3. It moves one step per outcome and sticks at the ends, so one surprise does not flip a strong prediction.
+- id: speculative-execution
+  term: Speculative execution
+  short: Running instructions before it is certain they should run, on a predicted path. Results are kept only if the prediction proves right; otherwise registers and memory are rolled back.
+- id: branchless-code
+  term: Branchless code
+  short: Code that computes both outcomes and selects one with arithmetic, a mask or a conditional move, so there is no data-dependent jump to predict. Constant cost, whatever the data.
+- id: conditional-move
+  term: Conditional move
+  short: An instruction that copies a value only if a condition holds (CMOV on x86, CSEL on ARM). It depends on the condition as data, not as control flow, so it cannot be mispredicted.
+- id: spectre
+  term: Spectre
+  short: A family of attacks, disclosed in January 2018, that steer speculative execution to read secret data on a mispredicted path and recover it through cache timing, because rollback does not undo cache changes.

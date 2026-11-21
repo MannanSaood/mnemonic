@@ -1,0 +1,470 @@
+---
+title: Branch prediction and speculation
+track: computer-architecture
+group: CPU
+order: 12
+summary: A pipelined CPU cannot wait to learn which way a branch goes, so it guesses and runs ahead. A right guess is free; a wrong one throws away 15 to 20 cycles of work. The same loop over the same data can be several times slower when the branch outcome looks random.
+intent: Know when a branch costs nothing and when it costs a pipeline flush, so you can recognise unpredictable branches in hot loops and remove them.
+changeRequest: Move the large-order filter from the sorted nightly export to the live order stream, which arrives in random order.
+languages: [go, python, typescript, rust]
+glossary: [branch-predictor, branch-misprediction, saturating-counter, speculative-execution, branchless-code, conditional-move, spectre]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [computer-architecture/pipelining-and-hazards, computer-architecture/control-flow-in-machine-code]
+skills: [architecture, performance, security]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: branch-prediction-and-speculation
+  scenarios:
+    - try: "Predict, then Run to end on Sorted. Switch the data to Random and run again."
+      notice: "Same 64 numbers, same sum. Sorted costs 2 mispredicts and 158 cycles; random costs 33 and 623, about 4 times as much."
+    - try: "On Random, switch the code to Branchless mask and run."
+      notice: "192 cycles and no mispredicts. On sorted data the branchy loop is still a little cheaper: branchless wins only when the branch is unpredictable."
+    - try: "Choose Periodic 7:1 and run with the 1-bit predictor, then the 2-bit counter."
+      notice: "1-bit misses twice per period, at the exit and at the next entry. The 2-bit counter misses only the exit."
+    - try: "Choose Alternating with the 2-bit counter, then with 2-bit + history."
+      notice: "The counter gets every one wrong. With two bits of history, each pattern has its own counter, and after a few values it is never wrong."
+
+# ---------------------------------------------------------------- diagram
+# before: "the CPU runs one line, then the next". after: predictor, speculative fetch, retire or flush.
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: loop
+      kind: client
+      before: { x: 8, y: 110, w: 120, h: 52, title: Filter loop, sub: "if a >= t" }
+      after:  { x: 8, y: 110, w: 120, h: 52, title: Filter loop, sub: "if a >= t" }
+    - id: pipe
+      kind: context
+      before: { x: 150, y: 18, w: 400, h: 236, title: The CPU, sub: one line, then the next }
+      after:  { x: 150, y: 110, w: 124, h: 52, title: Pipeline, sub: 15-20 stages }
+    - id: predictor
+      kind: strategy
+      appears: after
+      before: { x: 150, y: 24, w: 124, h: 52, title: "" }
+      after:  { x: 150, y: 24, w: 124, h: 52, title: Predictor, sub: counters + history }
+    - id: fetch
+      kind: concrete
+      before: { x: 170, y: 64, w: 360, h: 38, title: "check a >= t" }
+      after:  { x: 296, y: 110, w: 116, h: 52, title: Fetch ahead, sub: guessed path }
+    - id: flush
+      kind: concrete
+      before: { x: 170, y: 112, w: 360, h: 38, title: "then add, or skip" }
+      after:  { x: 434, y: 170, w: 118, h: 52, title: Flush, sub: wrong · ~15-20 cyc }
+    - id: retire
+      kind: concrete
+      before: { x: 170, y: 160, w: 360, h: 38, title: same cost either way }
+      after:  { x: 434, y: 50, w: 118, h: 52, title: Retire, sub: right · free }
+    - id: select
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 208, w: 360, h: 38, title: + live, unsorted stream }
+      after:  { x: 150, y: 200, w: 124, h: 50, title: Branchless, sub: a mask, no guess }
+  edges:
+    - { from: loop, to: pipe }
+    - { from: pipe, to: fetch }
+    - { from: predictor, to: fetch, label: guess }
+    - { from: fetch, to: retire, label: right }
+    - { from: fetch, to: flush, label: wrong }
+    - { from: flush, to: predictor, label: train }
+    - { from: select, to: loop }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: risk.go
+      source: |
+        // risk.go
+        // LargeOrderTotal sums the orders at or above the review threshold.
+        // amounts are cents; the nightly export arrives sorted by amount.
+        func LargeOrderTotal(amounts []int64, threshold int64) int64 {
+            var total int64
+            for _, a := range amounts {
+                if a >= threshold {
+                    total += a
+                }
+            }
+            return total
+        }
+      roles: { loop: [6, 10], pipe: [7, 9], predictor: [7, 7], fetch: [8, 8], retire: [8, 8], flush: [7, 7], select: [7, 9] }
+      change:
+        - { line: 3, replace: '// amounts are cents, now from the live stream in arrival order.' }
+        - { after: 7, add: ['            // in arrival order the answer is a coin toss: half the guesses miss'] }
+    after:
+      file: risk.go
+      source: |
+        // risk.go
+        // LargeOrderTotal sums the orders at or above the review threshold.
+        // amounts are cents, in any order.
+        func LargeOrderTotal(amounts []int64, threshold int64) int64 {
+            var total int64
+            for _, a := range amounts {
+                // threshold-1-a is negative exactly when a >= threshold, so the
+                // arithmetic shift gives a mask of all ones (keep a) or zero (drop it).
+                mask := (threshold - 1 - a) >> 63
+                total += a & mask
+            }
+            return total
+        }
+      roles: { loop: [6, 11], pipe: [6, 6], predictor: [6, 6], fetch: [9, 10], retire: [10, 10], flush: [9, 9], select: [7, 10], guess: [6, 6], ahead: [9, 10], resolve: [9, 10], train: [6, 6], mask: [7, 10] }
+    again:
+      file: batch timings
+      source: |
+        // live stream, 50M orders per batch: 110 ms (was 390 ms)
+        // perf stat: branch-misses near zero, the same in any order
+    cost:
+      before: { text: "390 ms per batch · half the guesses wrong", value: 0.8 }
+      after: { text: "110 ms per batch · nothing to guess", value: 0.25 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Go''s compiler turns some simple if-assignments into conditional moves on its own (its branchelim pass, on amd64 and arm64), so check the assembly before rewriting: `go build -gcflags=-S` or Compiler Explorer. When the body is more than one assignment, the branch stays. Go has no bool-to-int conversion, so branchless Go uses shifts and masks like the one here.'
+      seenIn: '`go build -gcflags=-S`, `perf stat -e branches,branch-misses` on a benchmark binary, `slices.Sort` before a hot filter when the data is reused.'
+
+  python:
+    before:
+      file: risk.py
+      source: |
+        # risk.py
+        def large_order_total(amounts: list[int], threshold: int) -> int:
+            """Sum the orders at or above the review threshold. amounts are cents;
+            the nightly export arrives sorted by amount."""
+            total = 0
+            for a in amounts:
+                if a >= threshold:
+                    total += a
+            return total
+      roles: { loop: [6, 8], pipe: [7, 8], predictor: [7, 7], fetch: [8, 8], retire: [8, 8], flush: [7, 7], select: [7, 8] }
+      change:
+        - { line: 4, replace: '    now from the live stream, in arrival order."""' }
+        - { after: 7, add: ['            # in arrival order the answer is a coin toss: half the guesses miss'] }
+    after:
+      file: risk.py
+      source: |
+        # risk.py
+        import numpy as np
+
+        def large_order_total(amounts: np.ndarray, threshold: int) -> int:
+            """amounts: an int64 array of cents, in any order."""
+            # One compare, one select and one sum over the whole array, in C:
+            # no Python-level branch and no data-dependent jump per element.
+            return int(np.where(amounts >= threshold, amounts, 0).sum())
+      roles: { loop: [8, 8], pipe: [8, 8], predictor: [8, 8], fetch: [8, 8], retire: [8, 8], flush: [8, 8], select: [6, 8], guess: [8, 8], ahead: [8, 8], resolve: [8, 8], train: [8, 8], mask: [6, 8] }
+    again:
+      file: batch timings
+      source: |
+        # live stream, 50M orders per batch: one NumPy pass, the same in any order
+        # the pure-Python loop took seconds, sorted or not
+    cost:
+      before: { text: "seconds per batch · interpreter-bound", value: 0.9 }
+      after: { text: "one vectorised pass · nothing to guess", value: 0.2 }
+    lens:
+      need: 1
+      needLabel: Rare
+      note: 'In pure Python the interpreter runs dozens of machine instructions and several branches of its own for every bytecode, so one mispredicted `if` is lost in the noise; sorting barely changes the speed of a Python loop. The effect returns as soon as the loop moves into NumPy, where `np.where` and boolean masks are the branchless forms.'
+      seenIn: '`np.where`, boolean mask indexing `a[a >= t]`, `np.count_nonzero`. Numba and Cython loops behave like C, branches included.'
+
+  typescript:
+    before:
+      file: risk.ts
+      source: |
+        // risk.ts
+        // Sums the orders at or above the review threshold.
+        // amounts are cents; the nightly export arrives sorted by amount.
+        export function largeOrderTotal(amounts: Int32Array, threshold: number): number {
+          let total = 0;
+          for (const a of amounts) {
+            if (a >= threshold) {
+              total += a;
+            }
+          }
+          return total;
+        }
+      roles: { loop: [6, 10], pipe: [7, 9], predictor: [7, 7], fetch: [8, 8], retire: [8, 8], flush: [7, 7], select: [7, 9] }
+      change:
+        - { line: 3, replace: '// amounts are cents, now from the live stream in arrival order.' }
+        - { after: 7, add: ['      // in arrival order the answer is a coin toss: half the guesses miss'] }
+    after:
+      file: risk.ts
+      source: |
+        // risk.ts
+        // Sums the orders at or above the review threshold.
+        // amounts are cents (below 2^31), in any order.
+        export function largeOrderTotal(amounts: Int32Array, threshold: number): number {
+          let total = 0;
+          for (const a of amounts) {
+            // threshold-1-a is negative exactly when a >= threshold; >> 31 works on
+            // int32 and copies the sign bit: a mask of all ones (keep a) or zero.
+            const mask = (threshold - 1 - a) >> 31;
+            total += a & mask;
+          }
+          return total;
+        }
+      roles: { loop: [6, 11], pipe: [6, 6], predictor: [6, 6], fetch: [9, 10], retire: [10, 10], flush: [9, 9], select: [7, 10], guess: [6, 6], ahead: [9, 10], resolve: [9, 10], train: [6, 6], mask: [7, 10] }
+    again:
+      file: batch timings
+      source: |
+        // live stream, 50M orders per batch: about the sorted export's time
+        // the loop runs the same instructions for every order
+    cost:
+      before: { text: "390 ms per batch · half the guesses wrong", value: 0.8 }
+      after: { text: "110 ms per batch · nothing to guess", value: 0.25 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Once V8''s optimising compiler has compiled a hot loop over a typed array, it is machine code with real branches, and the same sorted-versus-random effect appears. Bitwise operators work on int32, which is what makes the mask trick legal, and also why it is wrong for values of 2^31 and above. Measure before and after: the JIT may already have chosen a different instruction sequence.'
+      seenIn: '`Int32Array`, `node --cpu-prof`, `node --perf-basic-prof` with `perf stat -e branch-misses`.'
+
+  rust:
+    before:
+      file: risk.rs
+      source: |
+        // risk.rs
+        /// Sums the orders at or above the review threshold.
+        /// amounts are cents; the nightly export arrives sorted by amount.
+        pub fn large_order_total(amounts: &[i64], threshold: i64) -> i64 {
+            let mut total = 0;
+            for &a in amounts {
+                if a >= threshold {
+                    total += a;
+                }
+            }
+            total
+        }
+      roles: { loop: [6, 10], pipe: [7, 9], predictor: [7, 7], fetch: [8, 8], retire: [8, 8], flush: [7, 7], select: [7, 9] }
+      change:
+        - { line: 3, replace: '/// amounts are cents, now from the live stream in arrival order.' }
+        - { after: 7, add: ['            // in arrival order the answer is a coin toss: half the guesses miss'] }
+    after:
+      file: risk.rs
+      source: |
+        // risk.rs
+        /// Sums the orders at or above the review threshold.
+        /// amounts are cents, in any order.
+        pub fn large_order_total(amounts: &[i64], threshold: i64) -> i64 {
+            amounts
+                .iter()
+                // the comparison becomes a 0 or 1 multiplier: no data-dependent jump
+                .map(|&a| a * i64::from(a >= threshold))
+                .sum()
+        }
+      roles: { loop: [5, 9], pipe: [5, 6], predictor: [6, 6], fetch: [8, 8], retire: [9, 9], flush: [8, 8], select: [7, 8], guess: [6, 6], ahead: [8, 9], resolve: [8, 8], train: [6, 6], mask: [7, 8] }
+    again:
+      file: batch timings
+      source: |
+        // live stream, 50M orders per batch: 110 ms (was 390 ms)
+        // LLVM can vectorise this form: compares and adds on 4 lanes at a time
+    cost:
+      before: { text: "390 ms per batch · half the guesses wrong", value: 0.8 }
+      after: { text: "110 ms per batch · nothing to guess", value: 0.25 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'LLVM if-converts simple branches into `cmov` and often vectorises loops like this one with SIMD compares, which are branchless by nature, so the `if` version may already be fast in release builds. Check with `cargo asm` or Compiler Explorer, and benchmark with random input, not sorted fixtures. `i64::from(bool)` and `as` casts are the idiomatic 0-or-1 conversions.'
+      seenIn: '`#[cold]` on rarely taken paths, `std::hint::black_box` in benchmarks, criterion benchmarks, `perf stat -e branch-misses`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: 'Even the fixed loop has one branch left: the jump back to the top. The fetch stage reaches it long before the previous iteration has finished, and asks the predictor which way it goes. The predictor says taken: loop again.'
+    nodes: [pipe, predictor, fetch]
+    edges: [pipe>fetch, predictor>fetch]
+    role: guess
+  - text: 'The core does not wait. It fetches and starts the next iterations on that guess, dozens of instructions ahead of the oldest one still running. This is speculative execution.'
+    nodes: [fetch]
+    edges: []
+    role: ahead
+  - text: 'When the condition is computed, the guess is checked. Right, and the speculative work simply retires. Wrong, at the loop exit, and everything after the branch is flushed and fetch restarts from the right address, about 15 to 20 cycles lost.'
+    nodes: [fetch, retire, flush]
+    edges: [fetch>retire, fetch>flush]
+    role: resolve
+  - text: 'The predictor learns from the outcome. A 2-bit counter at strong taken drops one step at the exit and still says taken, so the next batch''s loop is predicted right from its first iteration.'
+    nodes: [flush, predictor]
+    edges: [flush>predictor]
+    role: train
+  - text: 'The data-dependent `if` is gone. The comparison became a mask or a multiplier, data instead of control flow, so every order runs the same instructions and there is nothing to guess, sorted or not.'
+    nodes: [select, loop]
+    edges: [select>loop]
+    role: mask
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: What does a CPU's branch predictor do?
+    options:
+      - text: It guesses which way each branch will go, so the CPU can keep fetching and running instructions before the condition is known.
+        correct: true
+        why: Right. Without a guess, a deep pipeline would sit idle at every branch until the comparison finished.
+      - text: It removes branches that always go the same way when the program is compiled.
+        why: That would be the compiler. The predictor is hardware and works while the program runs.
+      - text: It runs both sides of every branch and keeps the right one.
+        why: Mainstream CPUs follow one predicted path. Running both everywhere would waste most of the core.
+  engineer:
+    question: A filter loop with `if x >= t` runs about four times faster on sorted input than on the same values shuffled. You cannot sort the live input. What recovers most of the speed?
+    options:
+      - text: Replace the branch with a branchless select (a mask, a multiply by 0 or 1, or a conditional move), so there is nothing to mispredict.
+        correct: true
+        why: Right. The cost was mispredictions, not the work. Branchless code costs a little more per element and the same on any data.
+      - text: Unroll the loop four times.
+        why: Each unrolled copy still has its own unpredictable branch. Unrolling removes loop overhead, not mispredictions.
+      - text: Use 32-bit integers instead of 64-bit ones.
+        why: The width of the data does not change how predictable the comparison is.
+  deep:
+    question: Mispredicted instructions are thrown away and never change registers or memory. How could speculation still leak secrets (Spectre)?
+    options:
+      - text: Rollback restores registers and memory but not the cache. A wrong-path load whose address depends on a secret leaves a cache line behind, and the attacker finds which line by timing reads.
+        correct: true
+        why: Right. The secret leaks through the side effect on the cache, a channel the architecture never promised to roll back.
+      - text: Speculative stores reach memory before they are cancelled.
+        why: No. Stores are held in a buffer until the instruction retires; cancelled stores never reach memory.
+      - text: The predictor tables store the secret values themselves.
+        why: Predictor tables hold branch history and targets, not data. They are used to steer speculation, not to carry the secret.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Branch predictor
+      example: counters, history, a branch target buffer
+      job: Guesses direction and target for every branch at fetch time.
+    - role: Speculative execution
+      example: dozens to hundreds of instructions in flight
+      job: Runs ahead on the guess, holding results until the branch is confirmed.
+    - role: Retire or flush
+      example: the reorder buffer
+      job: Commits results in order when the guess was right; discards everything after the branch when it was wrong.
+    - role: Misprediction penalty
+      example: roughly 15 to 20 cycles
+      job: The cost of refilling the pipeline. Deeper pipelines pay more.
+    - role: Branchless code
+      example: masks, conditional moves, SIMD compares
+      job: Turns a decision into data, with a fixed cost and nothing to predict.
+  useWhen:
+    - Hot loops whose branch depends on data with no pattern (filters, comparisons in sorts and searches, parsers on random input).
+    - A benchmark that is fast on sorted or synthetic data and slow on production data.
+    - Security reviews of code that handles secrets near attacker-controlled indexes.
+  avoidWhen:
+    - Branches that are predictable (error checks, loop exits, mostly-true conditions). They cost almost nothing; branchless versions can be slower.
+    - Branches that skip expensive work. A branchless form does the work every time.
+  tradeoffs:
+    - Branchless code has a constant cost, a little above a well-predicted branch and far below a mispredicted one.
+    - Sorting makes branches predictable but costs O(n log n) itself; it pays only if the data is reused.
+    - Compilers often if-convert or vectorise simple branches already, so hand-written tricks can be wasted. Read the assembly and measure.
+  lookalikes:
+    - name: Pipeline data hazard
+      how: A stall waiting for a value, not a wrong guess. Nothing is thrown away.
+    - name: Cache miss
+      how: Also a large, data-dependent stall, but on memory. A wrong-path load can cause one, which is how Spectre leaks.
+    - name: Profile-guided optimisation
+      how: The compiler lays out code using measured branch frequencies. It helps biased branches, not random ones.
+---
+
+## [concept] Branch prediction and speculation
+
+**A modern CPU works on many instructions at once in a long pipeline, so it reaches a branch long before it knows which way the branch goes. It does not wait: a <Term id="branch-predictor">branch predictor</Term> guesses, and the core runs ahead on the guess.**
+
+A right guess costs nothing. A wrong one, a <Term id="branch-misprediction">misprediction</Term>, throws away all the work started on the wrong path and refetches, which costs roughly 15 to 20 cycles. So the price of an `if` depends on how predictable its answers are.
+
+<Depth level={2}>
+Predictors learn patterns of outcomes per branch. Loop exits, error checks and conditions that are almost always true are predicted nearly perfectly. A branch whose answer depends on random data is right about half the time, and in a tight loop those misses can cost more than all the useful work.
+</Depth>
+
+<Depth level={3}>
+Running ahead on a guess is <Term id="speculative-execution">speculative execution</Term>. Results are held in the reorder buffer and only made permanent (retired) in program order once every earlier branch is confirmed. On a mispredict, everything younger than the branch is squashed: registers and memory look as if it never ran. Caches, though, are not rolled back.
+</Depth>
+
+## [problem] A filter over the nightly export
+
+A risk service sums every order at or above a review threshold. It runs over the nightly export of orders, which comes sorted by amount. The loop is three lines and a benchmark shows it doing about one order per nanosecond.
+
+<Depth level={2}>
+The author's picture: the CPU runs one statement after another, so each order costs a compare and maybe an add, whatever the order of the data. The benchmark agrees, because its fixture is the sorted export.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Whether the Go compiler emits a real branch here depends on the shape of the body; with one assignment it may emit a conditional move. Real filters do more in the `if`, and keep the branch.</Lang>
+<Lang only="python">In pure Python this loop is interpreter-bound, and the order of the data hardly matters. The service would be written with NumPy, where the same branch effects return.</Lang>
+<Lang only="typescript">The amounts are an `Int32Array`, so once V8 optimises the loop it is a tight machine-code loop with a real compare-and-branch per element.</Lang>
+<Lang only="rust">In a release build LLVM may if-convert or vectorise this exact loop. A slightly bigger body, or a debug build, keeps the branch.</Lang>
+</Depth>
+
+## [pain] The live stream is not sorted
+
+The filter moves to the live order stream, which arrives in random order. The same orders, the same sum, the same code. The batch takes almost four times as long, and CPU profiles point at the `if`.
+
+The marked lines are where it happens. Sorted, the answer is "no" for a long run and then "yes" for a long run, and the predictor is wrong only at the switch. Random, the answer is a coin toss.
+
+<Depth level={2}>
+`perf stat -e branches,branch-misses` shows it directly: on the sorted export, almost no misses; on the live stream, about one in four of all branches (half of the `if`s, plus the loop branches that are always right). Each miss flushes the pipeline. The work per order did not change; the waste per order did.
+</Depth>
+
+<Depth level={3}>
+A <Term id="saturating-counter">2-bit saturating counter</Term> per branch is the classic predictor: it changes its guess only after two wrong answers in a row, so a loop exit costs one miss instead of two. Modern predictors add history: they index tables of counters by the recent pattern of outcomes (gshare, TAGE-style designs), which learns alternating and periodic patterns too. No predictor learns randomness.
+</Depth>
+
+## [morph] From one line at a time to guessing ahead
+
+Drag the slider. The block labelled "the CPU" splits into what the core does: the pipeline, the predictor, the fetch that runs ahead on the guess, and the two ways it ends, retire or flush.
+
+Hover a box to see its code.
+
+<Depth level={2}>
+The fix is to turn the decision into data. A mask, a multiply by 0 or 1, or a <Term id="conditional-move">conditional move</Term> computes the result of both sides and selects one, with no jump. This is <Term id="branchless-code">branchless code</Term>: a little more work on every element, and nothing to mispredict, so it costs the same in any order.
+</Depth>
+
+<Depth level={3}>
+Branchless is not always better. On predictable data a branch is cheaper, since the CPU skips the add for free when it guesses right. And a branch that skips real work (a call, a write, a hash) should stay a branch. The rule: remove a branch only when it is hot, data-dependent and unpredictable, and measure with production-like input.
+</Depth>
+
+## [walk] Follow the loop's last branch
+
+The fixed loop, followed through the pipeline. Step through it with the numbered buttons.
+
+<Depth level={3}>
+The predictor does more than guess the direction. A branch target buffer predicts where taken branches and indirect calls go, and a return stack buffer predicts return addresses. All of them work at fetch time, before the instruction is even decoded, because the pipeline needs the next fetch address every cycle.
+</Depth>
+
+## [again] The same live stream, branchless
+
+The same live stream with the branchless loop. The batch takes about the time the sorted export took, and the order of the data stops mattering. `branch-misses` is near zero, because the only branch left is the loop's own.
+
+<Depth level={2}>
+The sorted export now runs a little slower than it did with the branch, because the mask is computed for every order. That is the trade: a small constant cost for a large variable one.
+</Depth>
+
+<Depth level={3}>
+Speculation also explains <Term id="spectre">Spectre</Term> (disclosed in January 2018). An attacker trains a bounds check to predict "in bounds", then passes an out-of-bounds index. The core speculatively reads the secret byte and uses it to index a probe array, loading one cache line. The mispredict is squashed, but the line stays cached, and timing reads of the probe array reveals which one it was. Mitigations include speculation barriers (`lfence` on x86), index masking in compilers and browsers, and process isolation for untrusted code.
+</Depth>
+
+## [play] Guess the branch
+
+Run the filter loop over 64 values with different data orders and predictors, and watch each guess land right or wrong. Switch to branchless code, drag the threshold, or click bars to move them across it.
+
+## [lens] How each language meets the predictor
+
+The predictor sees machine code, so what matters is how directly each language turns your `if` into a jump, and whether its compiler removes the jump for you.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={3}>
+<Lang only="go">Go has no branch hints and no `likely`. Its compiler lays out code using static heuristics (a panic path is assumed unlikely), and profile-guided optimisation, since Go 1.21, mainly drives inlining. Branchless arithmetic on signed integers relies on `>>` being an arithmetic shift, which the Go spec guarantees.</Lang>
+<Lang only="python">CPython 3.11 and later specialise bytecodes at run time, which removes some of the interpreter's own type-check branches, but a data-dependent `if` in your loop is still one of many branches per bytecode. Vectorise with NumPy and the branch disappears from your code entirely.</Lang>
+<Lang only="typescript">V8 collects type feedback while code runs and optimises for what it has seen. If a hot comparison suddenly sees a new type, the optimised code deoptimises, which costs far more than a mispredict. Keep hot loops monomorphic and on typed arrays.</Lang>
+<Lang only="rust">Rust has `#[cold]` to mark unlikely functions, and branch-hint intrinsics on nightly. Parts of the standard library, such as its sorting and binary search, use branchless inner loops where that measured faster.</Lang>
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="branch-prediction-and-speculation" />
+
+### Measuring it
+
+`perf stat -e branches,branch-misses ./bench` gives the miss rate for a run; `perf record -e branch-misses` finds the branches responsible. Always benchmark with data shaped like production: a sorted or constant fixture hides exactly this cost. Compiler Explorer (godbolt.org) shows whether your `if` became a jump, a conditional move or a vector compare.
