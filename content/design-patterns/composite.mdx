@@ -1,0 +1,541 @@
+---
+title: Composite
+track: design-patterns
+group: Structural
+order: 32
+summary: Give single items and groups of items one interface, so code can ask a whole tree the same question it asks one leaf.
+intent: Code that works on a tree should not need to know its shape, or whether it is holding one item or a group of them.
+changeRequest: Teams can now have sub-teams. ML platform moves under Data.
+languages: [go, python, typescript, rust]
+glossary: [interface, part-whole-hierarchy, tree-leaf, open-closed, structural-typing]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: composite
+  scenarios:
+    - try: "Predict what the loop report says, then move ML platform under Data."
+      notice: "The loop report drops $2,390 without an error. The composite total does not move."
+    - try: "Click a single VM, then a team, then the org."
+      notice: "The same cost() call works on all of them. A leaf answers with 1 call; a group asks each child, one call per node."
+    - try: "Move shared-infra into the org, then add the Kubernetes cluster."
+      notice: "A project with no team, and a resource that has children, are two more shapes the loops never expected. cost() handles both with no code change."
+    - try: "Try to move Data inside ML platform after ML platform is inside Data."
+      notice: "The move is refused. A composite has to stay a tree; a loop in it would make cost() recurse forever."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: finance, sub: monthly bill }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: finance, sub: org.cost() }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: { go: MonthlyCost, python: monthly_cost, typescript: monthlyCost, rust: monthly_cost }, sub: nested loops, fixed depth }
+      after:  { x: 260, y: 176, w: 130, h: 48, title: Group, sub: sums its children }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 200, y: 24, w: 200, h: 52, title: "" }
+      after:  { x: 200, y: 24, w: 200, h: 52, title: { go: Node, python: Node, typescript: CostNode, rust: "enum Node" }, sub: cost() }
+    - id: loops
+      kind: concrete
+      before: { x: 188, y: 80, w: 222, h: 40, title: for team · for project }
+      after:  { x: 420, y: 176, w: 132, h: 48, title: "Team, Project", sub: are Groups }
+    - id: resource
+      kind: concrete
+      before: { x: 188, y: 130, w: 222, h: 40, title: for resource }
+      after:  { x: 110, y: 176, w: 120, h: 48, title: Resource, sub: a leaf }
+    - id: subteam
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 206, w: 222, h: 40, title: for sub-team (1 level) }
+      after:  { x: 430, y: 96, w: 122, h: 44, title: Sub-team, sub: a Group in a Group }
+  edges:
+    - { from: client, to: strategy, label: calls }
+    - { from: resource, to: strategy, kind: implements }
+    - { from: context, to: strategy, kind: implements, label: same interface }
+    - { from: subteam, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: org.go · report.go
+      source: |
+        type Org struct{ Teams []Team }
+        type Team struct {
+            Name     string
+            Projects []Project
+        }
+        type Project struct {
+            Name      string
+            Resources []Resource
+        }
+        type Resource struct {
+            Name    string
+            Monthly int
+        }
+
+        // report.go
+        func MonthlyCost(o Org) int {
+            total := 0
+            for _, t := range o.Teams {
+                for _, p := range t.Projects {
+                    for _, r := range p.Resources {
+                        total += r.Monthly
+                    }
+                }
+            }
+            return total
+        }
+      roles: { context: [16, 26], loops: [18, 19], resource: [20, 22], client: [16, 16] }
+      change:
+        - { after: 4, add: ['    SubTeams []Team'] }
+        - { after: 23, add: ['        for _, sub := range t.SubTeams { // one level only', '            for _, p := range sub.Projects {', '                for _, r := range p.Resources {', '                    total += r.Monthly', '                }', '            }', '        }'] }
+    after:
+      file: node.go · report.go
+      source: |
+        type Node interface {
+            Name() string
+            Cost() int
+        }
+
+        type Resource struct {
+            name    string
+            monthly int
+        }
+
+        func (r Resource) Name() string { return r.name }
+        func (r Resource) Cost() int    { return r.monthly }
+
+        // Group is a team, a project or a folder: anything that holds nodes.
+        type Group struct {
+            name     string
+            children []Node
+        }
+
+        func (g *Group) Name() string { return g.name }
+        func (g *Group) Cost() int {
+            total := 0
+            for _, c := range g.children {
+                total += c.Cost()
+            }
+            return total
+        }
+
+        // report.go: one call, whatever the shape
+        total := org.Cost()
+      roles: { strategy: [1, 4], resource: [6, 12], context: [14, 27], loops: [14, 18], client: [30, 30], fanout: [23, 25], leaf: [12, 12], sum: [21, 27] }
+    again:
+      file: setup.go
+      source: |
+        // A sub-team is a Group inside a Group. Nothing above changes.
+        data.children = append(data.children, mlPlatform)
+    cost:
+      before: { text: 8 lines · every report, value: 0.8 }
+      after: { text: 0 code changes, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A small interface with one method is enough. Put `Add` only on `*Group`, so the compiler stops anyone adding children to a resource. Walk deep or untrusted trees with an explicit stack instead of recursion if their depth is unbounded.'
+      seenIn: '`go/ast`, where every syntax node satisfies `ast.Node` and `ast.Inspect` walks them all the same way. `fs.WalkDir` over files and directories. `html.Node` in `golang.org/x/net/html`.'
+
+  python:
+    before:
+      file: org.py · report.py
+      source: |
+        @dataclass
+        class Resource:
+            name: str
+            monthly: int
+
+        @dataclass
+        class Project:
+            name: str
+            resources: list[Resource]
+
+        @dataclass
+        class Team:
+            name: str
+            projects: list[Project]
+
+        # report.py
+        def monthly_cost(org: Org) -> int:
+            total = 0
+            for team in org.teams:
+                for project in team.projects:
+                    for r in project.resources:
+                        total += r.monthly
+            return total
+      roles: { context: [17, 23], loops: [19, 20], resource: [21, 22], client: [17, 17] }
+      change:
+        - { after: 14, add: ['    sub_teams: list["Team"] = field(default_factory=list)'] }
+        - { after: 22, add: ['        for sub in team.sub_teams:  # one level only', '            for project in sub.projects:', '                for r in project.resources:', '                    total += r.monthly'] }
+    after:
+      file: node.py · report.py
+      source: |
+        class Node(Protocol):
+            def cost(self) -> int: ...
+
+        @dataclass
+        class Resource:
+            name: str
+            monthly: int
+
+            def cost(self) -> int:
+                return self.monthly
+
+        @dataclass
+        class Group:
+            """A team, a project or a folder: anything that holds nodes."""
+            name: str
+            children: list[Node] = field(default_factory=list)
+
+            def cost(self) -> int:
+                return sum(c.cost() for c in self.children)
+
+        # report.py: one call, whatever the shape
+        total = org.cost()
+      roles: { strategy: [1, 2], resource: [4, 10], context: [12, 19], loops: [12, 16], client: [22, 22], fanout: [19, 19], leaf: [9, 10], sum: [18, 19] }
+    again:
+      file: setup.py
+      source: |
+        # A sub-team is a Group inside a Group. Nothing above changes.
+        data.children.append(ml_platform)
+    cost:
+      before: { text: 5 lines · every report, value: 0.75 }
+      after: { text: 0 code changes, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Duck typing makes it light: anything with a `cost()` method can sit in `children`. A `Protocol` lets a type checker confirm it. Python''s default recursion limit is 1000 frames, plenty for an org chart and not for arbitrary user-built trees.'
+      seenIn: 'The `ast` module, where `ast.walk` and `ast.NodeVisitor` treat every node alike. Tkinter, where frames hold widgets and other frames. `xml.etree.ElementTree`, where elements hold elements.'
+
+  typescript:
+    before:
+      file: org.ts · report.ts
+      source: |
+        interface Resource { name: string; monthly: number }
+        interface Project { name: string; resources: Resource[] }
+        interface Team { name: string; projects: Project[] }
+        interface Org { teams: Team[] }
+
+        // report.ts
+        export function monthlyCost(org: Org): number {
+          let total = 0;
+          for (const team of org.teams)
+            for (const project of team.projects)
+              for (const r of project.resources) total += r.monthly;
+          return total;
+        }
+      roles: { context: [7, 13], loops: [9, 10], resource: [11, 11], client: [7, 7] }
+      change:
+        - { line: 3, replace: 'interface Team { name: string; projects: Project[]; subTeams?: Team[] }' }
+        - { after: 11, add: ['  for (const team of org.teams)', '    for (const sub of team.subTeams ?? []) // one level only', '      for (const project of sub.projects)', '        for (const r of project.resources) total += r.monthly;'] }
+    after:
+      file: node.ts · report.ts
+      source: |
+        interface CostNode {
+          name: string;
+          cost(): number;
+        }
+
+        class Resource implements CostNode {
+          constructor(readonly name: string, private readonly monthly: number) {}
+          cost() { return this.monthly; }
+        }
+
+        // A team, a project or a folder: anything that holds nodes.
+        class Group implements CostNode {
+          constructor(readonly name: string, readonly children: CostNode[] = []) {}
+          cost(): number {
+            return this.children.reduce((sum, c) => sum + c.cost(), 0);
+          }
+        }
+
+        // report.ts: one call, whatever the shape
+        const total = org.cost();
+      roles: { strategy: [1, 4], resource: [6, 9], context: [11, 17], loops: [11, 13], client: [20, 20], fanout: [15, 15], leaf: [8, 8], sum: [14, 16] }
+    again:
+      file: setup.ts
+      source: |
+        // A sub-team is a Group inside a Group. Nothing above changes.
+        data.children.push(mlPlatform);
+    cost:
+      before: { text: 5 lines · every report, value: 0.75 }
+      after: { text: 0 code changes, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'For plain data, a discriminated union such as `{ kind: "resource"; monthly: number } | { kind: "group"; children: Node[] }` with a recursive function is often simpler than classes, and the compiler checks every `kind` is handled. Use classes when nodes carry behaviour of their own.'
+      seenIn: 'The DOM: elements hold nodes, text nodes are leaves, and `node.textContent` works on both. React, where a component renders elements that may be other components. Every AST in the ecosystem, from TypeScript''s own compiler to Babel.'
+
+  rust:
+    before:
+      file: org.rs · report.rs
+      source: |
+        struct Resource { name: String, monthly: u64 }
+        struct Project { name: String, resources: Vec<Resource> }
+        struct Team { name: String, projects: Vec<Project> }
+        struct Org { teams: Vec<Team> }
+
+        // report.rs
+        fn monthly_cost(org: &Org) -> u64 {
+            org.teams.iter()
+                .flat_map(|t| &t.projects)
+                .flat_map(|p| &p.resources)
+                .map(|r| r.monthly)
+                .sum()
+        }
+      roles: { context: [7, 13], loops: [8, 9], resource: [10, 11], client: [7, 7] }
+      change:
+        - { line: 3, replace: 'struct Team { name: String, projects: Vec<Project>, sub_teams: Vec<Team> }' }
+        - { line: 8, replace: '    org.teams.iter().chain(org.teams.iter().flat_map(|t| &t.sub_teams)) // one level only' }
+    after:
+      file: node.rs · report.rs
+      source: |
+        enum Node {
+            Resource { name: String, monthly: u64 },
+            Group { name: String, children: Vec<Node> },
+        }
+
+        impl Node {
+            fn cost(&self) -> u64 {
+                match self {
+                    Node::Resource { monthly, .. } => *monthly,
+                    Node::Group { children, .. } => children.iter().map(Node::cost).sum(),
+                }
+            }
+        }
+
+        // report.rs: one call, whatever the shape
+        let total = org.cost();
+      roles: { strategy: [1, 4], resource: [2, 2], context: [3, 3], loops: [3, 3], client: [16, 16], fanout: [10, 10], leaf: [9, 9], sum: [7, 12] }
+    again:
+      file: setup.rs
+      source: |
+        // A sub-team is a Group inside a Group. Nothing above changes.
+        if let Node::Group { children, .. } = &mut data {
+            children.push(ml_platform);
+        }
+    cost:
+      before: { text: 2 lines · every report, value: 0.6 }
+      after: { text: 0 code changes, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A recursive `enum` is the usual Rust composite when the kinds of node are fixed: the `match` is checked for every variant, and `Vec<Node>` gives the indirection a recursive type needs. Use a trait with `Box<dyn Node>` children when other crates must add node kinds.'
+      seenIn: '`serde_json::Value`, whose `Array` and `Object` variants hold more values. `syn`''s syntax tree. `std::fs::read_dir` and the `walkdir` crate over files and directories.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Finance calls cost() on the org. The org is a Group, but the caller only knows it holds a Node.
+    nodes: [client, strategy]
+    edges: [client>strategy]
+    role: client
+  - text: A Group asks each child for its cost. It never checks whether a child is a team, a project or a VM.
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: fanout
+  - text: A Resource is a leaf. It answers with its own monthly price and calls nothing.
+    nodes: [resource]
+    edges: [resource>strategy]
+    role: leaf
+  - text: Each Group returns the sum to whoever asked. A sub-team is just a Group inside a Group, so totals flow up through any depth.
+    nodes: [context, subteam]
+    edges: [context>strategy, subteam>strategy]
+    role: sum
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these situations calls for a Composite?
+    options:
+      - text: Access is granted on folders and on documents, folders hold documents and other folders, and "can Ana read this?" must work on either.
+        correct: true
+        why: Right. It is a part-whole tree, and the same question has to work on one item and on a group of items.
+      - text: Every storage call needs retries and timing, whichever vendor is behind it.
+        why: That is Decorator. One object is wrapped to add behaviour; there is no tree of parts.
+      - text: Tax is computed with one of three rules, chosen by country.
+        why: That is Strategy. One rule is plugged in; nothing is grouped.
+  engineer:
+    question: To make every node look the same, you give Resource an add_child method that throws. What did you trade?
+    options:
+      - text: Safety for transparency. Callers can treat every node alike, but adding a child to a VM now fails at runtime instead of at compile time.
+        correct: true
+        why: Right. The catalogue names this trade-off. Putting child management only on Group is the safe choice; callers that build trees usually know they hold a Group anyway.
+      - text: Nothing. Having the same methods on every node is strictly better.
+        why: A method that always throws is a promise the type does not keep. It moves an error the compiler could catch to runtime.
+      - text: Speed. Every call to cost() now has to check whether add_child was called.
+        why: No. add_child is a separate method. cost() is unaffected.
+  deep:
+    question: The tree has 200,000 resources and a dashboard calls org.cost() on every page load. What is the usual fix?
+    options:
+      - text: Cache each group's total, and invalidate the cached totals up the parent chain when a child changes.
+        correct: true
+        why: Right. The catalogue suggests exactly this, and it needs parent references so a change can walk up. Reads become one lookup; writes cost one walk to the root.
+      - text: Rewrite cost() to use an explicit stack instead of recursion.
+        why: That removes the risk of a very deep tree overflowing the call stack, but it still visits all 200,000 nodes on every page load.
+      - text: Go back to nested loops, which avoid the method calls.
+        why: The loops visit the same nodes and only save the call overhead, and they break again on the next new shape.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Component
+      example: { go: "Node (interface)", python: "Node (Protocol)", typescript: "CostNode (interface)", rust: "Node (enum)" }
+      job: The one interface for leaves and groups.
+    - role: Leaf
+      example: Resource (a VM, a database, a bucket)
+      job: Answers from its own data. Has no children.
+    - role: Composite
+      example: Group (a team, a project, a folder)
+      job: Holds children and answers by asking each of them.
+    - role: Client
+      example: the cost report, a budget alert
+      job: Calls the component interface on any node, never asking which kind it is.
+  useWhen:
+    - The data is a part-whole tree, such as org units, folders, menus, bundles or syntax trees.
+    - The same question must work on one item and on a group of items.
+    - The tree's shape changes over time, and code that walks it should not.
+  avoidWhen:
+    - The structure is flat or has a fixed, shallow depth that will not change.
+    - Leaves and groups need very different operations, so the shared interface would be mostly methods that do not apply.
+    - You need strict rules about which kinds may hold which. The pattern makes that a runtime check.
+  tradeoffs:
+    - Transparency against safety. Child management on every node makes nodes uniform but lets callers add children to leaves.
+    - Rules such as "a project may not hold a team" move from the type system to runtime checks.
+    - Recursive calls visit every node. Large trees need caching, and unbounded depth needs care with the call stack.
+    - The tree must stay a tree. A node inside its own subtree makes recursive operations loop forever.
+  lookalikes:
+    - name: Decorator
+      how: Also recursive, but a decorator wraps exactly one object to add behaviour. A composite holds many and combines their results.
+    - name: Iterator
+      how: Walks the elements of a structure. It is often how you traverse a composite.
+    - name: Visitor
+      how: Adds new operations over a composite's nodes without adding methods to each node.
+    - name: Chain of Responsibility
+      how: Often uses a composite's parent links to pass a request up the tree.
+    - name: Flyweight
+      how: Lets many leaves share one object, which a composite with no parent references allows.
+---
+
+## [concept] Composite
+
+**Give single items and groups of items one <Term id="interface">interface</Term>, so code can ask a whole tree the same question it asks one leaf.**
+
+Cloud bills, folders, menus and org charts are <Term id="part-whole-hierarchy">part-whole hierarchies</Term>: groups that hold items and other groups. With Composite, a VM and a whole department both answer `cost()`. The code that asks never needs to know which one it holds, or how deep the tree goes.
+
+<Depth level={2}>
+Three roles plus a client. The **component** is the shared interface (`Node` with `cost()`). A **<Term id="tree-leaf">leaf</Term>** answers from its own data (a VM's monthly price). A **composite** holds children and answers by asking each of them (a team sums its projects). The **client** calls the interface on any node. One design choice matters: where `add_child` lives. On every node it is transparent but unsafe; only on groups it is safe but less uniform.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue files Composite as an object structural pattern. It lists the benefits: client code becomes simple because it stops testing which class it holds, and new kinds of leaf or group work with existing code. It also names the main cost: the design becomes overly general, so restricting which components a composite may hold needs runtime checks. Its implementation notes cover parent references, sharing components, the transparency-against-safety choice for child operations, and caching results in composites to make traversal cheaper.
+</Depth>
+
+## [problem] A cost report shaped like last year's org chart
+
+Finance totals the monthly cloud bill. The report walks the org as it was when it was written: teams hold projects, projects hold resources. It works, and the numbers match the invoice.
+
+Read it once. The shape of the org is written into the report as nested loops, one per level.
+
+<Depth level={2}>
+The budget alert and the tag audit walk the tree the same way, each with its own copy of the loops. The data types fix the shape too: a team can only hold projects.
+</Depth>
+
+<Depth level={3}>
+Nothing is wrong yet. A fixed three-level structure with three loops is clear code. The trouble starts when the shape changes, and org charts change every reorganisation.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** teams can now have sub-teams. ML platform moves under Data.
+
+The marked lines must change: a new field, and another set of loops for the sub-teams, in every report. And the new loops only go one level deep.
+
+<Depth level={2}>
+The dangerous part is what happens when someone forgets. A report that was not updated does not fail. It skips the sub-team and prints a smaller total. The playground shows how much money disappears that way.
+</Depth>
+
+<Depth level={3}>
+The next reorganisation brings another shape: a project owned by no team, a sub-team of a sub-team, a resource such as a Kubernetes cluster that has children of its own. Each one adds another loop to every report.
+</Depth>
+
+## [morph] Give leaves and groups one interface
+
+Drag the slider. The loops leave the report. A Resource and a Group both implement one interface, and a Group holds any mix of Resources and Groups.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Now the report is one call, `org.cost()`. A sub-team is a Group inside a Group, so it needs no code change. New kinds of node work with the existing reports as long as they implement the interface: the <Term id="open-closed">open/closed principle</Term>, applied to the shape of the data.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`Resource` uses a value receiver and `*Group` a pointer receiver, so children can be added to a group in place. Both satisfy `Node` implicitly. `Add` exists only on `*Group`: the safe choice.</Lang>
+<Lang only="python">`Group.children` is typed `list[Node]`, and anything with a `cost()` method fits, including future node types nobody has written yet.</Lang>
+<Lang only="typescript">`children: CostNode[]` accepts any object with a `name` and a `cost()` method. With <Term id="structural-typing">structural typing</Term>, a node from another module fits without importing `Group` or `Resource`.</Lang>
+<Lang only="rust">The composite is an `enum`. The set of node kinds is closed, and `match` checks that `cost` handles every variant. A recursive enum needs indirection, which `Vec<Node>` provides.</Lang>
+</Depth>
+
+## [walk] Follow one cost() call down and back up
+
+One call on the org, down to the leaves and back up. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Each `Cost` call goes through the `Node` interface, so it is an indirect call per node. For a tree of thousands of nodes that is microseconds. The call stack grows by one frame per level of depth, not per node.</Lang>
+<Lang only="python">The recursion depth equals the tree's depth, not its size. Python's default limit of 1000 frames is far above any org chart, but a tree built from user input needs an explicit stack or a depth check.</Lang>
+<Lang only="typescript">`reduce` with a callback per child is fine for thousands of nodes. For very large trees, a plain `for` loop avoids the closure, and an explicit stack avoids deep recursion.</Lang>
+<Lang only="rust">`children.iter().map(Node::cost).sum()` compiles to a tight loop with a direct recursive call: no vtable, because the enum is matched in place. Depth is limited by the thread's stack size.</Lang>
+</Depth>
+
+## [again] Sub-teams, the second time
+
+The same request after the refactor. ML platform's Group goes into Data's children. No report changes, and no report can forget, because none of them knows the shape.
+
+<Depth level={2}>
+The same holds for shapes nobody has asked for yet: a project owned by the whole org, or a cluster that has a fee of its own and also holds namespaces. Anything that answers `cost()` fits.
+</Depth>
+
+<Depth level={3}>
+Keep the tree a tree. Check in `add` that the new child is not an ancestor of the group, or a reorganisation can create a loop and `cost()` will never return. If you keep parent references for upward walks or caching, set them only in `add` and `remove`, so they cannot go stale.
+</Depth>
+
+## [play] Reorganise the org, compare the bills
+
+Two reports total the same org. One uses nested loops, written for teams that hold projects that hold resources. The other calls `cost()` on the root.
+
+Reorganise the org the way real companies do, and see which report you can trust.
+
+## [lens] How each language writes it
+
+Object-oriented languages write Composite as an interface with leaf and group classes. Rust and TypeScript often use a recursive sum type instead, which gives the same uniform call and lets the compiler check every kind of node.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="composite" />
+
+### Beyond cost: permissions and policies
+
+Cloud providers use the same shape for access. In Google Cloud, policies set on an organization or folder are inherited by everything below, and a resource's effective policy combines its own with its ancestors'. That is a composite query that walks up the tree instead of down. It is the reason parent references are worth keeping.

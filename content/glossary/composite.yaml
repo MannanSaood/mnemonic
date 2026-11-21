@@ -1,0 +1,7 @@
+# Terms introduced by the Composite lesson.
+- id: part-whole-hierarchy
+  term: Part-whole hierarchy
+  short: A tree where groups hold items and other groups, such as folders, org units or menus. The whole is made of its parts.
+- id: tree-leaf
+  term: Leaf
+  short: A node in a tree with no children. In Composite, the leaf answers a request from its own data instead of asking children.
