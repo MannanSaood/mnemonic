@@ -1,0 +1,499 @@
+---
+title: When a goroutine blocks
+track: go-internals
+group: Scheduler
+order: 5
+summary: A goroutine that waits on a channel or a socket gives its thread back. One stuck in a system call keeps the thread, and the runtime hands its P to another thread.
+intent: Know which kinds of blocking cost an OS thread, and how the runtime keeps the other goroutines running when one does.
+changeRequest: Serve thumbnails from the archive too, which is mounted over NFS.
+languages: [go, python, typescript, rust]
+glossary: [goroutine-park, netpoller, blocking-syscall, sysmon, p-handoff]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [go-runtime, os, concurrency]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: blocking-and-handoff
+  scenarios:
+    - try: "Make a prediction, then run a file read on the stalled mount."
+      notice: "M0 goes into the kernel with the goroutine. A millisecond later sysmon hands P0 to a new thread, M2, and every request is still served on time. The price is a third thread."
+    - try: "Run the same 30 ms wait as a network read, then as a channel receive."
+      notice: "The goroutine parks (on the netpoller, or on the channel) and the thread runs the next request at once. No new thread, no hand-off."
+    - try: "Turn the hand-off off and run the file read again."
+      notice: "P0 sits idle for 30 ms. P1 steals what it can, but only 30 of the 45 requests in the block run on time, and one waits 20 ms."
+    - try: "Run 4 file reads at once, with the hand-off on and then off."
+      notice: "On: four extra threads, which park as idle threads when the reads return. Off: both Ps are stuck and nothing runs for 30 ms."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: handler
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: handler, sub: { go: os.ReadFile, python: path.read_bytes, typescript: readFileSync, rust: "std::fs::read" } }
+      after:  { x: 12, y: 24, w: 112, h: 48, title: handler, sub: { go: os.ReadFile, python: to_thread, typescript: readFile, rust: "tokio::fs::read" } }
+    - id: runtime
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: Go runtime, sub: "every wait looks the same?" }
+      after:  { x: 150, y: 24, w: 150, h: 48, title: sysmon, sub: "retake()" }
+    - id: sem
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 100, w: 110, h: 48, title: "" }
+      after:  { x: 330, y: 24, w: 220, h: 48, title: fileSlots, sub: "64 reads at most" }
+    - id: g
+      kind: concrete
+      before: { x: 170, y: 56, w: 230, h: 30, title: "G parks, thread is free" }
+      after:  { x: 12, y: 190, w: 96, h: 48, title: G, sub: "in read()" }
+    - id: m
+      kind: concrete
+      before: { x: 170, y: 94, w: 230, h: 30, title: "M runs other Gs" }
+      after:  { x: 120, y: 190, w: 96, h: 48, title: M0, sub: in the kernel }
+    - id: p
+      kind: concrete
+      before: { x: 170, y: 132, w: 230, h: 30, title: "P keeps working" }
+      after:  { x: 228, y: 190, w: 96, h: 48, title: P, sub: handed off }
+    - id: kernel
+      kind: concrete
+      before: { x: 170, y: 170, w: 230, h: 30, title: "threads: a few" }
+      after:  { x: 444, y: 190, w: 106, h: 48, title: NFS, sub: stalled }
+    - id: m2
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 208, w: 230, h: 30, title: "NFS stalls for 30 s" }
+      after:  { x: 336, y: 190, w: 96, h: 48, title: M2, sub: new thread }
+  edges:
+    - { from: handler, to: g, label: runs in }
+    - { from: g, to: kernel, label: "read()" }
+    - { from: m, to: g, label: stuck with }
+    - { from: runtime, to: p, label: retakes }
+    - { from: p, to: m2, label: handed to }
+    - { from: sem, to: handler, label: admits }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: thumbs.go · main.go
+      source: |
+        // thumbs.go
+        func (s *Server) thumbnail(w http.ResponseWriter, r *http.Request) {
+            path := filepath.Join(s.root, r.PathValue("id")+".jpg")
+            data, err := os.ReadFile(path) // fast on local disk
+            if err != nil {
+                http.Error(w, "not found", http.StatusNotFound)
+                return
+            }
+            w.Header().Set("Content-Type", "image/jpeg")
+            w.Write(data)
+        }
+
+        // main.go
+        srv := &Server{root: "/var/media/thumbs"}
+        http.HandleFunc("GET /thumbs/{id}", srv.thumbnail)
+      roles: { handler: [2, 11], g: [4, 4], kernel: [14, 14] }
+      change:
+        - { line: 14, replace: 'srv := &Server{root: "/mnt/archive/thumbs"} // NFS' }
+    after:
+      file: thumbs.go
+      source: |
+        // at most 64 threads may sit in file reads at once
+        var fileSlots = make(chan struct{}, 64)
+
+        func (s *Server) thumbnail(w http.ResponseWriter, r *http.Request) {
+            select {
+            case fileSlots <- struct{}{}:
+                defer func() { <-fileSlots }()
+            case <-r.Context().Done():
+                return
+            case <-time.After(2 * time.Second):
+                http.Error(w, "storage busy", http.StatusServiceUnavailable)
+                return
+            }
+            path := filepath.Join(s.root, r.PathValue("id")+".jpg")
+            data, err := os.ReadFile(path) // a blocking syscall: holds a thread
+            if err != nil {
+                http.Error(w, "not found", http.StatusNotFound)
+                return
+            }
+            w.Header().Set("Content-Type", "image/jpeg")
+            w.Write(data)
+        }
+      roles: { sem: [1, 2], handler: [4, 22], g: [15, 15], m: [15, 15], kernel: [15, 15], p: [15, 15], m2: [15, 15], enter: [15, 15], retake: [15, 15], handoff: [15, 15], exit: [16, 21], slots: [5, 13] }
+    again:
+      file: thumbs.go
+      source: |
+        // the same 30 s NFS stall, with the slots in place:
+        // 64 handlers hold threads in read(); the rest wait on fileSlots,
+        // parked like any channel wait, and get a 503 after 2 s.
+        // Threads stay near GOMAXPROCS + 64 instead of climbing to 10,000.
+    cost:
+      before: { text: "threads climb to 10,000 · crash", value: 0.95 }
+      after: { text: "≤ 64 stuck threads · fast 503s", value: 0.3 }
+    lens:
+      need: 3
+      needLabel: Mostly handled
+      note: 'Channel, mutex, sleep and network waits park the goroutine and cost no thread. File reads and cgo calls hold a thread until they return, and the runtime starts another thread to keep the P busy. Bound them with a semaphore so a stalled disk cannot create thousands of threads.'
+      seenIn: '`debug.SetMaxThreads` (10,000 by default; the program crashes beyond it). `/sched/threads/total:threads` and `/sched/goroutines/not-in-go:goroutines` in `runtime/metrics`. `golang.org/x/sync/semaphore`.'
+
+  python:
+    before:
+      file: thumbs.py · config.py
+      source: |
+        # thumbs.py
+        async def thumbnail(request: web.Request) -> web.Response:
+            path = ROOT / f"{request.match_info['id']}.jpg"
+            try:
+                data = path.read_bytes()  # fast on local disk
+            except FileNotFoundError:
+                raise web.HTTPNotFound()
+            return web.Response(body=data, content_type="image/jpeg")
+
+        # config.py
+        ROOT = Path("/var/media/thumbs")
+      roles: { handler: [2, 8], g: [5, 5], kernel: [11, 11] }
+      change:
+        - { line: 11, replace: 'ROOT = Path("/mnt/archive/thumbs")  # NFS' }
+    after:
+      file: thumbs.py
+      source: |
+        # the default executor has min(32, CPUs + 4) threads
+        file_slots = asyncio.Semaphore(16)
+
+        async def thumbnail(request: web.Request) -> web.Response:
+            path = ROOT / f"{request.match_info['id']}.jpg"
+            async with file_slots:
+                try:
+                    # the read runs on a worker thread; the event loop stays free
+                    data = await asyncio.to_thread(path.read_bytes)
+                except FileNotFoundError:
+                    raise web.HTTPNotFound()
+            return web.Response(body=data, content_type="image/jpeg")
+      roles: { sem: [1, 2], handler: [4, 12], g: [9, 9], m: [9, 9], kernel: [9, 9], p: [8, 9], m2: [8, 9], enter: [9, 9], retake: [8, 9], handoff: [8, 9], exit: [9, 11], slots: [6, 6] }
+    again:
+      file: thumbs.py
+      source: |
+        # the same 30 s NFS stall, with the read on a thread:
+        # 16 reads wait in executor threads, the rest wait on file_slots,
+        # and the event loop keeps answering every other route.
+    cost:
+      before: { text: "event loop frozen 30 s", value: 0.95 }
+      after: { text: "16 threads stuck · loop free", value: 0.3 }
+    lens:
+      need: 2
+      needLabel: Your job
+      note: 'In asyncio, a blocking call inside a coroutine freezes the whole event loop: every request stops. Move it to a thread with `asyncio.to_thread` or `run_in_executor`. A thread blocked in a file read releases the GIL, so other threads keep running Python meanwhile.'
+      seenIn: '`asyncio.to_thread`, `loop.run_in_executor`, `asyncio.Semaphore`. aiofiles runs file calls on a thread pool for the same reason.'
+
+  typescript:
+    before:
+      file: thumbs.ts · config.ts
+      source: |
+        // thumbs.ts
+        app.get("/thumbs/:id", (req, res) => {
+          const path = join(ROOT, `${req.params.id}.jpg`);
+          try {
+            const data = readFileSync(path); // fast on local disk
+            res.type("image/jpeg").send(data);
+          } catch {
+            res.status(404).send("not found");
+          }
+        });
+
+        // config.ts
+        export const ROOT = "/var/media/thumbs";
+      roles: { handler: [2, 10], g: [5, 5], kernel: [13, 13] }
+      change:
+        - { line: 13, replace: 'export const ROOT = "/mnt/archive/thumbs"; // NFS' }
+    after:
+      file: thumbs.ts
+      source: |
+        import { readFile } from "node:fs/promises";
+        import pLimit from "p-limit";
+
+        // libuv runs file reads on its pool, 4 threads by default;
+        // never let stalled NFS reads take all of them
+        const fileSlots = pLimit(2);
+
+        app.get("/thumbs/:id", async (req, res) => {
+          const path = join(ROOT, `${req.params.id}.jpg`);
+          try {
+            const data = await fileSlots(() => readFile(path));
+            res.type("image/jpeg").send(data);
+          } catch {
+            res.status(404).send("not found");
+          }
+        });
+      roles: { sem: [4, 6], handler: [8, 16], g: [11, 11], m: [11, 11], kernel: [11, 11], p: [11, 11], m2: [4, 5], enter: [11, 11], retake: [4, 5], handoff: [4, 5], exit: [12, 15], slots: [6, 6] }
+    again:
+      file: thumbs.ts
+      source: |
+        // the same 30 s NFS stall, with async reads and a limit:
+        // 2 pool threads are stuck, 2 stay free for other fs and dns.lookup calls,
+        // and the event loop keeps answering every other route.
+    cost:
+      before: { text: "event loop frozen 30 s", value: 0.95 }
+      after: { text: "2 pool threads stuck · loop free", value: 0.3 }
+    lens:
+      need: 2
+      needLabel: Your job
+      note: 'Node has one thread for your JavaScript. `readFileSync` blocks it, so every request waits. `fs.promises` hands the read to libuv''s thread pool, which also runs `dns.lookup` and some crypto, so a stalled mount can starve those too. Limit concurrent reads, or raise `UV_THREADPOOL_SIZE`.'
+      seenIn: '`fs.promises`, `UV_THREADPOOL_SIZE`, p-limit. Sockets do not use the pool: libuv waits on them with epoll, kqueue or IOCP, like Go''s netpoller.'
+
+  rust:
+    before:
+      file: thumbs.rs · main.rs
+      source: |
+        // thumbs.rs
+        async fn thumbnail(Path(id): Path<String>, State(app): State<App>) -> Response {
+            let path = app.root.join(format!("{id}.jpg"));
+            match std::fs::read(&path) { // fast on local disk
+                Ok(data) => ([(CONTENT_TYPE, "image/jpeg")], data).into_response(),
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+
+        // main.rs
+        let app = App { root: PathBuf::from("/var/media/thumbs") };
+      roles: { handler: [2, 8], g: [4, 4], kernel: [11, 11] }
+      change:
+        - { line: 11, replace: 'let app = App { root: PathBuf::from("/mnt/archive/thumbs") }; // NFS' }
+    after:
+      file: thumbs.rs
+      source: |
+        async fn thumbnail(Path(id): Path<String>, State(app): State<App>) -> Response {
+            // app.file_slots: Arc<Semaphore> with 64 permits
+            let Ok(_slot) = app.file_slots.acquire().await else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let path = app.root.join(format!("{id}.jpg"));
+            // tokio::fs runs the read on the blocking pool, not on an async worker
+            match tokio::fs::read(&path).await {
+                Ok(data) => ([(CONTENT_TYPE, "image/jpeg")], data).into_response(),
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+      roles: { sem: [2, 5], handler: [1, 12], g: [8, 8], m: [8, 8], kernel: [8, 8], p: [7, 8], m2: [7, 7], enter: [8, 8], retake: [7, 7], handoff: [7, 7], exit: [9, 10], slots: [3, 5] }
+    again:
+      file: thumbs.rs
+      source: |
+        // the same 30 s NFS stall, with tokio::fs and a semaphore:
+        // 64 blocking-pool threads wait in read(), the async workers stay free,
+        // and every other route keeps answering.
+    cost:
+      before: { text: "async workers stuck 30 s", value: 0.9 }
+      after: { text: "≤ 64 pool threads stuck", value: 0.3 }
+    lens:
+      need: 3
+      needLabel: Your job, with tools
+      note: 'Tokio cannot hand a worker''s queue away while a task blocks it. `std::fs::read` in an async handler stalls that worker and everything queued on it. Use `tokio::fs` or `spawn_blocking`, which run on a separate blocking pool (up to 512 threads by default), and bound them yourself.'
+      seenIn: '`tokio::task::spawn_blocking`, `tokio::fs`, `Builder::max_blocking_threads`, `tokio::sync::Semaphore`. Network I/O goes through mio, on epoll, kqueue or IOCP.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: '`os.ReadFile` makes a read system call. The M goes into the kernel with the goroutine, and the P stays loosely attached in case the call returns quickly.'
+    nodes: [g, m, kernel]
+    edges: [g>kernel, m>g]
+    role: enter
+  - text: sysmon, a runtime thread that needs no P, notices the P has been in the same system call since its last look and has work waiting. It retakes the P.
+    nodes: [runtime, p]
+    edges: [runtime>p]
+    role: retake
+  - text: The P is handed to another thread, an idle one or a new one. The goroutines queued on it keep running while M0 waits on NFS.
+    nodes: [p, m2]
+    edges: [p>m2]
+    role: handoff
+  - text: The read returns. M0 tries to get its old P back, then any idle P. If none is free, the goroutine goes on the global run queue and M0 parks as an idle thread.
+    nodes: [m, g]
+    edges: [m>g]
+    role: exit
+  - text: The semaphore caps how many handlers can be inside a file read at once, so a stalled mount costs at most 64 threads. The rest wait on a channel, which costs no thread.
+    nodes: [sem, handler]
+    edges: [sem>handler]
+    role: slots
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A goroutine waits on a channel that has no value yet. What happens to the OS thread it was running on?
+    options:
+      - text: The goroutine is parked and the thread runs another goroutine straight away.
+        correct: true
+        why: Right. Channel waits, mutex waits, sleeps and network reads all park the goroutine inside the runtime. The thread and the P carry on.
+      - text: The thread sleeps until the channel gets a value.
+        why: That is what a blocking system call does. A channel wait never leaves the Go runtime, so no thread has to wait.
+      - text: The runtime creates a new thread for the other goroutines.
+        why: Not needed. The thread is free already; a new one is started only when a thread is stuck in the kernel.
+  engineer:
+    question: A Go service with GOMAXPROCS 8 shows 3,000 OS threads while its NFS mount is slow. What is going on?
+    options:
+      - text: Each goroutine in a file read holds a thread in the kernel, and the runtime starts new threads so the Ps keep running other goroutines.
+        correct: true
+        why: Right. File reads are blocking system calls. Bound them with a semaphore; at 10,000 threads the runtime crashes the program.
+      - text: GOMAXPROCS is being ignored, so every goroutine gets its own thread.
+        why: GOMAXPROCS still holds. It limits threads running Go code, and threads blocked in system calls do not count against it.
+      - text: The netpoller creates one thread per open file.
+        why: The netpoller handles sockets and pipes with one epoll or kqueue instance. Regular files cannot be polled, which is why their reads block a thread.
+  deep:
+    question: A goroutine's read syscall returns after 30 s. Its P was handed off long ago and every P is busy. What does the runtime do?
+    options:
+      - text: It puts the goroutine on the global run queue and parks the thread as an idle M.
+        correct: true
+        why: Right. That is exitsyscall's slow path. The goroutine runs when some P picks it from the global queue, and the parked thread is reused later instead of being destroyed.
+      - text: It takes a P back from whichever thread is running a goroutine.
+        why: No. A P is only taken from a thread that is itself stuck in a system call. A running goroutine is never robbed of its P this way.
+      - text: The thread keeps running the goroutine without a P until it blocks again.
+        why: No. A thread must hold a P to run Go code. Without one, it can only hand the goroutine back and wait.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Parked goroutine
+      example: "<-jobs, mu.Lock(), conn.Read"
+      job: Waits inside the runtime. Costs a stack, no thread.
+    - role: Netpoller
+      example: epoll, kqueue or IOCP
+      job: Tells the scheduler which sockets are ready, so their goroutines can run again.
+    - role: Thread in a syscall
+      example: "f.Read, a cgo call"
+      job: Waits in the kernel with its goroutine. Holds an M until the call returns.
+    - role: sysmon
+      example: a runtime thread with no P
+      job: Retakes Ps from threads stuck in syscalls and hands them to other threads.
+  useWhen:
+    - A service reads files, calls cgo, or uses a syscall that can block for long.
+    - The thread count is far above GOMAXPROCS and you need to know why.
+    - Deciding whether a wait needs a bound (file and cgo) or not (network, channels).
+  avoidWhen:
+    - The wait is network I/O, a channel or a lock. Those park the goroutine; one goroutine per connection is fine.
+  tradeoffs:
+    - A hand-off keeps throughput but costs an OS thread per blocked call, each with its own stack and kernel bookkeeping.
+    - sysmon only looks every 20 µs to 10 ms, so a P can sit idle briefly before the hand-off.
+    - A semaphore around file reads turns a thread explosion into queued requests and 503s, which is better, but still visible to users.
+  lookalikes:
+    - name: Node's libuv thread pool
+      how: Runs file reads on a small fixed pool (4 threads by default) instead of creating threads; a stall fills the pool instead of growing it.
+    - name: "tokio's spawn_blocking"
+      how: A separate pool for blocking calls, up to 512 threads by default. The async workers never hand off; you must move blocking work there yourself.
+    - name: Python asyncio executors
+      how: Blocking calls go to a thread pool through to_thread or run_in_executor; otherwise they freeze the event loop.
+---
+
+## [concept] When a goroutine blocks
+
+**A goroutine that waits on a channel, a lock or a socket is <Term id="goroutine-park">parked</Term>, and its thread runs the next goroutine. A goroutine in a <Term id="blocking-syscall">blocking system call</Term> keeps its thread, so the runtime gives that thread's P to another thread.**
+
+Blocking looks the same in your code. In the runtime there are three different paths, and only one of them costs an OS thread.
+
+<Depth level={2}>
+Parked waits (channels, `sync.Mutex`, `time.Sleep`, `select`) never leave the runtime. Network reads and writes go through the <Term id="netpoller">netpoller</Term>: the socket is non-blocking, the goroutine parks, and the runtime learns from epoll, kqueue or IOCP when it is ready. File reads and cgo calls are real blocking calls: the thread waits in the kernel. That is when <Term id="sysmon">sysmon</Term> and the <Term id="p-handoff">P hand-off</Term> matter.
+</Depth>
+
+<Depth level={3}>
+A regular file is always "ready" as far as epoll is concerned, and Linux refuses to register one, so Go reads files with plain blocking syscalls. The runtime brackets every syscall with `entersyscall` and `exitsyscall`. In between, the goroutine is in the `_Gsyscall` state: it has an M, and the P is attached but not owned, so sysmon may take it.
+</Depth>
+
+## [problem] A thumbnail handler that reads from disk
+
+A media service serves thumbnails straight from disk. Each request runs in its own goroutine, reads one file, and writes it out. On local SSD a read takes well under a millisecond. It works, and it is tested.
+
+Read it with the usual model: goroutines are cheap, blocking is cheap, and the runtime handles the rest.
+
+<Depth level={2}>
+That model is right for the network side of this handler. Thousands of idle keep-alive connections cost goroutine stacks and nothing more, because they wait on the netpoller.
+</Depth>
+
+<Depth level={3}>
+The file read is the one call here that takes a thread into the kernel. On a fast disk the call returns before anyone notices, so the cost never shows.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** serve thumbnails from the archive too, which is mounted over NFS.
+
+The marked line is the only change. Weeks later the NFS server stalls for 30 seconds. Requests keep arriving, each goroutine blocks in `read`, and each one holds an OS thread. The runtime keeps starting threads so the Ps can serve other routes. The thread count climbs into the thousands, and at 10,000 the runtime stops the program with a fatal error.
+
+<Depth level={2}>
+The naive model says a blocked goroutine costs nothing. That is true for channels and sockets and false for file reads. GOMAXPROCS does not help: it limits threads running Go code, and threads stuck in system calls do not count against it.
+</Depth>
+
+<Depth level={3}>
+The 10,000 limit is the runtime's default `maxmcount`, changeable with `debug.SetMaxThreads`. Raising it only moves the crash: each thread has its own stack and kernel structures, and the process may hit the kernel's own thread or memory limits first.
+</Depth>
+
+## [morph] From "every wait is the same" to three paths
+
+Drag the slider. The single picture of a parked goroutine splits into what really happens for a file read: the goroutine and its M wait in the kernel, sysmon retakes the P, and another thread runs it.
+
+The code morphs to put a bound on how many handlers can be inside a file read at once.
+
+<Depth level={2}>
+The bound turns a thread explosion into a queue. Requests beyond the limit wait on the `fileSlots` channel, which parks them without a thread, and give up with a 503 after two seconds. Pick the limit from what the storage can serve, not from GOMAXPROCS.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">A blocked `read` cannot be cancelled from Go; the context only lets a waiting request give up before it starts the read. For a mount that can hang, `O_NONBLOCK` does not help either, because Linux ignores it for regular files.</Lang>
+<Lang only="python">`asyncio.to_thread` runs the call in the loop's default `ThreadPoolExecutor`. Its size is `min(32, os.cpu_count() + 4)`, so a limit of 16 leaves threads free for other blocking calls.</Lang>
+<Lang only="typescript">`readFile` from `fs/promises` queues the read on libuv's thread pool. The pool is shared with `dns.lookup`, `zlib` and some `crypto` calls, so reserve some of it.</Lang>
+<Lang only="rust">`tokio::fs::read` wraps `std::fs::read` in `spawn_blocking`. The semaphore keeps the blocking pool from filling with stuck reads.</Lang>
+</Depth>
+
+## [walk] Follow one stuck read
+
+One file read on the stalled mount, from the syscall to the hand-off and back. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">sysmon sleeps 20 µs at first, and starts doubling its sleep up to 10 ms once it has been idle for a while. In `retake`, it takes a P only if the P has stayed in the same syscall for more than one of its ticks. It leaves the P alone if the P has no work, other Ps are idle or spinning, and the call is younger than 10 ms. `handoffp` then starts an M when the P has work to run.</Lang>
+<Lang only="python">CPython releases the GIL around blocking I/O, so the executor thread waits in the kernel while other threads, including the event loop's, keep running Python.</Lang>
+<Lang only="typescript">libuv's thread pool has a fixed size, set once from `UV_THREADPOOL_SIZE` when it starts. When all its threads are stuck, new work simply waits in its queue; no thread is added.</Lang>
+<Lang only="rust">Tokio's blocking pool grows on demand up to `max_blocking_threads` and keeps idle threads for a while before they exit. Beyond the cap, new blocking tasks queue.</Lang>
+</Depth>
+
+## [again] The NFS stall, the second time
+
+The same 30-second stall with the bound in place. At most 64 threads wait in the kernel. Every other request either waits on the channel, which costs nothing, or gets a fast 503. Other routes keep their full speed, because their goroutines never need a file slot.
+
+<Depth level={2}>
+Watch `/sched/threads/total:threads` from `runtime/metrics`, or the thread count in your process metrics. A thread count far above GOMAXPROCS plus your bound means some blocking call is not behind it.
+</Depth>
+
+<Depth level={3}>
+cgo calls go through the same `entersyscall` path, so a slow C library call is a blocking syscall as far as the scheduler is concerned. Bound those the same way.
+</Depth>
+
+## [play] Block a goroutine and watch the thread
+
+Two Ps serve a steady stream of requests. One goroutine makes a call that waits 30 ms. You choose how it waits: a channel, a socket, or a file read on a stalled mount.
+
+Watch the timeline of threads, and count how many requests are still served on time.
+
+## [lens] How each language handles a blocking call
+
+Go detects the blocking call and adds a thread for you. Python, Node and tokio give you an event loop and expect you to move blocking calls off it yourself.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="blocking-and-handoff" />
+
+### Which waits cost a thread
+
+- Channel, `select`, `sync.Mutex`, `time.Sleep`: the goroutine waits in a runtime wait queue. No thread is held.
+- Socket read or write: the goroutine waits on the netpoller. No thread is held.
+- Regular file read or write: the goroutine and its thread wait in the kernel. A thread is held until the call returns.
+- cgo call: the thread runs or waits in C code, treated as a syscall. A thread is held.

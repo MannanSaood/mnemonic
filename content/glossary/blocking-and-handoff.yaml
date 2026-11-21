@@ -1,0 +1,13 @@
+# Terms introduced by the "When a goroutine blocks" lesson.
+- id: netpoller
+  term: Netpoller
+  short: The Go runtime's wrapper around epoll, kqueue or IOCP. Goroutines waiting on sockets park there instead of holding a thread, and the scheduler wakes them when data arrives.
+- id: sysmon
+  term: sysmon
+  short: A Go runtime thread that runs without a P. It sleeps between 20 µs and 10 ms, then retakes Ps stuck in system calls, preempts long-running goroutines and polls the network if nobody has.
+- id: blocking-syscall
+  term: Blocking system call
+  short: A call into the kernel that does not return until the work is done, such as read() on a regular file. The calling thread waits in the kernel, and the goroutine waits with it.
+- id: p-handoff
+  term: P hand-off
+  short: Giving a P whose thread is stuck in a system call to another thread, an idle one or a new one, so the P's other goroutines keep running.
