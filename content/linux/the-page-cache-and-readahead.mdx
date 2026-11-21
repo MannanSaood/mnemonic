@@ -1,0 +1,516 @@
+---
+title: The page cache and readahead
+track: linux
+group: Files and memory
+order: 15
+summary: Linux keeps file data in spare RAM, and reads ahead when you read in order. The first read of a page waits on the disk; every later read is a memory copy.
+intent: A read costs a microsecond or a disk round trip depending on whether the page is cached, so plan for the cold case.
+changeRequest: Ship fixes during the day. Every replica restarts at peak traffic, several times a day.
+languages: [go, python, typescript, rust]
+glossary: [page-cache, readahead, direct-io, posix-fadvise, cache-hit-ratio]
+
+prerequisites: [linux/vfs-and-file-descriptors, linux/page-faults-minor-and-major]
+skills: [linux, storage, performance]
+depths: [overview, engineer, deep]
+
+playground:
+  model: the-page-cache-and-readahead
+  scenarios:
+    - try: "Run the 100 lookups on a cold cache, then run them again."
+      notice: "The first run waits on the disk about 85 times. The second run never does: every page it needs is now in the page cache."
+    - try: "Drop caches, read the whole file in order, then run the lookups."
+      notice: "The in-order pass reads three times as much data in 11 I/Os, and the lookups after it are all hits. Together they finish several times faster than the cold lookups alone."
+    - try: "Drop caches, switch readahead off and read the whole file in order."
+      notice: "256 reads, 256 disk waits. Without readahead, reading in order is slower than the random lookups."
+    - try: "With the file fully cached, switch to O_DIRECT and read it again."
+      notice: "Every read goes to the device. O_DIRECT is for programs that keep their own cache, such as databases."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 118, h: 48, title: search svc, sub: pread per lookup }
+      after:  { x: 12, y: 30, w: 118, h: 48, title: search svc, sub: warm, then serve }
+    - id: context
+      kind: context
+      before: { x: 160, y: 14, w: 260, h: 246, title: index.bin, sub: thought to be in RAM }
+      after:  { x: 160, y: 30, w: 160, h: 52, title: page cache, sub: XArray per file }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 350, y: 30, w: 196, h: 52, title: "" }
+      after:  { x: 350, y: 30, w: 196, h: 52, title: readahead, sub: window 4 → 32 pages }
+    - id: hit
+      kind: concrete
+      before: { x: 180, y: 72, w: 220, h: 32, title: lookup · 1 µs }
+      after:  { x: 160, y: 150, w: 120, h: 44, title: cached page, sub: hit · about 1 µs }
+    - id: miss
+      kind: concrete
+      before: { x: 180, y: 114, w: 220, h: 32, title: lookup · 1 µs }
+      after:  { x: 296, y: 150, w: 110, h: 44, title: miss, sub: waits on I/O }
+    - id: disk
+      kind: concrete
+      before: { x: 180, y: 156, w: 220, h: 32, title: lookup · 1 µs }
+      after:  { x: 422, y: 150, w: 124, h: 44, title: disk, sub: 80 µs to 1 ms }
+    - id: warm
+      kind: concrete
+      appears: change
+      before: { x: 180, y: 212, w: 220, h: 32, title: restart at peak }
+      after:  { x: 12, y: 214, w: 268, h: 44, title: warm-up pass, sub: few large I/Os, then ready }
+  edges:
+    - { from: client, to: context, label: pread }
+    - { from: context, to: hit, label: found }
+    - { from: context, to: miss }
+    - { from: context, to: strategy, label: on a miss }
+    - { from: strategy, to: disk, label: one big I/O }
+    - { from: miss, to: disk }
+    - { from: warm, to: context, label: fills }
+
+code:
+  go:
+    before:
+      file: main.go
+      source: |
+        func main() {
+            idx, err := os.Open("/data/index.bin") // 6 GB
+            if err != nil {
+                log.Fatal(err)
+            }
+            srv := &Server{idx: idx}
+            http.HandleFunc("/lookup", srv.Lookup)
+            markReady() // the load balancer starts sending traffic
+            log.Fatal(http.ListenAndServe(":8080", nil))
+        }
+
+        func (s *Server) Lookup(w http.ResponseWriter, r *http.Request) {
+            buf := make([]byte, 4096)
+            off := blockOf(r.URL.Query().Get("q")) * 4096
+            if _, err := s.idx.ReadAt(buf, off); err != nil {
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+                return
+            }
+            w.Write(decode(buf))
+        }
+      roles: { client: [12, 20], context: [2, 2], hit: [15, 15], miss: [15, 15], disk: [2, 2], warm: [8, 8] }
+      change:
+        - { line: 8, replace: '    markReady() // now at peak traffic: the first lookups all wait on the disk' }
+    after:
+      file: main.go
+      source: |
+        func main() {
+            idx, err := os.Open("/data/index.bin")
+            if err != nil {
+                log.Fatal(err)
+            }
+            if err := warm(idx); err != nil {
+                log.Fatal(err)
+            }
+            srv := &Server{idx: idx}
+            http.HandleFunc("/lookup", srv.Lookup) // Lookup is unchanged
+            markReady() // only now take traffic
+            log.Fatal(http.ListenAndServe(":8080", nil))
+        }
+
+        // warm reads the file once, front to back, so readahead
+        // loads it in a few large I/Os before the first lookup.
+        func warm(f *os.File) error {
+            _ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_SEQUENTIAL) // a hint
+            buf := make([]byte, 1<<20)
+            var off int64
+            for {
+                n, err := f.ReadAt(buf, off)
+                off += int64(n)
+                if err == io.EOF {
+                    return nil
+                }
+                if err != nil {
+                    return err
+                }
+            }
+        }
+      roles: { client: [6, 11], context: [22, 22], strategy: [18, 18], hit: [10, 10], miss: [22, 22], disk: [22, 22], warm: [17, 31], start: [6, 6], lookup: [22, 22], window: [18, 22], marker: [21, 23], serve: [10, 11] }
+    again:
+      file: main.go
+      source: |
+        // the same deploy at peak traffic; nothing else changes.
+        // A 6 GB index warms in about 3 s on local NVMe, before markReady.
+    cost:
+      before: { text: 85 disk waits per 100 lookups, value: 0.85 }
+      after: { text: 0 waits · 11 I/Os to warm, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`os.File.ReadAt` is one `pread(2)`. A goroutine blocked in a cache-miss read holds its OS thread; the runtime hands the P to another thread, so other goroutines keep running. `golang.org/x/sys/unix.Fadvise` sets the readahead hint.'
+      seenIn: 'Go programs that serve from large files (embedded databases such as bbolt and Badger, Prometheus TSDB blocks) rely on the page cache, often through `mmap`, and warm it by reading.'
+
+  python:
+    before:
+      file: main.py
+      source: |
+        fd = os.open("/data/index.bin", os.O_RDONLY)  # 6 GB
+        app = Flask(__name__)
+
+        @app.get("/lookup")
+        def lookup():
+            off = block_of(request.args["q"]) * 4096
+            buf = os.pread(fd, 4096, off)
+            return decode(buf)
+
+        mark_ready()  # the load balancer starts sending traffic
+        app.run(port=8080)
+      roles: { client: [4, 8], context: [1, 1], hit: [7, 7], miss: [7, 7], disk: [1, 1], warm: [10, 10] }
+      change:
+        - { line: 10, replace: 'mark_ready()  # now at peak traffic: the first lookups all wait on the disk' }
+    after:
+      file: main.py
+      source: |
+        fd = os.open("/data/index.bin", os.O_RDONLY)
+
+        def warm(fd: int) -> None:
+            """Read the file once, front to back, so readahead loads it in a few large I/Os."""
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+            off = 0
+            while chunk := os.pread(fd, 1 << 20, off):
+                off += len(chunk)
+
+        warm(fd)
+        app = Flask(__name__)
+
+        @app.get("/lookup")
+        def lookup():  # unchanged
+            off = block_of(request.args["q"]) * 4096
+            return decode(os.pread(fd, 4096, off))
+
+        mark_ready()  # only now take traffic
+        app.run(port=8080)
+      roles: { client: [10, 18], context: [7, 7], strategy: [5, 5], hit: [16, 16], miss: [7, 7], disk: [7, 7], warm: [3, 8], start: [10, 10], lookup: [7, 7], window: [5, 7], marker: [7, 8], serve: [16, 18] }
+    again:
+      file: main.py
+      source: |
+        # the same deploy at peak traffic; nothing else changes.
+        # A 6 GB index warms in about 3 s on local NVMe, before mark_ready.
+    cost:
+      before: { text: 85 disk waits per 100 lookups, value: 0.85 }
+      after: { text: 0 waits · 11 I/Os to warm, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`os.pread` and `f.readinto` are single syscalls, and the GIL is released while they wait on the disk. `os.posix_fadvise` is in the standard library on Linux. Buffered `open()` adds its own small buffer on top of the page cache; it does not replace it.'
+      seenIn: 'SQLite (`sqlite3`) and LMDB bindings serve from the page cache. `numpy.memmap` and `mmap.mmap` read through the same cached pages as `read`.'
+
+  typescript:
+    before:
+      file: main.ts
+      source: |
+        import { open } from "node:fs/promises";
+
+        const idx = await open("/data/index.bin"); // 6 GB
+
+        app.get("/lookup", async (req, res) => {
+          const buf = Buffer.alloc(4096);
+          await idx.read(buf, 0, 4096, blockOf(String(req.query.q)) * 4096);
+          res.send(decode(buf));
+        });
+
+        markReady(); // the load balancer starts sending traffic
+        app.listen(8080);
+      roles: { client: [5, 9], context: [3, 3], hit: [7, 7], miss: [7, 7], disk: [3, 3], warm: [11, 11] }
+      change:
+        - { line: 11, replace: 'markReady(); // now at peak traffic: the first lookups all wait on the disk' }
+    after:
+      file: main.ts
+      source: |
+        import { open, type FileHandle } from "node:fs/promises";
+
+        // Read the file once, front to back, so readahead loads it
+        // in a few large I/Os before the first lookup.
+        async function warm(fh: FileHandle): Promise<void> {
+          const buf = Buffer.allocUnsafe(1 << 20);
+          for (let pos = 0; ; pos += buf.length) {
+            const { bytesRead } = await fh.read(buf, 0, buf.length, pos);
+            if (bytesRead === 0) return;
+          }
+        }
+
+        const idx = await open("/data/index.bin");
+        await warm(idx);
+
+        app.get("/lookup", async (req, res) => { // unchanged
+          const buf = Buffer.alloc(4096);
+          await idx.read(buf, 0, 4096, blockOf(String(req.query.q)) * 4096);
+          res.send(decode(buf));
+        });
+
+        markReady(); // only now take traffic
+        app.listen(8080);
+      roles: { client: [13, 23], context: [8, 8], strategy: [7, 8], hit: [18, 18], miss: [8, 8], disk: [8, 8], warm: [5, 11], start: [14, 14], lookup: [8, 8], window: [7, 8], marker: [8, 9], serve: [18, 22] }
+    again:
+      file: main.ts
+      source: |
+        // the same deploy at peak traffic; nothing else changes.
+        // A 6 GB index warms in about 3 s on local NVMe, before markReady.
+    cost:
+      before: { text: 85 disk waits per 100 lookups, value: 0.85 }
+      after: { text: 0 waits · 11 I/Os to warm, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`fs` file reads run on the libuv thread pool, 4 threads unless `UV_THREADPOOL_SIZE` says otherwise. On a cold cache each miss holds a pool thread for a whole disk wait, so a burst of lookups queues behind four of them, and so do DNS lookups and crypto work that share the pool. Node has no `fadvise`; a plain sequential read is the warm-up.'
+      seenIn: 'Static file servers such as `serve-static` read through the page cache on every request. `better-sqlite3` and LMDB bindings serve from cached pages.'
+
+  rust:
+    before:
+      file: main.rs
+      source: |
+        fn main() -> io::Result<()> {
+            let idx = File::open("/data/index.bin")?; // 6 GB
+            let server = Server::new(idx);
+            mark_ready(); // the load balancer starts sending traffic
+            server.run("0.0.0.0:8080")
+        }
+
+        fn lookup(idx: &File, key: &str) -> io::Result<Record> {
+            let mut buf = [0u8; 4096];
+            idx.read_exact_at(&mut buf, block_of(key) * 4096)?;
+            Ok(decode(&buf))
+        }
+      roles: { client: [8, 12], context: [2, 2], hit: [10, 10], miss: [10, 10], disk: [2, 2], warm: [4, 4] }
+      change:
+        - { line: 4, replace: '    mark_ready(); // now at peak traffic: the first lookups all wait on the disk' }
+    after:
+      file: main.rs
+      source: |
+        fn main() -> io::Result<()> {
+            let idx = File::open("/data/index.bin")?;
+            warm(&idx)?;
+            let server = Server::new(idx); // lookup is unchanged
+            mark_ready(); // only now take traffic
+            server.run("0.0.0.0:8080")
+        }
+
+        /// Read the file once, front to back, so readahead loads it
+        /// in a few large I/Os before the first lookup.
+        fn warm(f: &File) -> io::Result<()> {
+            // A hint; it only fails on a bad argument.
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+            let mut buf = vec![0u8; 1 << 20];
+            let mut off = 0u64;
+            loop {
+                let n = f.read_at(&mut buf, off)?;
+                if n == 0 {
+                    return Ok(());
+                }
+                off += n as u64;
+            }
+        }
+      roles: { client: [1, 7], context: [17, 17], strategy: [13, 13], hit: [4, 4], miss: [17, 17], disk: [17, 17], warm: [11, 23], start: [3, 3], lookup: [17, 17], window: [13, 17], marker: [16, 21], serve: [4, 6] }
+    again:
+      file: main.rs
+      source: |
+        // the same deploy at peak traffic; nothing else changes.
+        // A 6 GB index warms in about 3 s on local NVMe, before mark_ready.
+    cost:
+      before: { text: 85 disk waits per 100 lookups, value: 0.85 }
+      after: { text: 0 waits · 11 I/Os to warm, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`FileExt::read_at` is one `pread(2)`, and `fadvise` needs `libc` or `nix`. In tokio, `tokio::fs` runs each read on the blocking thread pool, so a cache miss does not stall the async workers; on a warm cache that hop costs more than the read itself.'
+      seenIn: 'Tantivy (the search library behind Quickwit) serves index segments through `mmap`, so its warm-up is the page cache warming. ripgrep reads files through the page cache, which is why a second search over the same tree is much faster.'
+
+walk:
+  - text: The service calls warm before it reports ready. The first read asks for the first 1 MiB of index.bin.
+    nodes: [client, warm]
+    edges: [warm>context]
+    role: start
+  - text: The kernel looks up page 0 in the file's page cache, an index from page offset to cached page. It is not there, so the read must wait for the disk.
+    nodes: [context, miss]
+    edges: [client>context, context>miss]
+    role: lookup
+  - text: A read from offset 0, or one that follows the previous read, looks sequential. Readahead asks the disk for a whole window of pages in one I/O, starting at 4 pages and growing to 32 (128 KiB).
+    nodes: [strategy, disk]
+    edges: [context>strategy, strategy>disk]
+    role: window
+  - text: One page in each window carries a readahead marker. Reading it starts the next, larger window in the background, so a sequential reader mostly finds its pages ready or already on their way.
+    nodes: [strategy, hit]
+    edges: [context>strategy, context>hit]
+    role: marker
+  - text: After the pass, a lookup's pread finds its page in the cache and copies it out in about a microsecond. No disk wait at all.
+    nodes: [client, context, hit]
+    edges: [client>context, context>hit]
+    role: serve
+
+checks:
+  overview:
+    question: A batch job reads a 2 GB file and takes 40 s. Run again a minute later on the same 16 GB machine, it takes 3 s. Why?
+    options:
+      - text: The file's pages are still in the page cache from the first run, so the second run copies from RAM.
+        correct: true
+        why: Right. Linux keeps file data in otherwise unused RAM. Nothing was evicted between the runs, so the second run never waited on the disk.
+      - text: The disk remembered the file in its own cache.
+        why: Drive caches are measured in megabytes to a few gigabytes and are shared by everything. A 13× speedup on 2 GB comes from the page cache in RAM.
+      - text: The program was compiled faster the second time.
+        why: Nothing was compiled. The difference is where the data came from.
+  engineer:
+    question: After each deploy, p99 latency of a search service is high for several minutes, and the disk shows many small random reads. What is the best fix?
+    options:
+      - text: Read the index once, front to back, before reporting ready, so readahead loads it in large I/Os and lookups hit the cache.
+        correct: true
+        why: Right. The new pod starts with a cold page cache. A sequential warm-up turns the random misses into a few large reads, before any user waits on them.
+      - text: Raise read_ahead_kb on the device.
+        why: Random lookups do not look sequential, so readahead does not kick in for them. A larger window only helps the sequential pass, which is already fast.
+      - text: Open the index with O_DIRECT so reads skip the cache.
+        why: That makes every lookup a device round trip forever, not only after a deploy. O_DIRECT is for programs that keep their own cache.
+  deep:
+    question: Why does a cold sequential read of 256 pages take about 11 I/Os, while 100 random reads of the same file take about 85?
+    options:
+      - text: The kernel only opens and grows a readahead window when the access looks sequential, and a marker page starts the next window early. A random miss reads just the page asked for.
+        correct: true
+        why: Right. Sequential reads batch into windows of 4, 8, 16 and then 32 pages; random misses get no window, so each distinct page costs its own I/O.
+      - text: The disk reorders random requests into sequential ones.
+        why: An I/O scheduler can merge adjacent requests, but random pages are not adjacent. Each still needs its own wait.
+      - text: Random reads bypass the page cache.
+        why: They go through the same cache. They miss because nobody predicted them.
+
+reference:
+  roles:
+    - role: Page cache
+      example: the cached pages of index.bin
+      job: Holds file contents in RAM, indexed per file by page offset. Every buffered read and write goes through it.
+    - role: Readahead
+      example: the 4 → 32 page window
+      job: Detects sequential access and reads the next pages in one larger I/O, partly in the background.
+    - role: Device
+      example: NVMe SSD or a network volume
+      job: Answers misses. Pays a fixed cost per I/O plus a cost per byte.
+    - role: Reader
+      example: the search service
+      job: Decides the access pattern, and can hint it with posix_fadvise.
+  useWhen:
+    - A service reads the same files repeatedly. Leave RAM free for the page cache instead of sizing every byte for the heap.
+    - Startup latency matters after a restart. Warm the hot files with a sequential read before taking traffic.
+    - A file is read once, in order, by a batch job. Readahead handles it; FADV_SEQUENTIAL can double the window.
+  avoidWhen:
+    - Your program keeps its own cache of the same data, as databases do. Two caches waste RAM; consider O_DIRECT.
+    - A one-off scan of huge files would evict the hot set. Use FADV_DONTNEED after reading, or read with O_DIRECT.
+  tradeoffs:
+    - The first read of each page pays a full device round trip.
+    - Cached file pages count toward a container's memory usage, and are reclaimed under pressure.
+    - Benchmarks run warm unless you drop caches; production after a deploy runs cold.
+    - Readahead can read pages nobody uses when the access only looks sequential.
+  lookalikes:
+    - name: Drive write and read cache
+      how: A small cache inside the device. It helps the device, but every request still crosses the bus and the kernel.
+    - name: Application cache
+      how: A cache in your process's heap, of decoded objects. It sits above the page cache and survives only as long as the process.
+    - name: mmap
+      how: Maps the same cached pages into your address space. A miss becomes a page fault instead of a read() call, but the cache is the same.
+---
+
+## [concept] The page cache and readahead
+
+**Linux keeps file data in spare RAM, in the <Term id="page-cache">page cache</Term>. A read finds its page there and copies it out in about a microsecond, or misses and waits for the disk.**
+
+When you read in order, the kernel also reads ahead: it fetches the next pages before you ask, in growing batches. That is <Term id="readahead">readahead</Term>.
+
+<Depth level={2}>
+Four parts do the work. The **reader** calls `read` or `pread`. The **page cache** holds each file's pages, indexed by offset, in RAM that would otherwise be idle. **Readahead** watches the access pattern of each open file and, when it looks sequential, turns the next misses into one larger I/O. The **device** answers misses, and charges mostly per I/O: 80 µs or so on a local NVMe SSD, around a millisecond on a network volume. The ratio of hits to all reads is the <Term id="cache-hit-ratio">cache hit ratio</Term>, and it decides your latency more than the disk does.
+</Depth>
+
+<Depth level={3}>
+Each cached file has one `address_space`, and its pages are indexed in an XArray (a radix tree until Linux 4.20). Since 5.16 the cache is managed in folios, which can hold more than one page. `mmap` and `read` share these pages: a file mapped by one process and read by another is cached once. Readahead state lives per open file, in `struct file_ra_state`, which records the current window's start, size and the async part that triggers the next one.
+</Depth>
+
+## [problem] A search service that reads its index per request
+
+A search service keeps a 6 GB index file on local disk. Each lookup reads one 4 KiB block at an offset with `pread`. The pod has 16 GB of RAM, so the whole index fits in the page cache.
+
+In load tests every lookup takes a few microseconds. The index seems to live in memory.
+
+<Depth level={2}>
+The load test ran on a machine that had been up for hours. The index was already cached, so the test only ever measured hits. Nothing in the code says what happens when the cache is empty.
+</Depth>
+
+<Depth level={3}>
+A test that wants the cold path must create it: `echo 1 > /proc/sys/vm/drop_caches` (as root, after `sync`) frees clean cached pages. Use it for benchmarks only. On a server it throws away useful cache for every process.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** ship fixes during the day. Every replica restarts at peak traffic, several times a day.
+
+Each new pod starts on a node whose page cache has never seen this index. Its first lookups all miss, and each one waits on the disk. In the playground's scale model, 100 lookups wait on the disk 85 times.
+
+<Depth level={2}>
+The symptom looks like a slow disk or a bad release: p99 jumps for minutes after each deploy and then recovers on its own as the cache fills. `cachestat` (bcc) or the `cachestat` syscall (Linux 6.5) shows the hit ratio collapsing; `iostat` shows many small reads.
+</Depth>
+
+<Depth level={3}>
+Random lookups do not trigger readahead, so the cache fills one 4 KiB page per miss. Filling 6 GB that way takes 1.5 million misses. Under load, the misses also queue behind each other on the device and in the runtime's I/O threads.
+</Depth>
+
+## [morph] From "it is in memory" to the page cache
+
+Drag the slider. The index stops being a block of memory and becomes what it is: a page cache in front of a disk, with readahead deciding how misses are fetched.
+
+The code gains a warm-up pass. It reads the file once, front to back, before the service reports ready.
+
+<Depth level={2}>
+The warm-up reads more data than the lookups would ever touch, and still finishes sooner, because a disk charges per I/O. Readahead turns the sequential pass into large batches; random misses pay one round trip each. <Term id="posix-fadvise">`posix_fadvise`</Term> with `SEQUENTIAL` doubles the window on Linux.
+</Depth>
+
+<Depth level={3}>
+`POSIX_FADV_WILLNEED` starts reading a range in the background without blocking, but the kernel may read less under memory pressure. Tools such as `vmtouch` warm files the same way. For a hot set much larger than RAM, warming everything just evicts itself; warm the part that is hot.
+</Depth>
+
+## [walk] Follow the warm-up read
+
+One sequential pass through the mechanism, then one lookup. Step through it with the numbered buttons.
+
+<Depth level={3}>
+In `mm/readahead.c`, a 1-page sequential miss opens a 4-page window. Each next window is 4× the last while small and 2× after that, capped at the device's `read_ahead_kb` (128 KiB unless changed). The first page of the async part carries the `PG_readahead` flag; reading it calls the async path, which submits the next window and returns without waiting. The kernel also checks whether the pages before a miss are cached, so a stream that resumes after a gap can still be seen as sequential.
+</Depth>
+
+## [again] The same deploy, warmed
+
+The same restart at peak traffic. The pod reads the index front to back before it reports ready, so the load balancer only sends traffic to a warm cache. In the scale model, 256 pages load in 11 I/Os, and the 100 lookups after them never wait.
+
+<Depth level={2}>
+At full size the warm-up is bounded by device bandwidth: 6 GB at about 2 GB/s on local NVMe is 3 seconds; at 250 MB/s on a network volume, about 25 seconds. Put it before the readiness probe goes green, and give the probe enough time.
+</Depth>
+
+<Depth level={3}>
+Cached file pages count toward the container's memory cgroup. A 6 GB warm-up in a pod with a tight memory limit reclaims its own cache as fast as it fills it. Size the limit for the heap plus the hot files.
+</Depth>
+
+## [play] Read the file yourself
+
+A 1 MiB index file (256 pages), the page cache and a disk. Click any page to read it, or run a whole sequential pass, or the same 100 random lookups the service answers after a restart. Drop the cache to simulate a fresh pod.
+
+Watch the readahead windows fill ahead of the reader, and compare the number of disk waits with your prediction.
+
+## [lens] How each language reads a file
+
+Every language here reads through the same page cache. What differs is what blocks while a miss waits on the disk.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+In Go, the goroutine's thread stays blocked in the syscall and the runtime hands its P to another thread. Python releases the GIL during the syscall. Node runs file reads on the libuv thread pool. Rust blocks the calling thread unless you move the read to a blocking pool.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="the-page-cache-and-readahead" />
+
+### Reading the cache from the shell
+
+`free -h` shows the page cache under `buff/cache`, and `available` counts the part that can be reclaimed. `fincore` (util-linux) and `vmtouch` show how much of a given file is cached. `cachestat` from bcc reports hits and misses per second, and the `cachestat` syscall (Linux 6.5) answers the same question for one file. `/sys/block/<dev>/queue/read_ahead_kb` is the readahead cap for a device.

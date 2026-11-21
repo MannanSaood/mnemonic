@@ -1,0 +1,16 @@
+# Terms introduced by the page cache and readahead lesson.
+- id: page-cache
+  term: Page cache
+  short: The kernel's cache of file contents in RAM, in 4 KiB pages. read() and write() go through it, and a cached page costs a memory copy instead of a disk wait.
+- id: readahead
+  term: Readahead
+  short: The kernel reading pages before they are asked for, when the access looks sequential. The window starts small and grows up to read_ahead_kb (128 KiB by default).
+- id: direct-io
+  term: Direct I/O (O_DIRECT)
+  short: Opening a file with O_DIRECT so reads and writes go between your buffer and the device, skipping the page cache. Used by databases that keep their own cache.
+- id: posix-fadvise
+  term: posix_fadvise
+  short: A hint to the kernel about how you will read a file. On Linux, SEQUENTIAL doubles the readahead window, RANDOM turns readahead off, WILLNEED starts reading in the background, DONTNEED drops cached pages.
+- id: cache-hit-ratio
+  term: Cache hit ratio
+  short: The share of reads served from the cache, hits divided by hits plus misses. Each miss pays a full device round trip.
