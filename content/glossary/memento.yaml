@@ -1,0 +1,7 @@
+# Terms introduced by design-patterns/memento.
+- id: shallow-copy
+  term: Shallow copy
+  short: A new outer object whose fields still refer to the same nested objects (maps, lists, clients) as the original.
+- id: persistent-data-structure
+  term: Persistent data structure
+  short: A collection where every change makes a new version that shares its unchanged parts with the old one, so keeping old versions is cheap.

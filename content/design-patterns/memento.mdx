@@ -1,0 +1,651 @@
+---
+title: Memento
+track: design-patterns
+group: Behavioral
+order: 45
+summary: Let an object hand out a sealed snapshot of its own state, so others can store it and give it back later without reading it.
+intent: Code that keeps a history should not need to know what is inside the thing it saves.
+changeRequest: The gateway config gets per-route rate limits, and rollback must restore them too.
+languages: [go, python, typescript, rust]
+glossary: [shallow-copy, persistent-data-structure, interface]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/command]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: memento
+  scenarios:
+    - try: Point /api at the next version, then press Roll back.
+      notice: The deploy tool puts nothing back. Its snapshot held the live routes map itself, so the edit changed the snapshot too. The memento restores api-v1.
+    - try: Change only the timeout and roll back.
+      notice: Both designs restore it, because a number is copied by value. A test that covers only this case passes while route rollbacks are broken.
+    - try: Ship the rate-limit change request, double a limit, and roll back.
+      notice: The deploy tool never heard of the new field, so the limit stays doubled. The memento saved it because the config made the snapshot.
+    - try: Make a few changes, then switch the production size to 50,000 routes.
+      notice: Full snapshots grow with config size times history length. Diffs stay tiny but need one replay step per change to go back.
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: Deployer, sub: copies fields }
+      after:  { x: 12, y: 30, w: 112, h: 48, title: Deployer, sub: keeps history }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: Config, sub: fields exposed }
+      after:  { x: 168, y: 30, w: 150, h: 56, title: Config, sub: save · restore }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 30, w: 180, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 180, h: 56, title: Snapshot, sub: opaque }
+    - id: routes
+      kind: concrete
+      before: { x: 188, y: 60, w: 222, h: 34, title: { go: Routes (exported), python: routes (public), typescript: routes (public), rust: pub routes } }
+      after:  { x: 370, y: 112, w: 180, h: 34, title: routes copy }
+    - id: timeout
+      kind: concrete
+      before: { x: 188, y: 104, w: 222, h: 34, title: { go: Timeout (exported), python: timeout (public), typescript: timeout (public), rust: pub timeout } }
+      after:  { x: 370, y: 154, w: 180, h: 34, title: timeout }
+    - id: limits
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 148, w: 222, h: 34, title: rate limits (new) }
+      after:  { x: 370, y: 196, w: 180, h: 34, title: rate limits }
+  edges:
+    - { from: client, to: context, label: save · restore }
+    - { from: client, to: strategy, label: stores }
+    - { from: context, to: strategy, label: creates }
+    - { from: routes, to: strategy }
+    - { from: timeout, to: strategy }
+    - { from: limits, to: strategy }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: gateway/config.go · deploy/rollout.go
+      source: |
+        // gateway/config.go: fields exported so the deploy tool can save them
+        type Config struct {
+            Routes  map[string]string
+            Timeout time.Duration
+            matcher *matcher // built from Routes
+        }
+
+        // deploy/rollout.go
+        type snapshot struct {
+            routes  map[string]string
+            timeout time.Duration
+        }
+
+        func (d *Deployer) Apply(change func(*gateway.Config)) {
+            d.history = append(d.history, snapshot{
+                routes:  d.cfg.Routes,
+                timeout: d.cfg.Timeout,
+            })
+            change(d.cfg)
+            d.cfg.Rebuild()
+        }
+
+        func (d *Deployer) Rollback() {
+            last := len(d.history) - 1
+            s := d.history[last]
+            d.history = d.history[:last]
+            d.cfg.Routes = s.routes
+            d.cfg.Timeout = s.timeout
+            d.cfg.Rebuild()
+        }
+      roles: { context: [2, 6], routes: [3, 3], timeout: [4, 4], client: [8, 30] }
+      change:
+        - { after: 4, add: ['    RateLimits map[string]int'] }
+        - { after: 11, add: ['    limits  map[string]int'] }
+        - { after: 17, add: ['        limits:  d.cfg.RateLimits,'] }
+        - { after: 28, add: ['    d.cfg.RateLimits = s.limits'] }
+    after:
+      file: gateway/config.go · deploy/rollout.go
+      source: |
+        // gateway/config.go
+        type Config struct {
+            routes  map[string]string
+            timeout time.Duration
+            matcher *matcher // built from routes
+        }
+
+        // Snapshot is opaque outside this package: its fields are unexported.
+        type Snapshot struct {
+            routes  map[string]string
+            timeout time.Duration
+        }
+
+        func (c *Config) Save() Snapshot {
+            return Snapshot{routes: maps.Clone(c.routes), timeout: c.timeout}
+        }
+
+        func (c *Config) Restore(s Snapshot) {
+            c.routes = maps.Clone(s.routes)
+            c.timeout = s.timeout
+            c.matcher = compile(c.routes)
+        }
+
+        // deploy/rollout.go: the caretaker stores snapshots and never looks inside.
+        func (d *Deployer) Apply(change func(*gateway.Config)) {
+            d.history = append(d.history, d.cfg.Save())
+            change(d.cfg)
+        }
+
+        func (d *Deployer) Rollback() {
+            last := len(d.history) - 1
+            d.cfg.Restore(d.history[last])
+            d.history = d.history[:last]
+        }
+      roles: { context: [2, 22], strategy: [8, 12], routes: [10, 10], timeout: [11, 11], client: [24, 34], save: [14, 16], restore: [18, 22], apply: [25, 28], rollback: [30, 34] }
+    again:
+      file: gateway/config.go
+      source: |
+        // gateway/config.go: Config and Snapshot each gain `limits map[string]int`.
+        func (c *Config) Save() Snapshot {
+            return Snapshot{routes: maps.Clone(c.routes), timeout: c.timeout, limits: maps.Clone(c.limits)}
+        }
+
+        func (c *Config) Restore(s Snapshot) {
+            c.routes = maps.Clone(s.routes)
+            c.timeout = s.timeout
+            c.limits = maps.Clone(s.limits)
+            c.matcher = compile(c.routes)
+        }
+        // deploy/rollout.go does not change.
+    cost:
+      before: { text: 4 lines · 2 packages, value: 0.8 }
+      after: { text: 3 lines · 1 file, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Unexported fields make the snapshot opaque outside the package at no cost. Watch maps and slices: assigning one copies a reference to the same data, so clone them with `maps.Clone` and `slices.Clone`, and clone again on restore so the snapshot stays intact.'
+      seenIn: 'The hashes in `crypto/sha256` and `hash/crc32` implement `encoding.BinaryMarshaler`: `MarshalBinary` returns an opaque blob of the running hash state, and `UnmarshalBinary` restores it.'
+
+  python:
+    before:
+      file: gateway/config.py · deploy/rollout.py
+      source: |
+        # gateway/config.py
+        class Config:
+            def __init__(self, routes: dict[str, str], timeout: float) -> None:
+                self.routes = routes
+                self.timeout = timeout
+                self._matcher = compile_routes(routes)
+
+        # deploy/rollout.py
+        class Deployer:
+            def apply(self, change: Callable[[Config], None]) -> None:
+                self.history.append({"routes": self.cfg.routes, "timeout": self.cfg.timeout})
+                change(self.cfg)
+                self.cfg.rebuild()
+
+            def rollback(self) -> None:
+                saved = self.history.pop()
+                self.cfg.routes = saved["routes"]
+                self.cfg.timeout = saved["timeout"]
+                self.cfg.rebuild()
+      roles: { context: [2, 6], routes: [4, 4], timeout: [5, 5], client: [8, 19] }
+      change:
+        - { after: 5, add: ['        self.rate_limits: dict[str, int] = {}'] }
+        - { line: 11, replace: '        self.history.append({"routes": self.cfg.routes, "timeout": self.cfg.timeout, "limits": self.cfg.rate_limits})' }
+        - { after: 18, add: ['        self.cfg.rate_limits = saved["limits"]'] }
+    after:
+      file: gateway/config.py · deploy/rollout.py
+      source: |
+        # gateway/config.py
+        @dataclass(frozen=True)
+        class Snapshot:
+            """Opaque to everyone but Config. Holds copies, never the live objects."""
+            _routes: dict[str, str]
+            _timeout: float
+
+        class Config:
+            def __init__(self, routes: dict[str, str], timeout: float) -> None:
+                self._routes = dict(routes)
+                self._timeout = timeout
+                self._matcher = compile_routes(self._routes)
+
+            def save(self) -> Snapshot:
+                return Snapshot(dict(self._routes), self._timeout)
+
+            def restore(self, s: Snapshot) -> None:
+                self._routes = dict(s._routes)
+                self._timeout = s._timeout
+                self._matcher = compile_routes(self._routes)
+
+        # deploy/rollout.py: the caretaker stores snapshots and never looks inside.
+        class Deployer:
+            def apply(self, change: Callable[[Config], None]) -> None:
+                self.history.append(self.cfg.save())
+                change(self.cfg)
+
+            def rollback(self) -> None:
+                self.cfg.restore(self.history.pop())
+      roles: { strategy: [2, 6], routes: [5, 5], timeout: [6, 6], context: [8, 20], save: [14, 15], restore: [17, 20], client: [22, 29], apply: [24, 26], rollback: [28, 29] }
+    again:
+      file: gateway/config.py
+      source: |
+        # gateway/config.py: Snapshot gains `_limits`; save and restore copy it.
+            def save(self) -> Snapshot:
+                return Snapshot(dict(self._routes), self._timeout, dict(self._limits))
+
+            def restore(self, s: Snapshot) -> None:
+                self._routes = dict(s._routes)
+                self._timeout = s._timeout
+                self._limits = dict(s._limits)
+                self._matcher = compile_routes(self._routes)
+        # deploy/rollout.py does not change.
+    cost:
+      before: { text: 3 lines · 2 modules, value: 0.8 }
+      after: { text: 3 lines · 1 file, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Python cannot stop anyone reading the snapshot. A leading underscore and a frozen dataclass state the intent; `frozen` blocks reassigning fields, not mutating the dict inside. `dict(...)` is a shallow copy, enough when the values are strings; use `copy.deepcopy` for nested data.'
+      seenIn: '`random.getstate()` returns the generator''s state as an opaque tuple, and `random.setstate(s)` restores it. `pickle` lets a class choose what it saves and restores with `__getstate__` and `__setstate__`.'
+
+  typescript:
+    before:
+      file: gateway/config.ts · deploy/rollout.ts
+      source: |
+        // gateway/config.ts
+        export class Config {
+          routes = new Map<string, string>();
+          timeout = 30_000;
+          private matcher = compileRoutes(this.routes);
+
+          rebuild(): void { this.matcher = compileRoutes(this.routes); }
+        }
+
+        // deploy/rollout.ts
+        type Saved = { routes: Map<string, string>; timeout: number };
+
+        export class Deployer {
+          private history: Saved[] = [];
+          constructor(private cfg: Config) {}
+
+          apply(change: (c: Config) => void): void {
+            this.history.push({ routes: this.cfg.routes, timeout: this.cfg.timeout });
+            change(this.cfg);
+            this.cfg.rebuild();
+          }
+
+          rollback(): void {
+            const saved = this.history.pop();
+            if (!saved) return;
+            this.cfg.routes = saved.routes;
+            this.cfg.timeout = saved.timeout;
+            this.cfg.rebuild();
+          }
+        }
+      roles: { context: [2, 8], routes: [3, 3], timeout: [4, 4], client: [10, 30] }
+      change:
+        - { after: 4, add: ['  rateLimits = new Map<string, number>();'] }
+        - { line: 11, replace: 'type Saved = { routes: Map<string, string>; timeout: number; limits: Map<string, number> };' }
+        - { line: 18, replace: '    this.history.push({ routes: this.cfg.routes, timeout: this.cfg.timeout, limits: this.cfg.rateLimits });' }
+        - { after: 27, add: ['    this.cfg.rateLimits = saved.limits;'] }
+    after:
+      file: gateway/config.ts · deploy/rollout.ts
+      source: |
+        // gateway/config.ts
+        declare const brand: unique symbol;
+        /** Opaque outside this module: callers can hold it, not read it. */
+        export type Snapshot = { readonly [brand]: true };
+        type Contents = { routes: Map<string, string>; timeout: number };
+
+        export class Config {
+          #routes = new Map<string, string>();
+          #timeout = 30_000;
+          #matcher = compileRoutes(this.#routes);
+
+          save(): Snapshot {
+            const c: Contents = { routes: new Map(this.#routes), timeout: this.#timeout };
+            return c as unknown as Snapshot;
+          }
+
+          restore(s: Snapshot): void {
+            const c = s as unknown as Contents;
+            this.#routes = new Map(c.routes);
+            this.#timeout = c.timeout;
+            this.#matcher = compileRoutes(this.#routes);
+          }
+        }
+
+        // deploy/rollout.ts: the caretaker stores snapshots and never looks inside.
+        export class Deployer {
+          private history: Snapshot[] = [];
+          constructor(private cfg: Config) {}
+
+          apply(change: (c: Config) => void): void {
+            this.history.push(this.cfg.save());
+            change(this.cfg);
+          }
+
+          rollback(): void {
+            const s = this.history.pop();
+            if (s) this.cfg.restore(s);
+          }
+        }
+      roles: { strategy: [2, 5], context: [7, 23], routes: [8, 8], timeout: [9, 9], save: [12, 15], restore: [17, 22], client: [25, 39], apply: [30, 33], rollback: [35, 38] }
+    again:
+      file: gateway/config.ts
+      source: |
+        // gateway/config.ts: Contents gains `limits`; save and restore copy it.
+        type Contents = { routes: Map<string, string>; timeout: number; limits: Map<string, number> };
+        //   save():    { routes: new Map(this.#routes), timeout: this.#timeout, limits: new Map(this.#limits) }
+        //   restore(): this.#limits = new Map(c.limits);
+        // deploy/rollout.ts does not change.
+    cost:
+      before: { text: 4 lines · 2 modules, value: 0.8 }
+      after: { text: 3 lines · 1 file, value: 0.3 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`#private` fields keep everyone out of the config, and a branded type keeps callers out of the snapshot: they can store it and pass it back, but the compiler shows them no fields. `structuredClone` deep-copies plain data, Maps included, when the state is nested.'
+      seenIn: '`CanvasRenderingContext2D.save()` and `restore()` keep a stack of drawing states inside the context. Immer''s `produceWithPatches` returns patches and inverse patches: the diff form of a snapshot. Redux DevTools jumps between recorded store snapshots.'
+
+  rust:
+    before:
+      file: gateway/config.rs · deploy/rollout.rs
+      source: |
+        // gateway/config.rs
+        pub struct Config {
+            pub routes: HashMap<String, String>,
+            pub timeout: Duration,
+            matcher: Matcher,
+        }
+
+        // deploy/rollout.rs
+        struct Saved {
+            routes: HashMap<String, String>,
+            timeout: Duration,
+        }
+
+        impl Deployer {
+            pub fn apply(&mut self, change: impl FnOnce(&mut Config)) {
+                self.history.push(Saved {
+                    routes: self.cfg.routes.clone(),
+                    timeout: self.cfg.timeout,
+                });
+                change(&mut self.cfg);
+                self.cfg.rebuild();
+            }
+
+            pub fn rollback(&mut self) {
+                if let Some(s) = self.history.pop() {
+                    self.cfg.routes = s.routes;
+                    self.cfg.timeout = s.timeout;
+                    self.cfg.rebuild();
+                }
+            }
+        }
+      roles: { context: [2, 6], routes: [3, 3], timeout: [4, 4], client: [8, 31] }
+      change:
+        - { after: 4, add: ['    pub rate_limits: HashMap<String, u32>,'] }
+        - { after: 11, add: ['    rate_limits: HashMap<String, u32>,'] }
+        - { after: 18, add: ['            rate_limits: self.cfg.rate_limits.clone(),'] }
+        - { after: 27, add: ['            self.cfg.rate_limits = s.rate_limits;'] }
+    after:
+      file: gateway/config.rs · deploy/rollout.rs
+      source: |
+        // gateway/config.rs
+        pub struct Config {
+            routes: HashMap<String, String>,
+            timeout: Duration,
+            matcher: Matcher,
+        }
+
+        /// Opaque outside this module: the fields are private.
+        #[derive(Clone)]
+        pub struct Snapshot {
+            routes: HashMap<String, String>,
+            timeout: Duration,
+        }
+
+        impl Config {
+            pub fn save(&self) -> Snapshot {
+                Snapshot { routes: self.routes.clone(), timeout: self.timeout }
+            }
+
+            pub fn restore(&mut self, s: Snapshot) {
+                self.matcher = Matcher::compile(&s.routes);
+                self.routes = s.routes;
+                self.timeout = s.timeout;
+            }
+        }
+
+        // deploy/rollout.rs: the caretaker stores snapshots and never looks inside.
+        impl Deployer {
+            pub fn apply(&mut self, change: impl FnOnce(&mut Config)) {
+                self.history.push(self.cfg.save());
+                change(&mut self.cfg);
+            }
+
+            pub fn rollback(&mut self) {
+                if let Some(s) = self.history.pop() {
+                    self.cfg.restore(s);
+                }
+            }
+        }
+      roles: { context: [2, 6], strategy: [8, 13], routes: [11, 11], timeout: [12, 12], save: [16, 18], restore: [20, 24], client: [27, 39], apply: [29, 32], rollback: [34, 38] }
+    again:
+      file: gateway/config.rs
+      source: |
+        // gateway/config.rs: Snapshot gains `rate_limits`; save clones it, restore moves it back.
+            pub fn save(&self) -> Snapshot {
+                Snapshot { routes: self.routes.clone(), timeout: self.timeout, rate_limits: self.rate_limits.clone() }
+            }
+            // in restore: self.rate_limits = s.rate_limits;
+        // deploy/rollout.rs does not change.
+    cost:
+      before: { text: 4 lines · 2 modules, value: 0.8 }
+      after: { text: 2 lines · 1 file, value: 0.25 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Module privacy makes the snapshot opaque. The borrow checker rules out the aliasing bug from the other languages: you cannot keep a reference into the config while you mutate it, so the before code already had to `clone()`. Its remaining bug is the field it never heard of. `restore` takes the snapshot by value and moves it in without copying.'
+      seenIn: '`rand_chacha` generators expose `get_word_pos` and `set_word_pos` to save and restore their position in the stream. The `im` crate''s persistent maps make `clone()` cheap by sharing structure, which suits snapshot histories.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { go: 'Before a change, the Deployer asks the config for a snapshot with `Save()`. It does not know what a config contains.', python: 'Before a change, the Deployer asks the config for a snapshot with `save()`. It does not know what a config contains.', typescript: 'Before a change, the Deployer asks the config for a snapshot with `save()`. It does not know what a config contains.', rust: 'Before a change, the Deployer asks the config for a snapshot with `save()`. It does not know what a config contains.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: apply
+  - text: { go: 'The config fills the snapshot itself. It knows its routes are a map, so it clones them with `maps.Clone`. It leaves the matcher out, because it can rebuild that.', python: 'The config fills the snapshot itself. It knows its routes are a dict, so it copies them. It leaves the matcher out, because it can rebuild that.', typescript: 'The config fills the snapshot itself. It knows its routes are a Map, so it copies them. It leaves the matcher out, because it can rebuild that.', rust: 'The config fills the snapshot itself and clones its routes. It leaves the matcher out, because it can rebuild that.' }
+    nodes: [context, strategy, routes, timeout]
+    edges: [context>strategy, routes>strategy, timeout>strategy]
+    role: save
+  - text: The change goes wrong. Rollback takes the newest snapshot off the history and hands it back unopened.
+    nodes: [client, strategy]
+    edges: [client>strategy]
+    role: rollback
+  - text: { go: '`Restore` copies the routes back out, so the stored snapshot stays intact, and rebuilds the matcher from them.', python: '`restore` copies the routes back out, so the stored snapshot stays intact, and rebuilds the matcher from them.', typescript: '`restore` copies the routes back out, so the stored snapshot stays intact, and rebuilds the matcher from them.', rust: '`restore` takes the snapshot by value. It rebuilds the matcher, then moves the routes in without a copy; the history no longer holds that snapshot.' }
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: restore
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these is a Memento?
+    options:
+      - text: Before a schema migration, the config service saves a sealed snapshot of itself, which the migration runner stores and hands back if the migration fails.
+        correct: true
+        why: Right. The object makes the snapshot, someone else keeps it without reading it, and the object restores itself from it.
+      - text: Every edit is an object with a do method and an undo method, kept in a history list.
+        why: That is Command. It undoes by running the inverse operation. Command can use a memento when the inverse is hard to compute, but the two are different ideas.
+      - text: The config service notifies every gateway instance when the config changes.
+        why: That is Observer. It is about who hears of a change, not about getting back to an earlier state.
+  engineer:
+    question: The deploy tool's test changes the timeout, rolls back and checks the timeout. It passes. Why did route rollbacks still fail in production?
+    options:
+      - text: The test only covered a plain number. The routes map was saved by reference, so editing it in place changed the saved copy too.
+        correct: true
+        why: Right. A value field is copied by assignment, a map is not. The outside copier had no way to know which fields needed a deep copy. The config does.
+      - text: The tool rolled back the changes in the wrong order.
+        why: The history is a stack and rollback pops the newest entry, so the order was right. The saved routes were simply the live routes.
+      - text: The tool forgot to rebuild the matcher after restoring.
+        why: It did call rebuild. The matcher was rebuilt from routes that still held the new values.
+  deep:
+    question: A gateway config with 50,000 routes is saved before each of 200 changes a day. Which keeps both the memory and the time to restore any version small?
+    options:
+      - text: Store the routes in a persistent map, so each snapshot shares every unchanged entry with the previous one.
+        correct: true
+        why: Right. Each save costs about as much as the changed entries, like a diff, and a restore is a pointer swap, like a full snapshot. Clojure's maps, Immutable.js and Rust's im crate work this way.
+      - text: Store only diffs.
+        why: Memory is small, but restoring a version from the morning means replaying every diff since, in order, and one bad diff breaks every restore behind it.
+      - text: Store full snapshots, compressed.
+        why: Each save still walks and copies 50,000 entries, and each restore decompresses them. Compression cuts the bytes kept, not the work per save.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Originator
+      example: Config
+      job: Makes snapshots of its own state and restores itself from them. The only code that reads a snapshot.
+    - role: Memento
+      example: { go: "Snapshot (unexported fields)", python: "Snapshot (frozen dataclass)", typescript: "Snapshot (branded type)", rust: "Snapshot (private fields)" }
+      job: Holds the saved state. Opaque to everyone except the originator.
+    - role: Caretaker
+      example: Deployer
+      job: Asks for snapshots, keeps them in order and hands them back. Never looks inside.
+  useWhen:
+    - You need rollback, undo or checkpoints, and the object's internals should stay private.
+    - The state has parts that need care to copy, such as maps, lists or nested objects.
+    - The fields change over time, and the history code lives somewhere else.
+  avoidWhen:
+    - The state is small and already immutable. Keep the old value; it is the snapshot.
+    - Each change has a cheap, exact inverse. An undo command is lighter than a copy of the whole state.
+  tradeoffs:
+    - Full snapshots cost memory in proportion to state size times history length.
+    - Diffs are small but restore by replaying in order, and every diff in the chain must be correct.
+    - The caretaker cannot tell how big a snapshot is, so it needs a limit on history length.
+    - In Python and JavaScript the opacity is a convention or a type trick, not something the runtime enforces.
+  lookalikes:
+    - name: Command
+      how: Undoes by running an inverse operation instead of restoring saved state. The two combine when an inverse is hard to compute.
+    - name: Prototype
+      how: Clones an object to create a new one. Memento copies state in order to return the same object to it later.
+    - name: Event sourcing
+      how: Rebuilds state by replaying a log of changes, the diff end of the same trade-off. Snapshots are often added to it to shorten the replay.
+---
+
+## [concept] Memento
+
+**Let an object hand out a sealed snapshot of its own state, so others can store it and give it back later without reading it.**
+
+Whoever keeps the history only holds the snapshots. Only the object that made a snapshot knows what is inside and how to restore it.
+
+<Depth level={2}>
+Three roles. The **originator** (`Config`) makes snapshots and restores itself from them. The **memento** (`Snapshot`) holds the saved state and shows nothing to anyone else. The **caretaker** (`Deployer`) asks for snapshots before risky changes, keeps them in order, and hands one back to roll back. The caretaker decides when; the originator decides what.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue lists Memento under object behavioural patterns, also known as Token. It describes two interfaces on the memento: a wide one for the originator and a narrow one, little more than "hold me", for everyone else. It warns that snapshots can be expensive and that a caretaker cannot see how much it is storing. It also suggests storing only the incremental change when snapshots are restored in a predictable order, as with an undo history.
+</Depth>
+
+## [problem] A rollback that copies fields
+
+An API gateway reads its routing config from a config object. The deploy tool supports rollback: before each change it copies the config's fields into its own history, and to roll back it writes them back.
+
+To make that possible, the config exposes its fields. The deploy tool now depends on exactly which fields a config has.
+
+<Depth level={2}>
+Look at how the routes are saved. In Go, Python and TypeScript, assigning a map copies a reference to it, not its contents. Every saved entry points at the live map, so an edit made in place changes every snapshot too. Rolling back a route change restores nothing. Timeout rollbacks work, because a number is copied by value, and that is the case the tests happened to cover.
+</Depth>
+
+<Depth level={3}>
+<Lang only="rust">In Rust the aliasing bug cannot compile: holding a reference into `self.cfg` while `change` mutates it is rejected by the borrow checker, so the deploy tool has to `clone()`. The other bug remains. The snapshot covers only the fields the tool knew about when it was written.</Lang>
+<Lang only="go">The fix looks easy, `maps.Clone(d.cfg.Routes)`. But the deploy tool would have to know, for every field, whether it is a value or holds a reference. It would have to stay right as the config changes in another package.</Lang>
+<Lang only="python">The fix looks easy, `dict(self.cfg.routes)` or `copy.deepcopy`. But the deploy tool would have to know, for every attribute, how deep to copy. It would have to stay right as the config class changes in another module.</Lang>
+<Lang only="typescript">The fix looks easy, `new Map(this.cfg.routes)` or `structuredClone`. But the deploy tool would have to know, for every field, how deep to copy. It would have to stay right as the config class changes in another module.</Lang>
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the gateway config gets per-route rate limits, and rollback must restore them too.
+
+The config team adds one field. The marked lines show what else must change, and they sit in another team's code: the saved record, the save, and the restore.
+
+<Depth level={2}>
+Nothing forces anyone to make those edits. The config change compiles and ships, the deploy tool keeps working, and rollbacks quietly stop restoring rate limits. Someone notices during an incident, when a bad limit cannot be rolled back.
+</Depth>
+
+<Depth level={3}>
+The exposed fields are also a cost of their own. Any code can now write `Routes` or `Timeout` directly and skip the matcher rebuild. The fields were made public only for the rollback, and every other caller gets that access too.
+</Depth>
+
+## [morph] Let the config make its own snapshot
+
+Drag the slider. The fields go private again. The config gains `Save` and `Restore`, the snapshot becomes a sealed value, and the deploy tool only stores it.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The deploy tool now depends on two methods and one opaque type. It cannot copy a field wrongly, because it copies nothing. The config decides which fields need a deep copy, which can be rebuilt instead of saved (the matcher), and whether to store a full copy or a diff.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Opacity comes from Go's package rule: the deploy package can hold a `gateway.Snapshot`, pass it around and hand it back, but cannot name its lowercase fields.</Lang>
+<Lang only="python">Python has no access control. The leading underscores and the docstring state the rule, and type checkers and reviewers enforce it. `frozen=True` stops reassignment of the snapshot's fields, not mutation of the dict inside.</Lang>
+<Lang only="typescript">The branded `Snapshot` type has no readable fields, so the compiler stops the deploy tool from reading it. At runtime it is still a plain object, so the opacity is a compile-time agreement.</Lang>
+<Lang only="rust">Rust's privacy is per module, so `deploy` can store a `Snapshot` but not read `routes` or `timeout`. `#[derive(Clone)]` lets the caretaker duplicate a snapshot if it needs to, still without seeing inside.</Lang>
+</Depth>
+
+## [walk] Follow one rollback
+
+A change is saved, applied, then rolled back. Step through it with the numbered buttons.
+
+<Depth level={3}>
+A <Term id="shallow-copy">shallow copy</Term> is enough here because the routes map holds strings, which no one mutates in place. If it held route objects with their own maps, the config would need a deep copy, and that knowledge belongs inside the config, which is the point of the pattern.
+</Depth>
+
+## [again] Rate limits, the second time
+
+The same request, after the refactor. The new field, its copy in `Save` and its restore all live in the config's own file. The deploy tool does not change and cannot be forgotten.
+
+<Depth level={2}>
+Review is easier too. Whoever adds a field sees `Save` and `Restore` a few lines below, and a test in the same package can check that a save and restore round-trips every field.
+</Depth>
+
+<Depth level={3}>
+Snapshots of old versions can outlive a deploy if the history is persisted. Once snapshots are stored or sent elsewhere, version their format, because a newer config may have to restore a snapshot made by an older one.
+</Depth>
+
+## [play] Roll back a live config
+
+Two copies of the gateway config take the same changes: one with the deploy tool copying fields, one with mementos. Make changes, roll them back, and then see what a history like yours costs at production size.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. How the snapshot is kept opaque is not, and in Rust the borrow checker removes one of the bugs.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="memento" />
+
+### Snapshots, diffs, or both
+
+A full snapshot restores in one step but costs memory for every change. A diff costs little memory but restores by replaying, in order, every diff back to the target. Most real systems mix them: databases write a log of changes plus periodic checkpoints, and editors keep diffs with a full copy every so often. A <Term id="persistent-data-structure">persistent data structure</Term> gets close to both at once, since each version shares its unchanged parts with the last.
