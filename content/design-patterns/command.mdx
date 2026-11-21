@@ -1,0 +1,598 @@
+---
+title: Command
+track: design-patterns
+group: Behavioral
+order: 41
+summary: Turn a request into an object that holds everything needed to carry it out, so it can be queued, retried, logged or undone later.
+intent: An action should be something you can store and hand around, not only something you call.
+changeRequest: Support needs bulk refunds that run in the background, retry when the billing API times out, and appear in the audit log.
+languages: [go, python, typescript, rust]
+glossary: [command-invoker, command-receiver, idempotency-key, at-least-once-delivery, interface]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: command
+  scenarios:
+    - try: "Queue the refund, set the next attempt to Times out after success, and run the worker twice."
+      notice: "The provider applied the refund, the worker only saw a timeout, and the retry refunded the customer again: $80 for a $40 refund."
+    - try: "Reset, tick Send an idempotency key, and do the same."
+      notice: "The retry carries the same key, the provider recognises it, and only $40 leaves."
+    - try: "Queue Move to the Pro plan and Add $25 credit, make both time out after success, and retry."
+      notice: "The plan is fine and the credit doubles. Setting a value is safe to repeat; adding to one is not."
+    - try: "Run a plan change and undo it, then run a refund and try to undo that."
+      notice: "Undo works when the command saved the old value. A refund has no undo: the money has left."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: routes, sub: one per action }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: console, sub: builds commands }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 200, title: Admin, sub: calls billing now }
+      after:  { x: 168, y: 30, w: 150, h: 56, title: Worker, sub: queue · retry · log }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 30, w: 180, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 180, h: 56, title: Command, sub: { go: Execute(ctx, b), python: execute(billing), typescript: execute(billing), rust: "enum + execute()" } }
+    - id: refund
+      kind: concrete
+      before: { x: 188, y: 70, w: 222, h: 32, title: { go: Refund(), python: refund(), typescript: refund(), rust: refund() } }
+      after:  { x: 300, y: 204, w: 76, h: 40, title: Refund }
+    - id: plan
+      kind: concrete
+      before: { x: 188, y: 115, w: 222, h: 32, title: { go: ChangePlan(), python: change_plan(), typescript: changePlan(), rust: change_plan() } }
+      after:  { x: 384, y: 204, w: 76, h: 40, title: Plan }
+    - id: credit
+      kind: concrete
+      before: { x: 188, y: 160, w: 222, h: 32, title: { go: AddCredit(), python: add_credit(), typescript: addCredit(), rust: add_credit() } }
+      after:  { x: 468, y: 204, w: 76, h: 40, title: Credit }
+  edges:
+    - { from: client, to: context, label: enqueues }
+    - { from: context, to: strategy, label: executes }
+    - { from: refund, to: strategy, kind: implements }
+    - { from: plan, to: strategy, kind: implements, label: implements }
+    - { from: credit, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: admin.go · routes.go
+      source: |
+        // admin.go
+        func (a *Admin) Refund(ctx context.Context, orderID string, cents int64) error {
+            return a.billing.Refund(ctx, orderID, cents)
+        }
+
+        func (a *Admin) ChangePlan(ctx context.Context, acct, plan string) error {
+            return a.billing.SetPlan(ctx, acct, plan)
+        }
+
+        func (a *Admin) AddCredit(ctx context.Context, acct string, cents int64) error {
+            return a.billing.AddCredit(ctx, acct, cents)
+        }
+
+        // routes.go: each button posts to its own handler
+        mux.HandleFunc("POST /admin/refund", a.handleRefund)
+      roles: { context: [1, 12], refund: [2, 4], plan: [6, 8], credit: [10, 12], client: [15, 15] }
+      change:
+        - { after: 2, add: ['    a.audit.Log(ctx, "refund", orderID, cents)'] }
+        - { line: 3, replace: '    return retry(ctx, 3, func() error { return a.billing.Refund(ctx, orderID, cents) })' }
+        - { after: 6, add: ['    a.audit.Log(ctx, "change_plan", acct, plan)'] }
+        - { line: 7, replace: '    return retry(ctx, 3, func() error { return a.billing.SetPlan(ctx, acct, plan) })' }
+        - { after: 10, add: ['    a.audit.Log(ctx, "add_credit", acct, cents)'] }
+        - { line: 11, replace: '    return retry(ctx, 3, func() error { return a.billing.AddCredit(ctx, acct, cents) })' }
+    after:
+      file: commands.go · worker.go
+      source: |
+        type Command interface {
+            Name() string
+            Execute(ctx context.Context, b Billing) error
+        }
+
+        // Optional: commands that can be reversed also have Undo.
+        type Undoable interface {
+            Undo(ctx context.Context, b Billing) error
+        }
+
+        type Refund struct {
+            OrderID string
+            Cents   int64
+            Key     string // idempotency key, fixed when the command is created
+        }
+
+        func (r Refund) Name() string { return "refund " + r.OrderID }
+        func (r Refund) Execute(ctx context.Context, b Billing) error {
+            return b.Refund(ctx, r.OrderID, r.Cents, r.Key)
+        }
+
+        type Worker struct {
+            billing Billing
+            audit   AuditLog
+            queue   chan Command
+        }
+
+        func (w *Worker) Run(ctx context.Context) {
+            for c := range w.queue {
+                err := retry(ctx, 3, func() error { return c.Execute(ctx, w.billing) })
+                w.audit.Record(ctx, c.Name(), err)
+            }
+        }
+
+        // the console only builds commands
+        w.queue <- Refund{OrderID: "1042", Cents: 4000, Key: uuid.NewString()}
+      roles: { strategy: [1, 9], refund: [11, 20], context: [22, 33], client: [35, 36], create: [36, 36], queue: [29, 29], execute: [30, 30], audit: [31, 31] }
+    again:
+      file: bulk.go
+      source: |
+        // bulk.go: queue every refund; the worker retries and logs them
+        for _, o := range ordersToRefund {
+            w.queue <- Refund{OrderID: o.ID, Cents: o.TotalCents, Key: "refund-" + o.ID}
+        }
+    cost:
+      before: { text: 6 lines · 3 methods · no queue, value: 0.8 }
+      after: { text: 1 loop · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Inside one process, a `func(ctx context.Context) error` is the lightest command, and Go uses it everywhere. Use a struct when the command must be stored, printed in a log, sent to another process or undone: a func value cannot be serialised, compared or inspected. Optional abilities like Undo fit a second small interface checked with a type assertion.'
+      seenIn: '`exec.Cmd` is built first and run later with `Run` or `Start`. An `http.Request` is a request object you build and hand to `Client.Do`. `sync.Once.Do(f)` and `errgroup.Group.Go(f)` take commands as funcs.'
+
+  python:
+    before:
+      file: admin.py · routes.py
+      source: |
+        # admin.py
+        class Admin:
+            def refund(self, order_id: str, cents: int) -> None:
+                self.billing.refund(order_id, cents)
+
+            def change_plan(self, account: str, plan: str) -> None:
+                self.billing.set_plan(account, plan)
+
+            def add_credit(self, account: str, cents: int) -> None:
+                self.billing.add_credit(account, cents)
+
+        # routes.py: each button posts to its own view
+        app.add_url_rule("/admin/refund", view_func=refund_view, methods=["POST"])
+      roles: { context: [2, 10], refund: [3, 4], plan: [6, 7], credit: [9, 10], client: [13, 13] }
+      change:
+        - { after: 3, add: ['        self.audit.log("refund", order_id, cents)'] }
+        - { line: 4, replace: '        retry(3, lambda: self.billing.refund(order_id, cents))' }
+        - { after: 6, add: ['        self.audit.log("change_plan", account, plan)'] }
+        - { line: 7, replace: '        retry(3, lambda: self.billing.set_plan(account, plan))' }
+        - { after: 9, add: ['        self.audit.log("add_credit", account, cents)'] }
+        - { line: 10, replace: '        retry(3, lambda: self.billing.add_credit(account, cents))' }
+    after:
+      file: commands.py · worker.py
+      source: |
+        from collections import deque
+        from dataclasses import dataclass, field
+        from typing import Protocol
+        import uuid
+
+        class Command(Protocol):
+            def execute(self, billing: Billing) -> None: ...
+
+        @dataclass(frozen=True)
+        class Refund:
+            order_id: str
+            cents: int
+            key: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+            def execute(self, billing: Billing) -> None:
+                billing.refund(self.order_id, self.cents, idempotency_key=self.key)
+
+        class Worker:
+            def __init__(self, billing: Billing, audit: AuditLog):
+                self.billing, self.audit = billing, audit
+                self.queue: deque[Command] = deque()
+
+            def run_next(self) -> None:
+                cmd = self.queue.popleft()
+                error = retry(3, lambda: cmd.execute(self.billing))
+                self.audit.record(cmd, error)
+
+        # the console only builds commands
+        worker.queue.append(Refund("1042", 4000))
+      roles: { strategy: [6, 7], refund: [9, 16], context: [18, 26], client: [28, 29], create: [29, 29], queue: [24, 24], execute: [25, 25], audit: [26, 26] }
+    again:
+      file: bulk.py
+      source: |
+        # bulk.py: queue every refund; the worker retries and logs them
+        for order in orders_to_refund:
+            worker.queue.append(Refund(order.id, order.total_cents, key=f"refund-{order.id}"))
+    cost:
+      before: { text: 6 lines · 3 methods · no queue, value: 0.8 }
+      after: { text: 1 loop · 0 edits, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'In one process, a function or `functools.partial(billing.refund, "1042", 4000)` is already a command you can store and call later. Reach for a frozen dataclass when the command is queued, logged or sent elsewhere: it has a readable `repr` for the audit log and turns into a dict with `dataclasses.asdict`.'
+      seenIn: '`concurrent.futures.Executor.submit(fn, *args)`. Celery''s `task.delay(...)` turns a call into a message for a worker. Django migration operations have `database_forwards` and `database_backwards`: commands with undo.'
+
+  typescript:
+    before:
+      file: admin.ts · routes.ts
+      source: |
+        // admin.ts
+        export class Admin {
+          constructor(private billing: Billing) {}
+
+          refund(orderId: string, cents: number): Promise<void> {
+            return this.billing.refund(orderId, cents);
+          }
+
+          changePlan(account: string, plan: Plan): Promise<void> {
+            return this.billing.setPlan(account, plan);
+          }
+
+          addCredit(account: string, cents: number): Promise<void> {
+            return this.billing.addCredit(account, cents);
+          }
+        }
+
+        // routes.ts: each button posts to its own handler
+        router.post("/admin/refund", (req) => admin.refund(req.body.orderId, req.body.cents));
+      roles: { context: [2, 16], refund: [5, 7], plan: [9, 11], credit: [13, 15], client: [19, 19] }
+      change:
+        - { after: 5, add: ['    this.audit.log("refund", { orderId, cents });'] }
+        - { line: 6, replace: '    return retry(3, () => this.billing.refund(orderId, cents));' }
+        - { after: 9, add: ['    this.audit.log("changePlan", { account, plan });'] }
+        - { line: 10, replace: '    return retry(3, () => this.billing.setPlan(account, plan));' }
+        - { after: 13, add: ['    this.audit.log("addCredit", { account, cents });'] }
+        - { line: 14, replace: '    return retry(3, () => this.billing.addCredit(account, cents));' }
+    after:
+      file: commands.ts · worker.ts
+      source: |
+        export interface Command {
+          readonly name: string;
+          execute(billing: Billing): Promise<void>;
+          undo?(billing: Billing): Promise<void>;
+        }
+
+        export class Refund implements Command {
+          readonly name = "refund";
+          constructor(
+            readonly orderId: string,
+            readonly cents: number,
+            readonly key: string = crypto.randomUUID(),
+          ) {}
+
+          execute(billing: Billing): Promise<void> {
+            return billing.refund(this.orderId, this.cents, { idempotencyKey: this.key });
+          }
+        }
+
+        export class Worker {
+          private queue: Command[] = [];
+          constructor(private billing: Billing, private audit: AuditLog) {}
+
+          enqueue(c: Command): void {
+            this.queue.push(c);
+          }
+
+          async runNext(): Promise<void> {
+            const c = this.queue.shift();
+            if (!c) return;
+            const error = await retry(3, () => c.execute(this.billing)).then(() => null, (e: unknown) => e);
+            this.audit.record(c, error);
+          }
+        }
+
+        // the console only builds commands
+        worker.enqueue(new Refund("1042", 4000));
+      roles: { strategy: [1, 5], refund: [7, 18], context: [20, 34], client: [36, 37], create: [37, 37], queue: [24, 26], execute: [31, 31], audit: [32, 32] }
+    again:
+      file: bulk.ts
+      source: |
+        // bulk.ts: queue every refund; the worker retries and logs them
+        for (const o of ordersToRefund) {
+          worker.enqueue(new Refund(o.id, o.totalCents, `refund-${o.id}`));
+        }
+    cost:
+      before: { text: 6 lines · 3 methods · no queue, value: 0.8 }
+      after: { text: 1 loop · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'In memory, a closure `() => billing.refund(id, cents)` is a command. Once commands cross a process boundary (a job queue, a log you replay), they must be plain data: a discriminated union such as `{ kind: "refund"; orderId: string; cents: number }` that survives `JSON.stringify`, plus one function that runs each kind.'
+      seenIn: 'Redux actions are commands as plain objects (`{ type, payload }`) handed to reducers. VS Code''s `commands.registerCommand` and `executeCommand`. BullMQ''s `queue.add(name, data)` stores a job for a worker to run.'
+
+  rust:
+    before:
+      file: admin.rs · routes.rs
+      source: |
+        // admin.rs
+        impl Admin {
+            pub fn refund(&self, order_id: &str, cents: u64) -> Result<(), BillingError> {
+                self.billing.refund(order_id, cents)
+            }
+
+            pub fn change_plan(&self, account: &str, plan: Plan) -> Result<(), BillingError> {
+                self.billing.set_plan(account, plan)
+            }
+
+            pub fn add_credit(&self, account: &str, cents: u64) -> Result<(), BillingError> {
+                self.billing.add_credit(account, cents)
+            }
+        }
+
+        // routes.rs: each button posts to its own handler
+        let app = Router::new().route("/admin/refund", post(refund_handler));
+      roles: { context: [2, 14], refund: [3, 5], plan: [7, 9], credit: [11, 13], client: [17, 17] }
+      change:
+        - { after: 3, add: ['        self.audit.log("refund", order_id, cents);'] }
+        - { line: 4, replace: '        retry(3, || self.billing.refund(order_id, cents))' }
+        - { after: 7, add: ['        self.audit.log("change_plan", account, plan);'] }
+        - { line: 8, replace: '        retry(3, || self.billing.set_plan(account, plan))' }
+        - { after: 11, add: ['        self.audit.log("add_credit", account, cents);'] }
+        - { line: 12, replace: '        retry(3, || self.billing.add_credit(account, cents))' }
+    after:
+      file: commands.rs · worker.rs
+      source: |
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub enum Command {
+            Refund { order_id: String, cents: u64, key: Uuid },
+            ChangePlan { account: String, plan: Plan },
+            AddCredit { account: String, cents: u64, key: Uuid },
+        }
+
+        impl Command {
+            pub fn execute(&self, b: &Billing) -> Result<(), BillingError> {
+                match self {
+                    Command::Refund { order_id, cents, key } => b.refund(order_id, *cents, *key),
+                    Command::ChangePlan { account, plan } => b.set_plan(account, *plan),
+                    Command::AddCredit { account, cents, key } => b.add_credit(account, *cents, *key),
+                }
+            }
+        }
+
+        pub struct Worker {
+            billing: Billing,
+            audit: AuditLog,
+            queue: VecDeque<Command>,
+        }
+
+        impl Worker {
+            pub fn run_next(&mut self) {
+                if let Some(cmd) = self.queue.pop_front() {
+                    let result = retry(3, || cmd.execute(&self.billing));
+                    self.audit.record(&cmd, &result);
+                }
+            }
+        }
+
+        // the console only builds commands
+        worker.queue.push_back(Command::Refund { order_id: "1042".into(), cents: 4000, key: Uuid::new_v4() });
+      roles: { strategy: [1, 16], refund: [3, 3], context: [18, 31], client: [33, 34], create: [34, 34], queue: [26, 26], execute: [27, 27], audit: [28, 28] }
+    again:
+      file: bulk.rs
+      source: |
+        // bulk.rs: queue every refund; the worker retries and logs them
+        for o in &orders_to_refund {
+            let key = Uuid::new_v5(&Uuid::NAMESPACE_OID, o.id.as_bytes());
+            worker.queue.push_back(Command::Refund { order_id: o.id.clone(), cents: o.total_cents, key });
+        }
+    cost:
+      before: { text: 6 lines · 3 methods · no queue, value: 0.8 }
+      after: { text: 1 loop · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'An `enum` is the natural command in Rust: each variant carries its arguments, `match` runs it, the compiler checks every variant is handled, and `serde` turns it into a queue message. Use `Box<dyn Command>` instead when other crates must add commands. Closures (`Box<dyn FnOnce()>`) work for in-memory jobs.'
+      seenIn: '`std::process::Command` is built, then run with `spawn` or `output`. Actor-style tasks receive an `enum` of messages over a `tokio::sync::mpsc` channel. `clap` parses subcommands into an `enum`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The console does not call billing. It builds a Refund with everything the refund needs, including an idempotency key. Nothing has happened yet.
+    nodes: [client, refund]
+    edges: []
+    role: create
+  - text: The command waits in the worker's queue. Because it is data, it can wait for hours, be stored in a table or be sent to another process.
+    nodes: [client, context]
+    edges: [client>context]
+    role: queue
+  - text: The worker takes the next command and calls Execute, wrapped in a retry. It does not know it is running a refund; the command calls the billing client itself.
+    nodes: [context, strategy, refund]
+    edges: [context>strategy, refund>strategy]
+    role: execute
+  - text: The worker records the command and its result in the audit log. One line of code covers every kind of command, today's and future ones.
+    nodes: [context]
+    edges: []
+    role: audit
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these calls for Command?
+    options:
+      - text: Support queues hundreds of refunds for a worker that runs them overnight, retries failures and records each one in an audit log.
+        correct: true
+        why: Right. Each refund must exist as data before it runs, so it can wait, be retried and be logged.
+      - text: When an order is placed, email, stock and analytics all need to react.
+        why: That is Observer. One event is broadcast to many listeners. Nothing needs to be stored or replayed.
+      - text: Each country uses one tax calculator, chosen from config when the request starts.
+        why: That is Strategy. The choice is how to do one step, not a request to store and run later.
+  engineer:
+    question: A queued refund command timed out and the worker retries it. What must the command carry so the customer is not refunded twice?
+    options:
+      - text: An idempotency key, chosen once when the command is created and sent with every attempt.
+        correct: true
+        why: Right. The provider stores the key with the first result and returns that result for any repeat, so a retry after a lost response does nothing new.
+      - text: A count of how many attempts have been made.
+        why: The worker can use it to give up, but the provider still cannot tell a retry from a new refund.
+      - text: The time of each attempt.
+        why: Every attempt gets a new time, so the provider sees each one as a different request. The key must stay the same across attempts.
+  deep:
+    question: Why should a queued refund command hold the order ID rather than the loaded Order object?
+    options:
+      - text: It runs later, maybe in another process. It must be serialised, and the order may change before it runs, so the command should carry the ID and let the worker read fresh data.
+        correct: true
+        why: Right. A command is a message to the future. Small, plain arguments survive serialisation and do not go stale.
+      - text: Executing with an ID is faster than with an object.
+        why: Loading the order by ID is extra work, not less. The reason is serialisation and staleness.
+      - text: No language can put an object in a queue.
+        why: An in-process queue such as a Go channel holds objects fine. The problem starts when the queue is durable or crosses a process boundary.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Command
+      example: { go: "Command (interface)", python: "Command (Protocol)", typescript: "Command (interface)", rust: "Command (enum)" }
+      job: One method to carry out the request. Optionally Undo.
+    - role: Concrete command
+      example: "Refund, ChangePlan, AddCredit"
+      job: Holds the arguments, and calls the receiver when executed.
+    - role: Invoker
+      example: Worker
+      job: Runs commands, and adds queueing, retries and logging to all of them.
+    - role: Receiver
+      example: Billing client
+      job: Does the real work.
+    - role: Client
+      example: Admin console
+      job: Builds commands and hands them to the invoker.
+  useWhen:
+    - Requests must run later, elsewhere, or more than once (queues, schedulers, retries).
+    - You need one audit trail or one retry policy for many different actions.
+    - Users expect undo and redo.
+  avoidWhen:
+    - The action runs once, now, in place. A method call or a function value is enough.
+    - Nothing will ever queue, log, retry or undo it. A class per action is ceremony.
+  tradeoffs:
+    - One more type per action, and the logic is one hop further from the caller.
+    - Commands that are stored or sent must be serialisable, so they carry IDs and plain values, not live objects.
+    - Retries need idempotent commands or idempotency keys. Undo needs the old state saved, and some actions cannot be undone at all.
+  lookalikes:
+    - name: Strategy
+      how: Swaps how one step is done. Command packages a whole request so it can run later.
+    - name: Memento
+      how: Saves an object's state so it can be restored. A command's Undo often uses one.
+    - name: Chain of Responsibility
+      how: Passes a request along handlers until one takes it. The request travelling down the chain is often a command object.
+---
+
+## [concept] Command
+
+**Turn a request into an object that holds everything needed to carry it out, so it can be queued, retried, logged or undone later.**
+
+A method call happens once, now, and leaves nothing behind. A command is the same call written down: which action, with which arguments.
+
+<Depth level={2}>
+Five roles share the work. The **command** is the <Term id="interface">interface</Term> every action implements, usually one method, `Execute`. Each **concrete command** (Refund, ChangePlan) holds its arguments. The <Term id="command-invoker">invoker</Term> (the worker) runs commands without knowing what they do, which is where queueing, retries and logging live. The <Term id="command-receiver">receiver</Term> (the billing client) does the real work. The **client** (the admin console) builds commands and hands them over.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue also calls it Action or Transaction. It describes commands as an object-oriented replacement for callbacks, and lists four uses: parameterising objects by an action, queueing and running requests at a different time, undo through an Unexecute operation and a history list, and logging changes so they can be replayed after a crash. It notes that a command may need to store the receiver's old state to undo itself.
+</Depth>
+
+## [problem] An admin console that calls billing directly
+
+Support staff use an admin console to refund orders, change plans and add credit. Each button posts to a handler, and each handler calls the billing client straight away.
+
+Read it once. It is simple and it works, because each action happens once, right now, while the support agent waits.
+
+<Depth level={2}>
+Every action is a method with its own name and signature. Nothing outside those methods can see an action before it runs, store it, or run it again.
+</Depth>
+
+<Depth level={3}>
+If the billing API is down, the agent gets an error and tries again later by hand. That is acceptable for one refund. It stops being acceptable when there are hundreds.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** support needs bulk refunds that run in the background, retry when the billing API times out, and appear in the audit log.
+
+The marked lines add an audit call and a retry to every method. The same two lines are pasted three times, and the next action must remember to paste them again.
+
+<Depth level={2}>
+The edit is the easy part. The background queue cannot be written at all: a method call is not something you can put in a table and run tonight. You would need a new job type per action, and a worker that knows every one of them.
+</Depth>
+
+<Depth level={3}>
+Retrying a refund blindly is also dangerous. If the API timed out after it sent the money, the retry sends it again. The method signature gives you nowhere to carry the information that would prevent that.
+</Depth>
+
+## [morph] Turn each method into an object
+
+Drag the slider. Each action becomes a small type that holds its arguments. The worker holds a queue of them and runs each one through the same interface.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Queueing, retries and the audit log now live in one place, the worker, and apply to every command. Adding an action means adding a command type; the worker does not change. The command is also where an <Term id="idempotency-key">idempotency key</Term> belongs: it is chosen once, when the command is created, and travels with every attempt.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">A `chan Command` is an in-process queue: the console sends, the worker's `for range` receives. It is lost when the process stops. For bulk refunds that must survive a deploy, store the commands in a table and let the worker read them; that is why they hold IDs and amounts, not pointers.</Lang>
+<Lang only="python">`deque.popleft()` is O(1), unlike `list.pop(0)`, which shifts every item. A frozen dataclass cannot be changed after it is queued, so the command that runs is the command that was logged.</Lang>
+<Lang only="typescript">The array is an in-memory queue and dies with the process. A real job queue such as BullMQ stores each job as JSON, so the class instance becomes plain data on the way in and must be rebuilt by `kind` on the way out.</Lang>
+<Lang only="rust">An `enum` makes the set of commands closed: adding a variant makes the compiler point at every `match` that must handle it. With `serde`, the same enum is the queue message format.</Lang>
+</Depth>
+
+## [walk] Follow one refund
+
+One refund through the design, from the console to the audit log. Step through it with the numbered buttons.
+
+<Depth level={2}>
+Retries make delivery <Term id="at-least-once-delivery">at least once</Term>: if the worker cannot tell whether an attempt succeeded, it must try again. That is only safe when running the command twice has the same effect as once. Setting a plan to Pro is like that by nature. Refunds and credits add to something, so they need the key.
+</Depth>
+
+<Depth level={3}>
+Payment APIs support this directly. Stripe, for example, accepts an `Idempotency-Key` header, stores the first response for that key and returns it again for any repeat. The key must come from the command, not from the attempt; a key generated inside the retry loop is a new key every time and protects nothing.
+</Depth>
+
+## [again] Bulk refunds, the second time
+
+The same request after the refactor. A bulk refund is a loop that queues one command per order. The worker already retries and logs every command, so nothing else changes.
+
+<Depth level={2}>
+The key is built from the order ID. If the bulk job itself crashes halfway and is run again, each refund gets the same key as before, and the provider skips the ones already done.
+</Depth>
+
+<Depth level={3}>
+Undo comes the same way. A ChangePlan command can save the old plan when it runs and set it back in `Undo`. A refund cannot be undone by the system at all: the money has left, and taking it back is a new charge that needs the customer's consent. Commands make undo possible; they do not make every action reversible.
+</Depth>
+
+## [play] Retry, undo, and pay for it
+
+An admin console for one customer. Every button queues a command. You run the worker, and you control what the network does on the next attempt.
+
+Make a refund time out after the provider has already paid, retry it, and compare what the customer received with what you asked for. Then try the same with idempotency keys, and try undoing things.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. How much ceremony it needs is not.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="command" />
+
+### When the command is just a function
+
+In memory, a function value or closure already is a command: Go's `func(ctx) error`, Python's `functools.partial`, a JavaScript arrow function, a Rust closure. Start there. Move to a named type when the command must be stored, sent to another process, shown in a log or undone, because a closure cannot be serialised or inspected and has nowhere to keep an idempotency key or the old value for undo.

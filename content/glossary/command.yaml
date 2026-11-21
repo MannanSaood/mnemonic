@@ -1,0 +1,9 @@
+- id: idempotency-key
+  term: Idempotency key
+  short: A unique value sent with a request so the server can recognise a repeat of it and return the first result instead of doing the work again.
+- id: command-invoker
+  term: Invoker
+  short: In Command, the object that runs commands (a button, a queue worker) without knowing what each one does.
+- id: command-receiver
+  term: Receiver
+  short: In Command, the object that does the real work when a command runs, such as the billing client a refund command calls.
