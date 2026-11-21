@@ -1,0 +1,10 @@
+# Terms introduced by the "Work stealing and run queues" lesson.
+- id: work-stealing
+  term: Work stealing
+  short: A scheduling scheme where each worker has its own queue, and a worker that runs out of work takes tasks from another worker's queue instead of from a central one.
+- id: global-run-queue
+  term: Global run queue
+  short: The Go runtime's one shared queue of runnable goroutines, behind a lock. It takes overflow from full local queues and goroutines with no P; each P checks it once every 61 schedules, and whenever its own queue is empty.
+- id: runnext
+  term: runnext
+  short: A one-goroutine slot on each P for the goroutine that should run next, usually the one just created or woken. It runs before the local queue and inherits the rest of the current time slice.

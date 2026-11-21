@@ -1,0 +1,472 @@
+---
+title: Work stealing and run queues
+track: go-internals
+group: Scheduler
+order: 4
+summary: Each P keeps its own run queue, and a P that runs dry steals half of another P's queue, so all cores stay busy without a central queue.
+intent: Know how goroutines spread across cores after they are created, and why one goroutine's work never spreads.
+changeRequest: Onboard Acme, one tenant that will send 40% of all log lines.
+languages: [go, python, typescript, rust]
+glossary: [work-stealing, run-queue, global-run-queue, runnext, go-p]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [concurrency/work-stealing-schedulers]
+skills: [concurrency, go-runtime]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: work-stealing
+  scenarios:
+    - try: "Make a prediction, then run the burst with stealing off."
+      notice: "P0 runs all 32 parse goroutines alone and the batch ends at 64 ms. P1 to P3 finish their own work in 4 ms and sit idle, hatched orange, while work waits."
+    - try: "Turn stealing to half the queue and run it again."
+      notice: "At 4 ms the quiet Ps steal from P0, half at a time, then from each other. The batch ends at 20 ms, one millisecond from a perfect split, after about 10 steals."
+    - try: "Try one at a time, then spread evenly with stealing off."
+      notice: "One at a time finishes just as fast but needs twice as many steals, each one a trip to someone else's queue. Stealing from a burst matches work that was spread perfectly from the start."
+    - try: "Spread the work evenly, make the jobs uneven, and compare stealing off and on."
+      notice: "Even a fair split goes unbalanced when jobs differ in size. Without stealing, some Ps finish early and wait; with it, they take the leftovers."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: reader
+      kind: client
+      before: { x: 12, y: 30, w: 112, h: 48, title: conn reader, sub: "tenant % 4" }
+      after:  { x: 12, y: 24, w: 112, h: 48, title: conn reader, sub: { go: "go parse(b)", python: "pool.submit", typescript: "pool.run(b)", rust: "rayon::spawn" } }
+    - id: sched
+      kind: context
+      before: { x: 150, y: 14, w: 270, h: 246, title: shard router, sub: "one worker per core" }
+      after:  { x: 150, y: 24, w: 150, h: 48, title: scheduler, sub: "findRunnable()" }
+    - id: g
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 100, w: 110, h: 48, title: "" }
+      after:  { x: 330, y: 24, w: 220, h: 48, title: parse goroutines, sub: one per batch }
+    - id: p0
+      kind: concrete
+      before: { x: 170, y: 56, w: 230, h: 30, title: "shard 0 → core 0" }
+      after:  { x: 12, y: 190, w: 120, h: 48, title: P0, sub: long queue }
+    - id: p1
+      kind: concrete
+      before: { x: 170, y: 94, w: 230, h: 30, title: "shard 1 → core 1" }
+      after:  { x: 150, y: 190, w: 120, h: 48, title: P1, sub: steals half }
+    - id: p2
+      kind: concrete
+      before: { x: 170, y: 132, w: 230, h: 30, title: "shard 2 → core 2" }
+      after:  { x: 288, y: 190, w: 120, h: 48, title: P2, sub: steals half }
+    - id: acme
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 208, w: 230, h: 30, title: "Acme: 40% on shard 0" }
+      after:  { x: 426, y: 190, w: 124, h: 48, title: Acme burst, sub: spread by steals }
+  edges:
+    - { from: reader, to: g, label: creates }
+    - { from: g, to: p0, label: queued on }
+    - { from: sched, to: p1, label: finds work }
+    - { from: p1, to: p0, label: steals from }
+    - { from: p2, to: p0 }
+    - { from: acme, to: g }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: ingest.go
+      source: |
+        // ingest.go: one worker per shard, one shard per core
+        func (s *Ingest) start() {
+            for i := range s.shards { // len(s.shards) == GOMAXPROCS
+                go func() {
+                    for batch := range s.shards[i] {
+                        s.store(parse(batch))
+                    }
+                }()
+            }
+        }
+
+        func (s *Ingest) serve(conn net.Conn, tenant uint64) {
+            shard := s.shards[tenant%uint64(len(s.shards))]
+            for batch := range readBatches(conn) {
+                shard <- batch // a tenant always lands on the same worker
+            }
+        }
+      roles: { sched: [2, 10], p0: [4, 8], reader: [12, 17], acme: [13, 13] }
+      change:
+        - { after: 13, add: ["    // Acme (tenant 8) now sends 40% of all lines: always shard 0"] }
+    after:
+      file: ingest.go
+      source: |
+        // ingest.go: a goroutine per batch; the scheduler spreads them
+        func (s *Ingest) serve(conn net.Conn, tenant uint64) {
+            for batch := range readBatches(conn) {
+                s.slots <- struct{}{} // at most cap(s.slots) batches in flight
+                go func() {
+                    defer func() { <-s.slots }()
+                    s.store(parse(batch))
+                }()
+            }
+        }
+      roles: { reader: [2, 10], g: [5, 8], p0: [5, 5], p1: [5, 8], p2: [5, 8], acme: [3, 3], sched: [5, 5], spawn: [5, 5], idle: [6, 7], steal: [5, 8], run: [7, 7] }
+    again:
+      file: ingest.go
+      source: |
+        // Acme's burst arrives on one connection, so its goroutines
+        // queue on one P. Idle Ps steal half of that queue at a time,
+        // and all four cores parse Acme's lines.
+    cost:
+      before: { text: "1 core busy · 3 idle · lag grows", value: 0.85 }
+      after: { text: "4 cores busy", value: 0.15 }
+    lens:
+      need: 4
+      needLabel: Built in
+      note: 'The runtime balances goroutines across Ps for you. Start a goroutine per unit of work, bounded, and let idle Ps steal it. Hand-sharding to a fixed worker per core undoes that: a worker is one goroutine, and one goroutine runs on one P at a time.'
+      seenIn: '`GODEBUG=schedtrace=1000` shows each P''s local queue length. `go tool trace` shows goroutines moving between Ps. `errgroup.Group.SetLimit` bounds the goroutines in flight.'
+
+  python:
+    before:
+      file: ingest.py
+      source: |
+        # ingest.py: one worker process per shard, one shard per core
+        shards = [mp.Queue() for _ in range(os.cpu_count() or 1)]
+        workers = [mp.Process(target=parse_loop, args=(q,)) for q in shards]
+
+        async def serve(reader: asyncio.StreamReader, tenant: int) -> None:
+            shard = shards[tenant % len(shards)]
+            async for batch in read_batches(reader):
+                shard.put(batch)  # a tenant always lands on the same worker
+      roles: { sched: [2, 3], p0: [3, 3], reader: [5, 8], acme: [6, 6] }
+      change:
+        - { after: 6, add: ["    # Acme (tenant 8) now sends 40% of all lines: always shard 0"] }
+    after:
+      file: ingest.py
+      source: |
+        # ingest.py: one shared pool; any free worker takes the next batch
+        pool = ProcessPoolExecutor(max_workers=os.cpu_count())
+        slots = asyncio.Semaphore(4 * (os.cpu_count() or 1))
+
+        async def parse_one(batch: bytes) -> None:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(pool, parse_and_store, batch)
+            finally:
+                slots.release()
+
+        async def serve(reader: asyncio.StreamReader, tenant: int) -> None:
+            async with asyncio.TaskGroup() as tg:
+                async for batch in read_batches(reader):
+                    await slots.acquire()  # bounded, like the Go version
+                    tg.create_task(parse_one(batch))
+      roles: { reader: [12, 16], g: [5, 10], p0: [2, 2], p1: [2, 2], p2: [2, 2], acme: [14, 14], sched: [2, 2], spawn: [16, 16], idle: [8, 8], steal: [2, 2], run: [8, 8] }
+    again:
+      file: ingest.py
+      source: |
+        # Acme's burst goes into the pool's one shared queue.
+        # Every worker process takes the next batch when it is free,
+        # so all cores parse Acme's lines.
+    cost:
+      before: { text: "1 core busy · 3 idle · lag grows", value: 0.85 }
+      after: { text: "4 cores busy", value: 0.2 }
+    lens:
+      need: 1
+      needLabel: No stealing
+      note: 'Python has no work-stealing scheduler. `ProcessPoolExecutor` balances with one shared queue: each worker process takes the next task when it is free. That is simple and fair; the shared queue is a single point of contention, which matters less when each task is milliseconds of work.'
+      seenIn: '`concurrent.futures.ProcessPoolExecutor`, `multiprocessing.Pool` (with `chunksize`), Celery workers pulling from one broker queue.'
+
+  typescript:
+    before:
+      file: ingest.ts
+      source: |
+        // ingest.ts: one worker thread per shard, one shard per core
+        const workers = Array.from({ length: availableParallelism() },
+          () => new Worker(new URL("./parse-worker.js", import.meta.url)));
+
+        export async function serve(socket: Socket, tenant: number): Promise<void> {
+          const worker = workers[tenant % workers.length];
+          for await (const batch of readBatches(socket)) {
+            worker.postMessage(batch); // a tenant always lands on the same worker
+          }
+        }
+      roles: { sched: [2, 3], p0: [2, 3], reader: [5, 10], acme: [6, 6] }
+      change:
+        - { after: 6, add: ["  // Acme (tenant 8) now sends 40% of all lines: always worker 0"] }
+    after:
+      file: ingest.ts
+      source: |
+        // ingest.ts: one shared pool; any idle thread takes the next batch
+        const pool = new Piscina({
+          filename: new URL("./parse-worker.js", import.meta.url).href,
+          maxThreads: availableParallelism(),
+        });
+
+        export async function serve(socket: Socket, tenant: number): Promise<void> {
+          const pending: Promise<void>[] = [];
+          for await (const batch of readBatches(socket)) {
+            pending.push(pool.run(batch)); // queued in the pool until a thread is free
+          }
+          await Promise.all(pending);
+        }
+      roles: { reader: [7, 13], g: [10, 10], p0: [2, 5], p1: [2, 5], p2: [2, 5], acme: [9, 9], sched: [2, 5], spawn: [10, 10], idle: [10, 10], steal: [2, 5], run: [10, 10] }
+    again:
+      file: ingest.ts
+      source: |
+        // Acme's burst goes into the pool's queue on the main thread.
+        // Each worker thread gets the next batch when it is free,
+        // so all cores parse Acme's lines.
+    cost:
+      before: { text: "1 core busy · 3 idle · lag grows", value: 0.85 }
+      after: { text: "4 cores busy", value: 0.2 }
+    lens:
+      need: 1
+      needLabel: No stealing
+      note: 'Node has no scheduler that moves work between threads. A worker-thread pool such as Piscina keeps one queue on the main thread and hands the next task to whichever worker is free. Pinning a key to one worker, as in the first version, keeps order per key but caps that key at one core.'
+      seenIn: '`worker_threads`, Piscina, the libuv thread pool (one shared queue for fs, dns and crypto work).'
+
+  rust:
+    before:
+      file: ingest.rs
+      source: |
+        // ingest.rs: one worker thread per shard, one shard per core
+        let cores = thread::available_parallelism()?.get();
+        let shards: Vec<mpsc::Sender<Batch>> = (0..cores).map(|_| {
+            let (tx, rx) = mpsc::channel::<Batch>();
+            let store = Arc::clone(&store);
+            thread::spawn(move || for batch in rx { store.put(parse(&batch)) });
+            tx
+        }).collect();
+
+        async fn serve(mut conn: TcpStream, tenant: u64, shards: &[mpsc::Sender<Batch>]) -> io::Result<()> {
+            let shard = &shards[(tenant % shards.len() as u64) as usize];
+            while let Some(batch) = read_batch(&mut conn).await? {
+                shard.send(batch).expect("worker exited"); // same tenant, same worker
+            }
+            Ok(())
+        }
+      roles: { sched: [2, 8], p0: [6, 6], reader: [10, 16], acme: [11, 11] }
+      change:
+        - { after: 11, add: ["    // Acme (tenant 8) now sends 40% of all lines: always shard 0"] }
+    after:
+      file: ingest.rs
+      source: |
+        // ingest.rs: rayon's pool steals; any idle thread takes queued batches
+        async fn serve(mut conn: TcpStream, store: Arc<Store>) -> io::Result<()> {
+            while let Some(batch) = read_batch(&mut conn).await? {
+                let store = Arc::clone(&store);
+                rayon::spawn(move || store.put(parse(&batch)));
+            }
+            Ok(())
+        }
+      roles: { reader: [2, 8], g: [5, 5], p0: [5, 5], p1: [5, 5], p2: [5, 5], acme: [3, 3], sched: [1, 1], spawn: [5, 5], idle: [1, 1], steal: [1, 1], run: [5, 5] }
+    again:
+      file: ingest.rs
+      source: |
+        // Acme's burst is pushed into rayon's global injector.
+        // Idle rayon threads take jobs from it and steal from each other's
+        // deques, so all cores parse Acme's lines.
+    cost:
+      before: { text: "1 core busy · 3 idle · lag grows", value: 0.85 }
+      after: { text: "4 cores busy", value: 0.15 }
+    lens:
+      need: 3
+      needLabel: In the libraries
+      note: 'std threads do not steal; you get exactly the threads you start. rayon and tokio both use work stealing: rayon with crossbeam''s deques, tokio with fixed-size per-worker queues that steal half, a design its authors took from Go''s scheduler.'
+      seenIn: '`rayon::spawn`, `par_iter`, `crossbeam_deque::{Worker, Stealer, Injector}`, tokio''s multi-threaded runtime.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: '`go func()` puts the new goroutine in the current P''s `runnext` slot, and the goroutine that was there moves to the back of P0''s local queue. A burst from one connection piles up on one P.'
+    nodes: [reader, g, p0]
+    edges: [reader>g, g>p0]
+    role: spawn
+  - text: P1 finishes its own work. Its local queue is empty, so it checks the global queue and the network poller, and then goes looking in other Ps' queues.
+    nodes: [sched, p1]
+    edges: [sched>p1]
+    role: idle
+  - text: P1 picks victims in random order and takes half of the first non-empty queue it finds, P0's. One atomic claim on P0's queue moves many goroutines at once.
+    nodes: [p1, p0]
+    edges: [p1>p0]
+    role: steal
+  - text: P1 runs the first stolen goroutine and keeps the rest in its own queue, where P2 can steal from it in turn. Within a few steals, every P has a share of the burst.
+    nodes: [p1, p2, p0, acme]
+    edges: [p2>p0, acme>g]
+    role: run
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: A P has finished every goroutine in its local queue. What does it do next?
+    options:
+      - text: Looks at the global queue and the network poller, then steals goroutines from another P's queue.
+        correct: true
+        why: Right. A P with nothing to do goes looking for work. Only when there is none anywhere does its thread stop and sleep.
+      - text: Waits until a central dispatcher assigns it new goroutines.
+        why: There is no dispatcher. Each P finds its own work; that is what lets Go avoid one big lock.
+      - text: Its thread exits, and a new one starts when work arrives.
+        why: Threads are kept. After a short search the thread parks, and it is woken when new work appears.
+  engineer:
+    question: An ingest service routes each tenant to one of 8 worker goroutines. One big tenant pegs one core while the other seven idle. Why does Go's work stealing not fix this?
+    options:
+      - text: Stealing moves whole goroutines between Ps. The tenant's work all runs inside one worker goroutine, which can run on only one P at a time.
+        correct: true
+        why: Right. Give the scheduler many goroutines to move, for example one per batch with a bound. If per-tenant order matters, split the tenant into sub-shards instead.
+      - text: Stealing is off by default and must be enabled with GODEBUG.
+        why: Stealing is always on; there is no switch for it.
+      - text: Channels pin the goroutines that read them to one P.
+        why: No. A goroutine blocked on a channel can be woken on, or stolen by, any P.
+  deep:
+    question: When P1 steals from P0's local queue of 30 goroutines, how many does it take, and why that many?
+    options:
+      - text: Half, 15, so one steal balances the two queues and the cost of touching another P's queue is paid rarely.
+        correct: true
+        why: Right. runqgrab takes n − n/2 with one compare-and-swap on the victim's head. Taking one at a time would mean a steal, and contention on P0's queue, for every goroutine.
+      - text: One, so P0 keeps as much of its cache-warm work as possible.
+        why: Locality matters, but one at a time would make the thief come back for every goroutine. The runtime takes half.
+      - text: All 30, because P0 is clearly overloaded.
+        why: Then P0 would be the idle one and steal them back. Taking half leaves both with about the same amount.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Local run queue
+      example: "P0's runq, 256 slots"
+      job: Runnable goroutines for one P. The owner adds and takes without a lock; thieves claim from the head with an atomic operation.
+    - role: runnext
+      example: the goroutine just created
+      job: Runs next on this P, ahead of the queue. Stolen only as a last resort.
+    - role: Global run queue
+      example: overflow and woken goroutines
+      job: Shared by all Ps behind a lock. Checked once every 61 schedules and whenever a local queue is empty.
+    - role: Thief
+      example: an idle P
+      job: Tries other Ps in random order and takes half of a non-empty queue.
+  useWhen:
+    - Deciding how to split CPU work. Many goroutines, bounded, let stealing balance them.
+    - A CPU profile or trace shows some Ps idle while others have long queues.
+  avoidWhen:
+    - Work must stay in order per key. Stealing reorders across goroutines, so keep one goroutine (or a sub-shard) per key and accept the cap.
+  tradeoffs:
+    - Each steal touches another P's queue, which costs an atomic operation and cache traffic. Stealing half keeps steals rare.
+    - Work created on one P runs there first, which is good for cache locality, until stealing moves it.
+    - Very small goroutines cost more in creating, queueing and stealing than they do in work. Batch them.
+  lookalikes:
+    - name: One shared queue
+      how: Python's ProcessPoolExecutor and Node worker pools hand out work from one queue. Simple, but every take contends on it.
+    - name: Static sharding
+      how: Each key to a fixed worker. Keeps order per key, but one hot key caps at one core.
+    - name: tokio and rayon
+      how: The same idea in Rust. Tokio's queues and steal-half policy were modelled on Go's.
+---
+
+## [concept] Work stealing and run queues
+
+**Each P has its own <Term id="run-queue">run queue</Term>. A P that runs out of work takes half of another P's queue. That is <Term id="work-stealing">work stealing</Term>, and it keeps every core busy without a central queue.**
+
+New goroutines start on the P that created them. They spread out only when idle Ps come and take them.
+
+<Depth level={2}>
+Without one central queue, Ps rarely wait on each other: a P adds to and takes from its own queue without a lock. The <Term id="global-run-queue">global run queue</Term> still exists, behind a lock, for overflow and for goroutines that have no P to go to. The cost of the design is that work starts unbalanced, and stealing has to fix it.
+</Depth>
+
+<Depth level={3}>
+`findRunnable` looks for work in a fixed order. Every 61st schedule it checks the global queue first, so goroutines there cannot starve. Then it tries its own <Term id="runnext">runnext</Term> slot and local queue, the global queue, the network poller, and finally `stealWork`: up to four passes over all Ps in random order, taking half of a victim's queue. Only on the last pass may it steal a victim's runnext.
+</Depth>
+
+## [problem] An ingest service sharded by tenant
+
+A log-ingest service parses batches of log lines. To use every core, the team made one worker goroutine per core and routed each tenant to a fixed worker by its ID. It keeps each tenant's lines in order, and it is tested.
+
+Read it with the model behind it: each worker owns a core, and the hash spreads tenants evenly, so the cores share the work.
+
+<Depth level={2}>
+For many small tenants of similar size this holds well enough. The hash gives each worker about the same number of tenants, and each tenant about the same traffic.
+</Depth>
+
+<Depth level={3}>
+The sharding also does the scheduler's job by hand. Each worker is a single goroutine with a channel in front of it, so the runtime sees GOMAXPROCS long-lived goroutines and nothing to move.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** onboard Acme, one tenant that will send 40% of all log lines.
+
+The marked line shows where Acme lands: always on shard 0. Shard 0's worker runs flat out, its channel fills up, and Acme's logs fall minutes behind. The host shows one core busy and three mostly idle. The naive model says the runtime balances goroutines across cores; it does, but there is nothing to balance.
+
+<Depth level={2}>
+Work stealing moves goroutines, never the work inside one. Shard 0's worker is one goroutine, so at any moment it runs on one P, whatever the other Ps are doing.
+</Depth>
+
+<Depth level={3}>
+The cost meter shows cores used, not throughput: the fix in the next step gives Acme four cores without touching the parser.
+</Depth>
+
+## [morph] From fixed shards to stealing
+
+Drag the slider. The shard router, one worker per core, becomes many parse goroutines queued on the P that made them, and idle Ps that steal from it.
+
+The code morphs from a fixed worker per shard to a bounded goroutine per batch.
+
+<Depth level={2}>
+Order is the price. Two batches from Acme can now finish in either order. If order matters, give each key several sub-shards, or tag batches with sequence numbers and reorder where they are stored.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The `slots` channel bounds the batches in flight, so a burst cannot create millions of goroutines and their buffers. Size it to a small multiple of GOMAXPROCS.</Lang>
+<Lang only="python">Python has no stealing, so the fix is one shared queue: `ProcessPoolExecutor` sends each task to whichever worker process asks next.</Lang>
+<Lang only="typescript">Node has no stealing either. Piscina's single queue gives the next batch to whichever worker thread is idle.</Lang>
+<Lang only="rust">`rayon::spawn` called from outside the pool pushes the job into rayon's global injector queue. Rayon threads take from it and steal from each other's deques.</Lang>
+</Depth>
+
+## [walk] Follow one burst
+
+One burst from Acme's connection, from `go` to every core. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">A P's local queue is a ring of 256 slots indexed by a head and a tail. The owner writes the tail; thieves advance the head with a compare-and-swap in `runqgrab`, which takes `n - n/2`. When the ring is full, `runqputslow` moves half of it, plus the new goroutine, to the global queue. At most half the busy Ps' threads may be spinning in search of work at once, which limits the CPU spent looking.</Lang>
+<Lang only="python">`ProcessPoolExecutor` feeds a call queue from a management thread; workers take items when they are free. The queue sits behind locks and pipes, which is fine when each task is milliseconds long.</Lang>
+<Lang only="typescript">Piscina keeps its task queue on the main thread and posts a task to a worker when one is free, so balancing costs a message per task.</Lang>
+<Lang only="rust">crossbeam's deque gives the owner a cheap push and pop at one end, and thieves steal from the other end. Tokio uses its own fixed-size queues and steals half, with a LIFO slot for the most recently woken task, similar to Go's runnext.</Lang>
+</Depth>
+
+## [again] Acme, the second time
+
+The same Acme traffic with a goroutine per batch. The burst queues on whichever P runs Acme's connection, and the other Ps steal from it. All four cores parse Acme's lines, and its lag stays flat.
+
+<Depth level={2}>
+Keep each goroutine's work large enough to be worth scheduling. A batch of a thousand lines is plenty. A goroutine per line would spend a large share of its time in creating, queueing and stealing.
+</Depth>
+
+<Depth level={3}>
+In `GODEBUG=schedtrace` output, a balanced run shows similar local queue lengths on every P. In the old design, the trace showed short queues everywhere, because the backlog sat in shard 0's channel, invisible to the scheduler.
+</Depth>
+
+## [play] Steal it
+
+Four Ps, and a burst of 32 parse goroutines that all land on P0. The other Ps have a little work of their own.
+
+Turn stealing off and on, try stealing one at a time, and compare how long the burst takes and how many steals it needs.
+
+## [lens] How each language balances work
+
+Go and the Rust libraries steal. Python and Node balance with one shared queue, or not at all.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="work-stealing" />
+
+### Why not one shared queue
+
+One queue for all cores is simple, and it balances perfectly. Every take, though, goes through the same lock or the same atomic counter, and at high rates the cores spend their time waiting on it. Per-P queues make the common case private. Stealing pays the shared cost only when a P has run dry, and stealing half makes that rare.
