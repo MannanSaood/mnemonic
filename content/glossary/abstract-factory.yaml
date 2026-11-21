@@ -1,0 +1,4 @@
+# Terms introduced by the Abstract Factory lesson.
+- id: associated-type
+  term: Associated type
+  short: In Rust, a type named inside a trait that each implementation fixes, such as the store type a cloud provides. Code generic over the trait can use it without knowing it.

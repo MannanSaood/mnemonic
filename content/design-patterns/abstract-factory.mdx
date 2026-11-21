@@ -1,0 +1,622 @@
+---
+title: Abstract Factory
+track: design-patterns
+group: Creational
+order: 21
+summary: Put the creation of a whole family of related objects behind one interface, so code picks the family once and can never mix parts from two families.
+intent: Objects that must work together should come from one place that only knows how to make matching sets.
+changeRequest: The EU region must run on Azure.
+languages: [go, python, typescript, rust]
+glossary: [product-role, interface, dependency-injection, associated-type, open-closed]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/factory-method]
+skills: [design, extensibility]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: abstract-factory
+  scenarios:
+    - try: "Predict, then send an upload with staging's half-migrated config: GCS, SQS and GCP secrets."
+      notice: "The upload returns 200 and nothing ever happens. GCS only notifies Pub/Sub, so the SQS queue never hears about the file, and no error is logged."
+    - try: "Click through the map of all eight wirings and send an upload with each."
+      notice: "One works. The others fail loudly, crash-loop the worker, or fail silently. Three settings let the config say things the system cannot do."
+    - try: "Switch to One cloud factory and try to mix families again."
+      notice: "You cannot. Clicking any cell moves the whole column, because one factory makes all three products."
+    - try: "Apply both change requests: Azure, then a cache."
+      notice: "A new family costs one new type. A new kind of product costs an edit to every factory. That is the pattern's known price."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: env, sub: 3 settings }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: main, sub: CLOUD=gcp }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: clients, sub: 3 switches }
+      after:  { x: 150, y: 120, w: 160, h: 60, title: Service, sub: store · queue · secrets }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 340, y: 24, w: 210, h: 60, title: "" }
+      after:  { x: 340, y: 24, w: 210, h: 60, title: CloudFactory, sub: { go: BlobStore · Queue · Secrets, python: blob_store · queue · secrets, typescript: blobStore · queue · secrets, rust: "type Store, Jobs, Vault" } }
+    - id: aws
+      kind: concrete
+      before: { x: 188, y: 88, w: 222, h: 40, title: s3 · sqs · aws, sub: one case per switch }
+      after:  { x: 340, y: 204, w: 62, h: 40, title: AWS }
+    - id: gcp
+      kind: concrete
+      before: { x: 188, y: 140, w: 222, h: 40, title: gcs · pubsub · gcp, sub: one case per switch }
+      after:  { x: 414, y: 204, w: 62, h: 40, title: GCP }
+    - id: azure
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 200, w: 222, h: 40, title: azure ×3, sub: a case in each switch }
+      after:  { x: 488, y: 204, w: 62, h: 40, title: Azure }
+  edges:
+    - { from: client, to: strategy, label: picks one }
+    - { from: client, to: context, label: passes it }
+    - { from: context, to: strategy, label: asks }
+    - { from: aws, to: strategy, kind: implements }
+    - { from: gcp, to: strategy, kind: implements, label: implements }
+    - { from: azure, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: clients.go · prod.env
+      source: |
+        // clients.go
+        func NewStorage(cfg Config) (BlobStore, error) {
+            switch cfg.Storage {
+            case "s3":
+                return s3store.New(cfg.Region)
+            case "gcs":
+                return gcsstore.New(cfg.Project)
+            }
+            return nil, fmt.Errorf("unknown storage %q", cfg.Storage)
+        }
+
+        func NewQueue(cfg Config) (Queue, error) {
+            switch cfg.Queue {
+            case "sqs":
+                return sqsqueue.New(cfg.Region)
+            case "pubsub":
+                return pubsubqueue.New(cfg.Project)
+            }
+            return nil, fmt.Errorf("unknown queue %q", cfg.Queue)
+        }
+
+        func NewSecrets(cfg Config) (Secrets, error) {
+            switch cfg.Secrets {
+            case "aws":
+                return awssecrets.New(cfg.Region)
+            case "gcp":
+                return gcpsecrets.New(cfg.Project)
+            }
+            return nil, fmt.Errorf("unknown secrets %q", cfg.Secrets)
+        }
+
+        // prod.env: three settings, set separately
+        // STORAGE=s3 QUEUE=sqs SECRETS=aws
+      roles: { context: [2, 30], aws: [4, 5], gcp: [6, 7], client: [32, 33] }
+      change:
+        - { after: 7, add: ['    case "azure":', '        return azblobstore.New(cfg.Account)'] }
+        - { after: 17, add: ['    case "azure":', '        return azqueue.New(cfg.Account)'] }
+        - { after: 27, add: ['    case "azure":', '        return keyvault.New(cfg.Account)'] }
+        - { line: 33, replace: '// STORAGE=azure QUEUE=sqs SECRETS=azure   (one setting missed)' }
+    after:
+      file: cloud.go · main.go
+      source: |
+        type CloudFactory interface {
+            BlobStore() (BlobStore, error)
+            Queue() (Queue, error)
+            Secrets() (Secrets, error)
+        }
+
+        type GCP struct{ Project string }
+
+        func (g GCP) BlobStore() (BlobStore, error) { return gcsstore.New(g.Project) }
+        func (g GCP) Queue() (Queue, error)         { return pubsubqueue.New(g.Project) }
+        func (g GCP) Secrets() (Secrets, error)     { return gcpsecrets.New(g.Project) }
+
+        // AWS has the same three methods, built on S3, SQS and Secrets Manager.
+
+        func NewService(f CloudFactory) (*Service, error) {
+            store, err := f.BlobStore()
+            if err != nil {
+                return nil, err
+            }
+            q, err := f.Queue()
+            if err != nil {
+                return nil, err
+            }
+            sec, err := f.Secrets()
+            if err != nil {
+                return nil, err
+            }
+            return &Service{store: store, queue: q, secrets: sec}, nil
+        }
+
+        // main.go: one setting picks the whole family
+        svc, err := NewService(clouds[cfg.Cloud])
+      roles: { strategy: [1, 5], gcp: [7, 11], aws: [13, 13], context: [15, 29], client: [31, 32], wire: [32, 32], store: [16, 19], family: [20, 27], use: [28, 28] }
+    again:
+      file: azure.go
+      source: |
+        // azure.go: a new type, plus one entry in clouds
+        type Azure struct{ Account string }
+
+        func (a Azure) BlobStore() (BlobStore, error) { return azblobstore.New(a.Account) }
+        func (a Azure) Queue() (Queue, error)         { return azqueue.New(a.Account) }
+        func (a Azure) Secrets() (Secrets, error)     { return keyvault.New(a.Account) }
+    cost:
+      before: { text: 7 lines · 4 places, value: 0.9 }
+      after: { text: 1 new type · 0 edits, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A small interface with one method per product, satisfied implicitly. Go code often skips the interface and passes a struct of constructor funcs instead; that still keeps the choice in one place. The pattern earns its keep when products from two families would compile together but fail at runtime, as here.'
+      seenIn: 'A `database/sql/driver.Conn` creates the `Stmt` and `Tx` that belong to it, so a Postgres statement never runs on a MySQL connection. The Go CDK (`gocloud.dev`) gives portable `blob`, `pubsub` and `secrets` APIs but opens each one by its own URL, so keeping them on one cloud is still your job.'
+
+  python:
+    before:
+      file: clients.py · prod.env
+      source: |
+        # clients.py
+        def make_storage(cfg: Config) -> BlobStore:
+            match cfg.storage:
+                case "s3": return S3Store(cfg.region)
+                case "gcs": return GcsStore(cfg.project)
+            raise ValueError(f"unknown storage {cfg.storage!r}")
+
+        def make_queue(cfg: Config) -> Queue:
+            match cfg.queue:
+                case "sqs": return SqsQueue(cfg.region)
+                case "pubsub": return PubSubQueue(cfg.project)
+            raise ValueError(f"unknown queue {cfg.queue!r}")
+
+        def make_secrets(cfg: Config) -> Secrets:
+            match cfg.secrets:
+                case "aws": return AwsSecrets(cfg.region)
+                case "gcp": return GcpSecrets(cfg.project)
+            raise ValueError(f"unknown secrets {cfg.secrets!r}")
+
+        # prod.env: three settings, set separately
+        # STORAGE=s3 QUEUE=sqs SECRETS=aws
+      roles: { context: [2, 18], aws: [4, 4], gcp: [5, 5], client: [20, 21] }
+      change:
+        - { after: 5, add: ['        case "azure": return AzureBlobStore(cfg.account)'] }
+        - { after: 11, add: ['        case "azure": return AzureQueue(cfg.account)'] }
+        - { after: 17, add: ['        case "azure": return KeyVaultSecrets(cfg.account)'] }
+        - { line: 21, replace: '# STORAGE=azure QUEUE=sqs SECRETS=azure   (one setting missed)' }
+    after:
+      file: cloud.py · main.py
+      source: |
+        class CloudFactory(Protocol):
+            def blob_store(self) -> BlobStore: ...
+            def queue(self) -> Queue: ...
+            def secrets(self) -> Secrets: ...
+
+        @dataclass(frozen=True)
+        class Gcp:
+            project: str
+            def blob_store(self) -> BlobStore: return GcsStore(self.project)
+            def queue(self) -> Queue: return PubSubQueue(self.project)
+            def secrets(self) -> Secrets: return GcpSecrets(self.project)
+
+        # Aws has the same three methods, built on S3, SQS and Secrets Manager.
+
+        class Service:
+            def __init__(self, cloud: CloudFactory):
+                self.store = cloud.blob_store()
+                self.queue = cloud.queue()
+                self.secrets = cloud.secrets()
+
+        # main.py: one setting picks the whole family
+        service = Service(cloud_for(settings.CLOUD))
+      roles: { strategy: [1, 4], gcp: [6, 11], aws: [13, 13], context: [15, 19], client: [21, 22], wire: [22, 22], store: [17, 17], family: [18, 19], use: [15, 16] }
+    again:
+      file: azure.py
+      source: |
+        # azure.py: a new class, plus one entry in cloud_for
+        @dataclass(frozen=True)
+        class Azure:
+            account: str
+            def blob_store(self) -> BlobStore: return AzureBlobStore(self.account)
+            def queue(self) -> Queue: return AzureQueue(self.account)
+            def secrets(self) -> Secrets: return KeyVaultSecrets(self.account)
+    cost:
+      before: { text: 4 lines · 4 places, value: 0.85 }
+      after: { text: 1 new class · 0 edits, value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A `Protocol` names the family, and any class with the three methods fits. A module can play the same role: `from clouds import gcp as cloud` gives you `cloud.blob_store()` and friends. Python will not stop a mixed wiring at type level, so build the three objects in one place.'
+      seenIn: 'Each Django database backend''s `DatabaseWrapper` names a matching `ops_class`, `features_class`, `introspection_class` and `creation_class`. SQLAlchemy dialects bundle a database''s type compiler, statement compiler and DBAPI wiring.'
+
+  typescript:
+    before:
+      file: clients.ts · prod.env
+      source: |
+        // clients.ts
+        export function makeStorage(cfg: Config): BlobStore {
+          switch (cfg.storage) {
+            case "s3": return new S3Store(cfg.region);
+            case "gcs": return new GcsStore(cfg.project);
+          }
+        }
+
+        export function makeQueue(cfg: Config): Queue {
+          switch (cfg.queue) {
+            case "sqs": return new SqsQueue(cfg.region);
+            case "pubsub": return new PubSubQueue(cfg.project);
+          }
+        }
+
+        export function makeSecrets(cfg: Config): Secrets {
+          switch (cfg.secrets) {
+            case "aws": return new AwsSecrets(cfg.region);
+            case "gcp": return new GcpSecrets(cfg.project);
+          }
+        }
+
+        // prod.env: three settings, set separately
+        // STORAGE=s3 QUEUE=sqs SECRETS=aws
+      roles: { context: [2, 21], aws: [4, 4], gcp: [5, 5], client: [23, 24] }
+      change:
+        - { after: 5, add: ['    case "azure": return new AzureBlobStore(cfg.account);'] }
+        - { after: 12, add: ['    case "azure": return new AzureQueue(cfg.account);'] }
+        - { after: 19, add: ['    case "azure": return new KeyVaultSecrets(cfg.account);'] }
+        - { line: 24, replace: '// STORAGE=azure QUEUE=sqs SECRETS=azure   (one setting missed)' }
+    after:
+      file: cloud.ts · main.ts
+      source: |
+        interface CloudFactory {
+          blobStore(): BlobStore;
+          queue(): Queue;
+          secrets(): Secrets;
+        }
+
+        class Gcp implements CloudFactory {
+          constructor(private readonly project: string) {}
+          blobStore() { return new GcsStore(this.project); }
+          queue() { return new PubSubQueue(this.project); }
+          secrets() { return new GcpSecrets(this.project); }
+        }
+
+        // Aws has the same three methods, built on S3, SQS and Secrets Manager.
+
+        class Service {
+          private readonly store: BlobStore;
+          private readonly queue: Queue;
+          private readonly secrets: Secrets;
+
+          constructor(cloud: CloudFactory) {
+            this.store = cloud.blobStore();
+            this.queue = cloud.queue();
+            this.secrets = cloud.secrets();
+          }
+        }
+
+        // main.ts: one setting picks the whole family
+        const service = new Service(cloudFor(env.CLOUD));
+      roles: { strategy: [1, 5], gcp: [7, 12], aws: [14, 14], context: [16, 26], client: [28, 29], wire: [29, 29], store: [22, 22], family: [23, 24], use: [16, 19] }
+    again:
+      file: azure.ts
+      source: |
+        // azure.ts: a new class, plus one entry in cloudFor
+        export class Azure implements CloudFactory {
+          constructor(private readonly account: string) {}
+          blobStore() { return new AzureBlobStore(this.account); }
+          queue() { return new AzureQueue(this.account); }
+          secrets() { return new KeyVaultSecrets(this.account); }
+        }
+    cost:
+      before: { text: 4 lines · 4 places, value: 0.85 }
+      after: { text: 1 new class · 0 edits, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'An interface and a class per family, or just an object literal with three functions. Types are structural, so any object with `blobStore`, `queue` and `secrets` fits. Keep `cloudFor` as the only place that reads `CLOUD`.'
+      seenIn: 'A Kysely `Dialect` creates the matching driver, query compiler, adapter and introspector for one database. Test setups that swap a whole set of fakes in through one object follow the same shape.'
+
+  rust:
+    before:
+      file: clients.rs · prod.env
+      source: |
+        // clients.rs
+        fn make_storage(cfg: &Config) -> Box<dyn BlobStore> {
+            match cfg.storage {
+                StorageKind::S3 => Box::new(S3Store::new(&cfg.region)),
+                StorageKind::Gcs => Box::new(GcsStore::new(&cfg.project)),
+            }
+        }
+
+        fn make_queue(cfg: &Config) -> Box<dyn Queue> {
+            match cfg.queue {
+                QueueKind::Sqs => Box::new(SqsQueue::new(&cfg.region)),
+                QueueKind::PubSub => Box::new(PubSubQueue::new(&cfg.project)),
+            }
+        }
+
+        fn make_secrets(cfg: &Config) -> Box<dyn Secrets> {
+            match cfg.secrets {
+                SecretsKind::Aws => Box::new(AwsSecrets::new(&cfg.region)),
+                SecretsKind::Gcp => Box::new(GcpSecrets::new(&cfg.project)),
+            }
+        }
+
+        // prod.env: three settings, set separately
+        // STORAGE=s3 QUEUE=sqs SECRETS=aws
+      roles: { context: [2, 21], aws: [4, 4], gcp: [5, 5], client: [23, 24] }
+      change:
+        - { after: 5, add: ['        StorageKind::Azure => Box::new(AzureBlobStore::new(&cfg.account)),'] }
+        - { after: 12, add: ['        QueueKind::Azure => Box::new(AzureQueue::new(&cfg.account)),'] }
+        - { after: 19, add: ['        SecretsKind::Azure => Box::new(KeyVault::new(&cfg.account)),'] }
+        - { line: 24, replace: '// STORAGE=azure QUEUE=sqs SECRETS=azure   (one setting missed)' }
+    after:
+      file: cloud.rs · main.rs
+      source: |
+        trait Cloud {
+            type Store: BlobStore;
+            type Jobs: Queue;
+            type Vault: Secrets;
+
+            fn blob_store(&self) -> Self::Store;
+            fn queue(&self) -> Self::Jobs;
+            fn secrets(&self) -> Self::Vault;
+        }
+
+        struct Gcp { project: String }
+
+        impl Cloud for Gcp {
+            type Store = GcsStore;
+            type Jobs = PubSubQueue;
+            type Vault = GcpSecrets;
+            fn blob_store(&self) -> GcsStore { GcsStore::new(&self.project) }
+            fn queue(&self) -> PubSubQueue { PubSubQueue::new(&self.project) }
+            fn secrets(&self) -> GcpSecrets { GcpSecrets::new(&self.project) }
+        }
+
+        struct Service<C: Cloud> { store: C::Store, queue: C::Jobs, secrets: C::Vault }
+
+        impl<C: Cloud> Service<C> {
+            fn new(cloud: &C) -> Self {
+                Service { store: cloud.blob_store(), queue: cloud.queue(), secrets: cloud.secrets() }
+            }
+        }
+
+        // main.rs: one setting picks the whole family
+        match cfg.cloud {
+            CloudKind::Gcp => run(Service::new(&Gcp { project: cfg.project })),
+            CloudKind::Aws => run(Service::new(&Aws { region: cfg.region })),
+        }
+      roles: { strategy: [1, 9], gcp: [11, 20], context: [22, 28], client: [30, 34], wire: [31, 32], store: [26, 26], family: [22, 22], use: [24, 28] }
+    again:
+      file: azure.rs
+      source: |
+        // azure.rs: a new type, plus one arm in main's match
+        struct Azure { account: String }
+
+        impl Cloud for Azure {
+            type Store = AzureBlobStore;
+            type Jobs = AzureQueue;
+            type Vault = KeyVault;
+            fn blob_store(&self) -> AzureBlobStore { AzureBlobStore::new(&self.account) }
+            fn queue(&self) -> AzureQueue { AzureQueue::new(&self.account) }
+            fn secrets(&self) -> KeyVault { KeyVault::new(&self.account) }
+        }
+    cost:
+      before: { text: 4 lines · 4 places, value: 0.85 }
+      after: { text: 1 new type · 1 match arm, value: 0.18 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Associated types make the family a compile-time fact. `Service<Gcp>` holds a `GcsStore` and a `PubSubQueue`, and no other combination type-checks. Calls are static and can be inlined. Use a trait object (`Box<dyn CloudFactory>` returning boxed products) only if the family must change without a rebuild.'
+      seenIn: '`sqlx::Database` ties a backend''s `Connection`, `Row` and `TypeInfo` together as associated types, so a Postgres row never meets a SQLite connection.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: '`main` reads one setting, `CLOUD=gcp`, and picks the GCP factory. This is the only place that knows which cloud the service runs on.'
+    nodes: [client, strategy, gcp]
+    edges: [client>strategy]
+    role: wire
+  - text: 'The service asks the factory for object storage and gets a GCS client. It only sees the `BlobStore` interface.'
+    nodes: [context, strategy, gcp]
+    edges: [client>context, context>strategy, gcp>strategy]
+    role: store
+  - text: It asks the same factory for the queue and the secrets store. The same factory can only answer with GCP products, so the queue is Pub/Sub, the one GCS can notify.
+    nodes: [context, strategy, gcp]
+    edges: [context>strategy, gcp>strategy]
+    role: family
+  - text: From here on the service works through three interfaces. It never names a cloud, and it can never hold a mixed set.
+    nodes: [context]
+    edges: []
+    role: use
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which of these situations calls for an Abstract Factory?
+    options:
+      - text: A tenant can run on Postgres or MySQL, and the connection, the query builder and the migration runner must all be for the same database.
+        correct: true
+        why: Right. Several related objects vary together, and mixing them is a bug. One factory per database makes the whole matching set.
+      - text: An export job writes CSV, JSON or Parquet, and each customer gets one format.
+        why: That is one product that varies. A factory method or a plain map from format to constructor is enough.
+      - text: Every part of the app should share one connection pool.
+        why: That is about how many instances exist, which is Singleton territory (and usually better solved by passing the pool in).
+  engineer:
+    question: Every cloud now needs a cache (ElastiCache, Memorystore, Azure Cache). What does the Abstract Factory design cost?
+    options:
+      - text: A new method on the factory interface, and an implementation of it in every factory.
+        correct: true
+        why: Right. The catalogue lists this as the pattern's main drawback. New families are cheap; new kinds of product touch every family.
+      - text: One new factory class for caches, and nothing else changes.
+        why: A separate cache factory would bring back the original problem. Nothing would stop an AWS cache in a GCP deployment.
+      - text: Nothing. The service can create the cache itself.
+        why: Then the service names a cloud again, and the cache can come from a different family than everything else.
+  deep:
+    question: In Rust, Service<C> stores C::Store and C::Jobs, both associated types of one Cloud type. What stops a Service from holding S3 storage with a Pub/Sub queue?
+    options:
+      - text: The compiler. Both field types come from the same C, and only an impl of Cloud can pair them, so a mixed set does not type-check.
+        correct: true
+        why: Right. The family is part of the type. The check costs nothing at runtime, and the calls are static.
+      - text: A runtime check that Service::new performs when it is built.
+        why: There is no such check in the code. The guarantee comes from the types before the program runs.
+      - text: Nothing. Associated types are erased, so any store and queue can be stored.
+        why: Associated types are resolved at compile time and become concrete field types in each monomorphised Service.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Abstract factory
+      example: { go: "CloudFactory (interface)", python: "CloudFactory (Protocol)", typescript: "CloudFactory (interface)", rust: "Cloud (trait with associated types)" }
+      job: One creation method per product in the family.
+    - role: Concrete factory
+      example: "AWS, GCP, Azure"
+      job: Creates every product for one family, and only that family.
+    - role: Abstract product
+      example: "BlobStore, Queue, Secrets"
+      job: The interfaces the client uses.
+    - role: Concrete product
+      example: "S3Store, SqsQueue, GcsStore, PubSubQueue"
+      job: One family's version of a product.
+    - role: Client
+      example: Service
+      job: Asks the factory for products and never names a family.
+  useWhen:
+    - Several objects vary together and only work in matching sets, like a cloud's storage and the queue it can notify.
+    - You choose the family once, from config or environment, and want the rest of the code free of that choice.
+    - New families arrive more often than new kinds of product.
+  avoidWhen:
+    - There is one product, or the products do not depend on each other. Separate factories, or none, are simpler.
+    - New kinds of product arrive often. Each one edits every factory.
+    - You only ever run on one family. An interface with one implementation is ceremony; add it when the second family is real.
+  tradeoffs:
+    - Adding a new kind of product changes the interface and every concrete factory.
+    - More interfaces and types than plain constructors.
+    - The factory has to be passed to everything that creates products, or the choice leaks back out.
+  lookalikes:
+    - name: Factory Method
+      how: One overridable method creating one product. An abstract factory is usually a set of factory methods on one object.
+    - name: Builder
+      how: Assembles one complex object step by step. Abstract Factory returns finished products right away, one per call.
+    - name: Prototype
+      how: Can implement a factory by cloning a registered example of each product instead of naming classes.
+    - name: Facade
+      how: Hides a set of subsystems behind one simpler interface. An abstract factory only creates; it does not hide how the products are used.
+---
+
+## [concept] Abstract Factory
+
+**Put the creation of a whole family of related objects behind one interface, so code picks the family once and can never mix parts from two families.**
+
+Objects that must work together come from one place, and that place only knows how to make matching sets.
+
+<Depth level={2}>
+The **abstract factory** (`CloudFactory`) has one creation method per product: storage, queue, secrets. Each **concrete factory** (AWS, GCP) implements all of them for its own cloud. The service receives one factory through <Term id="dependency-injection">dependency injection</Term> and only ever sees the <Term id="product-role">product</Term> interfaces.
+</Depth>
+
+<Depth level={3}>
+The 1994 *Design Patterns* catalogue, where the pattern is also called Kit, uses widget toolkits for its example: one factory per look and feel, so Motif scroll bars never appear next to Presentation Manager buttons. It lists four consequences. The pattern isolates concrete classes, makes exchanging families easy and promotes consistency among products, and it makes supporting new kinds of product difficult. It also notes that an application usually needs only one concrete factory per family.
+</Depth>
+
+## [problem] Three settings that must agree
+
+A service stores uploads in object storage. Storage notifies a queue, and a worker reads a database password from the secrets store before it processes the file. Production runs on AWS; the company is moving to GCP.
+
+Read it once. Storage, queue and secrets are each chosen by their own setting and their own switch.
+
+<Depth level={2}>
+Each switch is correct on its own. The bug lives between them. Nothing in the code says that S3 can only notify SQS, or that the worker can only read secrets from the cloud it runs in.
+</Depth>
+
+<Depth level={3}>
+The config can express eight wirings, and two of them are real deployments. Most of the other six fail with an error, but some fail silently: storage from one cloud, a queue from another, and uploads that are accepted and then never processed.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** the EU region must run on Azure.
+
+Every switch needs an Azure case, and every environment file needs three new values. Miss one value and the code is happy to build a mixed set.
+
+<Depth level={2}>
+Look at the env line. It is the kind of slip a reviewer does not catch: two of three settings changed. Azure Blob Storage cannot deliver its events to SQS, so EU uploads succeed and are never processed.
+</Depth>
+
+<Depth level={3}>
+Tests do not help much. Each switch has its own tests and they all pass. The failure only appears in the combination, and the number of combinations grows with the cube of the number of clouds.
+</Depth>
+
+## [morph] Make the family the unit of choice
+
+Drag the slider. The three switches collapse into one interface, and each cloud becomes one type that makes all three products.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The choice moves from three settings to one. A family can still be the wrong one for the environment, but then everything fails at once and loudly, which is easy to see and to fix.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">Go checks that `GCP` satisfies `CloudFactory` where a `GCP` is passed as one. It does not check that the three products belong together; that comes from writing them in one type.</Lang>
+<Lang only="python">mypy checks that `Gcp` fits the `CloudFactory` Protocol. Nothing at runtime ties the products together except that one class builds them all.</Lang>
+<Lang only="typescript">The interface is structural, so a test can pass `{ blobStore: () => fakeStore, queue: () => fakeQueue, secrets: () => fakeSecrets }` without any class.</Lang>
+<Lang only="rust">Each `impl Cloud` fixes three <Term id="associated-type">associated types</Term> at once. `Service<Gcp>` is a different type from `Service<Aws>`, and their fields can only be that cloud's products.</Lang>
+</Depth>
+
+## [walk] Follow the service starting up
+
+One startup on GCP, from the setting to a running service. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">Each `f.BlobStore()` call goes through the interface's method table. It happens three times at startup and never again, so the cost does not matter.</Lang>
+<Lang only="python">`cloud.blob_store()` is an ordinary method call on whatever object `cloud_for` returned. A `Protocol` adds nothing at runtime.</Lang>
+<Lang only="typescript">The interface disappears after compilation. At runtime `cloud.blobStore()` is a property lookup on the object `cloudFor` returned.</Lang>
+<Lang only="rust">`Service::new(&Gcp { … })` is compiled for `Gcp` specifically. Every call to `cloud.blob_store()` is static, and the `match` in `main` is the one place where the family is chosen at runtime.</Lang>
+</Depth>
+
+## [again] Azure, the second time
+
+The same Azure request after the refactor. You add one type that makes Azure's three products. The switches are gone, and the environment file has one value to set, so there is no setting left to miss.
+
+<Depth level={2}>
+The pattern's bill arrives with the other kind of change. If every cloud needs a cache next quarter, the factory interface grows a method and every factory must implement it. Abstract Factory makes new families cheap and new products expensive. Choose it when you expect more of the first.
+</Depth>
+
+<Depth level={3}>
+Tests benefit too. One fake factory that returns an in-memory store, queue and secrets map lets you test the service without any cloud, and the fakes always come as a matching set.
+</Depth>
+
+## [play] Wire a service to one cloud
+
+Staging moved to GCP last week, and somebody updated two of the three settings. Send an upload, then explore every wiring the config allows and see how few of them work.
+
+## [lens] How each language writes it
+
+The idea is the same in every language. How strongly each one enforces the family is not: Rust can make a mixed set a compile error, Python can only make it unlikely.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="abstract-factory" />
+
+### Families as configuration
+
+In many codebases the abstract factory is not a class at all. It is the function that reads `CLOUD` and returns three objects, or a dependency injection container's module for one environment. The pattern is in the shape, one choice that yields a matching set, whatever the code calls it.
