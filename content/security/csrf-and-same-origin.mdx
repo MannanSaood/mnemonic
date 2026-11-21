@@ -1,0 +1,514 @@
+---
+title: Cross-site request forgery and the same-origin idea
+track: security
+group: Web attacks
+order: 15
+summary: Browsers attach your cookies to requests that other sites start. Tell your own pages' requests apart with the Origin and Sec-Fetch-Site headers or a token, set SameSite explicitly, and never change state on GET.
+intent: Know which requests another site can make a logged-in browser send, which cookie and header rules apply, and which server check actually stops a forged one.
+changeRequest: Partners want to embed our account widget in their sites, so the session cookie needs SameSite=None.
+languages: [go, python, typescript, rust]
+glossary: [csrf, same-origin-policy, samesite, site-vs-origin, csrf-token, fetch-metadata, cors-preflight, cookie-prefix]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [security/sessions-and-cookies]
+skills: [appsec]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: csrf-and-same-origin
+  scenarios:
+    - try: "With SameSite=None and no checks, fire the fetch() card, then the JSON fetch() card."
+      notice: "The form-encoded fetch moves 250 even though the bank sends no CORS headers: only reading the reply is blocked. The JSON one needs a preflight, which fails, so it is never sent."
+    - try: "Switch the cookie to SameSite=Lax, turn on /transfer also accepts GET, and fire the link."
+      notice: "Lax still sends the cookie on a top-level GET, and the token and origin checks both skip GET. Turn GET off and the link gets a 405."
+    - try: "Set SameSite=Strict and fire the sibling subdomain's form."
+      notice: "community.bank.example is the same site, so even Strict sends the cookie. Only the origin check or the token stops it."
+    - try: "Turn on the origin check, then the token, and watch the badges on the attacker's page."
+      notice: "Either one alone blocks every forged POST, and your own form keeps working. GET must stay off."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: browser
+      kind: client
+      before: { x: 12, y: 106, w: 104, h: 56, title: browser, sub: logged in to bank }
+      after:  { x: 12, y: 106, w: 104, h: 56, title: browser, sub: logged in to bank }
+    - id: bank
+      kind: context
+      before: { x: 144, y: 24, w: 264, h: 226, title: POST /transfer, sub: "what you assumed: a cookie means the user asked" }
+      after:  { x: 144, y: 106, w: 122, h: 56, title: POST /transfer, sub: own pages only }
+    - id: defence
+      kind: strategy
+      appears: after
+      before: { x: 144, y: 206, w: 122, h: 52, title: "" }
+      after:  { x: 144, y: 206, w: 122, h: 52, title: origin check, sub: Sec-Fetch-Site · token }
+    - id: cookie
+      kind: concrete
+      before: { x: 164, y: 112, w: 224, h: 48, title: session cookie, sub: sent with every request }
+      after:  { x: 292, y: 106, w: 116, h: 56, title: SameSite=Lax, sub: withheld cross-site }
+    - id: attacker
+      kind: concrete
+      before: { x: 436, y: 106, w: 112, h: 56, title: deals.example, sub: hidden form }
+      after:  { x: 436, y: 106, w: 112, h: 56, title: deals.example, sub: "403 · no cookie" }
+  edges:
+    - { from: browser, to: bank, label: request }
+    - { from: bank, to: cookie }
+    - { from: attacker, to: cookie, label: forged POST }
+    - { from: defence, to: bank, kind: implements, label: rejects }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: session.go · transfer.go
+      source: |
+        // session.go · transfer.go
+        func setSession(w http.ResponseWriter, id string) {
+            http.SetCookie(w, &http.Cookie{
+                Name: "session", Value: id, Path: "/",
+                Secure: true, HttpOnly: true,
+            })
+        }
+
+        func (a *App) transfer(w http.ResponseWriter, r *http.Request) {
+            user, ok := a.sessions.User(r) // reads the session cookie
+            if !ok {
+                http.Error(w, "log in", http.StatusUnauthorized)
+                return
+            }
+            to, amount := r.FormValue("to"), r.FormValue("amount")
+            if err := a.ledger.Transfer(r.Context(), user, to, amount); err != nil {
+                http.Error(w, err.Error(), http.StatusBadRequest)
+                return
+            }
+            http.Redirect(w, r, "/account", http.StatusSeeOther)
+        }
+      roles: { browser: [10, 10], bank: [9, 21], defence: [10, 14], cookie: [2, 7], attacker: [15, 15] }
+      change:
+        - { line: 5, replace: '        Secure: true, HttpOnly: true, SameSite: http.SameSiteNoneMode, // so partners can embed the widget' }
+        - { line: 15, replace: '    to, amount := r.FormValue("to"), r.FormValue("amount") // FormValue also reads the query string' }
+    after:
+      file: session.go · routes.go
+      source: |
+        // session.go · routes.go
+        func setSession(w http.ResponseWriter, id string) {
+            http.SetCookie(w, &http.Cookie{
+                Name: "__Host-session", Value: id, Path: "/",
+                Secure: true, HttpOnly: true,
+                SameSite: http.SameSiteLaxMode, // explicit; the widget gets its own read-only cookie
+            })
+        }
+
+        func (a *App) routes() http.Handler {
+            mux := http.NewServeMux()
+            mux.HandleFunc("GET /account", a.account)
+            mux.HandleFunc("POST /transfer", a.transfer) // state changes only on POST
+            mux.Handle("GET /widget/", a.widget())       // read-only and embeddable
+
+            // Go 1.25: reject cross-origin POST, PUT, PATCH and DELETE, using
+            // Sec-Fetch-Site and falling back to comparing Origin with Host.
+            return http.NewCrossOriginProtection().Handler(mux)
+        }
+      roles: { browser: [12, 12], bank: [10, 19], defence: [16, 18], cookie: [2, 8], attacker: [18, 18], samesite: [6, 6], origin: [16, 18], post: [13, 14], own: [11, 13] }
+    again:
+      file: access.log
+      source: |
+        deals.example           POST /transfer  (hidden form)  no cookie: Lax    401
+        community.bank.example  POST /transfer  Sec-Fetch-Site: same-site        403
+        deals.example           GET  /transfer?to=mallory                        405
+        bank.example            POST /transfer  (your form)                      303
+    cost:
+      before: { text: any page you visit can move your money, value: 0.9 }
+      after: { text: 0 of 7 forged requests get through, value: 0.05 }
+    lens:
+      need: 2
+      needLabel: One setting
+      note: 'Go 1.25 added `http.CrossOriginProtection`: it rejects unsafe methods whose `Sec-Fetch-Site` is not same-origin or none, or, without that header, whose `Origin` host differs from `Host`. Requests with neither header (curl, servers) pass. GET, HEAD and OPTIONS are always allowed, so routes must not change state on them; method patterns such as `"POST /transfer"` in `ServeMux` enforce that. Before 1.25, `gorilla/csrf` provides tokens.'
+      seenIn: '`http.NewCrossOriginProtection()`, `AddTrustedOrigin`, `AddInsecureBypassPattern`. `http.Cookie.SameSite` and `http.SameSiteLaxMode`. `gorilla/csrf`.'
+
+  python:
+    before:
+      file: settings.py · views.py
+      source: |
+        # settings.py · views.py
+        SESSION_COOKIE_SECURE = True
+        SESSION_COOKIE_SAMESITE = "Lax"  # Django's default
+
+        @csrf_exempt  # the mobile app posts here too, and it has no token
+        @login_required
+        def transfer(request):
+            to, amount = request.POST["to"], request.POST["amount"]
+            ledger.transfer(request.user, to, amount)
+            return redirect("account")
+      roles: { browser: [7, 7], bank: [7, 10], defence: [5, 5], cookie: [2, 3], attacker: [8, 8] }
+      change:
+        - { line: 3, replace: 'SESSION_COOKIE_SAMESITE = "None"  # so partners can embed the widget' }
+    after:
+      file: settings.py · views.py
+      source: |
+        # settings.py · views.py
+        SESSION_COOKIE_SECURE = True
+        SESSION_COOKIE_SAMESITE = "Lax"  # the widget uses its own read-only cookie
+        CSRF_COOKIE_SECURE = True
+        CSRF_TRUSTED_ORIGINS = []  # no other origin may post to us
+        # django.middleware.csrf.CsrfViewMiddleware stays in MIDDLEWARE
+
+        # The mobile app moves to a token-authenticated API; this view is browser-only.
+        @require_POST
+        @login_required
+        def transfer(request):  # CsrfViewMiddleware checked Origin and the token already
+            to, amount = request.POST["to"], request.POST["amount"]
+            ledger.transfer(request.user, to, amount)
+            return redirect("account")
+      roles: { browser: [11, 11], bank: [9, 14], defence: [4, 6], cookie: [2, 3], attacker: [5, 5], samesite: [3, 3], origin: [4, 6], post: [9, 9], own: [11, 14] }
+    again:
+      file: access.log
+      source: |
+        deals.example           POST /transfer  (hidden form)  no cookie: Lax    302 to login
+        community.bank.example  POST /transfer  Origin not trusted               403
+        deals.example           GET  /transfer?to=mallory                        405
+        bank.example            POST /transfer  (your form)                      302
+    cost:
+      before: { text: any page you visit can move your money, value: 0.9 }
+      after: { text: 0 of 7 forged requests get through, value: 0.05 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: 'Django turns on `CsrfViewMiddleware` by default. On unsafe methods it checks the `Origin` header against the host and `CSRF_TRUSTED_ORIGINS` (Django 4.0+), the `Referer` on HTTPS when Origin is absent, and the masked token from `{% csrf_token %}` or the `X-CSRFToken` header. The usual hole is `@csrf_exempt` added for a non-browser client; give that client token authentication instead. Flask has no built-in protection; Flask-WTF''s `CSRFProtect` adds it.'
+      seenIn: '`CsrfViewMiddleware`, `{% csrf_token %}`, `@csrf_exempt`, `@require_POST`. `SESSION_COOKIE_SAMESITE`. Flask-WTF `CSRFProtect`. Starlette and FastAPI need a middleware or a header check you write.'
+
+  typescript:
+    before:
+      file: app.ts
+      source: |
+        // app.ts
+        app.use(session({
+          secret: process.env.SESSION_SECRET!,
+          cookie: { secure: true, httpOnly: true },
+        }));
+
+        app.post("/transfer", express.urlencoded({ extended: false }), async (req, res) => {
+          if (!req.session.userId) return res.status(401).send("log in");
+          await ledger.transfer(req.session.userId, req.body.to, req.body.amount);
+          res.redirect(303, "/account");
+        });
+      roles: { browser: [7, 7], bank: [7, 11], defence: [8, 8], cookie: [2, 5], attacker: [9, 9] }
+      change:
+        - { line: 4, replace: '  cookie: { secure: true, httpOnly: true, sameSite: "none" }, // so partners can embed the widget' }
+    after:
+      file: app.ts
+      source: |
+        // app.ts
+        app.use(session({
+          secret: process.env.SESSION_SECRET!,
+          cookie: { secure: true, httpOnly: true, sameSite: "lax" }, // explicit, never the browser's guess
+        }));
+
+        // Reject cross-origin state changes: Sec-Fetch-Site first, then Origin.
+        app.use((req, res, next) => {
+          if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+          const site = req.get("sec-fetch-site");
+          const origin = req.get("origin");
+          const ok = site ? site === "same-origin" || site === "none" : !origin || origin === APP_ORIGIN;
+          if (!ok) return res.status(403).send("cross-origin request blocked");
+          next();
+        });
+
+        app.post("/transfer", express.urlencoded({ extended: false }), async (req, res) => {
+          if (!req.session.userId) return res.status(401).send("log in");
+          await ledger.transfer(req.session.userId, req.body.to, req.body.amount);
+          res.redirect(303, "/account");
+        });
+      roles: { browser: [17, 17], bank: [17, 21], defence: [7, 15], cookie: [2, 5], attacker: [12, 13], samesite: [4, 4], origin: [8, 15], post: [17, 17], own: [17, 21] }
+    again:
+      file: access.log
+      source: |
+        deals.example           POST /transfer  (hidden form)  no cookie: Lax    401
+        community.bank.example  POST /transfer  Sec-Fetch-Site: same-site        403
+        deals.example           GET  /transfer?to=mallory                        404
+        bank.example            POST /transfer  (your form)                      303
+    cost:
+      before: { text: any page you visit can move your money, value: 0.9 }
+      after: { text: 0 of 7 forged requests get through, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'Express has no CSRF protection built in, and the long-used `csurf` package was deprecated in 2022. Use a Sec-Fetch-Site and Origin check like the one above, or a signed double-submit token library such as `csrf-csrf`. `express-session` sets no SameSite unless you say so, which leaves it to each browser. Next.js Server Actions compare `Origin` with the host for you.'
+      seenIn: '`express-session` `cookie.sameSite`. `csrf-csrf`. Next.js `serverActions.allowedOrigins`. `fetch(url, { credentials: "include" })` on the attacking side.'
+
+  rust:
+    before:
+      file: session.rs · routes.rs
+      source: |
+        // session.rs · routes.rs
+        fn session_cookie(id: String) -> Cookie<'static> {
+            Cookie::build(("session", id))
+                .path("/")
+                .secure(true)
+                .http_only(true)
+                .build()
+        }
+
+        pub fn routes(state: AppState) -> Router {
+            Router::new()
+                .route("/account", get(account))
+                .route("/transfer", post(transfer)) // reads the user from the session cookie
+                .with_state(state)
+        }
+      roles: { browser: [12, 12], bank: [10, 15], defence: [13, 13], cookie: [2, 8], attacker: [13, 13] }
+      change:
+        - { after: 6, add: ['        .same_site(SameSite::None) // so partners can embed the widget'] }
+    after:
+      file: session.rs · routes.rs
+      source: |
+        // session.rs · routes.rs
+        fn session_cookie(id: String) -> Cookie<'static> {
+            Cookie::build(("__Host-session", id))
+                .path("/")
+                .secure(true)
+                .http_only(true)
+                .same_site(SameSite::Lax) // explicit; the widget has its own cookie
+                .build()
+        }
+
+        // Reject cross-origin state changes: Sec-Fetch-Site first, then Origin.
+        async fn same_origin_only(req: Request, next: Next) -> Result<Response, StatusCode> {
+            if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+                let h = req.headers();
+                let ok = match h.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+                    Some(site) => site == "same-origin" || site == "none",
+                    None => h.get(header::ORIGIN).map_or(true, |o| o == APP_ORIGIN),
+                };
+                if !ok {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+            Ok(next.run(req).await)
+        }
+
+        pub fn routes(state: AppState) -> Router {
+            Router::new()
+                .route("/account", get(account))
+                .route("/transfer", post(transfer))
+                .layer(middleware::from_fn(same_origin_only))
+                .with_state(state)
+        }
+      roles: { browser: [28, 28], bank: [26, 32], defence: [11, 24], cookie: [2, 9], attacker: [15, 18], samesite: [7, 7], origin: [12, 24], post: [29, 29], own: [26, 32] }
+    again:
+      file: access.log
+      source: |
+        deals.example           POST /transfer  (hidden form)  no cookie: Lax    401
+        community.bank.example  POST /transfer  Sec-Fetch-Site: same-site        403
+        deals.example           GET  /transfer?to=mallory                        405
+        bank.example            POST /transfer  (your form)                      303
+    cost:
+      before: { text: any page you visit can move your money, value: 0.9 }
+      after: { text: 0 of 7 forged requests get through, value: 0.05 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'axum and actix-web ship no CSRF middleware. A Sec-Fetch-Site and Origin check is a dozen lines of `middleware::from_fn`, as above, or a tower layer; crates such as `axum_csrf` add tokens. `axum_extra::extract::cookie::Cookie` and `tower-sessions` let you set `SameSite`; check what your session crate defaults to rather than assuming.'
+      seenIn: '`axum::middleware::from_fn`. `axum_extra::extract::cookie::{Cookie, SameSite}`. `tower_sessions::SessionManagerLayer::with_same_site`. `axum_csrf`. actix-web `middleware::from_fn`.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The attacker's page auto-submits a hidden form that POSTs to /transfer. The browser builds the request and checks the session cookie's SameSite. The POST comes from another site, so a Lax cookie stays home and the bank sees an anonymous request.
+    nodes: [attacker, cookie, browser]
+    edges: [attacker>cookie]
+    role: samesite
+  - text: SameSite is not enough on its own. A sibling subdomain counts as the same site, and older browsers ignore the attribute. So the server also checks Sec-Fetch-Site, falling back to Origin. Anything but same-origin is refused for unsafe methods.
+    nodes: [defence, bank]
+    edges: [defence>bank]
+    role: origin
+  - text: Every such check exempts GET, because GET is meant to be safe. So the transfer is POST only, and a link or an image pointing at /transfer gets a 405.
+    nodes: [bank, browser]
+    edges: [browser>bank]
+    role: post
+  - text: The user's own form on bank.example is same-origin. The cookie goes along, Sec-Fetch-Site says same-origin, and the transfer goes through as before.
+    nodes: [browser, bank, cookie]
+    edges: [browser>bank, bank>cookie]
+    role: own
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: Why does a forged request from another site arrive at your bank with your session cookie?
+    options:
+      - text: The browser attaches cookies for the destination site by its own rules, whichever page started the request.
+        correct: true
+        why: Right. The cookie proves which browser sent the request, not that the user meant to send it.
+      - text: The attacker's page reads the cookie and copies it into the request.
+        why: It cannot. The same-origin policy and HttpOnly keep the cookie unreadable; the browser attaches it anyway.
+      - text: Only if the site is not using HTTPS.
+        why: HTTPS protects the request on the wire. The forged request is a genuine HTTPS request from the victim's own browser.
+  engineer:
+    question: The session cookie is SameSite=Lax and the transfer endpoint also accepts GET. Which forged request gets through?
+    options:
+      - text: A link on another site that the user clicks, because Lax sends the cookie on top-level GET navigations and CSRF checks skip GET.
+        correct: true
+        why: Right. Keep state changes on POST and Lax plus an origin check holds.
+      - text: An image tag pointing at the GET URL.
+        why: An image is a subresource, and Lax withholds the cookie from cross-site subresources.
+      - text: None. Lax blocks every cross-site request.
+        why: Lax deliberately allows top-level GET navigations so that links into your site keep you logged in.
+  deep:
+    question: What does the same-origin policy stop in a CSRF attack?
+    options:
+      - text: Reading the response of a cross-origin request, so the attacker cannot see the page or steal a token from it.
+        correct: true
+        why: Right. Sending is allowed and was never the policy's job. That is why a token the attacker cannot read works.
+      - text: Sending the cross-origin request in the first place.
+        why: Forms, images, links and simple fetches go out freely. Only requests that need a preflight wait for the server's permission.
+      - text: Attaching cookies to cross-origin requests.
+        why: Cookies are governed by SameSite, which works on sites, not origins, and None sends them everywhere.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Browser
+      example: Chrome, Firefox, Safari
+      job: Attaches cookies by SameSite and adds Origin and Sec-Fetch-Site, which pages cannot forge.
+    - role: Session cookie
+      example: "__Host-session; Secure; HttpOnly; SameSite=Lax"
+      job: Identifies the browser, and should be withheld from other sites' requests.
+    - role: Origin check
+      example: { go: "http.CrossOriginProtection", python: "CsrfViewMiddleware", typescript: "a Sec-Fetch-Site middleware", rust: "a from_fn middleware" }
+      job: Refuses unsafe requests that another origin started.
+    - role: CSRF token
+      example: a per-session random value in every form
+      job: Proves the request came from a page that could read your HTML.
+  useWhen:
+    - Any site that uses cookies for authentication and has state-changing endpoints.
+    - You set SameSite=None for an embed or a third-party flow. Add an origin check or tokens before you ship it.
+    - Login and logout forms. Login CSRF signs the victim into the attacker's account.
+  avoidWhen:
+    - APIs authenticated only by an Authorization header that your own script sets. Browsers do not attach it on their own, so there is nothing to forge.
+    - Do not rely on CORS settings. CORS controls which origins may read responses, and a simple request is sent regardless.
+    - Do not change state on GET, even behind a token, since tokens leak through URLs and logs.
+  tradeoffs:
+    - SameSite=Strict blocks the most but logs the user out when they follow a link from email or another site; Lax is the usual default.
+    - Tokens work in every browser but need plumbing into every form and fetch; origin checks need none but depend on modern browser headers.
+    - XSS on your own origin defeats both, because script on your page can read tokens and send same-origin requests.
+  lookalikes:
+    - name: Clickjacking
+      how: Frames your page under a decoy so the user really clicks your button. Stop it with CSP frame-ancestors or X-Frame-Options.
+    - name: CORS
+      how: Relaxes the same-origin policy for reading responses. It is not a CSRF defence, and a permissive CORS policy can make things worse.
+    - name: Cross-site scripting
+      how: Runs the attacker's script inside your origin, where every CSRF defence sees a same-origin request.
+---
+
+## [concept] Cross-site request forgery and the same-origin idea
+
+**A browser attaches your site's cookies to requests that other sites start. So a cookie proves which browser sent a request, not that the user meant to. Accept state changes only from your own pages, and let the browser tell you which those are.**
+
+<Term id="csrf">Cross-site request forgery</Term> needs nothing exotic: a hidden form on a page the user visits, posting to your site. The <Term id="same-origin-policy">same-origin policy</Term> stops that page reading your reply, but the request has already done its work.
+
+<Depth level={2}>
+Three tools stop it. The <Term id="samesite">SameSite</Term> attribute tells the browser not to attach the cookie to other sites' requests. The Origin header and the <Term id="fetch-metadata">fetch metadata</Term> header Sec-Fetch-Site tell the server who started the request, and pages cannot forge them. A <Term id="csrf-token">CSRF token</Term> in your own forms proves the page could read your HTML, which other origins cannot. And since every check exempts GET, state must change only on POST, PUT, PATCH or DELETE.
+</Depth>
+
+<Depth level={3}>
+SameSite works on sites, not origins. An origin is scheme, host and port; a site is scheme and registrable domain (<Term id="site-vs-origin">site and origin</Term>). So a page on community.bank.example is cross-origin but same-site to bank.example, and even Strict sends the cookie. Sec-Fetch-Site distinguishes the two (same-origin versus same-site), which is why an origin check covers what SameSite cannot.
+</Depth>
+
+## [problem] A transfer endpoint that trusts the cookie
+
+The banking app's transfer handler reads the user from the session cookie, takes the payee and amount from the form, and moves the money. It has no token and no origin check. Nobody wrote CSRF protection, and nothing has gone wrong.
+
+It is safe today by accident. The session cookie has no SameSite attribute, and the browsers most customers use treat that as Lax, which withholds the cookie from other sites' form posts.
+
+<Depth level={2}>
+The mental model behind it: the session cookie authenticates the user, so a request carrying it is the user's request. The cookie authenticates the browser. Anything the browser can be made to send carries it.
+</Depth>
+
+<Depth level={3}>
+Not every browser treats a missing SameSite as Lax, and Chrome's default has an exception: for two minutes after a cookie without the attribute is set, cross-site top-level POSTs still carry it, so that single sign-on flows keep working. The handler is relying on a browser default it never chose.
+</Depth>
+
+## [pain] Then partners embed the account widget
+
+**Change request:** partners want to embed our account widget in their sites, so the session cookie needs SameSite=None.
+
+The widget works. A month later customers report transfers they never made, all to the same account, all from people who had visited one coupon site. That site carries a hidden form that posts to /transfer and submits itself. With SameSite=None the browser attaches the session cookie, and the bank sees a logged-in customer asking for a transfer.
+
+<Depth level={2}>
+The attacker did not need to read anything. A form post, an image, a link or a simple fetch all go out from any page. The coupon site cannot see the bank's reply, and does not care: the money moved before the reply was written. Setting CORS headers would not have helped either, because CORS only decides which origins may read responses.
+</Depth>
+
+<Depth level={3}>
+Some forged requests fail on their own. A fetch with a JSON body is not a simple request, so the browser sends a <Term id="cors-preflight">CORS preflight</Term> first, and the bank's lack of CORS headers stops the real request from being sent. Do not lean on that. The same data sent as a form body needs no preflight, and plenty of endpoints accept both.
+</Depth>
+
+## [morph] From trusting the cookie to checking the origin
+
+Drag the slider. The cookie box gains an explicit SameSite=Lax, and an origin check sits in front of the transfer endpoint, refusing anything another origin started. The widget gets its own read-only cookie, so the session cookie no longer has to be sent everywhere.
+
+The code sets SameSite explicitly, keeps transfers on POST, and adds the check: the framework's middleware in Go and Django, a few lines in Express and axum.
+
+<Depth level={2}>
+Splitting the cookies is the key move for the change request. A read-only widget can run on a separate cookie with SameSite=None, or on a short-lived token in a URL fragment, while the cookie that can move money stays Lax and the transfer endpoint stays behind the origin check.
+</Depth>
+
+<Depth level={3}>
+Name the session cookie with the <Term id="cookie-prefix">__Host- prefix</Term>. The browser then refuses it unless it is Secure, has Path=/ and no Domain, so a compromised sibling subdomain cannot plant or overwrite it. That closes the cookie-tossing variant, where a sibling sets a session or token cookie the main site then trusts.
+</Depth>
+
+## [walk] Follow one forged transfer
+
+The coupon site's hidden form, sent to the fixed bank, then the customer's own transfer.
+
+<Depth level={3}>
+Origin is sent on every cross-origin POST, and Sec-Fetch-Site on every request from current browsers over HTTPS. Requests with neither header come from non-browser clients, which have no victim's cookies to abuse, so the checks let them through. OWASP's cheat sheet treats Sec-Fetch-Site as the primary signal, with Origin as a required fallback.
+</Depth>
+
+## [again] The coupon site, the second time
+
+The same coupon site, the same hidden form, against the fixed bank. The browser keeps the Lax cookie at home, so the bank sees an anonymous request and refuses it. A post from a sibling subdomain does carry the cookie and is refused by the origin check. A link to the old GET URL gets a 405. The customer's own transfer goes through.
+
+<Depth level={2}>
+Each layer covers a gap in another. SameSite fails for sibling subdomains and old browsers; the origin check fails for state changed on GET; tokens fail if they leak into URLs. Together they leave the attacker nothing to forge.
+</Depth>
+
+## [play] Forge a transfer from another site
+
+A bank tab and an attacker's tab. Choose the session cookie's SameSite, turn on a token or an origin check, and break things by letting /transfer accept GET. Then fire the attacker's requests one by one, or watch the badges, which show what each card would do right now.
+
+Each request is traced: which cookie went along, the headers the browser added, and every check the bank ran.
+
+## [lens] How each framework stops forged requests
+
+Django protects you by default; Go has had a one-line middleware since 1.25; Express and axum leave it to you. All of them exempt GET, HEAD and OPTIONS.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Two designs exist. Token-based protection (Django, gorilla/csrf, csrf-csrf) puts a secret in every form and checks it, and works in every browser. Header-based protection (Go's CrossOriginProtection, the Express and axum middleware above) checks Sec-Fetch-Site and Origin and needs no plumbing. Django does both.
+</Depth>
+
+<Depth level={3}>
+Whatever you choose, XSS on your own origin defeats it, because injected script runs as your page: it can read the token and send same-origin requests. CSRF defences assume the other origin is the attacker. Output encoding and a Content Security Policy keep that true.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="csrf-and-same-origin" />
+
+### Which requests carry a cross-site cookie
+
+| Request from another site | SameSite=None | Lax | Strict |
+|---|---|---|---|
+| Link click or redirect (GET) | sent | sent | not sent |
+| Form POST, top-level | sent | not sent | not sent |
+| Image, script, iframe | sent | not sent | not sent |
+| fetch() or XHR | sent | not sent | not sent |
+| From a sibling subdomain (same site) | sent | sent | sent |

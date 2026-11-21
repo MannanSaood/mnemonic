@@ -1,0 +1,25 @@
+# Terms introduced by the CSRF lesson.
+- id: csrf
+  term: Cross-site request forgery (CSRF)
+  short: Another site makes the victim's browser send a request to your site. The browser attaches your cookies, so the request looks like the logged-in user meant it.
+- id: same-origin-policy
+  term: Same-origin policy
+  short: The browser rule that a page's script may read responses only from its own origin (scheme, host and port). It limits reading, not sending.
+- id: samesite
+  term: SameSite cookie attribute
+  short: Tells the browser whether to attach a cookie to requests started by another site. Strict never does, Lax only on top-level GET navigations, None always.
+- id: site-vs-origin
+  term: Site and origin
+  short: An origin is scheme, host and port. A site is scheme plus registrable domain, so community.bank.example and bank.example are different origins but the same site.
+- id: csrf-token
+  term: CSRF token
+  short: A random value tied to the session, put in the site's own forms and checked on every state-changing request. Other sites cannot read it, so they cannot send it.
+- id: fetch-metadata
+  term: Fetch metadata headers
+  short: Request headers the browser sets and pages cannot forge, such as Sec-Fetch-Site, which says whether the request came from the same origin, the same site, another site, or the user.
+- id: cors-preflight
+  term: CORS preflight
+  short: An OPTIONS request the browser sends before a cross-origin request that is not simple (for example, a JSON body). If the server does not allow it, the real request is never sent.
+- id: cookie-prefix
+  term: __Host- cookie prefix
+  short: A cookie named __Host-… must be Secure, have Path=/ and no Domain, so a sibling subdomain cannot set or overwrite it.
