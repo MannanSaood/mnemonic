@@ -1,0 +1,16 @@
+# Terms introduced by algorithms/heaps-and-priority-queues.
+- id: priority-queue
+  term: Priority queue
+  short: A collection that hands back the most urgent item first, not the oldest. Push adds an item; pop removes the one with the best priority.
+- id: binary-heap
+  term: Binary heap
+  short: A priority queue stored as a complete binary tree inside an array. The children of index i are 2i+1 and 2i+2, so it needs no pointers.
+- id: heap-property
+  term: Heap property
+  short: The one rule a heap keeps. Each parent is at least as urgent as its children, so the root is the most urgent item; siblings are in no particular order.
+- id: sift
+  term: Sift up and sift down
+  short: The repairs that restore the heap property. Sift up swaps a new item with its parent while it is more urgent; sift down swaps an item with its more urgent child.
+- id: lazy-deletion
+  term: Lazy deletion
+  short: Cancelling or updating a heap entry by marking it stale and skipping it when it reaches the root, instead of finding and removing it.

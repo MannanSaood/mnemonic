@@ -1,0 +1,709 @@
+---
+title: Heaps and priority queues
+track: algorithms
+group: Data structures
+order: 13
+summary: A binary heap keeps the most urgent item at the front of an array and repairs itself along one root-to-leaf path, so push and pop cost O(log n). It is the structure behind job schedulers, timers, top-k and Dijkstra.
+intent: Pick a heap whenever you repeatedly need the smallest or largest item, and know its one rule well enough not to break it.
+changeRequest: Move every tenant's scheduled exports and webhook retries into one dispatcher. That is about 2 million pending jobs.
+languages: [go, python, typescript, rust]
+glossary: [priority-queue, binary-heap, heap-property, sift, lazy-deletion]
+
+prerequisites: [algorithms/arrays-and-linked-lists, algorithms/binary-search]
+skills: [data-structures]
+depths: [overview, engineer, deep]
+
+playground:
+  model: heaps-and-priority-queues
+  scenarios:
+    - try: "Set the priority to 5 and press Push job."
+      notice: "The job lands in the next free leaf, index 7, and swaps with its parent three times until it reaches the root. The sorted list shifted nothing this time; it got lucky."
+    - try: "Press Dispatch next and step through it."
+      notice: "The root leaves, the last leaf jumps into its place, and it sinks by swapping with its more urgent child. Only one path is touched."
+    - try: "Click a leaf, press Make urgent without sifting, then Dispatch next."
+      notice: "A red edge marks the broken rule. The dispatcher hands out the old root while the priority-1 job waits underneath."
+    - try: "Run the scheduler load test with 10,000 jobs, then the top 100 of 100,000 latencies."
+      notice: "The sorted list moves about 190 times as many jobs as the heap. For top-k, a heap of 100 moves about a tenth as many as a sorted list of 100."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 104, h: 48, title: api + workers, sub: add / next }
+      after:  { x: 12, y: 111, w: 104, h: 48, title: api + workers, sub: add / next }
+    - id: context
+      kind: context
+      before: { x: 140, y: 18, w: 260, h: 236, title: dispatcher, sub: "pictured as: a sorted list" }
+      after:  { x: 140, y: 20, w: 120, h: 48, title: dispatcher, sub: add / next }
+    - id: siftup
+      kind: concrete
+      before: { x: 160, y: 72, w: 220, h: 32, title: add · shift n/2 }
+      after:  { x: 140, y: 111, w: 120, h: 48, title: sift up, sub: ≤ log n swaps }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 290, y: 111, w: 120, h: 48, title: "" }
+      after:  { x: 290, y: 111, w: 120, h: 48, title: binary heap, sub: "array · 2i+1, 2i+2" }
+    - id: root
+      kind: concrete
+      before: { x: 160, y: 120, w: 220, h: 32, title: "jobs[0] · sorted" }
+      after:  { x: 430, y: 40, w: 118, h: 44, title: root, sub: next job · O(1) }
+    - id: siftdown
+      kind: concrete
+      before: { x: 160, y: 168, w: 220, h: 32, title: next · shift n }
+      after:  { x: 290, y: 202, w: 120, h: 44, title: sift down, sub: ≤ log n swaps }
+    - id: retries
+      kind: concrete
+      appears: change
+      before: { x: 424, y: 202, w: 124, h: 44, title: 2m jobs, sub: retries anywhere }
+      after:  { x: 430, y: 202, w: 118, h: 44, title: 2m jobs, sub: 21 levels }
+  edges:
+    - { from: client, to: context, label: call }
+    - { from: context, to: siftup, label: add }
+    - { from: siftup, to: strategy, label: leaf up }
+    - { from: strategy, to: root, label: peek }
+    - { from: strategy, to: siftdown, label: next }
+    - { from: retries, to: strategy, label: log n }
+
+code:
+  go:
+    before:
+      file: dispatcher.go
+      source: |
+        // dispatcher.go
+        type Job struct {
+            ID    string
+            RunAt time.Time
+        }
+
+        // Dispatcher hands out jobs in RunAt order. jobs is kept sorted.
+        type Dispatcher struct {
+            mu   sync.Mutex
+            jobs []Job
+        }
+
+        func byRunAt(a, b Job) int { return a.RunAt.Compare(b.RunAt) }
+
+        func (d *Dispatcher) Add(j Job) {
+            d.mu.Lock()
+            defer d.mu.Unlock()
+            i, _ := slices.BinarySearchFunc(d.jobs, j, byRunAt)
+            d.jobs = slices.Insert(d.jobs, i, j) // shifts every later job one place
+        }
+
+        // Next returns the earliest job if it is due.
+        func (d *Dispatcher) Next(now time.Time) (Job, bool) {
+            d.mu.Lock()
+            defer d.mu.Unlock()
+            if len(d.jobs) == 0 || d.jobs[0].RunAt.After(now) {
+                return Job{}, false
+            }
+            j := d.jobs[0]
+            d.jobs = slices.Delete(d.jobs, 0, 1) // shifts every remaining job
+            return j, true
+        }
+      roles: { context: [7, 11], siftup: [15, 20], root: [26, 29], siftdown: [30, 30], client: [23, 32] }
+      change:
+        - after: 32
+          add:
+            - ""
+            - "// Retry puts a failed job back with exponential backoff, anywhere in the queue."
+            - "func (d *Dispatcher) Retry(j Job, attempt int) {"
+            - "    j.RunAt = time.Now().Add(time.Second << attempt)"
+            - "    d.Add(j)"
+            - "}"
+    after:
+      file: dispatcher.go
+      source: |
+        // dispatcher.go: a binary min-heap on RunAt, stored in a slice
+        type Job struct {
+            ID    string
+            RunAt time.Time
+        }
+
+        type jobHeap []Job // jobHeap[0] is always the earliest
+
+        func (h jobHeap) Len() int           { return len(h) }
+        func (h jobHeap) Less(i, j int) bool { return h[i].RunAt.Before(h[j].RunAt) }
+        func (h jobHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+        func (h *jobHeap) Push(x any)        { *h = append(*h, x.(Job)) }
+        func (h *jobHeap) Pop() any {
+            old := *h
+            j := old[len(old)-1]
+            *h = old[:len(old)-1]
+            return j
+        }
+
+        type Dispatcher struct {
+            mu   sync.Mutex
+            jobs jobHeap
+        }
+
+        func (d *Dispatcher) Add(j Job) {
+            d.mu.Lock()
+            defer d.mu.Unlock()
+            heap.Push(&d.jobs, j) // append as the last leaf, then sift up
+        }
+
+        // Next returns the earliest job if it is due.
+        func (d *Dispatcher) Next(now time.Time) (Job, bool) {
+            d.mu.Lock()
+            defer d.mu.Unlock()
+            if d.jobs.Len() == 0 || d.jobs[0].RunAt.After(now) { // peek at the root
+                return Job{}, false
+            }
+            return heap.Pop(&d.jobs).(Job), true // last leaf to the root, then sift down
+        }
+
+        // Retry puts a failed job back with exponential backoff.
+        func (d *Dispatcher) Retry(j Job, attempt int) {
+            j.RunAt = time.Now().Add(time.Second << attempt)
+            d.Add(j)
+        }
+      roles: { strategy: [7, 18], context: [20, 23], client: [25, 45], append: [25, 29], siftup: [28, 28], peek: [35, 35], root: [35, 35], siftdown: [38, 38], scale: [41, 45], retries: [41, 45] }
+    again:
+      file: dispatcher_test.go
+      source: |
+        // dispatcher_test.go: 2 million jobs, and Next always returns the earliest
+        func TestEarliestFirst(t *testing.T) {
+            var d Dispatcher
+            base := time.Now()
+            for i := range 2_000_000 {
+                d.Add(Job{ID: strconv.Itoa(i), RunAt: base.Add(time.Duration(rand.Int64N(3_600_000)) * time.Millisecond)})
+            }
+            prev := time.Time{}
+            for range 1000 {
+                j, ok := d.Next(base.Add(time.Hour))
+                if !ok || j.RunAt.Before(prev) {
+                    t.Fatal("out of order")
+                }
+                prev = j.RunAt
+            }
+        }
+    cost:
+      before: { text: "2M jobs · ~1M shifted per add, 2M per next", value: 0.9 }
+      after: { text: "2M jobs · at most 21 swaps per add or next", value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Some glue
+      note: '`container/heap` is a set of functions over any type that implements `heap.Interface`: `sort.Interface` plus `Push` and `Pop`. Your `Push` and `Pop` only append and truncate; `heap.Push` and `heap.Pop` do the sifting. `heap.Init` builds a heap from a slice in O(n), and `heap.Fix(h, i)` re-sifts one element after you change its priority. It is a min-heap of whatever `Less` says.'
+      seenIn: '`heap.Push`, `heap.Pop`, `heap.Fix`, `heap.Remove`, `heap.Init`. The runtime keeps each P''s timers in a 4-ary heap, and `time.AfterFunc` lands there.'
+
+  python:
+    before:
+      file: dispatcher.py
+      source: |
+        # dispatcher.py
+        import bisect
+        import itertools
+        import threading
+        import time
+        from dataclasses import dataclass, field
+
+
+        @dataclass(order=True)
+        class Job:
+            run_at: float
+            seq: int
+            job_id: str = field(compare=False)
+
+
+        class Dispatcher:
+            """Hands out jobs in run_at order. self._jobs is kept sorted."""
+
+            def __init__(self) -> None:
+                self._jobs: list[Job] = []
+                self._seq = itertools.count()
+                self._lock = threading.Lock()
+
+            def add(self, job_id: str, run_at: float) -> None:
+                with self._lock:
+                    bisect.insort(self._jobs, Job(run_at, next(self._seq), job_id))  # shifts later jobs
+
+            def next(self, now: float) -> str | None:
+                with self._lock:
+                    if not self._jobs or self._jobs[0].run_at > now:
+                        return None
+                    return self._jobs.pop(0).job_id  # shifts every remaining job
+      roles: { context: [16, 22], siftup: [24, 26], root: [30, 30], siftdown: [32, 32], client: [24, 32] }
+      change:
+        - after: 32
+          add:
+            - ""
+            - "    def retry(self, job_id: str, attempt: int) -> None:"
+            - "        self.add(job_id, time.time() + 2**attempt)  # lands anywhere in the queue"
+    after:
+      file: dispatcher.py
+      source: |
+        # dispatcher.py: a binary min-heap on (run_at, seq) in a plain list
+        import heapq
+        import itertools
+        import threading
+        import time
+
+
+        class Dispatcher:
+            def __init__(self) -> None:
+                self._heap: list[tuple[float, int, str]] = []  # self._heap[0] is the earliest
+                self._seq = itertools.count()  # tie-breaker: equal run_at pops oldest first
+                self._lock = threading.Lock()
+
+            def add(self, job_id: str, run_at: float) -> None:
+                with self._lock:
+                    heapq.heappush(self._heap, (run_at, next(self._seq), job_id))  # append, sift up
+
+            def next(self, now: float) -> str | None:
+                with self._lock:
+                    if not self._heap or self._heap[0][0] > now:  # peek at the root
+                        return None
+                    return heapq.heappop(self._heap)[2]  # last leaf to the root, sift down
+
+            def retry(self, job_id: str, attempt: int) -> None:
+                self.add(job_id, time.time() + 2**attempt)
+      roles: { context: [8, 12], strategy: [10, 11], client: [14, 25], append: [14, 16], siftup: [16, 16], peek: [20, 20], root: [20, 20], siftdown: [22, 22], scale: [24, 25], retries: [24, 25] }
+    again:
+      file: test_dispatcher.py
+      source: |
+        # test_dispatcher.py: 2 million jobs, and next() always returns the earliest
+        def test_earliest_first():
+            d = Dispatcher()
+            run_at = {str(i): random.uniform(0, 3600) for i in range(2_000_000)}
+            for job_id, t in run_at.items():
+                d.add(job_id, t)
+            got = [run_at[d.next(3600)] for _ in range(1000)]
+            assert got == sorted(got)
+    cost:
+      before: { text: "2M jobs · ~1M shifted per add, 2M per next", value: 0.9 }
+      after: { text: "2M jobs · at most 21 swaps per add or next", value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: '`heapq` is a set of functions over a plain list, always a min-heap. Store tuples so the first field is the priority and a counter breaks ties; then two entries never fall through to comparing the payloads. `heapify` builds a heap in O(n). The docs show priority changes and cancellation done by marking an entry removed and skipping it on pop. Python 3.14 adds max-heap versions such as `heappush_max`.'
+      seenIn: '`heapq.heappush`, `heappop`, `heapify`, `heapreplace`, `nlargest` and `nsmallest` for top-k, `merge` for k-way merges. `queue.PriorityQueue` wraps heapq with a lock; `asyncio` keeps its timers in a heapq list.'
+
+  typescript:
+    before:
+      file: dispatcher.ts
+      source: |
+        // dispatcher.ts
+        interface Job {
+          id: string;
+          runAt: number; // epoch ms
+        }
+
+        // Hands out jobs in runAt order. jobs is kept sorted.
+        export class Dispatcher {
+          private jobs: Job[] = [];
+
+          add(job: Job): void {
+            this.jobs.push(job);
+            this.jobs.sort((a, b) => a.runAt - b.runAt); // re-sorts the whole queue
+          }
+
+          next(now: number): Job | undefined {
+            if (this.jobs.length === 0 || this.jobs[0].runAt > now) return undefined;
+            return this.jobs.shift(); // moves every remaining job down one index
+          }
+        }
+      roles: { context: [7, 9], siftup: [11, 14], root: [17, 17], siftdown: [18, 18], client: [11, 19] }
+      change:
+        - after: 19
+          add:
+            - ""
+            - "  retry(job: Job, attempt: number): void {"
+            - "    this.add({ ...job, runAt: Date.now() + 1000 * 2 ** attempt }); // lands anywhere in the queue"
+            - "  }"
+    after:
+      file: dispatcher.ts
+      source: |
+        // dispatcher.ts: no heap in the standard library, so a small binary min-heap
+        interface Job {
+          id: string;
+          runAt: number; // epoch ms
+        }
+
+        class MinHeap<T> {
+          private a: T[] = [];
+          constructor(private before: (x: T, y: T) => boolean) {}
+          peek(): T | undefined { return this.a[0]; }
+
+          push(x: T): void {
+            const a = this.a;
+            let i = a.push(x) - 1; // the next free leaf
+            while (i > 0) {
+              const p = (i - 1) >> 1;
+              if (!this.before(a[i], a[p])) break;
+              [a[i], a[p]] = [a[p], a[i]]; // sift up
+              i = p;
+            }
+          }
+
+          pop(): T | undefined {
+            const a = this.a;
+            const top = a[0];
+            const last = a.pop();
+            if (a.length === 0 || last === undefined) return top;
+            a[0] = last; // the last leaf takes the root's place
+            for (let i = 0; ; ) {
+              const l = 2 * i + 1, r = l + 1;
+              let c = i;
+              if (l < a.length && this.before(a[l], a[c])) c = l;
+              if (r < a.length && this.before(a[r], a[c])) c = r;
+              if (c === i) return top;
+              [a[i], a[c]] = [a[c], a[i]]; // sift down
+              i = c;
+            }
+          }
+        }
+
+        export class Dispatcher {
+          private jobs = new MinHeap<Job>((x, y) => x.runAt < y.runAt);
+
+          add(job: Job): void {
+            this.jobs.push(job);
+          }
+
+          next(now: number): Job | undefined {
+            const head = this.jobs.peek(); // the root is the earliest job
+            if (head === undefined || head.runAt > now) return undefined;
+            return this.jobs.pop();
+          }
+
+          retry(job: Job, attempt: number): void {
+            this.add({ ...job, runAt: Date.now() + 1000 * 2 ** attempt });
+          }
+        }
+      roles: { strategy: [7, 39], context: [41, 42], client: [44, 57], append: [12, 14], siftup: [15, 20], peek: [49, 50], root: [49, 50], siftdown: [23, 38], scale: [54, 56], retries: [54, 56] }
+    again:
+      file: dispatcher.test.ts
+      source: |
+        // dispatcher.test.ts: 2 million jobs, and next() always returns the earliest
+        test("earliest first", () => {
+          const d = new Dispatcher();
+          for (let i = 0; i < 2_000_000; i++) d.add({ id: String(i), runAt: Math.random() * 3_600_000 });
+          let prev = -Infinity;
+          for (let i = 0; i < 1000; i++) {
+            const j = d.next(Infinity)!;
+            assert.ok(j.runAt >= prev);
+            prev = j.runAt;
+          }
+        });
+    cost:
+      before: { text: "2M jobs · a full sort per add, 2M moved per next", value: 0.95 }
+      after: { text: "2M jobs · at most 21 swaps per add or next", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Write it
+      note: 'JavaScript has no heap or priority queue in the language or in Node''s public API, so you write the thirty lines above or take a package. `Array.prototype.sort` is O(n log n) per call and `shift()` moves every element, which is why the sorted-array queue falls over. Node''s own timers do use a binary heap internally, in `lib/internal/priority_queue.js`, but it is not exported.'
+      seenIn: 'Small heap classes in most codebases. Packages such as `@datastructures-js/priority-queue` and `heap-js`. `setTimeout` itself, which Node schedules through its internal heap.'
+
+  rust:
+    before:
+      file: dispatcher.rs
+      source: |
+        // dispatcher.rs
+        use std::time::{Duration, Instant};
+
+        pub struct Job {
+            pub id: String,
+            pub run_at: Instant,
+        }
+
+        /// Hands out jobs in run_at order. `jobs` is kept sorted.
+        #[derive(Default)]
+        pub struct Dispatcher {
+            jobs: Vec<Job>,
+        }
+
+        impl Dispatcher {
+            pub fn add(&mut self, job: Job) {
+                let i = self.jobs.partition_point(|j| j.run_at <= job.run_at);
+                self.jobs.insert(i, job); // shifts every later job one place
+            }
+
+            pub fn next(&mut self, now: Instant) -> Option<Job> {
+                if self.jobs.first()?.run_at > now {
+                    return None;
+                }
+                Some(self.jobs.remove(0)) // shifts every remaining job
+            }
+        }
+      roles: { context: [9, 13], siftup: [16, 19], root: [22, 22], siftdown: [25, 25], client: [16, 26] }
+      change:
+        - after: 26
+          add:
+            - ""
+            - "    pub fn retry(&mut self, mut job: Job, attempt: u32) {"
+            - "        job.run_at = Instant::now() + Duration::from_secs(1 << attempt); // lands anywhere"
+            - "        self.add(job);"
+            - "    }"
+    after:
+      file: dispatcher.rs
+      source: |
+        // dispatcher.rs: BinaryHeap is a max-heap, so wrap the key in Reverse
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        use std::time::{Duration, Instant};
+
+        #[derive(Default)]
+        pub struct Dispatcher {
+            // (run_at, seq): earliest first, ties oldest first; the id rides along
+            jobs: BinaryHeap<Reverse<(Instant, u64, String)>>,
+            seq: u64,
+        }
+
+        impl Dispatcher {
+            pub fn add(&mut self, id: String, run_at: Instant) {
+                self.seq += 1;
+                self.jobs.push(Reverse((run_at, self.seq, id))); // append, sift up
+            }
+
+            pub fn next(&mut self, now: Instant) -> Option<String> {
+                let Reverse((run_at, _, _)) = self.jobs.peek()?; // the root is the earliest
+                if *run_at > now {
+                    return None;
+                }
+                self.jobs.pop().map(|Reverse((_, _, id))| id) // last leaf to the root, sift down
+            }
+
+            pub fn retry(&mut self, id: String, attempt: u32) {
+                self.add(id, Instant::now() + Duration::from_secs(1 << attempt));
+            }
+        }
+      roles: { strategy: [8, 9], context: [6, 11], client: [14, 29], append: [14, 17], siftup: [16, 16], peek: [20, 20], root: [20, 20], siftdown: [24, 24], scale: [27, 29], retries: [27, 29] }
+    again:
+      file: tests/dispatcher.rs
+      source: |
+        // tests/dispatcher.rs: 2 million jobs, and next() always returns the earliest
+        #[test]
+        fn earliest_first() {
+            let mut d = Dispatcher::default();
+            let base = Instant::now();
+            for i in 0..2_000_000u64 {
+                d.add(i.to_string(), base + Duration::from_millis(i.wrapping_mul(2_654_435_761) % 3_600_000));
+            }
+            let later = base + Duration::from_secs(3600);
+            let mut prev = base;
+            for _ in 0..1000 {
+                let id: u64 = d.next(later).unwrap().parse().unwrap();
+                let at = base + Duration::from_millis(id.wrapping_mul(2_654_435_761) % 3_600_000);
+                assert!(at >= prev);
+                prev = at;
+            }
+        }
+    cost:
+      before: { text: "2M jobs · ~1M shifted per add, 2M per next", value: 0.9 }
+      after: { text: "2M jobs · at most 21 swaps per add or next", value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: '`std::collections::BinaryHeap` is a max-heap over a `Vec`, ordered by `Ord`. For earliest-first, wrap the key in `std::cmp::Reverse` or implement `Ord` backwards on your own type. `BinaryHeap::from(vec)` heapifies in O(n), `peek_mut` lets you change the top and re-sifts when the guard drops, and `into_sorted_vec` is heapsort.'
+      seenIn: '`BinaryHeap::push`, `pop`, `peek`, `peek_mut`, `into_sorted_vec`. `Reverse` for min-heaps. tokio''s timer uses a hierarchical timer wheel instead of a heap, a design built for millions of timeouts that are mostly cancelled.'
+
+walk:
+  - text: A retry calls add. The job is appended at the end of the array, which is the next free leaf in the bottom level of the tree. Nothing else moves yet.
+    nodes: [client, context, siftup]
+    edges: [client>context, context>siftup]
+    role: append
+  - text: Sift up. The job compares itself with its parent at index (i − 1) / 2 and swaps while it is earlier. Each swap climbs one level, so even a job that becomes the new root does at most log₂ n swaps, 21 for 2 million jobs.
+    nodes: [siftup, strategy]
+    edges: [siftup>strategy]
+    role: siftup
+  - text: A worker calls next. The earliest job is always at index 0, the root, so checking whether anything is due is one read.
+    nodes: [strategy, root]
+    edges: [strategy>root]
+    role: peek
+  - text: To remove the root, the last leaf moves into its place and sifts down, swapping with the earlier of its two children until both children are later. Again one path, at most log₂ n swaps.
+    nodes: [strategy, siftdown]
+    edges: [strategy>siftdown]
+    role: siftdown
+  - text: Two million jobs make a tree 21 levels deep. Retries land anywhere in time, and each one still costs at most 21 swaps, where the sorted list shifted about a million jobs.
+    nodes: [retries, strategy]
+    edges: [retries>strategy]
+    role: scale
+
+checks:
+  overview:
+    question: You read a min-heap's array from index 0 to the end. Do you get the jobs in priority order?
+    options:
+      - text: No. Only the root is guaranteed to be the most urgent; each parent beats its children, but siblings and cousins are in no order
+        correct: true
+        why: Right. That weaker rule is why the heap is cheap to maintain. To get sorted order you pop repeatedly, which is heapsort.
+      - text: Yes, a heap keeps its array sorted
+        why: Keeping it sorted would cost what the sorted list costs. A heap only orders each parent against its own children.
+      - text: Yes, but only after a pop
+        why: A pop repairs one path. The rest of the array stays in heap order, which is not sorted order.
+  engineer:
+    question: You merge 100 sorted log files of 1 million lines each by timestamp with a heap that holds one line per file. About how many comparisons does it take?
+    options:
+      - text: About 100 million × log₂ 100, roughly 700 million
+        correct: true
+        why: Right. Each of the n = 100 million lines is pushed and popped through a heap of k = 100 entries, so the cost is O(n log k), and memory holds just 100 lines.
+      - text: About 100 million × log₂ (100 million), as if you sorted everything
+        why: That is the cost of concatenating and sorting. The files are already sorted, so the heap only has to choose among 100 heads.
+      - text: About 100 million × 100, comparing every head each time
+        why: That is a linear scan of the heads. The heap finds the smallest of 100 in about 7 comparisons.
+  deep:
+    question: Why does building a heap from an unsorted array bottom-up (heapify) take O(n) and not O(n log n)?
+    options:
+      - text: Most nodes are near the bottom and can only sift down a few levels; summing heights over all nodes gives less than n
+        correct: true
+        why: Right. About n/2 nodes are leaves and do nothing, n/4 sift at most one level, n/8 at most two, and so on. The sum of h·n/2^(h+1) over all heights converges to about n.
+      - text: Heapify only has to sort the bottom level
+        why: Heapify touches every internal node, from the last one back to the root. It is cheap because each one sifts down only as far as its own height.
+      - text: It is O(n log n) in the worst case; O(n) is only the average
+        why: The bound holds in the worst case. Building with n separate pushes is the version that can cost O(n log n).
+
+reference:
+  roles:
+    - role: Array
+      example: "jobs[0 … n−1]"
+      job: Stores a complete binary tree with no pointers. Children of i are 2i+1 and 2i+2; the parent is (i−1)/2.
+    - role: Heap property
+      example: each parent runs no later than its children
+      job: Keeps the most urgent item at index 0.
+    - role: Sift up
+      example: heap.Push, heappush, BinaryHeap::push
+      job: Restores the rule after an append, climbing one path.
+    - role: Sift down
+      example: heap.Pop, heappop, BinaryHeap::pop
+      job: Restores the rule after the root is replaced, sinking down one path.
+  useWhen:
+    - You repeatedly need the smallest or largest item while items keep arriving. Schedulers, timers, retry queues, event simulation.
+    - Top-k over a stream, with a size-k heap whose root is the weakest of the kept items.
+    - Merging k sorted streams, and graph algorithms such as Dijkstra and Prim.
+  avoidWhen:
+    - You need the items in full sorted order or range queries. Sort once, or use an ordered map.
+    - You need to find, update or delete arbitrary items often. Track positions, use lazy deletion, or use an ordered map.
+    - Millions of timeouts that are mostly cancelled before they fire. A timer wheel makes add and cancel O(1).
+  tradeoffs:
+    - O(log n) push and pop and O(1) peek, against O(n) for search and arbitrary delete.
+    - Not stable. Equal priorities come out in arbitrary order unless the key includes a sequence number.
+    - Jumping between i and 2i+1 has poor cache locality on big heaps; 4-ary heaps trade more comparisons per level for fewer levels.
+  lookalikes:
+    - name: Sorted array
+      how: O(1) access to the minimum too, but O(n) per insert.
+    - name: Balanced search tree
+      how: O(log n) insert, delete and find of any item, plus ordered iteration, at a higher constant cost.
+    - name: Timer wheel
+      how: Buckets by expiry time for O(1) add and cancel, at the price of coarse resolution.
+---
+
+## [concept] Heaps and priority queues
+
+**A binary heap is a tree stored in an array where every parent is at least as urgent as its children. The most urgent item is always at index 0, and a push or a pop repairs the tree along one path from root to leaf, so both cost O(log n).**
+
+A <Term id="priority-queue">priority queue</Term> hands back the most urgent item, not the oldest. A <Term id="binary-heap">binary heap</Term> is the usual way to build one. It keeps a single rule, the <Term id="heap-property">heap property</Term>, and nothing more: a parent beats its children, while siblings can be in any order. That small rule is cheap to keep and still puts the winner at the root.
+
+<Depth level={2}>
+The tree has no pointers. A complete binary tree fills each level left to right, so it fits in an array with the children of index i at 2i+1 and 2i+2 and the parent at (i−1)/2. A push appends at the end and sifts up; a pop moves the last element to the root and sifts down. Peeking is O(1). Building a heap from n items at once is O(n). Searching for an arbitrary item is O(n), because the rule says nothing about where it is.
+</Depth>
+
+<Depth level={3}>
+The height of a heap with n items is ⌊log₂ n⌋, so <Term id="sift">sift up and sift down</Term> make at most that many swaps. A push of a random priority usually makes far fewer: about half the items are leaves, so a new item is more likely to belong near the bottom, and the expected number of levels it climbs is a small constant. A pop always goes most of the way down, because the item moved to the root came from the bottom.
+</Depth>
+
+## [problem] A dispatcher that keeps its queue sorted
+
+A job dispatcher holds scheduled work: report exports, webhook deliveries, emails. Workers ask for the earliest job that is due. The dispatcher keeps its jobs sorted by run time, binary-searches for the insert position, and hands out the first one.
+
+With a few thousand pending jobs it is fast, and the code is easy to read. Binary search makes the insert look like O(log n).
+
+<Depth level={2}>
+The search is O(log n); the insert is not. Inserting into the middle of an array moves every later element one place, and taking the first element moves every remaining one. In Python and TypeScript the dispatch is O(n) too (`pop(0)`, `shift()`); in Go the reslice is free, but the insert is still a shift.
+</Depth>
+
+<Depth level={3}>
+Shifting is a `memmove`, which is fast per byte, so small queues hide it well. At a million 24-byte entries an insert in the middle moves about 12 MB, and a queue taking thousands of adds a second spends its time copying memory.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** move every tenant's scheduled exports and webhook retries into one dispatcher. That is about 2 million pending jobs.
+
+The marked lines add retries with exponential backoff. Retries are due at all sorts of times, so they land all over the sorted list, not at the end. Each one shifts about a million jobs. Each dispatch in the Python and TypeScript versions shifts all 2 million. The dispatcher's lock is held during every shift, so workers queue up behind it and dispatch latency climbs with the queue length.
+
+<Depth level={2}>
+Profiles show the time in `memmove`, `list.insert` or `Array.prototype.sort`, not in your code. Sharding the dispatcher by tenant divides the cost but keeps it linear in the shard size, and the one tenant with a backlog still suffers.
+</Depth>
+
+<Depth level={3}>
+The TypeScript version is worse: it re-sorts the whole array on every add. V8's TimSort handles an almost sorted array in close to linear time, which is why it survived testing, but that is still O(n) per add.
+</Depth>
+
+## [morph] Keep one rule instead of full order
+
+Drag the slider. The sorted list becomes a tree stored in the same array, ordered only from parent to child.
+
+The dispatcher does not need the jobs in order. It needs the earliest one, again and again. A heap gives exactly that: the root is the earliest job, and each add or dispatch repairs one path of at most 21 levels for 2 million jobs.
+
+<Depth level={2}>
+Put a sequence number in the key when ties matter. A heap is not stable, so two jobs due at the same instant come out in arbitrary order unless the key says otherwise; `(run_at, seq)` gives first-in, first-out among equals. It also keeps Python from comparing payloads when the priorities tie.
+</Depth>
+
+<Depth level={3}>
+To cancel or reschedule a job, a binary heap has no cheap way to find it. Either keep each job's index up to date in the Swap method (Go's `container/heap` documentation shows this, with `heap.Fix` to re-sift after a change), or use <Term id="lazy-deletion">lazy deletion</Term>: mark the old entry cancelled, push a new one if needed, and drop stale entries when they reach the root. The Python `heapq` documentation describes exactly that.
+</Depth>
+
+## [walk] Follow one retry through the heap
+
+One add, one dispatch, then the same at 2 million jobs. Use the numbered buttons.
+
+<Depth level={2}>
+Top-k uses the heap the other way round. To keep the 100 slowest requests out of a stream, keep a min-heap of 100: its root is the fastest of the slow ones. A new latency that beats the root replaces it and sifts down; anything else is dropped after one comparison. That is O(n log k) time and O(k) memory, where sorting everything would be O(n log n) time and O(n) memory.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The Go runtime keeps timers in a 4-ary heap per P: four children per node halves the height, and since the four children sit next to each other in memory, comparing them is cheap.</Lang>
+<Lang only="python">`heapq` is written in C in CPython, with a pure Python fallback. Its `heappop` moves the hole down to a leaf first and then sifts the last item up, a trick that saves comparisons because that item usually belongs near the bottom.</Lang>
+<Lang only="typescript">Arrays of objects in V8 store pointers, so a swap moves two pointers whatever the job's size. Keep the comparison cheap: compare a number field, not a computed value.</Lang>
+<Lang only="rust">`BinaryHeap::pop` also uses the hole technique: it moves the hole to the bottom and then sifts up, so each level costs one move instead of a full swap.</Lang>
+</Depth>
+
+## [again] The same request with a heap
+
+Two million jobs, the same retries. Each add and each dispatch costs at most 21 swaps, and the lock is held for microseconds. The test pushes 2 million jobs and checks that dispatches come out earliest first.
+
+<Depth level={2}>
+If jobs are cancelled far more often than they run, such as request timeouts, look at a timer wheel. It puts each timer in a bucket by expiry time, so adding and cancelling are O(1), and it trades exact ordering within a bucket for that speed.
+</Depth>
+
+<Depth level={3}>
+Building the heap from a saved snapshot of 2 million jobs should use heapify (`heap.Init`, `heapq.heapify`, `BinaryHeap::from`), which is O(n), instead of 2 million pushes. Heapify sifts down every internal node from the last one back to the root; most nodes are near the bottom and barely move.
+</Depth>
+
+## [play] Push and dispatch jobs
+
+A scheduler's queue drawn as a tree and as the array it really is, with the same jobs in a sorted list next to it. Push jobs, dispatch them, and step through each sift. Then break the heap rule and see what the dispatcher does. The load tests run the same workloads through both structures and count how many jobs each one moves.
+
+## [lens] Heaps in each language
+
+Python and Rust ship a heap; Go ships the algorithm and asks you for the slice; JavaScript ships nothing. All four are binary heaps in an array.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Mind the direction. `heapq` and `container/heap` (with the usual `Less`) are min-heaps, Rust's `BinaryHeap` is a max-heap, and a hand-written heap is whatever its comparison says. Flipping the comparison is the most common heap bug.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="heaps-and-priority-queues" />
+
+### What each operation costs
+
+| Operation | Binary heap | Sorted array | Unsorted array |
+|---|---|---|---|
+| Peek at the most urgent | O(1) | O(1) | O(n) |
+| Push | O(log n) | O(n) | O(1) |
+| Pop the most urgent | O(log n) | O(1) at the end | O(n) |
+| Build from n items | O(n) | O(n log n) | O(1) |
+| Find or delete any item | O(n) | O(log n) find, O(n) delete | O(n) |
