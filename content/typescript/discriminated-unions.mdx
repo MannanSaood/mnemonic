@@ -1,0 +1,594 @@
+---
+title: Tagged unions and exhaustiveness
+track: typescript
+group: Modelling
+order: 8
+summary: Model each state as its own member of a union, tagged with a literal field. Switch on the tag, end with assertNever, and every new state becomes a compile error wherever it is not handled yet.
+intent: A payment held as one object with optional fields can represent states that never happen, and adding a real new state breaks code without a single compile error.
+changeRequest: Support 3-D Secure. A payment can now wait in requires_action while the customer confirms it with their bank.
+languages: [go, python, typescript, rust]
+glossary: [discriminated-union, discriminant, sum-type, exhaustive-match, bottom-type, literal-type, finite-state-machine]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [design, types]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: discriminated-unions
+  scenarios:
+    - try: Predict, then press Add requires_action to both.
+      notice: Four union switches turn red with the same error. The optional-fields side stays green in all five functions. The fifth union switch is green too, because it ends in a default branch.
+    - try: Press Ship it before handling anything.
+      notice: The union build fails, so nothing deploys. The optional build ships, and the 3-D Secure payment is sent to the warehouse unpaid and never shown a verification link.
+    - try: Handle the four flagged cases, switch statusLabel to End with assertNever, handle it, and ship again.
+      notice: Zero wrong outcomes. The compiler pointed at every place. On the optional side you have to read all five functions to find the three that are wrong.
+    - try: Reset, give every union switch a default branch, add the state and ship.
+      notice: The union side is now as quiet as the optional side and ships two wrong answers. The safety comes from assertNever, not from the union alone.
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 132, h: 48, title: 5 functions, sub: ship · label · refund · email · retry }
+      after:  { x: 12, y: 30, w: 132, h: 48, title: 5 functions, sub: switch (p.status) }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 380, h: 240, title: Payment, sub: id + 4 optional fields }
+      after:  { x: 168, y: 30, w: 160, h: 56, title: Payment, sub: union of 5 members }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 370, y: 30, w: 178, h: 56, title: "" }
+      after:  { x: 370, y: 30, w: 178, h: 56, title: status, sub: literal tag }
+    - id: pending
+      kind: concrete
+      appears: after
+      before: { x: 12, y: 204, w: 84, h: 40, title: "" }
+      after:  { x: 12, y: 204, w: 84, h: 40, title: Pending }
+    - id: authorized
+      kind: concrete
+      before: { x: 190, y: 72, w: 160, h: 32, title: authCode? }
+      after:  { x: 102, y: 204, w: 92, h: 40, title: Authorized }
+    - id: captured
+      kind: concrete
+      before: { x: 370, y: 72, w: 160, h: 32, title: capturedAt? }
+      after:  { x: 200, y: 204, w: 84, h: 40, title: Captured }
+    - id: failed
+      kind: concrete
+      before: { x: 190, y: 116, w: 160, h: 32, title: failureReason? }
+      after:  { x: 290, y: 204, w: 72, h: 40, title: Failed }
+    - id: refunded
+      kind: concrete
+      before: { x: 370, y: 116, w: 160, h: 32, title: refundId? }
+      after:  { x: 368, y: 204, w: 84, h: 40, title: Refunded }
+    - id: action
+      kind: concrete
+      appears: change
+      before: { x: 190, y: 160, w: 160, h: 32, title: redirectUrl? }
+      after:  { x: 458, y: 204, w: 96, h: 40, title: RequiresAction }
+  edges:
+    - { from: client, to: context, label: switch }
+    - { from: context, to: strategy, label: tagged by }
+    - { from: pending, to: strategy, kind: implements }
+    - { from: authorized, to: strategy, kind: implements }
+    - { from: captured, to: strategy, kind: implements }
+    - { from: failed, to: strategy, kind: implements, label: member }
+    - { from: refunded, to: strategy, kind: implements }
+    - { from: action, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  typescript:
+    before:
+      file: payment.ts · ready.ts · PaymentBadge.tsx
+      source: |
+        // payment.ts
+        type Payment = {
+          id: string;
+          authCode?: string;
+          capturedAt?: Date;
+          failureReason?: string;
+          refundId?: string;
+        };
+
+        // fulfillment/ready.ts: checkout waits for authorization, so pending never gets here
+        export function readyToShip(p: Payment): boolean {
+          return !p.failureReason && !p.refundId;
+        }
+
+        // ui/PaymentBadge.tsx
+        export function statusLabel(p: Payment): string {
+          if (p.refundId) return "Refunded";
+          if (p.failureReason) return "Failed";
+          if (p.capturedAt) return `Paid ${p.capturedAt.toLocaleDateString()}`;
+          if (p.authCode) return "Authorized";
+          return "Processing";
+        }
+      roles: { context: [2, 8], authorized: [4, 4], captured: [5, 5], failed: [6, 6], refunded: [7, 7], client: [10, 22] }
+      change:
+        - { after: 7, add: ['  redirectUrl?: string; // 3-D Secure: the customer must confirm'] }
+        - { line: 12, replace: '  return !p.failureReason && !p.refundId; // true for requires_action: ships unpaid' }
+        - { line: 21, replace: '  return "Processing"; // requires_action lands here: no link to the bank' }
+    after:
+      file: payment.ts · ready.ts
+      source: |
+        type Payment =
+          | { status: "pending"; id: string }
+          | { status: "authorized"; id: string; authCode: string }
+          | { status: "captured"; id: string; authCode: string; capturedAt: Date }
+          | { status: "failed"; id: string; reason: string }
+          | { status: "refunded"; id: string; refundId: string };
+
+        export function assertNever(x: never): never {
+          throw new Error(`unhandled payment: ${JSON.stringify(x)}`);
+        }
+
+        export function readyToShip(p: Payment): boolean {
+          switch (p.status) {
+            case "authorized":
+            case "captured":
+              return true;
+            case "pending":
+            case "failed":
+            case "refunded":
+              return false;
+            default:
+              return assertNever(p); // p: never, because every member is handled
+          }
+        }
+      roles: { context: [1, 6], strategy: [2, 6], pending: [2, 2], authorized: [3, 3], captured: [4, 4], failed: [5, 5], refunded: [6, 6], client: [12, 24], tag: [13, 13], narrow: [14, 16], rest: [17, 20], never: [21, 22] }
+    again:
+      file: payment.ts
+      source: |
+        // payment.ts: one new member
+          | { status: "requires_action"; id: string; redirectUrl: string };
+
+        // The compiler now stops at every switch that ends in assertNever:
+        //   fulfillment/ready.ts  Argument of type '{ status: "requires_action"; ... }'
+        //                         is not assignable to parameter of type 'never'.
+        //   email/receipt.ts, support/refunds.ts, jobs/retry.ts: the same.
+        // Each gets one case, and someone decides what it means there:
+            case "requires_action":
+              return false; // wait for the bank
+    cost:
+      before: { text: 1 field · 0 errors · 3 functions wrong in production, value: 0.9 }
+      after: { text: 1 member · 4 errors · each one a place to decide, value: 0.25 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Discriminated unions are how TypeScript models variants: payment states, events, actions, AST nodes. The tag must be a literal type. `satisfies never` or a `never`-typed variable in the default branch work as well as an `assertNever` function, and the `switch-exhaustiveness-check` rule in typescript-eslint reports missing cases even without a default.'
+      seenIn: '`Promise.allSettled` returns `PromiseSettledResult`, the union of `PromiseFulfilledResult` (status "fulfilled", value) and `PromiseRejectedResult` (status "rejected", reason). Redux actions and XState events are tagged with `type`.'
+
+  go:
+    before:
+      file: payment.go
+      source: |
+        // payment.go
+        type Payment struct {
+        	ID            string
+        	AuthCode      string     // empty until authorized
+        	CapturedAt    *time.Time // nil until captured
+        	FailureReason string
+        	RefundID      string
+        }
+
+        // checkout waits for authorization, so pending never gets here
+        func ReadyToShip(p Payment) bool {
+        	return p.FailureReason == "" && p.RefundID == ""
+        }
+
+        func StatusLabel(p Payment) string {
+        	switch {
+        	case p.RefundID != "":
+        		return "Refunded"
+        	case p.FailureReason != "":
+        		return "Failed"
+        	case p.CapturedAt != nil:
+        		return "Paid"
+        	case p.AuthCode != "":
+        		return "Authorized"
+        	}
+        	return "Processing"
+        }
+      roles: { context: [2, 8], authorized: [4, 4], captured: [5, 5], failed: [6, 6], refunded: [7, 7], client: [10, 27] }
+      change:
+        - { after: 7, add: ['	RedirectURL   string // 3-D Secure: the customer must confirm'] }
+        - { line: 12, replace: '	return p.FailureReason == "" && p.RefundID == "" // true for requires_action: ships unpaid' }
+        - { line: 26, replace: '	return "Processing" // requires_action lands here: no link to the bank' }
+    after:
+      file: payment.go
+      source: |
+        //go-sumtype:decl Payment
+        type Payment interface{ isPayment() }
+
+        type Pending struct{ ID string }
+        type Authorized struct{ ID, AuthCode string }
+        type Captured struct {
+        	ID, AuthCode string
+        	CapturedAt   time.Time
+        }
+        type Failed struct{ ID, Reason string }
+        type Refunded struct{ ID, RefundID string }
+
+        func (Pending) isPayment()    {}
+        func (Authorized) isPayment() {}
+        func (Captured) isPayment()   {}
+        func (Failed) isPayment()     {}
+        func (Refunded) isPayment()   {}
+
+        func ReadyToShip(p Payment) bool {
+        	switch p.(type) {
+        	case Authorized, Captured:
+        		return true
+        	case Pending, Failed, Refunded:
+        		return false
+        	default:
+        		panic(fmt.Sprintf("unhandled payment %T", p))
+        	}
+        }
+      roles: { context: [1, 2], strategy: [13, 17], pending: [4, 4], authorized: [5, 5], captured: [6, 9], failed: [10, 10], refunded: [11, 11], client: [19, 28], tag: [20, 20], narrow: [21, 22], rest: [23, 24], never: [25, 26] }
+    again:
+      file: payment.go
+      source: |
+        // payment.go: one new type
+        type RequiresAction struct{ ID, RedirectURL string }
+
+        func (RequiresAction) isPayment() {}
+
+        // go build: no errors. ReadyToShip panics at runtime on the first 3-D Secure payment.
+        // go-sumtype ./...: reports that the switch in ReadyToShip is missing RequiresAction.
+    cost:
+      before: { text: 1 field · 0 errors · 3 functions wrong in production, value: 0.9 }
+      after: { text: 1 type · 0 compiler errors · a linter or a panic finds the rest, value: 0.55 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Go has no sum types. The usual stand-in is a sealed interface, one with an unexported method so only this package can add members, plus a type switch. The compiler never checks that a type switch is exhaustive; the `go-sumtype` linter does for interfaces marked with `//go-sumtype:decl`, and the `exhaustive` linter does the same for switches over enum-like constants.'
+      seenIn: '`go/ast` is a sealed family of node types (`ast.Expr`, `ast.Stmt`), walked with type switches. `reflect.Kind` is the constant-based form, switched on everywhere in `encoding/json`.'
+
+  python:
+    before:
+      file: payment.py
+      source: |
+        # payment.py
+        @dataclass
+        class Payment:
+            id: str
+            auth_code: str | None = None
+            captured_at: datetime | None = None
+            failure_reason: str | None = None
+            refund_id: str | None = None
+
+        # checkout waits for authorization, so pending never gets here
+        def ready_to_ship(p: Payment) -> bool:
+            return p.failure_reason is None and p.refund_id is None
+
+        def status_label(p: Payment) -> str:
+            if p.refund_id: return "Refunded"
+            if p.failure_reason: return "Failed"
+            if p.captured_at: return f"Paid {p.captured_at:%d %b}"
+            if p.auth_code: return "Authorized"
+            return "Processing"
+      roles: { context: [2, 8], authorized: [5, 5], captured: [6, 6], failed: [7, 7], refunded: [8, 8], client: [10, 19] }
+      change:
+        - { after: 8, add: ['    redirect_url: str | None = None  # 3-D Secure: the customer must confirm'] }
+        - { line: 12, replace: '    return p.failure_reason is None and p.refund_id is None  # True for requires_action' }
+        - { line: 19, replace: '    return "Processing"  # requires_action lands here: no link to the bank' }
+    after:
+      file: payment.py
+      source: |
+        from typing import assert_never
+
+        @dataclass(frozen=True)
+        class Pending: id: str
+        @dataclass(frozen=True)
+        class Authorized: id: str; auth_code: str
+        @dataclass(frozen=True)
+        class Captured: id: str; auth_code: str; captured_at: datetime
+        @dataclass(frozen=True)
+        class Failed: id: str; reason: str
+        @dataclass(frozen=True)
+        class Refunded: id: str; refund_id: str
+
+        type Payment = Pending | Authorized | Captured | Failed | Refunded
+
+        def ready_to_ship(p: Payment) -> bool:
+            match p:
+                case Authorized() | Captured():
+                    return True
+                case Pending() | Failed() | Refunded():
+                    return False
+                case _:
+                    assert_never(p)  # p: Never, because every class is handled
+      roles: { context: [14, 14], strategy: [3, 12], pending: [3, 4], authorized: [5, 6], captured: [7, 8], failed: [9, 10], refunded: [11, 12], client: [16, 23], tag: [17, 17], narrow: [18, 19], rest: [20, 21], never: [22, 23] }
+    again:
+      file: payment.py
+      source: |
+        # payment.py: one new class, added to the union
+        @dataclass(frozen=True)
+        class RequiresAction: id: str; redirect_url: str
+
+        type Payment = Pending | Authorized | Captured | Failed | Refunded | RequiresAction
+
+        # mypy and pyright now report every assert_never(p) that can receive a RequiresAction.
+    cost:
+      before: { text: 1 field · 0 errors · 3 functions wrong in production, value: 0.9 }
+      after: { text: 1 class · the checker lists each match to update, value: 0.3 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'In Python the tag is usually the class itself: a union of small frozen dataclasses, a `match` statement with class patterns, and `typing.assert_never` (3.11) in the last case. With TypedDicts from JSON, a `Literal` field such as `status` plays the tag. Only the checker enforces exhaustiveness; at runtime `assert_never` raises.'
+      seenIn: 'The `ast` module''s node classes are matched with `match node: case ast.Call(func=ast.Name(id="print")): …`. `typing.assert_never` and `typing.Never` arrived in Python 3.11.'
+
+  rust:
+    before:
+      file: payment.rs
+      source: |
+        // payment.rs
+        pub struct Payment {
+            pub id: String,
+            pub auth_code: Option<String>,
+            pub captured_at: Option<DateTime<Utc>>,
+            pub failure_reason: Option<String>,
+            pub refund_id: Option<String>,
+        }
+
+        // checkout waits for authorization, so pending never gets here
+        pub fn ready_to_ship(p: &Payment) -> bool {
+            p.failure_reason.is_none() && p.refund_id.is_none()
+        }
+
+        pub fn status_label(p: &Payment) -> String {
+            if p.refund_id.is_some() { return "Refunded".into(); }
+            if p.failure_reason.is_some() { return "Failed".into(); }
+            if let Some(at) = p.captured_at { return format!("Paid {}", at.format("%d %b")); }
+            if p.auth_code.is_some() { return "Authorized".into(); }
+            "Processing".into()
+        }
+      roles: { context: [2, 8], authorized: [4, 4], captured: [5, 5], failed: [6, 6], refunded: [7, 7], client: [10, 21] }
+      change:
+        - { after: 7, add: ['    pub redirect_url: Option<String>, // 3-D Secure: the customer must confirm'] }
+        - { line: 12, replace: '    p.failure_reason.is_none() && p.refund_id.is_none() // true for requires_action' }
+        - { line: 20, replace: '    "Processing".into() // requires_action lands here: no link to the bank' }
+    after:
+      file: payment.rs
+      source: |
+        pub enum Payment {
+            Pending { id: String },
+            Authorized { id: String, auth_code: String },
+            Captured { id: String, auth_code: String, captured_at: DateTime<Utc> },
+            Failed { id: String, reason: String },
+            Refunded { id: String, refund_id: String },
+        }
+
+        pub fn ready_to_ship(p: &Payment) -> bool {
+            match p {
+                Payment::Authorized { .. } | Payment::Captured { .. } => true,
+                Payment::Pending { .. } | Payment::Failed { .. } | Payment::Refunded { .. } => false,
+            } // no catch-all arm: the compiler checks that every variant is covered
+        }
+      roles: { context: [1, 7], strategy: [1, 7], pending: [2, 2], authorized: [3, 3], captured: [4, 4], failed: [5, 5], refunded: [6, 6], client: [9, 14], tag: [10, 10], narrow: [11, 11], rest: [12, 12], never: [13, 13] }
+    again:
+      file: payment.rs
+      source: |
+        // payment.rs: one new variant
+            RequiresAction { id: String, redirect_url: String },
+
+        // cargo build stops at every match without a catch-all arm:
+        //   error[E0004]: non-exhaustive patterns: `&Payment::RequiresAction { .. }` not covered
+        // Each gets one arm:
+                Payment::RequiresAction { .. } => false, // wait for the bank
+    cost:
+      before: { text: 1 field · 0 errors · 3 functions wrong in production, value: 0.9 }
+      after: { text: 1 variant · every match flagged by the compiler, value: 0.2 }
+    lens:
+      need: 4
+      needLabel: Core idiom
+      note: 'Enums with data are Rust''s sum types, and `match` must be exhaustive, so there is nothing to opt into. The same trap exists: a `_ =>` arm accepts new variants silently. Library authors mark public enums `#[non_exhaustive]` when they plan to add variants, which forces downstream matches to keep a catch-all.'
+      seenIn: '`Option` and `Result` are the sum types every Rust program matches on. `std::io::ErrorKind` is `#[non_exhaustive]`, so code matching it must have a `_` arm. `serde_json::Value` is an enum of the six JSON kinds.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { typescript: '`readyToShip` switches on `p.status`. Every member of the union has a `status` property with a different literal type, so the value of the tag says which member `p` is.', go: '`ReadyToShip` runs a type switch. The dynamic type stored in the interface is the tag.', python: '`match p` tries class patterns in order. The class of the object is the tag.', rust: '`match p` reads the enum''s discriminant, a small integer stored with every value.' }
+    nodes: [client, context]
+    edges: [client>context]
+    role: tag
+  - text: { typescript: 'In `case "captured"`, the compiler narrows `p` to the captured member. `p.capturedAt` is a `Date`, never undefined; no `!` and no `?.`.', go: 'In `case Captured`, a `switch v := p.(type)` form would bind `v` as a `Captured`, so `v.CapturedAt` is a plain `time.Time`.', python: 'In `case Captured()`, the checker narrows `p` to `Captured`, so `p.captured_at` is a `datetime`, not an optional one.', rust: 'An arm like `Payment::Captured { captured_at, .. }` binds the field directly. Other variants simply do not have it.' }
+    nodes: [context, strategy, captured]
+    edges: [context>strategy, captured>strategy]
+    role: narrow
+  - text: { typescript: 'Each case removes its members from the type of `p`. After pending, failed and refunded, nothing is left.', go: 'The remaining cases list the other three types. Go does not track what is left; the list is only as complete as you made it.', python: 'Each case removes its classes from the type of `p` in the checker''s view.', rust: 'The second arm covers the remaining three variants. rustc tracks which variants every arm has covered.' }
+    nodes: [pending, failed, refunded, strategy]
+    edges: [pending>strategy, failed>strategy, refunded>strategy]
+    role: rest
+  - text: { typescript: 'In `default`, `p` has type `never`, the empty set, so `assertNever(p)` compiles. Add a member, and `p` there becomes that member, which is not assignable to `never`: a compile error in every such switch.', go: 'The `default` panics at runtime. A new type reaches it in production unless `go-sumtype` reports the switch first.', python: 'In `case _`, `p` is `Never`, so `assert_never(p)` type-checks. A new class leaves `p` non-empty there, and the checker reports it.', rust: 'There is no default arm. A new variant leaves the match non-exhaustive, and rustc refuses to compile it: error E0004.' }
+    nodes: [strategy, action]
+    edges: [action>strategy]
+    role: never
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: What makes a union of object types a discriminated union?
+    options:
+      - text: Every member has the same property, such as status, and each member gives it a different literal type.
+        correct: true
+        why: Right. Comparing that property to a literal tells the compiler which member it has, so it can narrow.
+      - text: Every member is a class, so instanceof can tell them apart.
+        why: Classes work with instanceof, but a discriminated union needs no classes. Plain objects from JSON with a status field work.
+      - text: The members share no properties at all.
+        why: Then there is nothing to switch on. The shared tag property is what makes the union usable.
+  engineer:
+    question: "statusLabel switches on p.status and ends with default: return \"Processing\". You add requires_action to the union. What happens?"
+    options:
+      - text: It compiles. Every requires_action payment is labelled Processing until someone notices.
+        correct: true
+        why: Right. The default branch accepts any member, including future ones. Ending with assertNever(p) instead turns the new member into a compile error here.
+      - text: The compiler flags the switch because requires_action has no case.
+        why: Only if the default branch requires never. A default that returns a value is a valid branch for any member.
+      - text: It throws at runtime when a requires_action payment arrives.
+        why: Nothing throws; the default returns "Processing". That silence is the problem.
+  deep:
+    question: Why does assertNever(p) in the default branch compile today but fail after you add a member?
+    options:
+      - text: In the default branch, p has the type of the members no case handled. With all handled, that is never, which is assignable to never; a new member leaves a non-empty type, which is not.
+        correct: true
+        why: Right. Each case removes its members from p's type by narrowing on the literal tag. The default sees what is left, and the parameter type never accepts only the empty set.
+      - text: The compiler counts the cases and compares the count to the number of members.
+        why: There is no counting. It is ordinary narrowing plus an assignability check against never.
+      - text: assertNever is a compiler built-in that checks the switch it appears in.
+        why: It is an ordinary function you write. Its parameter type, never, does all the work.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Union
+      example: Payment
+      job: Lists every state the value can be in, and nothing else.
+    - role: Tag (discriminant)
+      example: status
+      job: A property every member has, with a different literal type in each. Comparing it narrows to one member.
+    - role: Member
+      example: "{ status: \"captured\"; capturedAt: Date }"
+      job: One state with exactly the fields that state has, all required.
+    - role: Exhaustiveness check
+      example: assertNever(p) in default
+      job: Fails to compile while any member is unhandled, so a new member is flagged at every switch.
+  useWhen:
+    - A value moves through states, and each state has different data, such as payments, uploads, fetches or deploys.
+    - You decode tagged JSON events or messages.
+    - You expect new variants over time and want the compiler to list every place that must handle them.
+  avoidWhen:
+    - The variants differ only in behaviour that changes together. An interface with one method per operation may be simpler.
+    - Other teams add variants you cannot see, such as plugins. A closed union cannot be extended from outside.
+  tradeoffs:
+    - Every switch must change when you add a member. That is the point, but in a large codebase it is a real cost.
+    - Adding a new operation is cheap (one more switch). Adding a new member touches every switch. This is the expression problem, the mirror image of class hierarchies.
+    - The union shapes data in memory only. Values from the network still need a check at the boundary to become a Payment.
+  lookalikes:
+    - name: Optional fields
+      how: One object type with many optional properties. Flexible, but it allows impossible combinations and gives the compiler no list of states to check.
+    - name: State pattern
+      how: Each state is a class with its own methods. Adding a state is one class; adding an operation touches every class. Unions make the opposite trade.
+    - name: Enum
+      how: A TypeScript enum or a union of strings names the states but carries no per-state data. A discriminated union attaches data to each state.
+---
+
+## [concept] Tagged unions and exhaustiveness
+
+**Model each state as its own member of a union, tagged with a literal field. Switch on the tag, end with assertNever, and every new state becomes a compile error wherever it is not handled yet.**
+
+A captured payment has a capture date. A failed one has a reason. In a <Term id="discriminated-union">discriminated union</Term> each state is its own type with exactly those fields, and a shared `status` field says which state this is.
+
+<Depth level={2}>
+The shared field is the <Term id="discriminant">discriminant</Term>. Its type in each member is a <Term id="literal-type">literal type</Term>, so `p.status === "captured"` narrows `p` to the captured member. Code inside that branch reads `p.capturedAt` as a `Date`, never `undefined`. The union lists the states of a <Term id="finite-state-machine">finite-state machine</Term>, and each member carries only the data its state can have, so a payment that is both failed and captured cannot be written.
+</Depth>
+
+<Depth level={3}>
+This is a <Term id="sum-type">sum type</Term>, the same idea as a Rust enum or an ML variant. TypeScript builds it from parts it already has: unions, literal types and narrowing. The exhaustiveness check is the last part. Each `case` removes its members from the type of `p`, so the `default` branch sees what is left. When nothing is left, `p` there is `never`, the <Term id="bottom-type">bottom type</Term>, and only `never` can be passed to a parameter of type `never`. That one assignment turns the switch into an <Term id="exhaustive-match">exhaustive match</Term>.
+</Depth>
+
+## [problem] A payment made of optional fields
+
+A shop keeps each payment as one object: an id plus optional fields that fill in as the payment moves along. Five functions in five files read it: fulfillment, the status badge, refunds, the receipt email and a retry job.
+
+It works. Each function checks the fields it cares about, and the tests cover the five statuses the payment provider sends.
+
+<Depth level={2}>
+Look at what the type allows. Four optional fields make 16 combinations, and only five of them are real payments. A refunded payment without a capture date, or a failed one with an auth code, type-checks just as well. Each function infers the state from whichever fields it happens to test, and each one infers it a little differently.
+</Depth>
+
+<Depth level={3}>
+`readyToShip` relies on a comment: checkout waits for authorization, so a pending payment never reaches fulfillment. That assumption is invisible to the compiler and true only for the flows that existed when it was written.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** support 3-D Secure. A payment can now wait in requires_action while the customer confirms it with their bank.
+
+Add one optional field, `redirectUrl`. Everything compiles. Checkout now returns to the customer before authorization, so 3-D Secure payments reach fulfillment, and `readyToShip` says true: the warehouse ships an order nobody has paid for. The badge says Processing, the receipt says Pending, and neither shows the link the customer needs.
+
+<Depth level={2}>
+The marked lines are the ones that misbehave, and nothing marks them. Two of the five functions happen to do the right thing, by luck. To find the three that do not, someone has to read all five, and every function added since.
+</Depth>
+
+<Depth level={3}>
+Five optional fields make 32 combinations. Each new optional field doubles the shapes the type allows, while the business gained one state.
+</Depth>
+
+## [morph] One member per state
+
+Drag the slider. The optional fields move into five member types, one per state, each tagged by `status`. The functions switch on the tag and end with `assertNever`.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+Fields that were optional become required where they belong. `capturedAt` exists only on the captured member, so `readyToShip` and every other function can stop guessing the state from which fields are set.
+</Depth>
+
+<Depth level={3}>
+<Lang only="typescript">`assertNever` does two jobs. At compile time its parameter type proves the switch is complete. At runtime it throws if a value outside the union arrives anyway, for example from an API that started sending a new status before you deployed.</Lang>
+<Lang only="go">The sealed interface keeps other packages from adding members, which is what makes a list of cases meaningful. The compiler still does not check the list; the `//go-sumtype:decl` comment lets the linter do it.</Lang>
+<Lang only="python">Frozen dataclasses make each state immutable, so moving between states means building a new object, which keeps the old one honest. `assert_never` both satisfies the checker and raises at runtime.</Lang>
+<Lang only="rust">Rust needs no helper. A `match` without a catch-all arm is already exhaustive, and the compiler refuses to build one that misses a variant.</Lang>
+</Depth>
+
+## [walk] Follow one switch
+
+`readyToShip` receives a payment. Step through the switch with the numbered buttons, and watch what the compiler knows about `p` at each case.
+
+<Depth level={3}>
+<Lang only="typescript">A `switch` on a string tag compiles to ordinary JavaScript comparisons; the union and the narrowing are erased. The check costs nothing at runtime, and protects nothing at runtime except through the throw in `assertNever`.</Lang>
+<Lang only="go">A type switch compares the interface's type word against each case's type. Order matters only for readability, since each concrete type matches one case.</Lang>
+<Lang only="python">Class patterns call `isinstance` in order. The checker's narrowing is static; at runtime the `case _` arm really runs `assert_never`, which raises `AssertionError`.</Lang>
+<Lang only="rust">The match compiles to a jump on the discriminant. Exhaustiveness is checked before code generation, so a missing variant never reaches a binary.</Lang>
+</Depth>
+
+## [again] 3-D Secure, the second time
+
+The same request, after the refactor. Add one member, `requires_action`, with a required `redirectUrl`. The compiler stops at every switch that ends in `assertNever`, with the file and line. Each one gets a case, and someone decides, in that place, what a payment waiting for the bank means there.
+
+<Depth level={2}>
+Not every switch is flagged. One that ends in `default: return "Processing"` compiles and quietly treats the new state like the default. Keep defaults for switches over open sets, such as strings from outside; over your own union, end with `assertNever`.
+</Depth>
+
+<Depth level={3}>
+The trade-off is the <Term id="exhaustive-match">exhaustive match</Term>'s mirror image: adding a member touches every switch, while adding a new operation is one new function. Classes make the opposite trade. Pick the one that matches what changes more often in your domain.
+</Depth>
+
+## [play] Add a payment state
+
+The same payment, modelled both ways, read by the same five functions. Add the 3-D Secure state, see which side tells you where the work is, then ship and run one real 3-D Secure payment through both. Then break the union side with default branches.
+
+## [lens] How each language writes it
+
+Rust has sum types and exhaustive matching built in. TypeScript and Python assemble them from unions, tags and a never-typed check. Go has neither, and leans on a sealed interface and a linter.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="discriminated-unions" />
+
+### Three ways to write the exhaustiveness check
+
+| Form | Example | Notes |
+|---|---|---|
+| Helper function | `default: return assertNever(p);` | Fails to compile on a new member, and throws at runtime if a bad value slips in |
+| `satisfies never` | `default: p satisfies never; throw new Error();` | Needs TypeScript 4.9+; no helper to import |
+| Return-type check | no default; the function returns `boolean` | With `strictNullChecks`, a missing case means the function can end without returning, which is an error. Weaker: it says nothing about switches with side effects only |

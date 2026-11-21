@@ -1,0 +1,10 @@
+# Terms introduced by typescript/discriminated-unions.
+- id: discriminated-union
+  term: Discriminated union
+  short: A union of object types that share one property, the tag, with a different literal type in each member. Checking the tag narrows the value to one member.
+- id: discriminant
+  term: Discriminant
+  short: The shared property of a discriminated union, such as status or kind. Its type in each member must be a literal, so comparing it tells the members apart.
+- id: sum-type
+  term: Sum type
+  short: A type whose value is exactly one of several variants, each with its own data. Rust enums and TypeScript discriminated unions are sum types.
