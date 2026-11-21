@@ -1,0 +1,566 @@
+---
+title: "DNS: from name to address"
+track: networking
+group: DNS and TLS
+order: 21
+summary: A resolver walks from the root to the domain's own servers, and every answer it gets comes with a time limit.
+intent: Know who answers a DNS lookup, why the second lookup is nearly free, and why an address you resolved is only good for its TTL.
+changeRequest: The platform team replaces the metrics relay. The new VM has a new address, and they update metrics.example.com with a TTL of 60 s.
+languages: [go, python, typescript, rust]
+glossary: [stub-resolver, recursive-resolver, authoritative-server, dns-referral, glue-record, cname, time-to-live]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [networking/ports-sockets-multiplexing]
+skills: [networking, dns]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground
+playground:
+  model: dns-resolution
+  scenarios:
+    - try: "Resolve api.example.com, press +10 s, and resolve it again."
+      notice: "The first lookup asks the root, .com and example.com. The second never leaves the resolver: about 2 ms against about 100."
+    - try: "Now resolve www.example.com, then shop.example.com."
+      notice: "www costs one query: the referrals to example.com are cached for two days. shop is a CNAME into example.net, so the resolver walks a second branch of the tree."
+    - try: "Move api.example.com to its new address while it is cached."
+      notice: "The resolver keeps handing out the old address until the TTL it was given runs out: up to an hour here. Lowering the TTL now does not shorten that copy."
+    - try: "Take ns1.example.com down and resolve a name the cache does not have."
+      notice: "The resolver waits 800 ms for ns1, then asks ns2. Cached names are not affected at all."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: app
+      kind: client
+      before: { x: 12, y: 106, w: 108, h: 56, title: app, sub: metrics client }
+      after:  { x: 12, y: 106, w: 108, h: 56, title: app, sub: stub resolver }
+    - id: resolver
+      kind: context
+      before: { x: 150, y: 24, w: 260, h: 226, title: DNS, sub: "what you assumed: one lookup, good forever" }
+      after:  { x: 150, y: 106, w: 118, h: 56, title: recursive, sub: resolver }
+    - id: cache
+      kind: strategy
+      appears: after
+      before: { x: 150, y: 204, w: 118, h: 50, title: "" }
+      after:  { x: 150, y: 204, w: 118, h: 50, title: cache, sub: one TTL per answer }
+    - id: root
+      kind: concrete
+      appears: after
+      before: { x: 420, y: 14, w: 128, h: 48, title: root, sub: "refers to .com" }
+      after:  { x: 420, y: 14, w: 128, h: 48, title: root, sub: "refers to .com" }
+    - id: tld
+      kind: concrete
+      appears: after
+      before: { x: 420, y: 110, w: 128, h: 48, title: .com, sub: refers to example.com }
+      after:  { x: 420, y: 110, w: 128, h: 48, title: .com, sub: refers to example.com }
+    - id: auth
+      kind: concrete
+      before: { x: 170, y: 110, w: 220, h: 48, title: metrics → 203.0.113.10, sub: fixed }
+      after:  { x: 420, y: 206, w: 128, h: 48, title: example.com, sub: answers · TTL 60 }
+  edges:
+    - { from: app, to: resolver, label: query }
+    - { from: resolver, to: root, label: "1" }
+    - { from: resolver, to: tld, label: "2" }
+    - { from: resolver, to: auth, label: "3" }
+    - { from: cache, to: resolver, kind: implements, label: keeps for TTL }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: metrics.go
+      source: |
+        // metrics.go
+        type Metrics struct {
+            conn *net.UDPConn
+        }
+
+        func NewMetrics() (*Metrics, error) {
+            addr, err := net.ResolveUDPAddr("udp", "metrics.example.com:8125")
+            if err != nil {
+                return nil, err
+            }
+            conn, err := net.DialUDP("udp", nil, addr)
+            if err != nil {
+                return nil, err
+            }
+            return &Metrics{conn: conn}, nil
+        }
+
+        func (m *Metrics) Count(name string, n int) {
+            fmt.Fprintf(m.conn, "%s:%d|c", name, n) // fire and forget
+        }
+      roles: { app: [18, 20], resolver: [7, 7], auth: [7, 7] }
+      change:
+        - { after: 7, add: ['    // 203.0.113.10, looked up once; the relay is now at 198.51.100.7'] }
+        - { line: 19, replace: '    fmt.Fprintf(m.conn, "%s:%d|c", name, n) // to the old VM, silently lost' }
+    after:
+      file: metrics.go
+      source: |
+        // metrics.go
+        const metricsAddr = "metrics.example.com:8125"
+
+        type Metrics struct {
+            conn atomic.Pointer[net.UDPConn]
+        }
+
+        // Ask the resolver again every 30 s. Its cache answers most of these in a
+        // millisecond, and a moved record reaches us within TTL + 30 s.
+        func (m *Metrics) refresh() {
+            for range time.Tick(30 * time.Second) {
+                conn, err := dialMetrics()
+                if err != nil {
+                    continue // keep the last good address
+                }
+                if old := m.conn.Swap(conn); old != nil {
+                    old.Close()
+                }
+            }
+        }
+
+        func dialMetrics() (*net.UDPConn, error) {
+            addr, err := net.ResolveUDPAddr("udp", metricsAddr) // a fresh lookup
+            if err != nil {
+                return nil, err
+            }
+            return net.DialUDP("udp", nil, addr)
+        }
+
+        func (m *Metrics) Count(name string, n int) {
+            fmt.Fprintf(m.conn.Load(), "%s:%d|c", name, n)
+        }
+      roles: { app: [30, 32], resolver: [23, 23], cache: [8, 9], root: [23, 23], tld: [23, 23], auth: [23, 23], stub: [22, 23], referral: [23, 23], answer: [16, 18], ttl: [10, 11] }
+    again:
+      file: main.go
+      source: |
+        // main.go: the same client, now it follows the record
+        m := &Metrics{}
+        conn, err := dialMetrics()
+        if err != nil {
+            log.Fatal(err)
+        }
+        m.conn.Store(conn)
+        go m.refresh()
+    cost:
+      before: { text: hours of lost metrics, value: 0.9 }
+      after: { text: "≤ 90 s: TTL 60 + 30 s", value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'On Linux, Go uses its own resolver: it reads `/etc/resolv.conf` and `/etc/hosts` itself, and a blocked lookup costs a goroutine, not a thread. It falls back to the C library''s `getaddrinfo` for settings it cannot handle. Force either with `GODEBUG=netdns=go` or `netdns=cgo`. Neither caches answers in the process.'
+      seenIn: '`net.Resolver` with `PreferGo` and a custom `Dial` to choose the DNS server. `net.Dialer` resolves on every dial. `GODEBUG=netdns=go+1` prints which resolver was picked.'
+
+  python:
+    before:
+      file: metrics.py
+      source: |
+        # metrics.py
+        import socket
+
+        class Metrics:
+            def __init__(self) -> None:
+                self.addr = (socket.gethostbyname("metrics.example.com"), 8125)
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+            def count(self, name: str, n: int = 1) -> None:
+                self.sock.sendto(f"{name}:{n}|c".encode(), self.addr)  # fire and forget
+      roles: { app: [9, 10], resolver: [6, 6], auth: [6, 6] }
+      change:
+        - { after: 6, add: ['        # 203.0.113.10, looked up once; the relay is now at 198.51.100.7'] }
+        - { line: 10, replace: '        self.sock.sendto(f"{name}:{n}|c".encode(), self.addr)  # silently lost' }
+    after:
+      file: metrics.py
+      source: |
+        # metrics.py
+        import socket
+        import threading
+        import time
+
+        HOST, PORT = "metrics.example.com", 8125
+
+        class Metrics:
+            def __init__(self) -> None:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.addr = (socket.gethostbyname(HOST), PORT)
+                threading.Thread(target=self._refresh, daemon=True).start()
+
+            # Ask the resolver again every 30 s. Its cache answers most of these in a
+            # millisecond, and a moved record reaches us within TTL + 30 s.
+            def _refresh(self) -> None:
+                while True:
+                    time.sleep(30)
+                    try:
+                        self.addr = (socket.gethostbyname(HOST), PORT)  # a fresh lookup
+                    except OSError:
+                        pass  # keep the last good address
+
+            def count(self, name: str, n: int = 1) -> None:
+                self.sock.sendto(f"{name}:{n}|c".encode(), self.addr)
+      roles: { app: [24, 25], resolver: [20, 20], cache: [14, 15], root: [20, 20], tld: [20, 20], auth: [20, 20], stub: [20, 20], referral: [20, 20], answer: [19, 22], ttl: [16, 18] }
+    again:
+      file: app.py
+      source: |
+        # app.py: the same client, now it follows the record
+        metrics = Metrics()
+        metrics.count("checkout.completed")
+    cost:
+      before: { text: hours of lost metrics, value: 0.9 }
+      after: { text: "≤ 90 s: TTL 60 + 30 s", value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`socket.getaddrinfo` and `gethostbyname` call the C library. The call blocks the thread and caches nothing, unless the host runs a local cache such as `systemd-resolved` or `nscd`. asyncio''s `loop.getaddrinfo` runs the same call in a thread pool. For TTLs or a chosen server, use `dnspython`.'
+      seenIn: '`socket.getaddrinfo`. `loop.getaddrinfo` in asyncio. `dns.resolver.resolve()` in dnspython, whose answer carries its TTL.'
+
+  typescript:
+    before:
+      file: metrics.ts
+      source: |
+        // metrics.ts
+        import dgram from "node:dgram";
+        import { lookup } from "node:dns/promises";
+
+        export async function createMetrics() {
+          const { address } = await lookup("metrics.example.com", { family: 4 });
+          const sock = dgram.createSocket("udp4");
+          return {
+            count(name: string, n = 1) {
+              sock.send(`${name}:${n}|c`, 8125, address); // fire and forget
+            },
+          };
+        }
+      roles: { app: [8, 12], resolver: [6, 6], auth: [6, 6] }
+      change:
+        - { after: 6, add: ['  // 203.0.113.10, looked up once; the relay is now at 198.51.100.7'] }
+        - { line: 10, replace: '      sock.send(`${name}:${n}|c`, 8125, address); // silently lost' }
+    after:
+      file: metrics.ts
+      source: |
+        // metrics.ts
+        import dgram from "node:dgram";
+        import { lookup } from "node:dns/promises";
+
+        const HOST = "metrics.example.com";
+
+        export async function createMetrics() {
+          const sock = dgram.createSocket("udp4");
+          let { address } = await lookup(HOST, { family: 4 });
+
+          // Ask the resolver again every 30 s. Its cache answers most of these in a
+          // millisecond, and a moved record reaches us within TTL + 30 s.
+          setInterval(async () => {
+            try {
+              ({ address } = await lookup(HOST, { family: 4 })); // a fresh lookup
+            } catch {
+              // keep the last good address
+            }
+          }, 30_000).unref();
+
+          return {
+            count(name: string, n = 1) {
+              sock.send(`${name}:${n}|c`, 8125, address);
+            },
+          };
+        }
+      roles: { app: [21, 25], resolver: [15, 15], cache: [11, 12], root: [15, 15], tld: [15, 15], auth: [15, 15], stub: [9, 9], referral: [15, 15], answer: [14, 18], ttl: [13, 19] }
+    again:
+      file: server.ts
+      source: |
+        // server.ts: the same client, now it follows the record
+        const metrics = await createMetrics();
+        metrics.count("checkout.completed");
+    cost:
+      before: { text: hours of lost metrics, value: 0.9 }
+      after: { text: "≤ 90 s: TTL 60 + 30 s", value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`dns.lookup`, which `net`, `http` and `dgram` call when you pass a hostname, runs `getaddrinfo` on libuv''s thread pool (four threads by default) and reads `/etc/hosts`. `dns.resolve4` speaks DNS itself through c-ares, skips `/etc/hosts`, and with `{ ttl: true }` returns each record''s TTL. Node caches neither.'
+      seenIn: '`dns.lookup` behind `http.request` and `fetch`. `dns.promises.resolve4(host, { ttl: true })`. `UV_THREADPOOL_SIZE`, when slow lookups hold up file I/O on the same pool.'
+
+  rust:
+    before:
+      file: metrics.rs
+      source: |
+        // metrics.rs
+        use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+
+        pub struct Metrics {
+            sock: UdpSocket,
+            addr: SocketAddr,
+        }
+
+        impl Metrics {
+            pub fn new() -> std::io::Result<Self> {
+                let addr = ("metrics.example.com", 8125)
+                    .to_socket_addrs()?
+                    .next()
+                    .ok_or_else(|| std::io::Error::other("no address"))?;
+                let sock = UdpSocket::bind("0.0.0.0:0")?;
+                Ok(Self { sock, addr })
+            }
+
+            pub fn count(&self, name: &str, n: u64) {
+                let _ = self.sock.send_to(format!("{name}:{n}|c").as_bytes(), self.addr);
+            }
+        }
+      roles: { app: [19, 21], resolver: [11, 14], auth: [11, 14] }
+      change:
+        - { after: 14, add: ['        // 203.0.113.10, looked up once; the relay is now at 198.51.100.7'] }
+        - { line: 20, replace: '        let _ = self.sock.send_to(format!("{name}:{n}|c").as_bytes(), self.addr); // lost' }
+    after:
+      file: metrics.rs
+      source: |
+        // metrics.rs
+        use std::net::{SocketAddr, UdpSocket};
+        use std::sync::{Arc, RwLock};
+        use std::time::Duration;
+
+        const HOST: (&str, u16) = ("metrics.example.com", 8125);
+
+        pub struct Metrics {
+            sock: UdpSocket,
+            addr: Arc<RwLock<SocketAddr>>,
+        }
+
+        impl Metrics {
+            pub async fn new() -> std::io::Result<Self> {
+                let addr = Arc::new(RwLock::new(resolve().await?));
+                // Ask the resolver again every 30 s. Its cache answers most of these in a
+                // millisecond, and a moved record reaches us within TTL + 30 s.
+                let shared = Arc::clone(&addr);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        if let Ok(a) = resolve().await {
+                            *shared.write().unwrap() = a; // else keep the last good address
+                        }
+                    }
+                });
+                Ok(Self { sock: UdpSocket::bind("0.0.0.0:0")?, addr })
+            }
+
+            pub fn count(&self, name: &str, n: u64) {
+                let to = *self.addr.read().unwrap();
+                let _ = self.sock.send_to(format!("{name}:{n}|c").as_bytes(), to);
+            }
+        }
+
+        async fn resolve() -> std::io::Result<SocketAddr> {
+            tokio::net::lookup_host(HOST).await?.next() // getaddrinfo on a blocking thread
+                .ok_or_else(|| std::io::Error::other("no address"))
+        }
+      roles: { app: [30, 33], resolver: [37, 37], cache: [16, 17], root: [37, 37], tld: [37, 37], auth: [37, 37], stub: [36, 38], referral: [37, 37], answer: [22, 23], ttl: [16, 21] }
+    again:
+      file: main.rs
+      source: |
+        // main.rs: the same client, now it follows the record
+        let metrics = Metrics::new().await?;
+        metrics.count("checkout.completed", 1);
+    cost:
+      before: { text: hours of lost metrics, value: 0.9 }
+      after: { text: "≤ 90 s: TTL 60 + 30 s", value: 0.15 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: '`ToSocketAddrs` calls `getaddrinfo` and blocks the thread; `tokio::net::lookup_host` runs it on the blocking pool. `hickory-resolver` is a pure-Rust resolver that speaks DNS itself and caches answers for their TTL; reqwest uses it with the `hickory-dns` feature.'
+      seenIn: '`std::net::ToSocketAddrs`. `tokio::net::lookup_host`. `hickory_resolver`, formerly trust-dns. `reqwest::ClientBuilder::dns_resolver` to plug in your own.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Every 30 s the client asks for metrics.example.com. The stub, in the C library or the Go runtime, checks /etc/hosts, then sends one UDP query to the recursive resolver named in /etc/resolv.conf.
+    nodes: [app, resolver]
+    edges: [app>resolver]
+    role: stub
+  - text: With a cold cache the resolver starts at a root server. The root knows only who runs .com and says so, a referral. The .com server refers it on to example.com's own name servers. Both referrals are cached for two days.
+    nodes: [resolver, root, tld]
+    edges: [resolver>root, resolver>tld]
+    role: referral
+  - text: "example.com's authoritative server answers: metrics.example.com A 198.51.100.7, TTL 60. The resolver passes it to the stub, and the client swaps its socket to the new address."
+    nodes: [resolver, auth, app]
+    edges: [resolver>auth]
+    role: answer
+  - text: The resolver keeps that answer for 60 s. The next refresh is a cache hit that takes about a millisecond. A changed record reaches the client at most 60 + 30 s after the change.
+    nodes: [cache, resolver]
+    edges: [cache>resolver]
+    role: ttl
+
+# ---------------------------------------------------------------- checks
+checks:
+  overview:
+    question: Who walks from the root down to the domain's own name servers?
+    options:
+      - text: The recursive resolver, such as the one your data center or ISP runs.
+        correct: true
+        why: Right. It asks the root, the TLD and the authoritative server in turn, and caches what it learns for everyone who uses it.
+      - text: Your application's stub resolver.
+        why: The stub sends one query to the recursive resolver and waits. It does not follow referrals.
+      - text: The root server, which forwards the question down the tree for you.
+        why: The root only answers with a referral to the TLD servers. It never asks anyone on your behalf.
+  engineer:
+    question: api.example.com has a TTL of 3600 s and must move to a new address tomorrow with as little stale traffic as possible. What do you do first?
+    options:
+      - text: Lower the TTL to 60 s today, wait at least an hour, then change the address.
+        correct: true
+        why: Right. Copies cached before today still carry 3600 s. Once they have expired, every cache holds the record for 60 s at most, so the move reaches everyone within a minute.
+      - text: Change the address and the TTL to 60 s at the same moment.
+        why: Resolvers that cached the old record under TTL 3600 keep it for up to an hour. The new TTL only applies to copies fetched after the change.
+      - text: Change the address, then flush your own resolver's cache.
+        why: That fixes your resolver only. Every other resolver on the internet still holds the old answer until its TTL runs out.
+  deep:
+    question: The .com servers refer resolvers to ns1.example.com for example.com. Why do they also send ns1.example.com's address, a glue record?
+    options:
+      - text: Without it, the resolver would need example.com's servers to find the address of example.com's servers.
+        correct: true
+        why: Right. The name server's name sits inside the zone it serves, so the parent zone hands out its address along with the referral to break the loop.
+      - text: Glue records sign the referral so it cannot be forged.
+        why: Signing is DNSSEC's job, with RRSIG and DS records. Glue is plain, unsigned address data.
+      - text: Glue records let the TLD answer the A query for any name in example.com.
+        why: The TLD only knows the delegation and the name servers' addresses. Names inside example.com are answered by example.com's servers.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Stub resolver
+      example: { go: Go's built-in resolver, python: "getaddrinfo in libc", typescript: "dns.lookup (getaddrinfo)", rust: "getaddrinfo via ToSocketAddrs" }
+      job: Reads /etc/hosts and resolv.conf, sends one query, waits.
+    - role: Recursive resolver
+      example: "the VPC resolver, CoreDNS, 1.1.1.1"
+      job: Walks the hierarchy and caches every answer for its TTL.
+    - role: Root servers
+      example: "a.root-servers.net to m.root-servers.net"
+      job: Refer each TLD to its servers.
+    - role: TLD servers
+      example: "a.gtld-servers.net for .com"
+      job: Refer each domain to its authoritative servers, with glue.
+    - role: Authoritative servers
+      example: "ns1.example.com"
+      job: Hold the zone's records and answer for them, with a TTL.
+  useWhen:
+    - A long-running client resolves a name once at startup and keeps the address. It will miss every later change.
+    - The first request after a deploy or a quiet period is slow. A cold lookup costs several round trips to far-away servers.
+    - You plan to move a service to a new address. Lower the TTL first.
+  avoidWhen:
+    - Do not cache addresses in the process for longer than their TTL, and do not cache them forever. Let the resolver cache them.
+    - Do not set very low TTLs everywhere by default. Each one multiplies queries to your name servers and adds cold lookups for your users.
+  tradeoffs:
+    - A long TTL means fewer queries and faster lookups, and slow changes.
+    - A short TTL means quick changes, and more load on your name servers plus more cold lookups.
+    - "Most stubs do not cache: on many Linux hosts every getaddrinfo call goes to the resolver."
+    - Lookups usually run over UDP. Big answers come back truncated and the resolver retries over TCP.
+  lookalikes:
+    - name: /etc/hosts
+      how: A local file the stub reads before asking DNS. Nothing expires, and nobody else sees it.
+    - name: Service discovery
+      how: Consul, Kubernetes Services and similar systems often serve DNS too, with very short TTLs, from their own registry.
+    - name: DNS caching and failures
+      how: The next lesson covers negative caching, search domains and timeouts when a resolver is down.
+---
+
+## [concept] DNS: from name to address
+
+**A name is resolved by walking down a tree of servers: the root, then the top-level domain, then the domain's own servers. Every answer along the way comes with a TTL, and is cached for exactly that long.**
+
+You never do the walk yourself. Your program asks a resolver, and the resolver does the walking and keeps what it learns.
+
+<Depth level={2}>
+Three roles share the work. The <Term id="stub-resolver">stub resolver</Term> in your process sends one query and waits. The <Term id="recursive-resolver">recursive resolver</Term>, run by your data center, cloud or ISP, follows <Term id="dns-referral">referrals</Term>: the root names the .com servers, the .com servers name example.com's servers, and an <Term id="authoritative-server">authoritative server</Term> finally answers. Each record carries a <Term id="time-to-live">TTL</Term>, and every cache that holds the record may reuse it until the TTL runs out. Common record types: A (IPv4), AAAA (IPv6), <Term id="cname">CNAME</Term> (an alias), MX, TXT, NS and SRV.
+</Depth>
+
+<Depth level={3}>
+DNS is defined in RFC 1034 (concepts) and RFC 1035 (the wire format). Queries normally go over UDP port 53, and an answer too big for the UDP buffer comes back with the TC bit set, so the resolver repeats the question over TCP. There are 13 root server identities, a to m, each run on many anycast instances. When a zone's name server lives inside the zone (ns1.example.com for example.com), the parent hands out its address with the referral: a <Term id="glue-record">glue record</Term>.
+</Depth>
+
+## [problem] A metrics client that looks up its relay once
+
+Every service sends counters over UDP to a metrics relay at metrics.example.com. The client resolves the name when the service starts, then sends to that address for as long as the process lives.
+
+It works. Lookups never show up in a profile, and the relay has had the same address for a year.
+
+<Depth level={2}>
+The mental model behind it: a name is an address with a nicer spelling. Look it up once and you know it. Resolving on every send looks wasteful, so the code does it at startup.
+</Depth>
+
+<Depth level={3}>
+UDP makes the bug quiet. A send to an address where nobody listens usually succeeds locally; the datagram is simply lost. Nothing in the service logs an error.
+</Depth>
+
+## [pain] Then the relay moves
+
+**Change request:** the platform team replaces the metrics relay. The new VM has a new address, and they update metrics.example.com with a TTL of 60 s.
+
+Within two minutes the old VM is gone. Dashboards for most services go flat and stay flat. The few services that were redeployed that afternoon keep reporting. The marked lines are why: the address was fixed at startup.
+
+<Depth level={2}>
+The DNS change worked. Every resolver handed out the new address within 60 s. The services simply never asked again. The cost is every metric from every long-running process until each one restarts, which for a stable service can be weeks.
+</Depth>
+
+<Depth level={3}>
+Clients written this way exist in every ecosystem: StatsD and syslog senders, database drivers that pin a primary's address, connection pools that never close connections. Some runtimes add a cache of their own; the JVM's address cache, for example, can keep successful lookups forever when a security manager is installed. An address from DNS is a lease, valid for the TTL.
+</Depth>
+
+## [morph] From one fixed answer to a lease
+
+Drag the slider. The single box labelled DNS opens up into the real chain: a recursive resolver with a cache, and three levels of servers it asks in turn.
+
+The code changes to ask again every 30 seconds. Most of those lookups are cache hits at the resolver, so they cost about a millisecond.
+
+<Depth level={2}>
+Asking again is cheap because of the resolver's cache, and it is safe because the client keeps the last good address if a lookup fails. The refresh period adds to the TTL: with TTL 60 and a 30 s refresh, a change reaches the client within 90 s.
+</Depth>
+
+<Depth level={3}>
+Connection-oriented clients need one more thing. A TCP connection opened to the old address stays on the old address however often you resolve, so pools need a maximum connection lifetime too. HTTP clients usually get this for free when the old server closes its connections.
+</Depth>
+
+## [walk] Follow one lookup
+
+One refresh, starting from a cold resolver cache, traced through every server it reaches.
+
+<Depth level={3}>
+Real resolvers add a few details. They pick among a zone's name servers by measured response time, and they send only as much of the name as each level needs (QNAME minimisation, RFC 9156), so the root sees "com" rather than the full name. They also cache negative answers, so a name that does not exist is not asked about again until the zone's SOA says it may be.
+</Depth>
+
+## [again] The relay moves again
+
+The platform team moves the relay a second time. Each service picks up the new address at its next refresh after the resolver's copy expires: within 90 seconds, with no restarts.
+
+<Depth level={2}>
+For planned moves the TTL is the lever. Lower it a day ahead, wait out the old TTL, move, then raise it again. The playground lets you try the move both ways.
+</Depth>
+
+<Depth level={3}>
+If the refresh fails because DNS itself is down, the client keeps sending to the last address it had. That is the right default for a metrics client. For a client where a wrong address is worse than none, fail closed instead.
+</Depth>
+
+## [play] Run a resolver
+
+A recursive resolver with an empty cache, the root, two TLDs and two zones. Resolve names, let time pass, change the record, and break a name server.
+
+The diagram shows every query the resolver sends for the latest lookup; the table shows what it remembers and for how long.
+
+## [lens] How each language resolves names
+
+Each runtime has its own stub. Some call the C library's `getaddrinfo` on a thread, some speak DNS themselves, and almost none cache answers in the process.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+The difference shows up in failures. A stub that calls `getaddrinfo` follows `/etc/nsswitch.conf`, `/etc/hosts` and the C library's timeouts (5 s per try, 2 tries by default in glibc). A stub that speaks DNS itself reads `/etc/resolv.conf` on its own and may treat those settings slightly differently.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="dns-resolution" />
+
+### Trace it yourself
+
+`dig +trace metrics.example.com` does the resolver's walk from your machine: the root, the TLD, then the authoritative servers, with each referral printed. `dig metrics.example.com` asks your configured resolver instead; run it twice and watch the TTL in the answer count down, which shows you are reading from its cache.

@@ -1,0 +1,19 @@
+# Terms introduced by the DNS resolution lesson.
+- id: stub-resolver
+  term: Stub resolver
+  short: The small resolver inside your process or C library. It reads /etc/hosts and resolv.conf and sends one query to a recursive resolver; it does not walk the hierarchy itself.
+- id: recursive-resolver
+  term: Recursive resolver
+  short: The server that does the work of a lookup. It asks the root, a TLD server and the zone's own servers in turn, and caches every answer for its TTL.
+- id: authoritative-server
+  term: Authoritative server
+  short: A name server that holds a zone's records and answers for them directly, such as ns1.example.com for example.com.
+- id: dns-referral
+  term: Referral
+  short: A DNS reply that does not answer the question but names the servers one level down that can, such as the root pointing at the .com servers.
+- id: glue-record
+  term: Glue record
+  short: An address for a name server whose name sits inside the zone it serves. The parent zone hands it out with the referral so resolvers can reach the server without a loop.
+- id: cname
+  term: CNAME
+  short: A DNS record that says one name is an alias for another. The resolver follows it and looks up the target name.
