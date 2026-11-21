@@ -1,0 +1,547 @@
+---
+title: Dependency injection
+track: design-patterns
+group: Principles
+order: 13
+summary: Pass a function the things it depends on, such as the clock and the database, instead of letting it reach out and grab them.
+intent: A test should be able to choose every input the code depends on, including today's date and the data.
+changeRequest: "Finance found a wrong January report: add a regression test that runs the report on 5 January."
+languages: [go, python, typescript, rust]
+glossary: [dependency-injection, composition-root, test-double, seam, service-locator, interface]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [design-patterns/interfaces-and-polymorphism]
+skills: [design, testing]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: dependency-injection
+  scenarios:
+    - try: "Predict, then run the hard-wired test three times."
+      notice: "It always runs on 21 November, so the January bug is out of reach for 41 days. The answer changes between runs, because other teams write to staging."
+    - try: "On the injected bench, set the clock to 5 January and run."
+      notice: "The wrong-year bug shows at once. The date is just an argument."
+    - try: "Find the other two bugs on the injected bench."
+      notice: "An empty month crashes; a failing source is reported as $0 revenue. Neither can be staged on a shared database."
+    - try: "Compare the time spent on each bench."
+      notice: "About a second per hard-wired run against a few milliseconds. Fast tests get run; slow ones get skipped."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: cron job, sub: calls it }
+      after:  { x: 12, y: 30, w: 100, h: 48, title: main, sub: passes both in }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 380, h: 246, title: { go: MonthlyRevenue, python: monthly_revenue, typescript: monthlyRevenue, rust: monthly_revenue }, sub: reaches out by itself }
+      after:  { x: 150, y: 30, w: 160, h: 56, title: { go: MonthlyRevenue, python: monthly_revenue, typescript: monthlyRevenue, rust: monthly_revenue }, sub: "(now, source)" }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 350, y: 30, w: 190, h: 56, title: "" }
+      after:  { x: 350, y: 30, w: 190, h: 56, title: InvoiceSource, sub: { go: "Totals(from, to)", python: "totals(start, end)", typescript: "totals(start, end)", rust: "totals(start, end)" } }
+    - id: clock
+      kind: concrete
+      before: { x: 188, y: 80, w: 300, h: 36, title: { go: "time.Now()", python: "datetime.now(UTC)", typescript: "new Date()", rust: "Utc::now()" } }
+      after:  { x: 12, y: 160, w: 100, h: 48, title: now, sub: a value }
+    - id: postgres
+      kind: concrete
+      before: { x: 188, y: 130, w: 300, h: 36, title: { go: "sql.Open(BILLING_DB_URL)", python: "psycopg.connect(…)", typescript: "new Pool(…)", rust: "PgPool::connect(…)" } }
+      after:  { x: 330, y: 200, w: 100, h: 40, title: Postgres }
+    - id: fake
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 190, w: 300, h: 36, title: "test fake: no way in" }
+      after:  { x: 440, y: 200, w: 100, h: 40, title: Fake }
+  edges:
+    - { from: client, to: context, label: passes }
+    - { from: clock, to: context, label: passed in }
+    - { from: context, to: strategy, label: asks }
+    - { from: postgres, to: strategy, kind: implements, label: implements }
+    - { from: fake, to: strategy, kind: implements }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: report.go
+      source: |
+        // report.go
+        func MonthlyRevenue(ctx context.Context) (Report, error) {
+            now := time.Now().UTC()
+            start := time.Date(now.Year(), now.Month()-1, 1, 0, 0, 0, 0, time.UTC)
+            end := start.AddDate(0, 1, 0)
+
+            db, err := sql.Open("postgres", os.Getenv("BILLING_DB_URL"))
+            if err != nil {
+                return Report{}, err
+            }
+            defer db.Close()
+
+            r := Report{Month: start}
+            err = db.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(amount_cents), 0)
+                FROM invoices WHERE issued_at >= $1 AND issued_at < $2`, start, end).
+                Scan(&r.Count, &r.TotalCents)
+            return r, err
+        }
+      roles: { context: [2, 18], clock: [3, 5], postgres: [7, 11], query: [13, 17] }
+      change:
+        - { after: 1, add: ['var nowFunc = time.Now // a global that a test overwrites, then must restore'] }
+        - { line: 3, replace: '    now := nowFunc().UTC()' }
+        - { line: 7, replace: '    db, err := sql.Open("postgres", os.Getenv("BILLING_DB_URL")) // the test still needs a real, seeded Postgres' }
+    after:
+      file: report.go · main.go
+      source: |
+        type InvoiceSource interface {
+            Totals(ctx context.Context, from, to time.Time) (count int, cents int64, err error)
+        }
+
+        func MonthlyRevenue(ctx context.Context, now time.Time, src InvoiceSource) (Report, error) {
+            start := time.Date(now.Year(), now.Month()-1, 1, 0, 0, 0, 0, time.UTC)
+            end := start.AddDate(0, 1, 0)
+            count, cents, err := src.Totals(ctx, start, end)
+            if err != nil {
+                return Report{}, fmt.Errorf("monthly revenue: %w", err)
+            }
+            return Report{Month: start, Count: count, TotalCents: cents}, nil
+        }
+
+        // main.go: the only place that knows the real clock and the real database
+        db, err := sql.Open("postgres", os.Getenv("BILLING_DB_URL"))
+        report, err := MonthlyRevenue(ctx, time.Now().UTC(), PostgresInvoices{db})
+      roles: { strategy: [1, 3], context: [5, 13], client: [15, 17], clock: [17, 17], postgres: [16, 16], wire: [15, 17], period: [6, 7], ask: [8, 8], error: [9, 11] }
+    again:
+      file: report_test.go
+      source: |
+        // report_test.go: the January case, with no database and no globals
+        type fakeInvoices struct{ from, to time.Time }
+
+        func (f *fakeInvoices) Totals(_ context.Context, from, to time.Time) (int, int64, error) {
+            f.from, f.to = from, to
+            return 2, 83000, nil
+        }
+
+        func TestJanuaryCoversLastDecember(t *testing.T) {
+            src := &fakeInvoices{}
+            jan5 := time.Date(2027, time.January, 5, 9, 0, 0, 0, time.UTC)
+            if _, err := MonthlyRevenue(context.Background(), jan5, src); err != nil {
+                t.Fatal(err)
+            }
+            if want := time.Date(2026, time.December, 1, 0, 0, 0, 0, time.UTC); !src.from.Equal(want) {
+                t.Errorf("report covered %v, want %v", src.from, want)
+            }
+        }
+    cost:
+      before: { text: 1 global hook · a real database per test, value: 0.8 }
+      after: { text: 1 test file · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Pass plain values as arguments (`now time.Time`) and collaborators as small interfaces defined next to the code that uses them. Go has no DI framework in its standard library and most code needs none: `main` builds the objects and passes them down.'
+      seenIn: '`http.Server{Handler: h}` and `http.Client{Transport: rt}` take their collaborators as fields. `httptest.NewRecorder()` is a test double for `http.ResponseWriter`. `*sql.DB` is passed in, not opened per call.'
+
+  python:
+    before:
+      file: report.py
+      source: |
+        # report.py
+        def monthly_revenue() -> Report:
+            today = datetime.now(UTC).date()
+            end = today.replace(day=1)
+            start = (end - timedelta(days=1)).replace(day=1)
+
+            with psycopg.connect(os.environ["BILLING_DB_URL"]) as conn:
+                count, cents = conn.execute(
+                    "SELECT count(*), coalesce(sum(amount_cents), 0) FROM invoices"
+                    " WHERE issued_at >= %s AND issued_at < %s",
+                    (start, end),
+                ).fetchone()
+            return Report(month=start, count=count, total_cents=cents)
+      roles: { context: [2, 13], clock: [3, 5], postgres: [7, 12], query: [8, 12] }
+      change:
+        - { after: 1, add: ['_now = lambda: datetime.now(UTC)  # a hook that only tests overwrite'] }
+        - { line: 3, replace: '    today = _now().date()' }
+        - { line: 7, replace: '    with psycopg.connect(os.environ["BILLING_DB_URL"]) as conn:  # the test still needs a real, seeded Postgres' }
+    after:
+      file: report.py · main.py
+      source: |
+        class InvoiceSource(Protocol):
+            def totals(self, start: date, end: date) -> tuple[int, int]: ...
+
+        def monthly_revenue(today: date, invoices: InvoiceSource) -> Report:
+            end = today.replace(day=1)
+            start = (end - timedelta(days=1)).replace(day=1)
+            count, cents = invoices.totals(start, end)
+            return Report(month=start, count=count, total_cents=cents)
+
+        # main.py: the only place that knows the real clock and the real database
+        with psycopg.connect(os.environ["BILLING_DB_URL"]) as conn:
+            report = monthly_revenue(datetime.now(UTC).date(), PostgresInvoices(conn))
+      roles: { strategy: [1, 2], context: [4, 8], client: [10, 12], clock: [12, 12], postgres: [11, 11], wire: [10, 12], period: [5, 6], ask: [7, 7], error: [7, 7] }
+    again:
+      file: test_report.py
+      source: |
+        # test_report.py: the January case, with no database and no patching
+        class FakeInvoices:
+            def __init__(self):
+                self.asked: tuple[date, date] | None = None
+
+            def totals(self, start: date, end: date) -> tuple[int, int]:
+                self.asked = (start, end)
+                return 2, 83_000
+
+        def test_january_covers_last_december():
+            invoices = FakeInvoices()
+            report = monthly_revenue(date(2027, 1, 5), invoices)
+            assert invoices.asked == (date(2026, 12, 1), date(2027, 1, 1))
+            assert report.total_cents == 83_000
+    cost:
+      before: { text: 1 hook or a patch · a real database per test, value: 0.75 }
+      after: { text: 1 test file · 0 edits, value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'Python can patch almost anything at runtime (`unittest.mock.patch`, `freezegun`), so tests are possible without injection. They are also tied to import paths and global state. Passing `today` and a `Protocol`-typed source keeps the dependencies in the signature, where readers and type checkers see them.'
+      seenIn: 'FastAPI''s `Depends(...)` injects request dependencies, and tests replace them with `app.dependency_overrides`. pytest fixtures are injected by parameter name. `logging.getLogger` callers can be handed a logger instead.'
+
+  typescript:
+    before:
+      file: report.ts
+      source: |
+        // report.ts
+        export async function monthlyRevenue(): Promise<Report> {
+          const now = new Date();
+          const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+          const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+
+          const db = new Pool({ connectionString: process.env.BILLING_DB_URL });
+          try {
+            const { rows } = await db.query(
+              "SELECT count(*)::int AS count, coalesce(sum(amount_cents), 0)::int AS cents FROM invoices WHERE issued_at >= $1 AND issued_at < $2",
+              [start, end],
+            );
+            return { month: start, count: rows[0].count, totalCents: rows[0].cents };
+          } finally {
+            await db.end();
+          }
+        }
+      roles: { context: [2, 17], clock: [3, 5], postgres: [7, 16], query: [9, 13] }
+      change:
+        - { after: 1, add: ['export const clock = { now: () => new Date() }; // tests overwrite this, then must restore it'] }
+        - { line: 3, replace: '  const now = clock.now();' }
+        - { line: 7, replace: '  const db = new Pool({ connectionString: process.env.BILLING_DB_URL }); // the test still needs a real, seeded Postgres' }
+    after:
+      file: report.ts · main.ts
+      source: |
+        export interface InvoiceSource {
+          totals(start: Date, end: Date): Promise<{ count: number; cents: number }>;
+        }
+
+        export async function monthlyRevenue(now: Date, invoices: InvoiceSource): Promise<Report> {
+          const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+          const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+          const { count, cents } = await invoices.totals(start, end);
+          return { month: start, count, totalCents: cents };
+        }
+
+        // main.ts: the only place that knows the real clock and the real database
+        const pool = new Pool({ connectionString: process.env.BILLING_DB_URL });
+        const report = await monthlyRevenue(new Date(), new PostgresInvoices(pool));
+      roles: { strategy: [1, 3], context: [5, 10], client: [12, 14], clock: [14, 14], postgres: [13, 13], wire: [12, 14], period: [6, 7], ask: [8, 8], error: [8, 8] }
+    again:
+      file: report.test.ts
+      source: |
+        // report.test.ts: the January case, with no database and no fake timers
+        test("January covers last December", async () => {
+          const asked: Date[] = [];
+          const invoices: InvoiceSource = {
+            totals: async (start, end) => { asked.push(start, end); return { count: 2, cents: 83_000 }; },
+          };
+          const report = await monthlyRevenue(new Date("2027-01-05T09:00:00Z"), invoices);
+          assert.deepEqual(asked, [new Date("2026-12-01T00:00:00Z"), new Date("2027-01-01T00:00:00Z")]);
+          assert.equal(report.totalCents, 83_000);
+        });
+    cost:
+      before: { text: 1 global hook · a real database per test, value: 0.8 }
+      after: { text: 1 test file · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Structural types make fakes cheap: an object literal with a `totals` method is an `InvoiceSource`. Fake timers (`vi.useFakeTimers`, `jest.useFakeTimers`) can stand in for the clock without injection, but they change time for the whole test file.'
+      seenIn: 'Angular and NestJS inject constructor parameters from a container. Express handlers receive `req` and `res` rather than reading globals. `fetch` is often passed into SDK clients so tests can hand in a fake.'
+
+  rust:
+    before:
+      file: report.rs
+      source: |
+        // report.rs
+        pub async fn monthly_revenue() -> Result<Report, ReportError> {
+            let today = Utc::now().date_naive();
+            let end = today.with_day(1).unwrap();
+            let start = (end - Days::new(1)).with_day(1).unwrap();
+
+            let pool = PgPool::connect(&std::env::var("BILLING_DB_URL")?).await?;
+            let (count, cents): (i64, i64) = sqlx::query_as(
+                "SELECT count(*), coalesce(sum(amount_cents), 0)::bigint FROM invoices
+                 WHERE issued_at >= $1 AND issued_at < $2")
+                .bind(start)
+                .bind(end)
+                .fetch_one(&pool)
+                .await?;
+            Ok(Report { month: start, count, total_cents: cents })
+        }
+      roles: { context: [2, 16], clock: [3, 5], postgres: [7, 14], query: [8, 15] }
+      change:
+        - { after: 1, add: ['thread_local! { static NOW: Cell<Option<DateTime<Utc>>> = Cell::new(None) } // a hook only tests set'] }
+        - { line: 3, replace: '    let today = NOW.with(|n| n.get()).unwrap_or_else(Utc::now).date_naive();' }
+        - { line: 7, replace: '    let pool = PgPool::connect(&std::env::var("BILLING_DB_URL")?).await?; // the test still needs a real, seeded Postgres' }
+    after:
+      file: report.rs · main.rs
+      source: |
+        pub trait InvoiceSource {
+            async fn totals(&self, start: NaiveDate, end: NaiveDate) -> Result<(i64, i64), ReportError>;
+        }
+
+        pub async fn monthly_revenue(today: NaiveDate, invoices: &impl InvoiceSource) -> Result<Report, ReportError> {
+            let end = today.with_day(1).unwrap();
+            let start = (end - Days::new(1)).with_day(1).unwrap();
+            let (count, cents) = invoices.totals(start, end).await?;
+            Ok(Report { month: start, count, total_cents: cents })
+        }
+
+        // main.rs: the only place that knows the real clock and the real database
+        let pool = PgPool::connect(&std::env::var("BILLING_DB_URL")?).await?;
+        let report = monthly_revenue(Utc::now().date_naive(), &PgInvoices(pool)).await?;
+      roles: { strategy: [1, 3], context: [5, 10], client: [12, 14], clock: [14, 14], postgres: [13, 13], wire: [12, 14], period: [6, 7], ask: [8, 8], error: [8, 8] }
+    again:
+      file: report.rs (tests)
+      source: |
+        // the January case, with no database
+        struct FakeInvoices { asked: Mutex<Option<(NaiveDate, NaiveDate)>> }
+
+        impl InvoiceSource for FakeInvoices {
+            async fn totals(&self, start: NaiveDate, end: NaiveDate) -> Result<(i64, i64), ReportError> {
+                *self.asked.lock().unwrap() = Some((start, end));
+                Ok((2, 83_000))
+            }
+        }
+
+        #[tokio::test]
+        async fn january_covers_last_december() {
+            let fake = FakeInvoices { asked: Mutex::new(None) };
+            let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+            monthly_revenue(day(2027, 1, 5), &fake).await.unwrap();
+            assert_eq!(*fake.asked.lock().unwrap(), Some((day(2026, 12, 1), day(2027, 1, 1))));
+        }
+    cost:
+      before: { text: 1 thread-local hook · a real database per test, value: 0.8 }
+      after: { text: 1 test module · 0 edits, value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'Take dependencies as generic parameters (`&impl InvoiceSource`) and the compiler makes one copy for Postgres and one for the fake, with no runtime cost. `async fn` in traits is stable since Rust 1.75, but such traits cannot be used as `dyn`; use generics, or the `async-trait` crate where you need a trait object.'
+      seenIn: 'axum handlers receive shared state through the `State` extractor. `tower::Service` layers are handed the inner service. Testing crates such as `mockall` generate fakes for traits.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: '`main` reads the real clock and opens the real database, then passes both in. It is the only code that knows which ones are real.'
+    nodes: [client, clock, context]
+    edges: [client>context, clock>context]
+    role: wire
+  - text: The report works out last month from the date it was given. On 5 January that is December of the year before.
+    nodes: [context, clock]
+    edges: [clock>context]
+    role: period
+  - text: It asks its InvoiceSource for the totals. In production that is Postgres; in a test it is a fake that answers from memory.
+    nodes: [context, strategy, postgres]
+    edges: [context>strategy, postgres>strategy]
+    role: ask
+  - text: { go: 'If the source fails, the error comes back wrapped. Nothing turns it into an empty report.', python: 'If the source raises, the exception propagates to the caller. Nothing turns it into an empty report.', typescript: 'If the source rejects, the promise rejects. Nothing turns it into an empty report.', rust: 'If the source fails, `?` returns the error. Nothing turns it into an empty report.' }
+    nodes: [context, strategy]
+    edges: [context>strategy]
+    role: error
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Which version of the report lets a test check what happens when it runs on 1 January?
+    options:
+      - text: The one that takes today's date as an argument.
+        correct: true
+        why: Right. The test passes 1 January and checks the result. No waiting, no clock tricks.
+      - text: The one that calls the system clock, as long as the test runs on a CI server.
+        why: The CI server's clock says today too. The test can only cover January if it happens to run in January.
+      - text: The one that reads the date from an environment variable, falling back to the clock.
+        why: That works, but it is injection through a global. Every test that sets the variable must unset it, and tests running at the same time see each other's dates.
+  engineer:
+    question: Where should the real Postgres source and the real clock be created?
+    options:
+      - text: In main, or the job's entry point, which builds them and passes them down.
+        correct: true
+        why: Right. That is the composition root. Everything below it receives its dependencies and never decides which ones are real.
+      - text: Inside the report, with optional parameters that override them in tests.
+        why: The defaults keep the hidden dependencies, so callers can still forget to pass them. Production and tests take different paths through the code.
+      - text: In a global registry that the report looks up when it runs.
+        why: That is a service locator. The report's signature no longer says what it needs, and a missing registration fails at runtime.
+  deep:
+    question: A team stubs the clock by swapping a package-level variable in their tests instead of passing it in. Once tests run in parallel, some fail at random. Why?
+    options:
+      - text: The variable is shared by every test in the process, so one test's fake January date leaks into another test running at the same time.
+        correct: true
+        why: Right. A global hook is shared mutable state. An argument belongs to one call, so parallel tests cannot see each other's values.
+      - text: Parallel tests make the system clock less accurate.
+        why: The real clock is fine. The failures come from tests overwriting the same variable.
+      - text: The compiler or interpreter caches the old value of the variable.
+        why: Nothing is cached. Each read sees whatever value was written last, which is exactly the problem.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Consumer
+      example: { go: MonthlyRevenue, python: monthly_revenue, typescript: monthlyRevenue, rust: monthly_revenue }
+      job: Does the work with what it is given. Never creates or looks up its own dependencies.
+    - role: Dependency
+      example: { go: "InvoiceSource (interface), now (time.Time)", python: "InvoiceSource (Protocol), today (date)", typescript: "InvoiceSource (interface), now (Date)", rust: "InvoiceSource (trait), today (NaiveDate)" }
+      job: What the consumer needs, named as a small interface or a plain value.
+    - role: Composition root
+      example: main
+      job: Creates the real implementations and passes them in. The only place that knows them.
+    - role: Test double
+      example: FakeInvoices
+      job: Stands in for the real dependency in a test, answering from memory.
+  useWhen:
+    - The code reads anything that varies between runs or environments, such as the clock, random numbers, environment variables, the network or the database.
+    - You want to test a case that is hard to stage for real, such as a date, an empty table or an outage.
+    - Several environments (production, a replica, a backfill job) need the same logic with different sources.
+  avoidWhen:
+    - The dependency is pure and deterministic, such as a string formatter or a math function. Call it directly.
+    - Passing it would thread one value through ten layers that do not use it. Wire it closer to where it is used, or group it in a context struct.
+  tradeoffs:
+    - Signatures grow, and every caller must supply the dependencies.
+    - Someone has to build the object graph; in a big application that wiring code is real code to maintain.
+    - Fakes can drift from the real implementation, so a few tests against the real database are still needed.
+  lookalikes:
+    - name: Service locator
+      how: Code asks a global registry for its dependencies. Testable, but the dependencies are hidden from the signature and fail at runtime when missing.
+    - name: Strategy
+      how: One use of injection, for a step with several interchangeable implementations. Injection is the general habit; the clock here is not a strategy.
+    - name: Dependency inversion
+      how: About which way source dependencies point (high-level code owns the interface). Injection is how the implementation gets in at runtime.
+---
+
+## [concept] Dependency injection
+
+**Pass a function the things it depends on, such as the clock and the database, instead of letting it reach out and grab them.**
+
+Code that asks the system for the time, or opens its own connection, gets whatever the world gives it. Code that receives them as arguments gets whatever the caller chooses, and in a test, the caller is you.
+
+<Depth level={2}>
+That is all <Term id="dependency-injection">dependency injection</Term> means. No framework is needed. Dependencies come in as plain values (the date) or as small interfaces (the invoice source). The real ones are created in one place near `main`, the <Term id="composition-root">composition root</Term>. Tests create <Term id="test-double">test doubles</Term> instead.
+</Depth>
+
+<Depth level={3}>
+Martin Fowler named the pattern in his 2004 article on inversion of control containers, and described three forms: constructor injection, setter injection and interface injection. Constructor (or argument) injection is the one most code uses today. Michael Feathers calls the place where behaviour can be swapped without editing the code a <Term id="seam">seam</Term>; an argument is the simplest seam there is.
+</Depth>
+
+## [problem] A report that grabs its own inputs
+
+On the first of each month, a job emails the CFO last month's revenue. The report finds last month from today's date, opens the billing database, and sums the invoices.
+
+Read it once. The two lines that make it hard to test are the first ones: it asks the clock for today, and it opens a connection from an environment variable.
+
+<Depth level={2}>
+To test it as written, you need a real Postgres with seeded invoices, and you get today's date whether you like it or not. So it is tested by hand, once, and then trusted.
+</Depth>
+
+<Depth level={3}>
+The report also mixes two jobs: deciding the period and fetching the data. Each is easy to test alone. Together, behind a clock call and a connection, neither is.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** Finance found a wrong January report. Add a regression test that runs the report on 5 January.
+
+The marked lines are what it takes without injection: a global hook so the test can fake "now", restored after every test, and a real database seeded with December invoices. The test is slow, it needs infrastructure, and tests that touch the hook cannot run in parallel.
+
+<Depth level={2}>
+The usual workaround is a shared staging database. Then the test's answer depends on what other teams left in it, so the same test passes one run and fails the next. Teams learn to ignore it.
+</Depth>
+
+<Depth level={3}>
+<Lang only="python">`freezegun` or `mock.patch("report.datetime")` can fake the clock without a hook. It works, but it patches by import path: rename an import and the patch silently stops applying.</Lang>
+<Lang only="go">A package-level `var nowFunc = time.Now` is a common Go hook. Tests that swap it cannot use `t.Parallel()`, and `go test -race` flags them if they try.</Lang>
+<Lang only="typescript">Fake timers can freeze `new Date()` for a test. They also replace `setTimeout` and its relatives, which other code in the test, such as a database driver or a retry loop, may rely on.</Lang>
+<Lang only="rust">The test harness runs each test on its own thread, so a thread-local hook stays per test. Under a multi-threaded async runtime, though, the report can run on a worker thread that never saw the hook.</Lang>
+</Depth>
+
+## [morph] Pass them in
+
+Drag the slider. The clock becomes an argument, the database becomes an InvoiceSource, and `main` takes over the job of creating the real ones.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The report's signature now lists everything it depends on. A reader sees it, the compiler checks it, and a test supplies it. Production behaviour does not change: `main` passes the real clock and the real database.
+</Depth>
+
+<Depth level={3}>
+The interface belongs to the report, shaped by what the report needs (`totals(start, end)`), not by what the database can do. That keeps the fake tiny, and it is the dependency inversion principle at small scale.
+</Depth>
+
+## [walk] Follow one run
+
+One production run, from `main` to the totals. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`now` is a `time.Time` value, copied into the call. `src` is an interface value, so `Totals` is an indirect call through its itab, next to a database round trip it is free.</Lang>
+<Lang only="python">`today` is a `date` object passed by reference; dates are immutable, so the report cannot change the caller's value. `invoices.totals` is looked up on the object at call time.</Lang>
+<Lang only="typescript">The interface is erased at compile time; any object with a `totals` method works at runtime. `Date` objects are mutable, so the report creates new ones rather than changing `now`.</Lang>
+<Lang only="rust">`&impl InvoiceSource` is a generic parameter: the compiler builds one copy of the report for `PgInvoices` and one for the fake, with direct calls in each.</Lang>
+</Depth>
+
+## [again] The January test, the second time
+
+The same request, after the refactor. You write one test file with a fake invoice source and pass 5 January as the date. The report does not change, the test needs no database, and it runs in milliseconds, in parallel with every other test.
+
+<Depth level={2}>
+The empty-month and outage cases are now one-line fakes too: a source that returns zero rows, and one that returns an error. Keep a few slower tests that run the real Postgres source against a real database, so the fake and the real one stay honest.
+</Depth>
+
+<Depth level={3}>
+Backfills come for free. Running the report for March 2025 is `monthlyRevenue(march2025, source)`, and pointing it at a read replica is a different source. Neither needs a flag inside the report.
+</Depth>
+
+## [play] Hunt three bugs in a billing report
+
+The same report runs on two test benches. One is hard-wired: it reads the system clock and the shared staging database. The other takes both as arguments, and you choose them.
+
+The report has three bugs. Find them, and compare what each bench let you do.
+
+## [lens] How each language writes it
+
+Every language here can pass dependencies as arguments. They differ in how tempting the alternatives are: runtime patching in Python, fake timers in JavaScript, globals in Go.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="dependency-injection" />
+
+### Containers are optional
+
+DI containers (Spring, NestJS, .NET's built-in one) build the object graph for you from type information. They help in large applications with hundreds of services. For most code, a composition root written by hand, a few dozen lines in `main`, is clearer and easier to debug. Start there.

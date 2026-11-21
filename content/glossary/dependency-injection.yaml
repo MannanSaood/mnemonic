@@ -1,0 +1,13 @@
+# Terms introduced by design-patterns/dependency-injection
+- id: composition-root
+  term: Composition root
+  short: The one place, near the program's entry point, where the real objects are created and wired together.
+- id: test-double
+  term: Test double
+  short: A stand-in for a real dependency in a test, such as a fake database or a fixed clock.
+- id: seam
+  term: Seam
+  short: A place where you can change what a piece of code does without editing that code, for example by passing in a different object.
+- id: service-locator
+  term: Service locator
+  short: A global registry that code asks for its dependencies. It hides what a function needs, unlike passing them in.
