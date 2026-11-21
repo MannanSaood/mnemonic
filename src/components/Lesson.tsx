@@ -24,15 +24,15 @@ interface Visual {
 }
 
 const VISUALS: Record<StepKey, Visual> = {
-  concept: { t: 1, change: "none", code: "after", caption: "The roles, and how they connect", meter: null },
-  problem: { t: 0, change: "none", code: "before", caption: "Before: one method knows every variant", meter: null },
-  pain: { t: 0, change: "ghost", code: "pain", caption: "The change request touches every marked line", meter: "before" },
+  concept: { t: 1, change: "none", code: "after", caption: "The parts, and how they connect", meter: null },
+  problem: { t: 0, change: "none", code: "before", caption: "Before: the code as first written", meter: null },
+  pain: { t: 0, change: "ghost", code: "pain", caption: "What the change costs in the code as it was", meter: "before" },
   morph: { t: null, change: "none", code: "morph", caption: "Drag the slider to morph before into after", meter: null },
-  walk: { t: 1, change: "none", code: "after", caption: "One call, start to finish", meter: null },
-  again: { t: 1, change: "fresh", code: "again", caption: "After: the same request is one new piece", meter: "after" },
+  walk: { t: 1, change: "none", code: "after", caption: "One operation, start to finish", meter: null },
+  again: { t: 1, change: "fresh", code: "again", caption: "After: the same request again", meter: "after" },
   play: { t: 1, change: "none", code: "after", caption: "", meter: null, play: true },
   lens: { t: 1, change: "none", code: "after", caption: "The same roles, in your language", meter: null, lens: true },
-  check: { t: 1, change: "none", code: "after", caption: "The design you just built", meter: null },
+  check: { t: 1, change: "none", code: "after", caption: "The finished picture", meter: null },
 };
 
 const EASE = [0.65, 0, 0.35, 1] as const;

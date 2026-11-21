@@ -25,8 +25,10 @@ const CONTENT = path.join(process.cwd(), "content");
 const PLAYGROUNDS = path.join(process.cwd(), "src", "playgrounds");
 
 /** Playgrounds are folders src/playgrounds/<name>/ with a View.tsx (registered automatically). */
+let pgNames: string[] | null = null;
 export function playgroundNames(): string[] {
-  return fs.readdirSync(PLAYGROUNDS, { withFileTypes: true })
+  if (pgNames) return pgNames;
+  return pgNames = fs.readdirSync(PLAYGROUNDS, { withFileTypes: true })
     .filter((d) => d.isDirectory() && fs.existsSync(path.join(PLAYGROUNDS, d.name, "View.tsx")))
     .map((d) => d.name);
 }
@@ -62,9 +64,12 @@ export function getGlossary(): Record<string, GlossaryEntry> {
   return glossaryCache;
 }
 
+let skillsCache: Record<string, SkillEntry> | null = null;
 export function getSkills(): Record<string, SkillEntry> {
+  if (skillsCache) return skillsCache;
   const list = YAML.parse(fs.readFileSync(path.join(CONTENT, "skills.yaml"), "utf8")) as SkillEntry[];
-  return Object.fromEntries(list.map((x) => [x.id, x]));
+  skillsCache = Object.fromEntries(list.map((x) => [x.id, x]));
+  return skillsCache;
 }
 
 export function listRoadmaps(): RoadmapProfile[] {
@@ -102,7 +107,17 @@ function fail(file: string, msg: string): never {
   throw new Error(`[content] ${file}: ${msg}`);
 }
 
+// Parsing and validating a lesson is costly; every page asks for many lessons, so cache them.
+const topicCache = new Map<string, Topic>();
 function parseTopic(file: string): Topic {
+  const hit = topicCache.get(file);
+  if (hit) return hit;
+  const t = parseTopicUncached(file);
+  topicCache.set(file, t);
+  return t;
+}
+
+function parseTopicUncached(file: string): Topic {
   const raw = fs.readFileSync(file, "utf8");
   const { data, content } = matter(raw, { engines: { yaml: (s: string) => YAML.parse(s) as object } });
   const meta = data as TopicMeta;
@@ -189,7 +204,9 @@ function validate(file: string, meta: TopicMeta, steps: StepSource[], prose: str
 }
 
 let prereqWarned = false;
+let topicsCache: TopicMeta[] | null = null;
 export function listTopics(): TopicMeta[] {
+  if (topicsCache) return topicsCache;
   const out: TopicMeta[] = [];
   for (const track of fs.readdirSync(CONTENT, { withFileTypes: true })) {
     if (!track.isDirectory() || ["glossary", "roadmaps", "outlines"].includes(track.name)) continue;
@@ -204,7 +221,8 @@ export function listTopics(): TopicMeta[] {
     for (const t of out) for (const p of t.prerequisites)
       if (!ids.has(p)) console.warn(`[content] ${t.id}: prerequisite "${p}" is not written yet`);
   }
-  return out.sort((a, b) => a.order - b.order);
+  topicsCache = out.sort((a, b) => a.order - b.order);
+  return topicsCache;
 }
 
 export function getTopic(track: string, slug: string): Topic {
