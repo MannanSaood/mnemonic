@@ -1,0 +1,22 @@
+# Terms introduced by the cache-friendly code lesson.
+- id: cache-line
+  term: Cache line
+  short: The fixed-size block that moves between memory and the CPU caches, 64 bytes on x86 and most ARM cores (Apple M-series use 128). Reading one byte brings in its whole line.
+- id: spatial-locality
+  term: Spatial locality
+  short: The tendency to use data near data you just used. A loop that walks memory in address order uses every byte of each cache line it pays for.
+- id: temporal-locality
+  term: Temporal locality
+  short: The tendency to reuse the same data soon. It pays off only if the data is still in the cache when it is used again.
+- id: row-major-order
+  term: Row-major order
+  short: Storing a 2-D array row by row, so a[i][j] and a[i][j+1] are neighbours in memory. C, Go, Rust, NumPy (by default) and typed-array code use it; Fortran and MATLAB use column-major.
+- id: struct-of-arrays
+  term: Struct of arrays (SoA)
+  short: Storing each field of many records in its own array (all prices together, all ids together) instead of an array of whole records (AoS). A loop over one field then reads only that field.
+- id: hardware-prefetcher
+  term: Hardware prefetcher
+  short: CPU logic that watches the stream of misses, detects sequential or constant-stride patterns, and fetches the next lines before they are asked for. It cannot predict pointer chasing or irregular jumps.
+- id: working-set
+  term: Working set
+  short: The data a piece of code touches over a short window. Performance drops in steps as the working set outgrows L1, then L2, then L3.

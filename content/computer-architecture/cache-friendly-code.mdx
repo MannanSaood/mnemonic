@@ -1,0 +1,476 @@
+---
+title: Writing cache-friendly code
+track: computer-architecture
+group: Memory
+order: 18
+summary: The CPU reads memory in 64-byte cache lines, and a read that misses every cache waits about a hundred times longer than one that hits. Walking data in the order it is laid out, and laying it out in the order you walk it, turns the same loop from slow to fast.
+intent: See which loops pay for a cache miss on every read, so you can fix them with loop order and data layout instead of a bigger machine.
+changeRequest: The fleet grows from 500 hosts to 20,000, and the per-minute dashboard must still load in under a second.
+languages: [go, python, typescript, rust]
+glossary: [cache-line, spatial-locality, temporal-locality, row-major-order, struct-of-arrays, hardware-prefetcher, working-set]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [computer-architecture/cache-misses-writes-and-amat, computer-architecture/data-layout-and-alignment]
+skills: [performance, memory]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: cache-friendly-code
+  scenarios:
+    - try: "Predict, then Run to end in row order with 32 hosts. Switch to column order and run again."
+      notice: "Row order misses once per line, 64 times. Column order misses on all 512 reads and takes about 7.5 times as long."
+    - try: "Switch to 8 hosts and run both orders."
+      notice: "Both cost 16 misses. The lines one column pass needs fit in the cache, which is why the slow loop passed its tests."
+    - try: "Switch to Order records and run the price sum as an array of structs, then as a struct of arrays."
+      notice: "32 misses against 8. In the array of structs, three quarters of every line fetched is fields the loop never reads."
+    - try: "Turn the prefetcher on and run row order, then column order."
+      notice: "Row order drops to a single miss. Column order still misses every read and now wastes bandwidth on lines it never uses."
+
+# ---------------------------------------------------------------- diagram
+# before: "every read costs the same". after: L1, the lower levels, DRAM, lines and the prefetcher.
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: loop
+      kind: client
+      before: { x: 8, y: 110, w: 120, h: 52, title: Rollup loop, sub: "sum by minute" }
+      after:  { x: 8, y: 110, w: 120, h: 52, title: Rollup loop, sub: "totals[m] += v" }
+    - id: mem
+      kind: context
+      before: { x: 150, y: 18, w: 400, h: 236, title: Samples in RAM, sub: every read costs the same }
+      after:  { x: 296, y: 110, w: 116, h: 52, title: L2 and L3, sub: MiBs · 4-40 ns }
+    - id: cache
+      kind: strategy
+      appears: after
+      before: { x: 152, y: 110, w: 122, h: 52, title: "" }
+      after:  { x: 152, y: 110, w: 122, h: 52, title: L1 cache, sub: 32-48 KiB · ~1 ns }
+    - id: line
+      kind: concrete
+      before: { x: 170, y: 64, w: 360, h: 38, title: "samples[h][m]: 8 bytes" }
+      after:  { x: 152, y: 200, w: 122, h: 50, title: Cache line, sub: 64 B = 8 floats }
+    - id: dram
+      kind: concrete
+      before: { x: 170, y: 112, w: 360, h: 38, title: one read ≈ one add }
+      after:  { x: 434, y: 110, w: 118, h: 52, title: DRAM, sub: ~100 ns }
+    - id: prefetch
+      kind: concrete
+      before: { x: 170, y: 160, w: 360, h: 38, title: loop order does not matter }
+      after:  { x: 296, y: 200, w: 116, h: 50, title: Prefetcher, sub: follows strides }
+    - id: swap
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 208, w: 360, h: 38, title: + 40 times the hosts }
+      after:  { x: 8, y: 200, w: 120, h: 50, title: Row order, sub: unit stride }
+  edges:
+    - { from: loop, to: cache, label: read }
+    - { from: cache, to: mem, label: miss }
+    - { from: mem, to: dram, label: miss }
+    - { from: cache, to: line }
+    - { from: prefetch, to: dram, label: ahead }
+    - { from: swap, to: loop }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: rollup.go
+      source: |
+        // rollup.go
+        // samples holds one float64 per host per minute, host-major:
+        // samples[h*minutes+m] is host h at minute m.
+        func Rollup(samples []float64, hosts, minutes int) []float64 {
+            totals := make([]float64, minutes)
+            for m := 0; m < minutes; m++ {
+                var sum float64
+                for h := 0; h < hosts; h++ {
+                    sum += samples[h*minutes+m]
+                }
+                totals[m] = sum
+            }
+            return totals
+        }
+      roles: { loop: [6, 12], mem: [9, 9], line: [9, 9], dram: [9, 9], prefetch: [8, 8], swap: [6, 8], cache: [9, 9] }
+      change:
+        - { after: 9, add: ['            // each read is minutes*8 bytes past the last: a new line every time'] }
+        - { after: 13, add: ['    // 20,000 hosts: 600 ms per dashboard load (2 ms at 500 hosts)'] }
+    after:
+      file: rollup.go
+      source: |
+        // rollup.go
+        // samples[h*minutes+m] is host h at minute m: each host's minutes are contiguous.
+        func Rollup(samples []float64, hosts, minutes int) []float64 {
+            totals := make([]float64, minutes) // 1,440 floats: 11 KiB, stays in L1
+            for h := 0; h < hosts; h++ {
+                row := samples[h*minutes : (h+1)*minutes]
+                for m, v := range row { // unit stride: 8 values per cache line
+                    totals[m] += v
+                }
+            }
+            return totals
+        }
+      roles: { loop: [5, 10], cache: [7, 8], line: [7, 7], dram: [6, 6], mem: [6, 6], prefetch: [6, 7], swap: [5, 7], first: [6, 8], same: [7, 8], ahead: [5, 6], hot: [4, 4], order: [5, 7] }
+    again:
+      file: dashboard load
+      source: |
+        // 20,000 hosts × 1,440 minutes: rollup 40 ms (was 600 ms)
+        // L1 misses: about 1 per 8 reads instead of 1 per read
+    cost:
+      before: { text: "600 ms per load · a miss on every read", value: 0.85 }
+      after: { text: "40 ms per load · 1 miss per 8 reads", value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: 'A Go slice of structs is one contiguous block, so `[]Order` walks well and `[]*Order` scatters every element across the heap. A `[][]float64` allocates each row separately: rows are contiguous inside, not with each other. Go keeps struct fields in the order you write them and pads each to its alignment, so field order changes the size; the `fieldalignment` analyzer reports structs that would shrink.'
+      seenIn: '`unsafe.Sizeof` and `unsafe.Offsetof`. `golang.org/x/tools/go/analysis/passes/fieldalignment`. `perf stat -e cache-misses` on a `go test -bench` binary.'
+
+  python:
+    before:
+      file: rollup.py
+      source: |
+        # rollup.py
+        import numpy as np
+
+        def rollup(samples: np.ndarray) -> np.ndarray:
+            """samples[host, minute] -> per-minute totals across the fleet."""
+            hosts, minutes = samples.shape
+            totals = np.zeros(minutes)
+            for m in range(minutes):
+                totals[m] = samples[:, m].sum()
+            return totals
+      roles: { loop: [8, 9], mem: [9, 9], line: [9, 9], dram: [9, 9], prefetch: [9, 9], swap: [8, 9], cache: [9, 9] }
+      change:
+        - { after: 9, add: ['        # samples[:, m] is a strided view: one float every minutes*8 bytes'] }
+        - { after: 10, add: ['    # 20,000 hosts: 600 ms per dashboard load (2 ms at 500 hosts)'] }
+    after:
+      file: rollup.py
+      source: |
+        # rollup.py
+        import numpy as np
+
+        def rollup(samples: np.ndarray) -> np.ndarray:
+            """samples[host, minute] in C order: each host's minutes are contiguous."""
+            samples = np.ascontiguousarray(samples)  # no copy if it already is
+            # Adds whole rows together, so memory is read front to back.
+            return samples.sum(axis=0)
+      roles: { loop: [8, 8], cache: [8, 8], line: [6, 6], dram: [8, 8], mem: [6, 6], prefetch: [7, 8], swap: [7, 8], first: [8, 8], same: [7, 8], ahead: [7, 8], hot: [8, 8], order: [6, 8] }
+    again:
+      file: dashboard load
+      source: |
+        # 20,000 hosts × 1,440 minutes: rollup 40 ms (was 600 ms)
+        # one vectorised pass, front to back through the array
+    cost:
+      before: { text: "600 ms per load · a miss on every read", value: 0.85 }
+      after: { text: "40 ms per load · 1 miss per 8 reads", value: 0.1 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'A Python `list` holds pointers to separate float objects of 24 bytes each, scattered over the heap, and the interpreter''s overhead per element dwarfs any cache effect. Cache-friendly Python means NumPy, pandas or Arrow: dense arrays in C order by default (`order="F"` for column-major), where loop order and strides decide speed just as in C.'
+      seenIn: '`ndarray.strides`, `ndarray.flags.c_contiguous`, `np.ascontiguousarray`. pandas and Apache Arrow store each column as its own array, a struct of arrays.'
+
+  typescript:
+    before:
+      file: rollup.ts
+      source: |
+        // rollup.ts
+        // samples[h * minutes + m] is host h at minute m (host-major).
+
+        export function rollup(samples: Float64Array, hosts: number, minutes: number): Float64Array {
+          const totals = new Float64Array(minutes);
+          for (let m = 0; m < minutes; m++) {
+            let sum = 0;
+            for (let h = 0; h < hosts; h++) {
+              sum += samples[h * minutes + m];
+            }
+            totals[m] = sum;
+          }
+          return totals;
+        }
+      roles: { loop: [6, 12], mem: [9, 9], line: [9, 9], dram: [9, 9], prefetch: [8, 8], swap: [6, 8], cache: [9, 9] }
+      change:
+        - { after: 9, add: ['      // each read is minutes*8 bytes past the last: a new line every time'] }
+        - { after: 13, add: ['  // 20,000 hosts: 600 ms per dashboard load (2 ms at 500 hosts)'] }
+    after:
+      file: rollup.ts
+      source: |
+        // rollup.ts
+        // samples[h * minutes + m]: each host's minutes are contiguous.
+        export function rollup(samples: Float64Array, hosts: number, minutes: number): Float64Array {
+          const totals = new Float64Array(minutes); // 1,440 floats: 11 KiB, stays in L1
+          for (let h = 0; h < hosts; h++) {
+            const row = samples.subarray(h * minutes, (h + 1) * minutes);
+            for (let m = 0; m < minutes; m++) { // unit stride: 8 values per cache line
+              totals[m] += row[m];
+            }
+          }
+          return totals;
+        }
+      roles: { loop: [5, 10], cache: [7, 8], line: [7, 7], dram: [6, 6], mem: [6, 6], prefetch: [6, 7], swap: [5, 7], first: [6, 8], same: [7, 8], ahead: [5, 6], hot: [4, 4], order: [5, 7] }
+    again:
+      file: dashboard load
+      source: |
+        // 20,000 hosts × 1,440 minutes: rollup 40 ms (was 600 ms)
+        // L1 misses: about 1 per 8 reads instead of 1 per read
+    cost:
+      before: { text: "600 ms per load · a miss on every read", value: 0.85 }
+      after: { text: "40 ms per load · 1 miss per 8 reads", value: 0.1 }
+    lens:
+      need: 2
+      needLabel: Sometimes
+      note: 'An array of objects is an array of pointers; V8 often allocates the objects one after another, but nothing guarantees it, and each object carries a header. Typed arrays (`Float64Array`, `Int32Array`) are dense, contiguous and row-major by your own indexing, so they behave like C arrays. For records, one typed array per field is the struct-of-arrays layout.'
+      seenIn: '`Float64Array.subarray` (a view, no copy), `DataView` for packed records. Entity-component systems such as bitECS keep each component field in its own typed array.'
+
+  rust:
+    before:
+      file: rollup.rs
+      source: |
+        // rollup.rs
+        // samples[h * minutes + m] is host h at minute m (host-major).
+        pub fn rollup(samples: &[f64], hosts: usize, minutes: usize) -> Vec<f64> {
+            let mut totals = vec![0.0; minutes];
+            for m in 0..minutes {
+                let mut sum = 0.0;
+                for h in 0..hosts {
+                    sum += samples[h * minutes + m];
+                }
+                totals[m] = sum;
+            }
+            totals
+        }
+      roles: { loop: [5, 11], mem: [8, 8], line: [8, 8], dram: [8, 8], prefetch: [7, 7], swap: [5, 7], cache: [8, 8] }
+      change:
+        - { after: 8, add: ['            // each read is minutes*8 bytes past the last: a new line every time'] }
+        - { after: 12, add: ['    // 20,000 hosts: 600 ms per dashboard load (2 ms at 500 hosts)'] }
+    after:
+      file: rollup.rs
+      source: |
+        // rollup.rs
+        // samples[h * minutes + m]: each host's minutes are contiguous.
+        pub fn rollup(samples: &[f64], minutes: usize) -> Vec<f64> {
+            let mut totals = vec![0.0; minutes]; // 1,440 floats: 11 KiB, stays in L1
+            for row in samples.chunks_exact(minutes) {
+                for (t, v) in totals.iter_mut().zip(row) { // unit stride: 8 values per line
+                    *t += v;
+                }
+            }
+            totals
+        }
+      roles: { loop: [5, 9], cache: [6, 7], line: [6, 6], dram: [5, 5], mem: [5, 5], prefetch: [5, 6], swap: [5, 6], first: [5, 7], same: [6, 7], ahead: [5, 5], hot: [4, 4], order: [5, 6] }
+    again:
+      file: dashboard load
+      source: |
+        // 20,000 hosts × 1,440 minutes: rollup 40 ms (was 600 ms)
+        // no bounds checks left in the inner loop, and LLVM vectorises it
+    cost:
+      before: { text: "600 ms per load · a miss on every read", value: 0.85 }
+      after: { text: "40 ms per load · 1 miss per 8 reads", value: 0.1 }
+    lens:
+      need: 3
+      needLabel: Common
+      note: '`Vec<T>` stores its elements inline and contiguously, while `Vec<Box<T>>` scatters them. Rust''s default struct layout may reorder fields to cut padding; `#[repr(C)]` keeps your order. Iterators such as `chunks_exact` and `zip` walk memory front to back and let the compiler drop bounds checks, which often lets LLVM vectorise the loop.'
+      seenIn: '`std::mem::size_of`, `#[repr(C)]`, `slice::chunks_exact`. `ndarray::Array2` is row-major by default. `crossbeam_utils::CachePadded` puts a value on its own cache line.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: 'The inner loop reads the first value of a host''s row. It is not in L1, L2 or L3, so the core waits for DRAM, about 100 ns. The cache brings in the whole 64-byte line around it: eight floats.'
+    nodes: [loop, cache, mem, dram]
+    edges: [loop>cache, cache>mem, mem>dram]
+    role: first
+  - text: 'The next seven reads are in that same line. Each is an L1 hit, about a nanosecond. One miss pays for eight values.'
+    nodes: [cache, line]
+    edges: [cache>line]
+    role: same
+  - text: 'The prefetcher sees the misses climbing one line at a time and starts fetching the following lines before the loop asks. A long row streams in at memory bandwidth instead of waiting 100 ns per line.'
+    nodes: [prefetch, dram]
+    edges: [prefetch>dram]
+    role: ahead
+  - text: 'The totals array, 1,440 floats or 11 KiB, is read and written on every pass. It fits in L1 and stays there, so those accesses hit too.'
+    nodes: [loop, cache]
+    edges: [loop>cache]
+    role: hot
+  - text: 'Swapping the two loops did it. The column order read one float per line fetched; the row order reads all eight. Same reads, same additions, an eighth of the misses.'
+    nodes: [swap, loop]
+    edges: [swap>loop]
+    role: order
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Two loops sum the same large 2-D array of float64s, stored row by row. One walks along rows, the other down columns. Which is faster, and why?
+    options:
+      - text: Along rows. Neighbouring elements share a 64-byte cache line, so one miss serves eight reads. Down a column, every read is a full row away and needs a new line.
+        correct: true
+        why: Right. The work is identical; the number of lines fetched from memory is not.
+      - text: Both are the same speed. They do the same number of reads and additions.
+        why: Same operations, different memory traffic. On an array bigger than the cache, the column walk misses on nearly every read.
+      - text: Down columns, because the CPU fetches columns in parallel.
+        why: No. Memory comes in lines of consecutive bytes. A column of a row-major array is spread over many lines.
+  engineer:
+    question: A hot loop sums only the price of a million orders. Each order is a struct of four 8-byte fields (id, price, qty, created_at), stored in one array. How much of the memory the loop pulls into the cache does it use?
+    options:
+      - text: About a quarter. Each 64-byte line holds two orders, and the loop uses 16 of its 64 bytes. A separate array of prices would use all of it.
+        correct: true
+        why: Right. That is the case for a struct of arrays, or for splitting hot fields from cold ones.
+      - text: All of it. The array is contiguous, so there is no waste.
+        why: Contiguous helps, but the line still carries id, qty and created_at, which this loop never reads.
+      - text: One eighth, because only one float in each line is a price.
+        why: A line holds two 32-byte orders, so two prices. It is a quarter.
+  deep:
+    question: A column-order rollup was fast with 500 hosts and slow with 20,000, with the same code and the same number of minutes. What changed?
+    options:
+      - text: One pass down a column touches one line per host. 500 lines (32 KiB) fit in L1, so the next seven minutes hit the same lines; 20,000 lines (1.2 MiB) are evicted before the loop comes back.
+        correct: true
+        why: Right. The working set of the column pass outgrew the cache. Below that size the loop order barely matters; above it every read misses.
+      - text: The bigger array no longer fits in RAM, so it is swapped to disk.
+        why: 230 MB fits in RAM easily. The cliff is at the cache sizes, far below RAM.
+      - text: More hosts means more additions, so it is just proportionally slower.
+        why: 40 times the hosts would cost 40 times the time. It cost far more, because the miss rate jumped as well.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Cache line
+      example: 64 bytes on x86 and most ARM
+      job: The unit of transfer. Every miss moves a whole line, so unused bytes in it are wasted bandwidth.
+    - role: L1, L2, L3
+      example: 32-48 KiB, 1-2 MiB, tens of MiB
+      job: Each level is bigger and slower. Hits cost about 1, 4 and 10-40 ns.
+    - role: DRAM
+      example: main memory
+      job: About 100 ns per miss that reaches it, with high bandwidth for sequential streams.
+    - role: Prefetcher
+      example: next-line and stride prefetchers
+      job: Fetches lines ahead of a regular access pattern, hiding latency. Useless for random or pointer-chasing access.
+    - role: Loop order and layout
+      example: row order, struct of arrays
+      job: The levers you control. Make the inner loop walk consecutive addresses, and put the fields a hot loop reads next to each other.
+  useWhen:
+    - Hot loops over large arrays, matrices, images, columns of metrics or records.
+    - A loop that got far slower when its data grew past a cache size.
+    - Data structures you design for heavy reading (indexes, lookup tables, game state, analytics columns).
+  avoidWhen:
+    - Code that is not hot. Measure first; most code is not limited by cache misses.
+    - Splitting records into arrays when most code reads whole records; struct of arrays makes that path slower.
+  tradeoffs:
+    - Struct of arrays speeds up loops over one field and slows down code that reads whole records.
+    - Loop interchange changes the order of floating-point additions, so the last digits of sums can change.
+    - Tiling (blocking) helps algorithms that reuse data, such as matrix multiply, at the cost of more complex loops.
+  lookalikes:
+    - name: TLB misses
+      how: Another cache, for address translations. Large strides touch a new page on every read and miss there too.
+    - name: False sharing
+      how: Two threads writing different variables in one cache line make the line bounce between cores.
+    - name: Page cache
+      how: The kernel's cache of file pages in RAM, a level below everything in this lesson.
+---
+
+## [concept] Writing cache-friendly code
+
+**The CPU never reads one value from memory. It reads the 64-byte <Term id="cache-line">cache line</Term> around it into a small, fast cache, and a read that misses every cache level waits about a hundred times longer than one that hits.**
+
+So the order in which a loop touches memory decides its speed. Walking consecutive addresses uses every byte of each line it pays for. Jumping around pays for a whole line to use eight bytes of it.
+
+<Depth level={2}>
+Two habits of programs make caches work: <Term id="spatial-locality">spatial locality</Term> (using data next to data you just used) and <Term id="temporal-locality">temporal locality</Term> (using the same data again soon). Loop order controls the first. The size of the data a loop touches before it comes back, its <Term id="working-set">working set</Term>, controls the second.
+</Depth>
+
+<Depth level={3}>
+A typical x86 core has 32-48 KiB of L1 data cache (about 4-5 cycles), 1-2 MiB of L2 (about 12-15 cycles) and a shared L3 of tens of MiB (about 40-70 cycles); DRAM is around 80-100 ns. Exact figures vary by generation, so read them as orders of magnitude. Throughput falls in steps as the working set outgrows each level, the "memory mountain" of CS:APP.
+</Depth>
+
+## [problem] A metrics rollup by minute
+
+A monitoring service stores one float64 per host per minute in a flat array, host by host. The dashboard needs a total per minute across the fleet, so the rollup loops over minutes and, for each minute, adds up every host.
+
+With 500 hosts it takes 2 ms. Tests and code review are happy.
+
+<Depth level={2}>
+The author's picture: memory is a big array where every read costs the same, so the loop order is a matter of taste. The natural order follows the output, one total per minute. Nothing in the code suggests that the inner loop jumps 11,520 bytes on every read.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">The samples are one `[]float64` indexed as `h*minutes+m`, which is row-major: a host's minutes are neighbours. The inner loop varies `h`, the outer index of that layout.</Lang>
+<Lang only="python">NumPy arrays are C order (row-major) by default. `samples[:, m]` is a view with a stride of `minutes * 8` bytes, so `.sum()` on it reads one float per cache line.</Lang>
+<Lang only="typescript">The samples are one `Float64Array` indexed as `h * minutes + m`, which is row-major: a host's minutes are neighbours. The inner loop varies `h`, the outer index of that layout.</Lang>
+<Lang only="rust">The samples are one `&[f64]` indexed as `h * minutes + m`, which is row-major: a host's minutes are neighbours. The inner loop varies `h`, the outer index of that layout, and each index is bounds-checked.</Lang>
+</Depth>
+
+## [pain] Forty times the hosts
+
+The fleet grows to 20,000 hosts. The data grows 40 times, to 230 MB. The rollup does not get 40 times slower; it gets 300 times slower, 600 ms per dashboard load.
+
+The marked lines are where it happens. Each read in the inner loop is a whole host row past the last one, so it lands on a different cache line, and the line it lands on was evicted long ago.
+
+<Depth level={2}>
+At 500 hosts, one pass down a minute touches 500 lines, 32 KiB, which fits in L1. The next seven minutes are in the same lines, so they hit. At 20,000 hosts a pass touches 1.2 MiB of lines, and by the time the loop returns for the next minute those lines are gone from L1 and L2. Almost every read misses, and each miss fetches 64 bytes to use 8.
+</Depth>
+
+<Depth level={3}>
+The jump is also 11,520 bytes, almost three 4 KiB pages, so every read lands on a different page and misses the TLB as well. A stride prefetcher can follow a constant stride inside a page, but this stride leaves the page on every read, and its lines still waste seven eighths of the bandwidth.
+</Depth>
+
+## [morph] From flat memory to the cache hierarchy
+
+Drag the slider. The block labelled "samples in RAM" splits into what the hardware does: the L1 cache, the lower levels, DRAM, the cache line and the prefetcher.
+
+Hover a box to see its code.
+
+<Depth level={2}>
+The fix is loop interchange: walk hosts in the outer loop and minutes in the inner loop, adding each row into a totals array. Now the inner loop reads consecutive addresses, and the totals, 11 KiB, stay in L1 the whole time. Same reads, same additions, about an eighth of the misses, and the prefetcher can stream the rows.
+</Depth>
+
+<Depth level={3}>
+When a loop reads one field out of many records, the same idea applies to layout. An array of structs puts every field of a record together, so a loop over prices drags ids and timestamps through the cache too. A <Term id="struct-of-arrays">struct of arrays</Term> keeps all prices together. Column stores (Parquet, Arrow, analytical databases) are this layout at scale. And because the data is in <Term id="row-major-order">row-major order</Term>, the natural fix for a column-first loop is always to make the last index the fastest.
+</Depth>
+
+## [walk] Follow one row
+
+One row of samples, followed through the corrected loop. Step through it with the numbered buttons.
+
+<Depth level={3}>
+A cache is organised as sets of a few ways. An address splits into an offset within the line (6 bits for 64 bytes), a set index and a tag. Lines whose addresses differ by a multiple of the set count times the line size compete for the same set, which is why strides that are large powers of two can thrash a cache that is mostly empty. The <Term id="hardware-prefetcher">hardware prefetcher</Term> tracks streams of misses and runs ahead of them; it is why a sequential scan reaches memory bandwidth instead of paying full latency per line.
+</Depth>
+
+## [again] The same 20,000 hosts, row by row
+
+The same data with the loops swapped. The rollup reads memory front to back, takes about 40 ms, and the dashboard loads well inside its budget. It will keep scaling linearly with the fleet, because the miss rate no longer depends on the number of hosts.
+
+<Depth level={2}>
+The totals change in their last digits, because the floats are added in a different order. For a dashboard that does not matter; for anything compared exactly, sum in a fixed order or use integers.
+</Depth>
+
+<Depth level={3}>
+When both orders are needed, such as a matrix multiply that walks one matrix by rows and the other by columns, interchange alone is not enough. Tiling (blocking) processes small square blocks that fit in L1 or L2, so each block is reused many times while it is cached. Optimised BLAS libraries do this, and more.
+</Depth>
+
+## [play] Walk memory through a cache
+
+Run a loop through a small cache and watch each read hit or miss. Switch the loop order, grow the data past the cache, change the record layout, and turn on the prefetcher. Click any cell to read it yourself.
+
+## [lens] How each language lays out memory
+
+The cache rules are the same for every language. What differs is whether your data is dense at all, and who decides its layout.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={3}>
+<Lang only="go">A struct `{a bool; b int64; c bool}` is 24 bytes in Go because of padding; `{b int64; a, c bool}` is 16. Go never reorders fields for you. Slices of values are dense; maps and slices of pointers are not.</Lang>
+<Lang only="python">`array.array('d')` and NumPy arrays store raw doubles; a list of floats stores 8-byte pointers to 24-byte objects. `np.sum(a, axis=0)` and `a.sum(axis=1)` both run at C speed on a C-order array because NumPy orders its inner loop by memory layout.</Lang>
+<Lang only="typescript">V8 stores small integers and doubles in arrays specially (packed SMI and double elements) as long as the array stays homogeneous; a single string or hole switches it to generic elements. Typed arrays never change representation.</Lang>
+<Lang only="rust">`#[repr(C)]` fixes field order; `#[repr(align(64))]` gives a type its own cache line. Without `repr(C)`, `size_of::<{a: u8, b: u64, c: u8}>()` is 16, because the compiler sorts the fields to cut padding.</Lang>
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="cache-friendly-code" />
+
+### Measuring it
+
+Time is the first signal: a loop that slows down far more than its data grew is a cache suspect. On Linux, `perf stat -e cache-references,cache-misses,L1-dcache-load-misses` counts misses for a run, and `perf c2c` finds false sharing. Valgrind's `cachegrind` simulates the caches and reports misses per source line, slowly but exactly.
