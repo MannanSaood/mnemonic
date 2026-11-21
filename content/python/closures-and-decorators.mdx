@@ -1,0 +1,644 @@
+---
+title: "Closures and decorators"
+track: python
+group: Objects
+order: 9
+summary: A closure is a function that keeps the variables it was created with. A decorator uses one to replace a function with a wrapper, so retry, timing and caching are written once and stacked on any call.
+intent: Write cross-cutting behaviour once, as a wrapper, and know that the stack order and functools.wraps decide what each layer sees and reports.
+changeRequest: Add random jitter to the retry backoff, so retries from every pod do not land at once.
+languages: [python, go, typescript, rust]
+glossary: [closure, cell-object, late-binding, function-decorator, decorator-factory, first-class-function, middleware-onion]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: []
+skills: [python, metaprogramming]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: closures-and-decorators
+  scenarios:
+    - try: "Make your prediction, then send the three calls through the starting stack."
+      notice: "Every latency sample is named wrapper, the cache hit is timed as 0 ms, and inspect.signature shows (*args, **kwargs). Nothing crashed."
+    - try: "Turn @wraps on for retry."
+      notice: "Every name upstream heals at once: timed now reads fetch_invoice, and the top-level __name__ follows, because each @wraps copies the name of the layer below it."
+    - try: "Move timed below retry, then back above it."
+      notice: "Below retry, timed records one sample per attempt and misses the backoff sleeps. Above it, one sample covers the whole call, retries included."
+    - try: "Move lru_cache to the top line and meet all four goals."
+      notice: "A hit now returns before timed or retry run, cache_info() is reachable, and the failed id is still fetched again next time because exceptions are never cached."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 30, w: 100, h: 48, title: billing job, sub: calls both }
+      after:  { x: 4, y: 160, w: 70, h: 48, title: caller, sub: calls }
+    - id: context
+      kind: context
+      before: { x: 168, y: 18, w: 262, h: 246, title: { python: fetch_invoice, go: FetchInvoice, typescript: fetchInvoice, rust: fetch_invoice }, sub: "and fetch_customer, the same" }
+      after:  { x: 404, y: 160, w: 152, h: 48, title: { python: fetch_invoice, go: getInvoice, typescript: getInvoice, rust: get_invoice }, sub: one GET }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 150, y: 14, w: 260, h: 50, title: "" }
+      after:  { x: 150, y: 14, w: 260, h: 50, title: { python: a callable, go: "Fetch[T]", typescript: "Fetch<T>", rust: "impl Fn(&str)" }, sub: { python: "(*args, **kwargs)", go: "func(ctx, id) (T, error)", typescript: "(id) => Promise<T>", rust: "-> Result<T, E>" } }
+    - id: cache
+      kind: concrete
+      appears: after
+      before: { x: 188, y: 200, w: 222, h: 32, title: "" }
+      after:  { x: 84, y: 160, w: 100, h: 48, title: { python: lru_cache, go: Cached, typescript: cached, rust: cached }, sub: "hit?" }
+    - id: timed
+      kind: concrete
+      before: { x: 188, y: 70, w: 222, h: 32, title: timer around the loop ×2 }
+      after:  { x: 194, y: 160, w: 90, h: 48, title: { python: timed, go: Timed, typescript: timed, rust: timed }, sub: one sample }
+    - id: retry
+      kind: concrete
+      before: { x: 188, y: 112, w: 222, h: 32, title: retry loop ×2 }
+      after:  { x: 294, y: 160, w: 100, h: 48, title: { python: retry, go: Retry, typescript: retry, rust: retry }, sub: "closure: fn, times" }
+    - id: jitter
+      kind: concrete
+      appears: change
+      before: { x: 188, y: 154, w: 222, h: 32, title: + jitter ×2 }
+      after:  { x: 294, y: 220, w: 100, h: 40, title: jitter, sub: one line }
+  edges:
+    - { from: client, to: cache, label: calls }
+    - { from: cache, to: timed }
+    - { from: timed, to: retry }
+    - { from: retry, to: context, label: wraps }
+    - { from: cache, to: strategy, kind: implements }
+    - { from: timed, to: strategy, kind: implements }
+    - { from: retry, to: strategy, kind: implements, label: same shape }
+    - { from: context, to: strategy, kind: implements }
+    - { from: jitter, to: retry }
+
+# ---------------------------------------------------------------- code
+code:
+  python:
+    before:
+      file: billing_client.py
+      source: |
+        # billing_client.py
+        def fetch_invoice(invoice_id: str) -> dict:
+            start = time.perf_counter()
+            try:
+                for attempt in range(3):
+                    try:
+                        resp = http.get(f"/invoices/{invoice_id}", timeout=2.0)
+                        resp.raise_for_status()
+                        return resp.json()
+                    except httpx.TransportError:
+                        if attempt == 2:
+                            raise
+                        time.sleep(0.2 * 2**attempt)
+            finally:
+                metrics.observe("fetch_invoice", time.perf_counter() - start)
+
+
+        def fetch_customer(customer_id: str) -> dict:
+            start = time.perf_counter()
+            try:
+                for attempt in range(3):
+                    try:
+                        resp = http.get(f"/customers/{customer_id}", timeout=2.0)
+                        resp.raise_for_status()
+                        return resp.json()
+                    except httpx.TransportError:
+                        if attempt == 2:
+                            raise
+                        time.sleep(0.2 * 2**attempt)
+            finally:
+                metrics.observe("fetch_customer", time.perf_counter() - start)
+      roles: { context: [2, 31], timed: [3, 15], retry: [5, 13] }
+      change:
+        - { line: 13, replace: '                time.sleep(random.uniform(0, 0.2 * 2**attempt))' }
+        - { line: 29, replace: '                time.sleep(random.uniform(0, 0.2 * 2**attempt))' }
+    after:
+      file: retrying.py · billing_client.py
+      source: |
+        # retrying.py
+        def retry(times: int = 3, on: type[Exception] = httpx.TransportError):
+            def decorate(fn):
+                @functools.wraps(fn)
+                def wrapper(*args, **kwargs):
+                    for attempt in range(times):
+                        try:
+                            return fn(*args, **kwargs)
+                        except on:
+                            if attempt == times - 1:
+                                raise
+                            time.sleep(0.2 * 2**attempt)
+                return wrapper
+            return decorate
+
+
+        def timed(fn):
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                start = time.perf_counter()
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    metrics.observe(fn.__name__, time.perf_counter() - start)
+            return wrapper
+
+
+        # billing_client.py
+        @functools.lru_cache(maxsize=1024)
+        @timed
+        @retry(times=3)
+        def fetch_invoice(invoice_id: str) -> dict:
+            resp = http.get(f"/invoices/{invoice_id}", timeout=2.0)
+            resp.raise_for_status()
+            return resp.json()
+
+
+        @timed
+        @retry(times=3)
+        def fetch_customer(customer_id: str) -> dict:
+            resp = http.get(f"/customers/{customer_id}", timeout=2.0)
+            resp.raise_for_status()
+            return resp.json()
+      roles: { strategy: [5, 5], retry: [2, 14], timed: [17, 25], cache: [29, 29], context: [32, 35], client: [29, 32], jitter: [12, 12], import: [29, 32], cachehit: [29, 29], timing: [19, 24], retrying: [5, 12] }
+    again:
+      file: retrying.py
+      source: |
+        # The jitter change, after: one line in retry(), and every decorated call gets it.
+                        time.sleep(random.uniform(0, 0.2 * 2**attempt))
+    cost:
+      before: { text: "2 loops · 2 edits · and every new endpoint", value: 0.7 }
+      after: { text: "1 line in retry()", value: 0.12 }
+    lens:
+      need: 1
+      needLabel: Built in
+      note: '`@d` above `def f` means `f = d(f)`, run once when `def` runs. Stacked decorators apply bottom-up and run top-down. A wrapper is a closure over `fn`; captured variables live in cells and are read when the wrapper runs, which is why closures made in a loop see the last value. Always put `@functools.wraps(fn)` on the inner function, or the name, docstring and signature are lost.'
+      seenIn: '`functools.lru_cache`, `functools.cache` (3.9) and `functools.wraps`, `contextlib.contextmanager`, `pytest.fixture`, Flask''s `@app.route` and Click''s `@click.command` (registration decorators), and tenacity''s `@retry`.'
+
+  go:
+    before:
+      file: client.go
+      source: |
+        // client.go
+        func FetchInvoice(ctx context.Context, id string) (Invoice, error) {
+        	start := time.Now()
+        	defer func() { metrics.Observe("fetch_invoice", time.Since(start)) }()
+        	var inv Invoice
+        	err := getJSON(ctx, "/invoices/"+id, &inv)
+        	for attempt := 1; attempt < 3 && isTransient(err); attempt++ {
+        		time.Sleep(100 * time.Millisecond << attempt)
+        		err = getJSON(ctx, "/invoices/"+id, &inv)
+        	}
+        	return inv, err
+        }
+
+        func FetchCustomer(ctx context.Context, id string) (Customer, error) {
+        	start := time.Now()
+        	defer func() { metrics.Observe("fetch_customer", time.Since(start)) }()
+        	var c Customer
+        	err := getJSON(ctx, "/customers/"+id, &c)
+        	for attempt := 1; attempt < 3 && isTransient(err); attempt++ {
+        		time.Sleep(100 * time.Millisecond << attempt)
+        		err = getJSON(ctx, "/customers/"+id, &c)
+        	}
+        	return c, err
+        }
+      roles: { context: [2, 24], timed: [3, 4], retry: [7, 10] }
+      change:
+        - { line: 8, replace: '		time.Sleep(rand.N(100 * time.Millisecond << attempt))' }
+        - { line: 20, replace: '		time.Sleep(rand.N(100 * time.Millisecond << attempt))' }
+    after:
+      file: middleware.go · client.go
+      source: |
+        // middleware.go
+        type Fetch[T any] func(ctx context.Context, id string) (T, error)
+
+        func Retry[T any](times int, next Fetch[T]) Fetch[T] {
+        	return func(ctx context.Context, id string) (T, error) {
+        		v, err := next(ctx, id)
+        		for attempt := 1; attempt < times && isTransient(err); attempt++ {
+        			time.Sleep(100 * time.Millisecond << attempt)
+        			v, err = next(ctx, id)
+        		}
+        		return v, err
+        	}
+        }
+
+        func Timed[T any](name string, next Fetch[T]) Fetch[T] {
+        	return func(ctx context.Context, id string) (T, error) {
+        		start := time.Now()
+        		defer func() { metrics.Observe(name, time.Since(start)) }()
+        		return next(ctx, id)
+        	}
+        }
+
+        // client.go (Cached is a map behind a mutex, in cache.go)
+        var FetchInvoice = Cached(Timed("fetch_invoice", Retry(3, getInvoice)))
+        var FetchCustomer = Timed("fetch_customer", Retry(3, getCustomer))
+
+        func getInvoice(ctx context.Context, id string) (Invoice, error) {
+        	var inv Invoice
+        	err := getJSON(ctx, "/invoices/"+id, &inv)
+        	return inv, err
+        }
+      roles: { strategy: [2, 2], retry: [4, 13], timed: [15, 21], cache: [24, 24], context: [27, 31], client: [24, 25], jitter: [8, 8], import: [24, 24], cachehit: [24, 24], timing: [16, 20], retrying: [5, 12] }
+    again:
+      file: middleware.go
+      source: |
+        // The jitter change, after: one line in Retry, and every wrapped fetch gets it.
+        			time.Sleep(rand.N(100 * time.Millisecond << attempt))
+    cost:
+      before: { text: "2 loops · 2 edits · and every new endpoint", value: 0.7 }
+      after: { text: "1 line in Retry", value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Plain functions
+      note: 'No decorator syntax: a wrapper is a function that takes a function and returns a closure, and you compose them by hand where the value is defined. Closures capture variables, not values. Since Go 1.22 each loop iteration gets its own loop variable, which removed the classic late-binding bug in `for` loops. There is no metadata to copy, so the name for metrics is passed in.'
+      seenIn: 'HTTP middleware as `func(http.Handler) http.Handler`, gRPC interceptors, `sync.OnceValue` (Go 1.21), which wraps a function so it runs once.'
+
+  typescript:
+    before:
+      file: client.ts
+      source: |
+        // client.ts
+        export async function fetchInvoice(id: string): Promise<Invoice> {
+          const start = performance.now();
+          try {
+            for (let attempt = 0; ; attempt++) {
+              try {
+                return await getJSON<Invoice>(`/invoices/${id}`);
+              } catch (err) {
+                if (attempt === 2 || !isTransient(err)) throw err;
+                await sleep(200 * 2 ** attempt);
+              }
+            }
+          } finally {
+            metrics.observe("fetch_invoice", performance.now() - start);
+          }
+        }
+
+        export async function fetchCustomer(id: string): Promise<Customer> {
+          const start = performance.now();
+          try {
+            for (let attempt = 0; ; attempt++) {
+              try {
+                return await getJSON<Customer>(`/customers/${id}`);
+              } catch (err) {
+                if (attempt === 2 || !isTransient(err)) throw err;
+                await sleep(200 * 2 ** attempt);
+              }
+            }
+          } finally {
+            metrics.observe("fetch_customer", performance.now() - start);
+          }
+        }
+      roles: { context: [2, 32], timed: [3, 15], retry: [5, 12] }
+      change:
+        - { line: 10, replace: '        await sleep(Math.random() * 200 * 2 ** attempt);' }
+        - { line: 26, replace: '        await sleep(Math.random() * 200 * 2 ** attempt);' }
+    after:
+      file: middleware.ts · client.ts
+      source: |
+        // middleware.ts
+        type Fetch<T> = (id: string) => Promise<T>;
+
+        export const retry = (times: number) => <T>(next: Fetch<T>): Fetch<T> =>
+          async (id) => {
+            for (let attempt = 0; ; attempt++) {
+              try {
+                return await next(id);
+              } catch (err) {
+                if (attempt === times - 1 || !isTransient(err)) throw err;
+                await sleep(200 * 2 ** attempt);
+              }
+            }
+          };
+
+        export const timed = (name: string) => <T>(next: Fetch<T>): Fetch<T> =>
+          async (id) => {
+            const start = performance.now();
+            try {
+              return await next(id);
+            } finally {
+              metrics.observe(name, performance.now() - start);
+            }
+          };
+
+        // client.ts
+        export const fetchInvoice = cached(timed("fetch_invoice")(retry(3)(getInvoice)));
+        export const fetchCustomer = timed("fetch_customer")(retry(3)(getCustomer));
+      roles: { strategy: [2, 2], retry: [4, 14], timed: [16, 24], cache: [27, 27], context: [27, 28], client: [27, 28], jitter: [11, 11], import: [27, 27], cachehit: [27, 27], timing: [17, 23], retrying: [5, 13] }
+    again:
+      file: middleware.ts
+      source: |
+        // The jitter change, after: one line in retry, and every wrapped fetch gets it.
+                await sleep(Math.random() * 200 * 2 ** attempt);
+    cost:
+      before: { text: "2 loops · 2 edits · and every new endpoint", value: 0.7 }
+      after: { text: "1 line in retry", value: 0.12 }
+    lens:
+      need: 2
+      needLabel: Plain functions
+      note: 'Higher-order functions do the job; the TypeScript 5 `@decorator` syntax applies only to classes and their members, not to standalone functions. Closures capture bindings: a `let` in a `for` loop is a fresh binding per iteration, a `var` is one binding for the whole loop. Wrapping an async function means awaiting inside `try`, or `finally` runs before the call finishes.'
+      seenIn: '`p-retry`, lodash `memoize` and `debounce`, Express and Koa middleware, and the class decorators of Angular and NestJS (which use the older experimental decorators).'
+
+  rust:
+    before:
+      file: client.rs
+      source: |
+        // client.rs
+        fn fetch_invoice(id: &str) -> Result<Invoice, ApiError> {
+            let start = Instant::now();
+            let mut attempt = 0;
+            let result = loop {
+                match get_json(&format!("/invoices/{id}")) {
+                    Err(e) if e.is_transient() && attempt < 2 => {
+                        thread::sleep(Duration::from_millis(200 << attempt));
+                        attempt += 1;
+                    }
+                    result => break result,
+                }
+            };
+            metrics::observe("fetch_invoice", start.elapsed());
+            result
+        }
+
+        fn fetch_customer(id: &str) -> Result<Customer, ApiError> {
+            let start = Instant::now();
+            let mut attempt = 0;
+            let result = loop {
+                match get_json(&format!("/customers/{id}")) {
+                    Err(e) if e.is_transient() && attempt < 2 => {
+                        thread::sleep(Duration::from_millis(200 << attempt));
+                        attempt += 1;
+                    }
+                    result => break result,
+                }
+            };
+            metrics::observe("fetch_customer", start.elapsed());
+            result
+        }
+      roles: { context: [2, 32], timed: [3, 15], retry: [5, 13] }
+      change:
+        - { line: 8, replace: '                thread::sleep(Duration::from_millis(rand::random_range(0..200 << attempt)));' }
+        - { line: 24, replace: '                thread::sleep(Duration::from_millis(rand::random_range(0..200 << attempt)));' }
+    after:
+      file: middleware.rs · client.rs
+      source: |
+        // middleware.rs
+        fn retry<T, E: Transient>(times: u32, f: impl Fn(&str) -> Result<T, E>) -> impl Fn(&str) -> Result<T, E> {
+            move |id: &str| {
+                let mut attempt = 0;
+                loop {
+                    match f(id) {
+                        Err(e) if e.is_transient() && attempt + 1 < times => {
+                            thread::sleep(Duration::from_millis(200 << attempt));
+                            attempt += 1;
+                        }
+                        result => return result,
+                    }
+                }
+            }
+        }
+
+        fn timed<T>(name: &'static str, f: impl Fn(&str) -> T) -> impl Fn(&str) -> T {
+            move |id: &str| {
+                let start = Instant::now();
+                let out = f(id);
+                metrics::observe(name, start.elapsed());
+                out
+            }
+        }
+
+        // client.rs
+        let fetch_invoice = cached(timed("fetch_invoice", retry(3, get_invoice)));
+        let fetch_customer = timed("fetch_customer", retry(3, get_customer));
+      roles: { strategy: [2, 2], retry: [2, 15], timed: [17, 24], cache: [27, 27], context: [27, 28], client: [27, 28], jitter: [8, 8], import: [27, 27], cachehit: [27, 27], timing: [18, 23], retrying: [3, 14] }
+    again:
+      file: middleware.rs
+      source: |
+        // The jitter change, after: one line in retry, and every wrapped fetch gets it.
+                            thread::sleep(Duration::from_millis(rand::random_range(0..200 << attempt)));
+    cost:
+      before: { text: "2 loops · 2 edits · and every new endpoint", value: 0.7 }
+      after: { text: "1 line in retry", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Generics
+      note: 'A wrapper is a generic function that takes `impl Fn` and returns a `move` closure that owns what it captured. The compiler decides whether a closure is `Fn`, `FnMut` or `FnOnce` from what it does with its captures. Each stack is its own type, so calls between layers are static. Attribute macros such as `#[tracing::instrument]` rewrite the function at compile time instead.'
+      seenIn: 'tower''s `Layer` and `ServiceBuilder` (with retry and timeout layers), `#[tracing::instrument]`, and the `cached` crate''s `#[cached]` attribute.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: { python: 'When the module is imported, Python applies the decorators bottom-up. `retry(times=3)` returns `decorate`; `decorate(fetch_invoice)` returns retry''s wrapper; `timed` wraps that; `lru_cache` wraps that; and the name `fetch_invoice` is rebound to the outermost result. This happens once.', go: 'The package-level `var` composes the wrappers inside out when the package initialises: `Retry` wraps `getInvoice`, `Timed` wraps that, `Cached` wraps that. Once.', typescript: 'When the module loads, the expression is evaluated inside out: `retry(3)(getInvoice)`, then `timed(...)`, then `cached(...)`. `fetchInvoice` is the outermost function. Once.', rust: 'The `let` composes the closures inside out: `retry` returns a closure that owns `get_invoice`, `timed` returns one that owns that, and `cached` wraps it. Each layer is a distinct closure type.' }
+    nodes: [retry, timed, cache, context]
+    edges: [retry>context, timed>retry, cache>timed]
+    role: import
+  - text: A call enters the outermost layer first. The cache looks the invoice id up; on a hit it returns the stored result at once, and nothing below it runs, not the timer and not the network.
+    nodes: [client, cache]
+    edges: [client>cache]
+    role: cachehit
+  - text: { python: 'On a miss, timed''s wrapper starts the clock and calls `fn`. `fn` is not a global: it is a free variable of `wrapper`, stored in a cell in `wrapper.__closure__`, captured when `timed` ran at import.', go: 'On a miss, the `Timed` closure starts the clock and calls `next`, which it captured when `Timed` ran. `name` was captured too, so the metric has the right label.', typescript: 'On a miss, timed''s inner function starts the clock and awaits `next(id)`. `next` and `name` are captured bindings from the outer calls.', rust: 'On a miss, the timed closure starts the clock and calls `f`, which it owns because of `move`. `name` is a `&''static str` it copied in.' }
+    nodes: [cache, timed]
+    edges: [cache>timed]
+    role: timing
+  - text: { python: 'retry''s wrapper reads `fn`, `times` and `on` from its closure and loops. A connection error sleeps and calls `fn` again; the last failure is re-raised. timed sees one call, retries and sleeps included, and records one sample under `fn.__name__`, which `@wraps` made `fetch_invoice`.', go: 'The `Retry` closure calls `next` until it succeeds, a non-transient error comes back, or it has tried `times` times. `Timed` above it sees one call and records one sample.', typescript: 'The retry closure awaits `next(id)` in a loop and rethrows the last error. The timer above it sees one call and records one sample.', rust: 'The retry closure calls `f` in a loop until the result is not a transient error or the attempts run out. The timer above sees one call.' }
+    nodes: [timed, retry, context]
+    edges: [timed>retry, retry>context]
+    role: retrying
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: "A module defines `@timed def fetch_invoice(...)` and is imported once. Then `fetch_invoice` is called 1,000 times. How many times does the body of `timed` itself (not its inner wrapper) run?"
+    options:
+      - text: Once, when def ran at import. The 1,000 calls run the wrapper it returned.
+        correct: true
+        why: Right. @timed means fetch_invoice = timed(fetch_invoice), evaluated once. timed builds and returns the wrapper; only the wrapper runs per call.
+      - text: 1,000 times, once per call.
+        why: The decorator is called once, when def runs. Per call, only the inner wrapper runs.
+      - text: Never. Decorators only add metadata.
+        why: A Python decorator replaces the function with whatever it returns. Here that is a new function.
+  engineer:
+    question: "A router is built with `for path in ('/invoices', '/customers'): handlers[path] = lambda id: http.get(f'{path}/{id}')`. What does `handlers['/invoices']('42')` request?"
+    options:
+      - text: "/customers/42. Both lambdas read the variable path when they run, and by then it holds the last value."
+        correct: true
+        why: Right. Closures capture variables, not values. Bind the value at creation time with a default (lambda id, path=path) or functools.partial.
+      - text: "/invoices/42. Each lambda captured path when it was created."
+        why: That would be capture by value. Python closures read the variable at call time.
+      - text: A NameError, because path no longer exists after the loop.
+        why: The loop variable survives the loop at module or function scope, holding its last value.
+  deep:
+    question: "`retry`'s wrapper lacks `@functools.wraps(fn)`. `timed` sits above `retry` and does use `@wraps`. What do `fetch_invoice.__name__` and `inspect.signature(fetch_invoice)` show?"
+    options:
+      - text: "`wrapper` and `(*args, **kwargs)`. timed copies the name of what it wraps, which is retry's wrapper, and the __wrapped__ chain stops there."
+        correct: true
+        why: Right. update_wrapper copies attributes from the callable directly below and sets __wrapped__ to it. inspect.signature follows __wrapped__ until an object without one, retry's wrapper, and reports its (*args, **kwargs).
+      - text: "`fetch_invoice` and its real signature, because the outermost layer used @wraps."
+        why: "@wraps copies from the layer directly below, and that layer already says wrapper. It cannot see past it."
+      - text: "`timed` and `(fn)`."
+        why: The decorator function itself is not what callers hold. They hold the wrapper it returned.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Decorator
+      example: { python: "timed, retry(times=3)", go: "Timed, Retry", typescript: "timed(name), retry(n)", rust: "timed, retry" }
+      job: Takes a function, returns a replacement with the same call shape.
+    - role: Decorator factory
+      example: "retry(times=3)"
+      job: Takes settings and returns the decorator. The extra level of nesting holds the settings in a closure.
+    - role: Wrapper
+      example: "the inner wrapper(*args, **kwargs)"
+      job: Runs on every call. Does its job before or after calling the function it closed over.
+    - role: Closure cell
+      example: "wrapper.__closure__[0].cell_contents"
+      job: Keeps a captured variable alive for as long as the wrapper exists.
+  useWhen:
+    - The same before-and-after logic (retry, timing, caching, auth, logging) is copied into many functions.
+    - The behaviour should be switchable per function by adding or removing one line.
+    - You need to register functions in a table at import time (routes, CLI commands, plug-ins).
+  avoidWhen:
+    - Only one function needs the behaviour, and it is short. Inline code is easier to read and debug.
+    - The wrapper must change the function's arguments or return type in ways callers cannot see from its signature.
+  tradeoffs:
+    - Every layer is one more frame in tracebacks and profiles, named wrapper unless @wraps is used.
+    - The order of the lines is behaviour. A reviewer must read the stack, not just each decorator.
+    - lru_cache returns the same object to every caller. A caller that mutates a cached dict changes it for everyone.
+  lookalikes:
+    - name: The Decorator pattern
+      how: Wraps objects that share an interface. Python's @ syntax wraps functions, at definition time; the idea is the same, the mechanism differs.
+    - name: Middleware
+      how: Decorators applied to request handlers by a framework, usually configured as a list instead of stacked @ lines.
+    - name: Context manager
+      how: Wraps a block of code inside one function with with, instead of wrapping every call of a function.
+---
+
+## [concept] Closures and decorators
+
+**A <Term id="closure">closure</Term> is a function that keeps the variables it was created with. A <Term id="function-decorator">decorator</Term> is a function that takes a function and returns a closure that wraps it, so retry, timing and caching are written once and stacked on any call.**
+
+Python functions are <Term id="first-class-function">first-class</Term>: you can pass one to another function and get a new one back. `@timed` above `def fetch_invoice` means `fetch_invoice = timed(fetch_invoice)`. From then on, the name refers to the wrapper.
+
+<Depth level={2}>
+Two moments matter. At definition time, when `def` runs (usually at import), the decorators run once, bottom-up, and the name is rebound to the outermost result. At call time, every call goes through the wrappers top-down, like the layers of an <Term id="middleware-onion">onion</Term>. A <Term id="decorator-factory">decorator factory</Term> such as `retry(times=3)` adds one level: it is called first and returns the real decorator. Put `@functools.wraps(fn)` on every inner wrapper, or the wrapper's own name, `wrapper`, is what logs, metrics and `help()` will show.
+</Depth>
+
+<Depth level={3}>
+A variable used in an inner function but assigned in the enclosing one is a free variable. CPython stores it in a <Term id="cell-object">cell</Term>: the outer frame and every inner function that uses it share the cell, listed in `fn.__code__.co_freevars` and `fn.__closure__`. That is why a closure sees later assignments to the variable, and why `nonlocal` is needed to assign to it from inside. It is also the source of <Term id="late-binding">late binding</Term>:
+
+```python
+handlers = {}
+for path in ("/invoices", "/customers"):
+    handlers[path] = lambda id: http.get(f"{path}/{id}")   # both read path later
+
+handlers["/invoices"]("42")   # requests /customers/42
+```
+
+Bind the value when the closure is made, with `lambda id, path=path: ...` or `functools.partial`.
+</Depth>
+
+## [problem] Two API calls that both retry and time themselves
+
+A billing job fetches invoices and customers from an internal API. The network drops connections now and then, so each fetch retries with exponential backoff, and each one reports its latency. It works, and it is tested.
+
+Read it once. The retry loop and the timer are copied into both functions, and each copy has to get the `try`/`finally` right so failures are timed too.
+
+<Depth level={2}>
+The interesting code is three lines per function: the GET, the status check, the JSON. The other ten are policy: how many attempts, which errors, how long to wait, what to measure. Policy changes for the whole client at once, and here it lives in every function.
+</Depth>
+
+<Depth level={3}>
+<Lang only="python">The metric name is a string literal in each copy. When someone copies `fetch_customer` to make `fetch_payment` and forgets to edit it, the payment latency lands in the customer series.</Lang>
+<Lang only="go">The `defer` reads `start` through a closure, so the timer is right even on early returns. Each new fetch has to repeat that idiom.</Lang>
+<Lang only="typescript">The `finally` block runs after the awaited promise settles, because the `return await` is inside the `try`. Drop the `await` and the timer stops before the request finishes.</Lang>
+<Lang only="rust">The `loop` with `break result` keeps both the success and the final error. Every new endpoint repeats the match arms.</Lang>
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** add random jitter to the retry backoff, so retries from every pod do not land at once.
+
+The marked lines change, one per copy. This sample has two fetches; the real client has eleven. Miss one, and that endpoint keeps retrying in lockstep with every other pod after an outage.
+
+<Depth level={2}>
+Nothing fails when a copy is missed. The endpoint still retries, just without jitter, and the thundering herd it causes shows up only during the next incident.
+</Depth>
+
+<Depth level={3}>
+Tests make it worse. To check jitter, each function's tests must patch `time.sleep` and the random source separately, eleven times over.
+</Depth>
+
+## [morph] Turn the policy into wrappers
+
+Drag the slider. The retry loop and the timer leave the fetches and become two decorators with the same call shape as the function they wrap. The fetches shrink to one GET each, and the stack of lines above `def` says which policy applies.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+`retry` is a factory: `retry(times=3)` returns `decorate`, which returns `wrapper`. Three levels, because the settings, the function and the call arguments arrive at three different times. `timed` needs no settings, so it has two levels and reads the metric name from `fn.__name__`, which only works because `retry` used `@wraps`.
+</Depth>
+
+<Depth level={3}>
+<Lang only="python">`functools.wraps(fn)` calls `update_wrapper`, which copies `__module__`, `__name__`, `__qualname__`, `__annotations__`, `__type_params__` and `__doc__`, updates `__dict__`, and sets `wrapper.__wrapped__ = fn`. `inspect.signature` follows `__wrapped__`, so tools see the real parameters.</Lang>
+<Lang only="go">`Retry` and `Timed` are generic over the result type, so one wrapper serves `Invoice` and `Customer`. The metric name is a parameter, because a Go function value has no name to read.</Lang>
+<Lang only="typescript">`retry(3)` returns a generic function, so `retry(3)(getInvoice)` infers `Fetch<Invoice>`. Each layer awaits the next inside `try`, so errors and timing pass through correctly.</Lang>
+<Lang only="rust">`retry` returns `impl Fn(&str) -> Result<T, E>`. The `move` closure owns `f` and `times`, so the wrapper can outlive the function that built it.</Lang>
+</Depth>
+
+## [walk] Follow one call through the stack
+
+From import to one fetch, through three wrappers. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="python">`lru_cache` is written in C in CPython. It calls `update_wrapper` itself, so it reports the name of whatever it wraps, and its `cache_info()` and `cache_clear()` are methods of the wrapper object. An outer `@wraps` copies `__dict__`, not methods, so they are reachable only when the cache is the outermost line.</Lang>
+<Lang only="go">Each layer is a call through a func value: an indirect call, which the compiler usually cannot inline. For an HTTP fetch that cost is invisible.</Lang>
+<Lang only="typescript">Each layer adds a promise and a microtask hop. A call through three async wrappers settles three promises from the inside out.</Lang>
+<Lang only="rust">The full stack is one concrete type built from three closure types, so the calls between layers are static and can be inlined.</Lang>
+</Depth>
+
+## [again] Jitter, the second time
+
+The same request after the refactor. One line in `retry`, and every function decorated with it gets jitter, including the ones added next quarter.
+
+<Depth level={2}>
+Test the decorator once, on a fake function that fails twice: it should be called three times and sleep twice. Then one test per important stack order, such as "a cache hit makes no HTTP call". `fetch_invoice.__wrapped__` reaches the undecorated function when a test needs it.
+</Depth>
+
+<Depth level={3}>
+`lru_cache` hands every caller the same dict. If one caller adds a key to the invoice it got back, every later hit sees that key. Return immutable data from cached functions, or copy before mutating.
+</Depth>
+
+## [play] Stack the decorators, replay the calls
+
+`lru_cache`, `timed` and `retry` wrap `fetch_invoice`, in an order that looks reasonable, and `retry` forgot `@wraps`. The same three calls replay every time you change the stack: a fetch that needs one retry, the same fetch again, and a fetch whose shard is down.
+
+## [lens] How each language writes it
+
+Every language here has closures. Only Python has syntax for wrapping a plain function at its definition; the others compose wrappers where the function value is defined.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Late binding exists wherever closures capture variables. Go fixed the loop case in 1.22 with per-iteration loop variables. JavaScript fixed it for `let` but not `var`. Python has not changed it: bind with a default or `partial`.
+</Depth>
+
+<Depth level={3}>
+Rust is the one place a closure's capture mode is visible in its type. A closure that only reads is `Fn`, one that mutates a capture is `FnMut`, and one that moves a capture out is `FnOnce`. `move` decides whether it borrows or owns what it captured.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="closures-and-decorators" />
+
+### Read the stack from the top
+
+The top line is the outermost wrapper: it runs first on every call and was applied last at import. For each decorator ask what it must see and what it must hide. A cache goes above the timer and the retries, so hits skip both. A timer goes above the retries, so one sample covers the whole call. And every wrapper that is not a C built-in uses `@functools.wraps`, so the name and signature survive the stack.

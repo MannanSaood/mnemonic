@@ -1,0 +1,16 @@
+# Terms introduced by the Closures and decorators lesson (python track).
+- id: closure
+  term: Closure
+  short: A function together with the variables it uses from the function that created it. The variables stay alive as long as the closure does.
+- id: cell-object
+  term: Cell
+  short: The small object CPython uses to hold a captured variable. The inner function's __closure__ lists its cells, and every function sharing a cell sees later changes to it.
+- id: late-binding
+  term: Late binding
+  short: A closure reads a captured variable when it runs, not when it is created. Closures made in a loop all see the loop variable's last value.
+- id: function-decorator
+  term: Function decorator
+  short: A callable that takes a function and returns a replacement for it. In Python, @d above def f is shorthand for f = d(f), run once when def runs.
+- id: decorator-factory
+  term: Decorator factory
+  short: A function that takes settings and returns a decorator, such as retry(times=3). It adds a third level of nesting.
