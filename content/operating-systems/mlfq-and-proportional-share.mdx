@@ -1,0 +1,569 @@
+---
+title: MLFQ and proportional-share scheduling
+track: operating-systems
+group: Scheduling
+order: 8
+summary: MLFQ learns which jobs are interactive from how they use the CPU; proportional share ignores behaviour and gives each job a set fraction by tickets or weights.
+intent: Know how a scheduler can favour interactive work without being told, how that gets gamed, and when to give out fixed shares instead.
+changeRequest: Onboard an enterprise customer whose nightly sync submits 500 jobs at once.
+languages: [go, python, typescript, rust]
+glossary: [mlfq, priority-boost, lottery-scheduling, stride-scheduling, nice-value, vruntime, eevdf, starvation, time-slice]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [operating-systems/scheduling-basics]
+skills: [os, scheduling]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: mlfq-and-proportional-share
+  scenarios:
+    - try: "Run the batch job and the editor under MLFQ."
+      notice: "The batch job sinks to the bottom level after its first allotments. The editor stays on top and runs the moment it wakes."
+    - try: "Make a prediction, add a gamer and run again with accounting off."
+      notice: "The gamer never uses a full allotment, so it never moves down. It takes close to 90% of the CPU."
+    - try: "Add a second gamer. Then turn on a boost every 50 ms, and separately turn accounting on."
+      notice: "Two gamers starve the batch job for the whole run. The boost lets it run every 50 ms; accounting sinks the gamers."
+    - try: "Switch the timeline to stride, then lottery, and give batch 200 tickets."
+      notice: "Stride hands out shares by tickets almost exactly, whatever the gamer does. Lottery matches on average but drifts over the first 40 ms; press Draw again."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: sync
+      kind: client
+      before: { x: 12, y: 30, w: 120, h: 50, title: Nightly syncs, sub: submit jobs }
+      after:  { x: 12, y: 30, w: 120, h: 50, title: Nightly syncs, sub: submit jobs }
+    - id: runner
+      kind: context
+      before: { x: 150, y: 14, w: 398, h: 246, title: Shared queue, sub: "chunks in arrival order" }
+      after:  { x: 176, y: 30, w: 150, h: 50, title: Runner, sub: "next()" }
+    - id: stride
+      kind: strategy
+      appears: after
+      before: { x: 440, y: 110, w: 100, h: 50, title: "" }
+      after:  { x: 352, y: 30, w: 196, h: 50, title: Lowest pass, sub: "pass += big / tickets" }
+    - id: big
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 60, w: 358, h: 40, title: "enterprise · 500 jobs" }
+      after:  { x: 396, y: 196, w: 152, h: 50, title: Enterprise, sub: 8 tickets }
+    - id: small
+      kind: concrete
+      before: { x: 170, y: 112, w: 358, h: 40, title: "team tenant waits" }
+      after:  { x: 204, y: 196, w: 150, h: 50, title: Team tenant, sub: 4 tickets }
+    - id: free
+      kind: concrete
+      before: { x: 170, y: 164, w: 358, h: 40, title: "free tenant waits" }
+      after:  { x: 12, y: 196, w: 150, h: 50, title: Free tenant, sub: 1 ticket }
+  edges:
+    - { from: sync, to: runner, label: submit }
+    - { from: stride, to: runner, label: picks }
+    - { from: runner, to: big, label: 8 of 13 }
+    - { from: runner, to: small, label: 4 of 13 }
+    - { from: runner, to: free, label: 1 of 13 }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: runner.go · sync.go
+      source: |
+        // runner.go: workers take chunks from one shared queue
+        func (r *Runner) Submit(t TenantID, job Job) {
+            for _, c := range job.Chunks() {
+                r.queue <- Chunk{Tenant: t, Work: c} // every job's chunks, in order
+            }
+        }
+
+        func (r *Runner) worker(ctx context.Context) {
+            for {
+                select {
+                case c := <-r.queue:
+                    c.Work.Run(ctx) // ~100 ms
+                case <-ctx.Done():
+                    return
+                }
+            }
+        }
+
+        // sync.go: each tenant's nightly sync
+        for _, job := range tenant.PendingJobs() { // usually 2 or 3
+            runner.Submit(tenant.ID, job)
+        }
+      roles: { runner: [8, 17], sync: [19, 22], big: [2, 6], small: [11, 12], free: [11, 12] }
+      change:
+        - { line: 20, replace: "for _, job := range tenant.PendingJobs() { // enterprise: 500" }
+    after:
+      file: runner.go
+      source: |
+        // runner.go: tenants share workers in proportion to their plan's tickets
+        type tenantQ struct {
+            chunks        []Chunk
+            tickets, pass int64
+        }
+
+        const strideBig = 1 << 20
+
+        func (r *Runner) Submit(t TenantID, job Job) {
+            r.mu.Lock()
+            defer r.mu.Unlock()
+            q := r.tenant(t) // tickets from the plan: free 1, team 4, enterprise 8
+            if len(q.chunks) == 0 {
+                q.pass = max(q.pass, r.minPass()) // no credit for time spent idle
+            }
+            q.chunks = append(q.chunks, job.Chunks()...)
+            r.cond.Signal()
+        }
+
+        // next picks the tenant with the lowest pass: stride scheduling.
+        func (r *Runner) next() Chunk {
+            r.mu.Lock()
+            defer r.mu.Unlock()
+            for !r.anyQueued() {
+                r.cond.Wait()
+            }
+            q := r.lowestPass() // among tenants with queued chunks
+            c := q.chunks[0]
+            q.chunks = q.chunks[1:]
+            q.pass += strideBig / q.tickets
+            return c
+        }
+      roles: { sync: [9, 18], runner: [21, 32], stride: [27, 30], small: [12, 12], free: [12, 12], big: [16, 16], submit: [9, 18], pick: [27, 27], run: [28, 31], advance: [30, 30], wake: [13, 15] }
+    again:
+      file: queue-wait.txt
+      source: |
+        // nightly sync with the enterprise tenant's 500 jobs queued
+        // team tenant, 3 jobs:   done in ~7 s     (was ~6 min)
+        // enterprise, 500 jobs:  8/13 of the workers while others wait
+    cost:
+      before: { text: "small tenants wait ~6 min", value: 0.9 }
+      after: { text: "team tenant done in ~7 s", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'The Go scheduler has no priorities or weights: every runnable goroutine is equal. Shares between kinds of work are yours to build, as here, or the kernel''s across processes. Nice values are per thread on Linux, and goroutines move between threads, so there is no way to nice one goroutine.'
+      seenIn: 'There is no nice in the standard library; `syscall.Setpriority` and `golang.org/x/sys/unix.Setpriority` set it for the process. Container CPU weights (cgroup v2 `cpu.weight`, set by Kubernetes from CPU requests) share CPU between whole Go processes.'
+
+  python:
+    before:
+      file: runner.py · sync.py
+      source: |
+        # runner.py: workers take chunks from one shared queue
+        import queue
+
+        chunks: queue.Queue[Chunk] = queue.Queue()
+
+        def submit(tenant: TenantId, job: Job) -> None:
+            for c in job.chunks():
+                chunks.put(Chunk(tenant, c))  # every job's chunks, in order
+
+        def worker() -> None:
+            while True:
+                chunks.get().run()  # ~100 ms
+
+        # sync.py: each tenant's nightly sync
+        for job in tenant.pending_jobs():  # usually 2 or 3
+            submit(tenant.id, job)
+      roles: { runner: [10, 12], sync: [14, 16], big: [6, 8], small: [12, 12], free: [12, 12] }
+      change:
+        - { line: 15, replace: "for job in tenant.pending_jobs():  # enterprise: 500" }
+    after:
+      file: runner.py
+      source: |
+        # runner.py: tenants share workers in proportion to their plan's tickets
+        import threading
+        from collections import deque
+        from dataclasses import dataclass, field
+
+        STRIDE_BIG = 1 << 20
+
+        @dataclass
+        class TenantQueue:
+            tickets: int  # from the plan: free 1, team 4, enterprise 8
+            pass_: int = 0
+            chunks: deque = field(default_factory=deque)
+
+        tenants: dict[TenantId, TenantQueue] = {}
+        cond = threading.Condition()
+
+        def submit(tenant: TenantId, job: Job) -> None:
+            with cond:
+                q = tenants.setdefault(tenant, TenantQueue(plan_tickets(tenant)))
+                if not q.chunks:  # no credit for time spent idle
+                    q.pass_ = max(q.pass_, min((t.pass_ for t in tenants.values() if t.chunks), default=0))
+                q.chunks.extend(job.chunks())
+                cond.notify()
+
+        def next_chunk() -> Chunk:
+            with cond:
+                cond.wait_for(lambda: any(t.chunks for t in tenants.values()))
+                q = min((t for t in tenants.values() if t.chunks), key=lambda t: t.pass_)
+                q.pass_ += STRIDE_BIG // q.tickets
+                return q.chunks.popleft()
+      roles: { sync: [17, 23], runner: [25, 30], stride: [28, 29], small: [10, 10], free: [10, 10], big: [22, 22], submit: [17, 23], pick: [28, 28], run: [30, 30], advance: [29, 29], wake: [20, 21] }
+    again:
+      file: queue-wait.txt
+      source: |
+        # nightly sync with the enterprise tenant's 500 jobs queued
+        # team tenant, 3 jobs:   done in ~7 s     (was ~6 min)
+        # enterprise, 500 jobs:  8/13 of the workers while others wait
+    cost:
+      before: { text: "small tenants wait ~6 min", value: 0.9 }
+      after: { text: "team tenant done in ~7 s", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'The GIL is not priority-aware. A thread with a better nice value gets the CPU sooner from the kernel, then may still wait for the GIL behind a thread the kernel ranks lower. Shares between kinds of Python work need separate processes, each with its own nice value or cgroup weight, or an application scheduler like this one.'
+      seenIn: '`os.nice`, `os.setpriority(os.PRIO_PROCESS, pid, n)`; on Linux a thread id from `threading.get_native_id()` works as the pid, so one thread can be niced. `heapq` makes the lowest-pass pick O(log n) for many tenants.'
+
+  typescript:
+    before:
+      file: runner.ts · sync.ts
+      source: |
+        // runner.ts: workers take chunks from one shared queue
+        const queue: Chunk[] = [];
+
+        export function submit(tenant: TenantId, job: Job): void {
+          for (const c of job.chunks()) queue.push({ tenant, work: c }); // in order
+        }
+
+        export async function worker(): Promise<never> {
+          for (;;) {
+            const c = queue.shift();
+            if (c) await c.work.run(); // ~100 ms, mostly database I/O
+            else await sleep(50);
+          }
+        }
+
+        // sync.ts: each tenant's nightly sync
+        for (const job of await tenant.pendingJobs()) { // usually 2 or 3
+          submit(tenant.id, job);
+        }
+      roles: { runner: [8, 14], sync: [16, 19], big: [4, 6], small: [11, 11], free: [11, 11] }
+      change:
+        - { line: 17, replace: "for (const job of await tenant.pendingJobs()) { // enterprise: 500" }
+    after:
+      file: runner.ts
+      source: |
+        // runner.ts: tenants share workers in proportion to their plan's tickets
+        const STRIDE_BIG = 1 << 20;
+        interface TenantQueue { tickets: number; pass: number; chunks: Chunk[] }
+        const tenants = new Map<TenantId, TenantQueue>();
+
+        const busy = () => [...tenants.values()].filter((t) => t.chunks.length > 0);
+
+        export function submit(tenant: TenantId, job: Job): void {
+          let q = tenants.get(tenant);
+          if (!q) tenants.set(tenant, (q = { tickets: planTickets(tenant), pass: 0, chunks: [] }));
+          if (q.chunks.length === 0) { // no credit for time spent idle
+            const low = Math.min(...busy().map((t) => t.pass));
+            if (Number.isFinite(low)) q.pass = Math.max(q.pass, low);
+          }
+          q.chunks.push(...job.chunks());
+        }
+
+        export function nextChunk(): Chunk | undefined {
+          const ready = busy();
+          if (ready.length === 0) return undefined;
+          const q = ready.reduce((a, b) => (b.pass < a.pass ? b : a)); // lowest pass
+          q.pass += STRIDE_BIG / q.tickets;
+          return q.chunks.shift();
+        }
+      roles: { sync: [8, 16], runner: [18, 24], stride: [21, 22], small: [10, 10], free: [10, 10], big: [15, 15], submit: [8, 16], pick: [21, 21], run: [23, 23], advance: [22, 22], wake: [11, 14] }
+    again:
+      file: queue-wait.txt
+      source: |
+        // nightly sync with the enterprise tenant's 500 jobs queued
+        // team tenant, 3 jobs:   done in ~7 s     (was ~6 min)
+        // enterprise, 500 jobs:  8/13 of the workers while others wait
+    cost:
+      before: { text: "small tenants wait ~6 min", value: 0.9 }
+      after: { text: "team tenant done in ~7 s", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'Node has one event loop with no priorities: callbacks run in arrival order within each phase. Weighted sharing between tenants is application code, as here. The only kernel-level knob is the process''s nice value, which ranks the whole Node process against others on the machine.'
+      seenIn: '`os.setPriority(pid, priority)` and `os.constants.priority`. Job libraries such as BullMQ offer per-job priorities and group rate limits; weights per tenant usually need a scheduler like this one.'
+
+  rust:
+    before:
+      file: runner.rs · sync.rs
+      source: |
+        // runner.rs: workers take chunks from one shared queue
+        pub fn submit(tx: &mpsc::Sender<Chunk>, tenant: TenantId, job: Job) {
+            for work in job.chunks() {
+                tx.send(Chunk { tenant, work }).unwrap(); // every job's chunks, in order
+            }
+        }
+
+        pub fn worker(rx: Arc<Mutex<mpsc::Receiver<Chunk>>>) {
+            loop {
+                let chunk = rx.lock().unwrap().recv().unwrap();
+                chunk.work.run(); // ~100 ms
+            }
+        }
+
+        // sync.rs: each tenant's nightly sync
+        for job in tenant.pending_jobs()? { // usually 2 or 3
+            submit(&tx, tenant.id, job);
+        }
+      roles: { runner: [8, 13], sync: [15, 18], big: [2, 6], small: [11, 11], free: [11, 11] }
+      change:
+        - { line: 16, replace: "for job in tenant.pending_jobs()? { // enterprise: 500" }
+    after:
+      file: runner.rs
+      source: |
+        // runner.rs: tenants share workers in proportion to their plan's tickets
+        const STRIDE_BIG: u64 = 1 << 20;
+
+        struct TenantQueue { tickets: u64, pass: u64, chunks: VecDeque<Work> }
+
+        #[derive(Default)]
+        pub struct Runner { tenants: Mutex<HashMap<TenantId, TenantQueue>>, ready: Condvar }
+
+        impl Runner {
+            pub fn submit(&self, tenant: TenantId, job: Job) {
+                let mut ts = self.tenants.lock().unwrap();
+                let low = ts.values().filter(|t| !t.chunks.is_empty()).map(|t| t.pass).min();
+                let q = ts.entry(tenant).or_insert_with(|| TenantQueue { tickets: plan_tickets(tenant), pass: 0, chunks: VecDeque::new() });
+                if q.chunks.is_empty() {
+                    q.pass = q.pass.max(low.unwrap_or(0)); // no credit for time spent idle
+                }
+                q.chunks.extend(job.chunks());
+                self.ready.notify_one();
+            }
+
+            pub fn next(&self) -> Work {
+                let mut ts = self.ready.wait_while(self.tenants.lock().unwrap(), |ts| ts.values().all(|t| t.chunks.is_empty())).unwrap();
+                let q = ts.values_mut().filter(|t| !t.chunks.is_empty()).min_by_key(|t| t.pass).unwrap(); // lowest pass
+                q.pass += STRIDE_BIG / q.tickets;
+                q.chunks.pop_front().unwrap()
+            }
+        }
+      roles: { sync: [10, 19], runner: [21, 26], stride: [23, 24], small: [13, 13], free: [13, 13], big: [17, 17], submit: [10, 19], pick: [23, 23], run: [25, 25], advance: [24, 24], wake: [14, 16] }
+    again:
+      file: queue-wait.txt
+      source: |
+        // nightly sync with the enterprise tenant's 500 jobs queued
+        // team tenant, 3 jobs:   done in ~7 s     (was ~6 min)
+        // enterprise, 500 jobs:  8/13 of the workers while others wait
+    cost:
+      before: { text: "small tenants wait ~6 min", value: 0.9 }
+      after: { text: "team tenant done in ~7 s", value: 0.12 }
+    lens:
+      need: 3
+      needLabel: Manual
+      note: 'Each `std::thread` is a kernel thread, so it can have its own nice value, and the kernel weights it accordingly. Tokio and rayon tasks have no priorities. For weighted shares between tasks, run them on separate thread pools with different nice values, or schedule them yourself as here.'
+      seenIn: '`libc::setpriority(libc::PRIO_PROCESS, tid, nice)` with the thread id from `libc::gettid()`, or the `thread-priority` crate. `std::collections::BinaryHeap` with `Reverse(pass)` keeps the lowest pass on top.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: The nightly syncs submit their jobs. Each tenant has its own queue of chunks, so the enterprise tenant's 500 jobs sit in its queue and nobody else's.
+    nodes: [sync, runner, big]
+    edges: [sync>runner, runner>big]
+    role: submit
+  - text: A free worker asks for the next chunk. The runner picks the tenant with the lowest pass among those with work queued.
+    nodes: [stride, runner]
+    edges: [stride>runner]
+    role: pick
+  - text: The worker runs one chunk of that tenant's work, about 100 ms.
+    nodes: [runner, small]
+    edges: [runner>small]
+    role: run
+  - text: The tenant's pass grows by its stride, a big number divided by its tickets. Enterprise moves an eighth as far per chunk as free, so over 13 chunks it gets 8, team 4 and free 1.
+    nodes: [big, small, free]
+    edges: [runner>big, runner>small, runner>free]
+    role: advance
+  - text: A tenant that was idle comes back with its pass raised to the lowest pass in play. It cannot spend the time it sat idle as credit and lock everyone else out.
+    nodes: [free, stride]
+    edges: [runner>free, stride>runner]
+    role: wake
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: How does MLFQ give interactive jobs priority without being told which ones they are?
+    options:
+      - text: It watches how each job uses the CPU. A job that gives up the CPU early stays at a high priority, and one that uses its whole allotment moves down.
+        correct: true
+        why: Right. Interactive jobs mostly wait for input, so they rarely use their allotment and stay on top. CPU-bound jobs sink.
+      - text: Programs declare at start-up whether they are interactive.
+        why: No. MLFQ needs no declaration; it learns from behaviour. That is its point.
+      - text: It measures each job's total run time in advance.
+        why: No scheduler knows run times in advance. MLFQ uses the recent past as its estimate.
+  engineer:
+    question: A job runs for 99% of its allotment, then makes a tiny I/O call, again and again. How does it game a basic MLFQ, and what fixes it?
+    options:
+      - text: Giving up the CPU before the allotment ends keeps it at the top level forever. Counting its time at a level across bursts, instead of resetting on I/O, moves it down.
+        correct: true
+        why: Right. That is MLFQ's accounting rule. However the job splits its time, once it has used its allotment at a level it is demoted.
+      - text: It raises its own priority with the I/O call. Banning that system call fixes it.
+        why: The I/O call is ordinary. The trick is the timing, which only better accounting removes.
+      - text: It cannot; MLFQ demotes every job after a fixed time.
+        why: Without accounting, a job that blocks before its allotment ends is never demoted. That is the gap the trick uses.
+  deep:
+    question: In stride scheduling, a new job joins while the others have passes around 50,000. What pass should it start with?
+    options:
+      - text: About the lowest pass among the running jobs. Starting at 0 would let it run alone until it caught up.
+        correct: true
+        why: Right. Lottery avoids the problem by having no per-job history. Linux's CFS did the same with vruntime, placing new and waking tasks near the queue's minimum.
+      - text: 0, so every job starts equal.
+        why: Every other job has a pass near 50,000, so a job at 0 has the lowest pass for thousands of turns and runs alone.
+      - text: Its stride, so it runs once and then joins the cycle.
+        why: Its stride is far below 50,000, so the problem is the same as starting at 0.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Priority levels
+      example: MLFQ queues, 60 in Solaris's time-sharing class
+      job: Order the ready jobs. Higher levels run first, round robin within a level.
+    - role: Allotment and accounting
+      example: "10 ms at the top level, longer below"
+      job: How much CPU a job may use at a level before it moves down.
+    - role: Priority boost
+      example: every second or so
+      job: Moves every job back to the top, so nothing starves.
+    - role: Tickets or weights
+      example: "plan tickets, nice values, cgroup cpu.weight"
+      job: Fix each job's share of the CPU, whatever its behaviour.
+    - role: Pass or vruntime
+      example: stride's pass, Linux's vruntime
+      job: Track how much CPU each job has had relative to its share; the lowest goes next.
+  useWhen:
+    - Interactive and batch work share a CPU or a worker pool and you cannot label which is which. Favour whoever gives up the CPU early.
+    - Tenants, teams or services must get fixed shares of a shared resource. Give them tickets or weights.
+    - Setting nice values or container CPU weights. Each nice step is about a 1.25x weight change; cpu.weight defaults to 100.
+  avoidWhen:
+    - A job needs a hard guarantee of when it runs, such as audio or control loops. That is real-time scheduling, the next lesson.
+  tradeoffs:
+    - MLFQ needs constants (levels, slices, boost period) with no right answer, and behaviour-based rules can be gamed.
+    - Proportional share is fair by construction but has no notion of interactivity unless weights or deadlines express it.
+    - Lottery is simple and stateless but only fair on average; stride is exact but keeps per-job state that must be handled when jobs come and go.
+  lookalikes:
+    - name: Priority queue
+      how: Fixed priorities, set from outside. MLFQ's priorities change with the job's behaviour.
+    - name: Weighted fair queuing
+      how: The same idea as stride scheduling, applied to packets on a link or requests to a disk.
+    - name: Rate limiting
+      how: Caps a job's use whether or not the CPU is idle. Proportional share only applies when jobs compete.
+---
+
+## [concept] MLFQ and proportional share
+
+**A <Term id="mlfq">multi-level feedback queue</Term> learns which jobs are interactive by watching how they use the CPU. Proportional-share schedulers ignore behaviour and give each job a set fraction, by tickets or weights.**
+
+MLFQ approximates shortest-job-first without knowing run times. Proportional share gives you control over who gets how much.
+
+<Depth level={2}>
+MLFQ's rules: higher levels run first, and jobs at the same level take turns. New jobs start on top. A job that uses up its allotment at a level moves down one. Every so often a <Term id="priority-boost">priority boost</Term> moves every job back to the top. Proportional share comes in two classic forms. <Term id="lottery-scheduling">Lottery scheduling</Term> draws a random ticket for each slice. <Term id="stride-scheduling">Stride scheduling</Term> runs the job with the lowest pass and advances it by its stride, a big number divided by its tickets.
+</Depth>
+
+<Depth level={3}>
+Solaris's time-sharing class is a table-driven MLFQ with 60 levels, slices from 20 ms at the top to a few hundred at the bottom, and a boost about once a second. BSD derivatives and Windows also use forms of MLFQ. Linux went the proportional-share way. Its scheduler weights each task by its <Term id="nice-value">nice value</Term> and tracks <Term id="vruntime">virtual runtime</Term>: CPU time used, divided by weight. CFS ran the task with the lowest vruntime from 2007; since Linux 6.6, <Term id="eevdf">EEVDF</Term> keeps the weights and vruntime and picks, among tasks owed CPU, the one with the earliest virtual deadline.
+</Depth>
+
+## [problem] Workers that take chunks in arrival order
+
+A SaaS product runs each customer's nightly sync as background jobs. Every job is split into chunks of about 100 ms, and a pool of workers takes chunks from one shared queue in arrival order.
+
+Each tenant submits two or three jobs a night. The queue drains in seconds and nobody waits long.
+
+<Depth level={2}>
+The mental model: chunks interleave jobs, so everyone gets a fair turn. That is round robin over chunks, and it is fair per chunk in the queue. A tenant with more chunks queued gets more turns.
+</Depth>
+
+<Depth level={3}>
+Per-chunk fairness also rewards splitting. A tenant that submits one job as ten small ones gets ten places in the queue. Any policy that counts turns instead of shares can be gamed this way, much as a job can game MLFQ by giving up the CPU at the right moment.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** onboard an enterprise customer whose nightly sync submits 500 jobs at once.
+
+The marked line is the only difference: the enterprise tenant's loop now submits 500 jobs. That is about 30,000 chunks, six minutes of all eight workers. A team tenant whose sync lands a moment later waits behind every one of them, and its dashboard shows yesterday's data until mid-morning.
+
+<Depth level={2}>
+More workers do not change the order. They only shorten the six minutes. What the queue needs is a share per tenant: the enterprise plan pays for more and should get more, but every tenant should make steady progress.
+</Depth>
+
+<Depth level={3}>
+The cost meter shows the team tenant's wait. Its own work is 3 jobs, 18 seconds of worker time. Nearly all of its turnaround is spent in the queue behind another tenant.
+</Depth>
+
+## [morph] From one queue to tickets per tenant
+
+Drag the slider. The single shared queue becomes a runner with one queue per tenant and a pick rule: the tenant with the lowest pass goes next.
+
+The code gives each tenant tickets from its plan and replaces the shared queue with stride scheduling.
+
+<Depth level={2}>
+With 8, 4 and 1 tickets, the strides are in the ratio 1 : 2 : 8. When all three have work, every 13 chunks go 8 to enterprise, 4 to team and 1 to free. When a tenant has nothing queued, its share goes to the others, so no worker idles. Lottery would also work: draw a ticket for each chunk. It needs no pass and no care when tenants come and go, but over a short window the shares can drift a long way from the tickets.
+</Depth>
+
+<Depth level={3}>
+The `max(pass, minPass)` line is the fix stride scheduling always needs. A tenant that was idle for an hour still has the pass it had an hour ago, far below everyone else's. Without the line it would get every chunk until it caught up. Linux's fair scheduler has the same guard: a task that wakes after a sleep is placed near the current minimum vruntime instead of keeping its old one.
+</Depth>
+
+## [walk] Follow one chunk through the runner
+
+One worker asking for its next chunk while three tenants have work queued. Step through it with the numbered buttons.
+
+<Depth level={3}>
+The pick is a minimum search over tenants. A heap keyed by pass makes it O(log n), and Linux's CFS kept its tasks in a red-black tree ordered by vruntime for the same reason. Integer strides from a large constant (here 2^20) keep the arithmetic exact; pass values grow forever, so real implementations rebase them or compare with wraparound-safe subtraction.
+</Depth>
+
+## [again] 500 jobs, the second time
+
+The same nightly sync. The enterprise tenant gets 8 of every 13 chunks while the others have work, and all of the workers once they are done. The team tenant's three jobs finish in about seven seconds instead of six minutes.
+
+<Depth level={2}>
+Tickets also give you a lever when a tenant must be slowed down: lower its tickets and its share drops at once. A ticket count of zero is not a pause, though; it is a division by zero. Use a separate paused state.
+</Depth>
+
+<Depth level={3}>
+Kubernetes does the same at the kernel level. A container's CPU request becomes its cgroup `cpu.weight` (1 to 10,000, default 100), and when the node's CPUs are contended, containers get CPU in proportion to their weights. That is proportional share between containers, enforced by the same scheduler that weights nice values.
+</Depth>
+
+## [play] Tune an MLFQ, then game it
+
+Add CPU-bound, interactive and gamer jobs and watch where MLFQ puts each one. Turn the boost and the accounting rule on and off, then run the same jobs under lottery and stride.
+
+Try to starve the batch job, then rescue it two different ways.
+
+## [lens] How each runtime meets OS priorities
+
+The kernel weights threads and processes by nice value or cgroup weight. None of the four runtimes passes priorities through to its own tasks: goroutines, asyncio tasks, Node callbacks and tokio tasks are all equal inside their runtime.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Your language choice is remembered on every lesson.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="mlfq-and-proportional-share" />
+
+### The MLFQ rules, in full
+
+| Rule | What it says | What it prevents |
+|---|---|---|
+| 1 | A higher level runs before a lower one | Batch work delaying interactive work |
+| 2 | Jobs at the same level take turns | One job monopolising a level |
+| 3 | A new job starts at the top | New short jobs waiting behind old long ones |
+| 4 | A job that uses its allotment at a level moves down, however it split its time | Gaming by giving up the CPU early |
+| 5 | Every period S, all jobs move to the top | Starvation, and missing jobs that became interactive |
+
+### Nice values as weights
+
+Linux turns a nice value into a weight: 1024 at nice 0, and about 1.25 times more or less for each step. Two CPU-bound tasks at nice 0 and nice 5 split a core roughly 75 : 25 (weights 1024 and 335). A cgroup's `cpu.weight` is converted to the same kind of weight, with the default 100 mapping to 1024, which is how container CPU requests turn into shares.

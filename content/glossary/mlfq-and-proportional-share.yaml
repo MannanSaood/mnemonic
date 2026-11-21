@@ -1,0 +1,22 @@
+# Terms introduced by the MLFQ and proportional-share lesson.
+- id: mlfq
+  term: Multi-level feedback queue (MLFQ)
+  short: A scheduler with several priority levels. Jobs start on top and move down when they use up their time at a level, so jobs that often wait for input stay on top.
+- id: priority-boost
+  term: Priority boost
+  short: MLFQ's periodic reset that moves every job back to the top level, so jobs at the bottom cannot starve and jobs that turned interactive are noticed.
+- id: lottery-scheduling
+  term: Lottery scheduling
+  short: Proportional-share scheduling by random draw. Each job holds tickets, and each time slice goes to the holder of a randomly drawn ticket.
+- id: stride-scheduling
+  term: Stride scheduling
+  short: Deterministic proportional share. Each job's stride is a large constant divided by its tickets; the job with the lowest pass runs and its pass grows by its stride.
+- id: nice-value
+  term: Nice value
+  short: A Unix process or thread priority hint from -20 (most CPU) to 19 (least). Linux turns it into a scheduling weight; each step changes the weight by about 1.25 times.
+- id: vruntime
+  term: Virtual runtime (vruntime)
+  short: CPU time a task has used, scaled down by its weight. Linux's fair schedulers favour tasks with less of it, so heavier tasks get more real time.
+- id: eevdf
+  term: EEVDF
+  short: Earliest eligible virtual deadline first, Linux's scheduler for normal tasks since 6.6. Among tasks owed CPU time, it runs the one with the earliest virtual deadline.
