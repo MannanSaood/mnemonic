@@ -1,0 +1,553 @@
+---
+title: Red, green, refactor
+track: testing
+group: TDD
+order: 4
+summary: Write one failing test, make it pass with the smallest change, then clean up while every test is green. Repeat, in steps small enough that a red bar is never a mystery.
+intent: Every line of code exists because a failing test asked for it, and every cleanup is checked by the tests.
+changeRequest: "Finance found two refunds: a $100.00 order got no discount, and a $3.00 order with SAVE5 was charged -$2.00."
+languages: [go, python, typescript, rust]
+glossary: [red-green-refactor, test-list]
+
+prerequisites: [testing/anatomy-of-a-test, code-craft/refactoring-safely]
+skills: [tdd, testing]
+depths: [overview, engineer, deep]
+
+playground:
+  model: tdd-red-green-refactor
+  scenarios:
+    - try: "Answer the prediction, write the empty-cart test, and make it pass by returning 0."
+      notice: "Red first, then green with three lines. A hard-coded answer is allowed: the next test will force the real code."
+    - try: "Write the two-mugs test, return 2400, then refactor away the duplication."
+      notice: "2400 appears in the test and the code. Computing it from the items removes the duplication, and the tests confirm nothing changed."
+    - try: "Reset. This time pick Write the whole calculator now for the first test, then keep going."
+      notice: "Lines nobody asked for pile up, later tests pass the moment they are written, and the $100.00 test finds the bug in the big step."
+    - try: "After the discount test is green, try the tidy-up that turns >= into >."
+      notice: "The safety net goes red at once. A refactoring must keep every test green, and here a test proves this one did not."
+
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: list
+      kind: client
+      before: { x: 12, y: 30, w: 124, h: 56, title: ticket, sub: read once }
+      after:  { x: 12, y: 107, w: 130, h: 56, title: test list, sub: one item at a time }
+    - id: code
+      kind: context
+      before: { x: 150, y: 18, w: 398, h: 246, title: cartTotal, sub: written in one go, tested after }
+      after:  { x: 200, y: 107, w: 160, h: 56, title: cartTotal, sub: grows in small steps }
+    - id: red
+      kind: concrete
+      appears: after
+      before: { x: 200, y: 20, w: 160, h: 56, title: red }
+      after:  { x: 200, y: 20, w: 160, h: 56, title: red, sub: one failing test }
+    - id: green
+      kind: concrete
+      appears: after
+      before: { x: 392, y: 107, w: 156, h: 56, title: green }
+      after:  { x: 392, y: 107, w: 156, h: 56, title: green, sub: smallest change }
+    - id: refactor
+      kind: strategy
+      appears: after
+      before: { x: 200, y: 194, w: 160, h: 56, title: refactor }
+      after:  { x: 200, y: 194, w: 160, h: 56, title: refactor, sub: tests stay green }
+    - id: change
+      kind: concrete
+      appears: change
+      before: { x: 170, y: 190, w: 200, h: 56, title: ">= 100.00 · max(0, …)", sub: two fixes, one wrong test }
+      after:  { x: 392, y: 194, w: 156, h: 56, title: edge cases, sub: on the list from day one }
+  edges:
+    - { from: list, to: red, label: write one }
+    - { from: red, to: green, label: make it pass }
+    - { from: green, to: refactor, label: clean up }
+    - { from: refactor, to: list, label: next }
+
+code:
+  go:
+    before:
+      file: cart.go · cart_test.go
+      source: |
+        // cart.go: written in one sitting from the ticket
+        func CartTotal(items []Item, coupon string) int {
+            total := 0
+            for _, it := range items {
+                total += it.PriceCents * it.Qty
+            }
+            if total > 10000 {
+                total -= total / 10
+            }
+            if coupon == "SAVE5" {
+                total -= 500
+            }
+            return total
+        }
+
+        // cart_test.go: written afterwards, expected value copied from what the code returned
+        func TestCartTotal(t *testing.T) {
+            if got := CartTotal([]Item{lamp(1)}, ""); got != 10000 {
+                t.Errorf("got %d", got)
+            }
+        }
+      roles: { code: [2, 14], boundary: [7, 7], coupon: [10, 12], test: [17, 21], pasted: [18, 18] }
+      change:
+        - { line: 7, replace: '    if total >= 10000 { // fixed: the ticket said "$100 or more"' }
+        - { line: 11, replace: '        total = max(0, total-500) // a $3 order with SAVE5 came out at -$2' }
+        - { line: 18, replace: '    if got := CartTotal([]Item{lamp(1)}, ""); got != 9000 { // the test asserted the bug' }
+    after:
+      file: cart_test.go · cart.go
+      source: |
+        // cart_test.go: written one row at a time, each seen red first
+        func TestCartTotal(t *testing.T) {
+            tests := []struct {
+                name   string
+                items  []Item
+                coupon string
+                want   int
+            }{
+                {"empty cart", nil, "", 0},
+                {"two mugs", []Item{mug(2)}, "", 2400},
+                {"exactly $100 gets 10% off", []Item{lamp(1)}, "", 9000},
+                {"SAVE5 takes $5 off", []Item{mug(2)}, "SAVE5", 1900},
+                {"never below zero", []Item{sticker(1)}, "SAVE5", 0},
+            }
+            for _, tc := range tests {
+                t.Run(tc.name, func(t *testing.T) {
+                    if got := CartTotal(tc.items, tc.coupon); got != tc.want {
+                        t.Errorf("CartTotal() = %d, want %d", got, tc.want)
+                    }
+                })
+            }
+        }
+
+        // cart.go: no line without a test that asked for it
+        func CartTotal(items []Item, coupon string) int {
+            total := subtotal(items)
+            if total >= BulkFromCents {
+                total -= total / 10
+            }
+            if coupon == "SAVE5" {
+                total = max(0, total-Save5Cents)
+            }
+            return total
+        }
+      roles: { list: [9, 13], red: [11, 11], test: [2, 22], code: [25, 34], green: [27, 29], refactor: [26, 26] }
+    again:
+      file: cart_test.go
+      source: |
+        // The same ticket, test first: two new rows, each run and seen red before any fix
+        {"exactly $100 gets 10% off", []Item{lamp(1)}, "", 9000}, // red: CartTotal() = 10000, want 9000
+        {"never below zero", []Item{sticker(1)}, "SAVE5", 0},      // red: CartTotal() = -200, want 0
+
+        // then the smallest change for each, one at a time, running the suite after each:
+        if total >= BulkFromCents { // was >
+        total = max(0, total-Save5Cents) // was total -= 500
+    cost:
+      before: { text: 2 refunds · 1 test that asserted a bug, value: 0.75 }
+      after: { text: 2 rows, each seen red, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Built in
+      note: '`go test` and table-driven tests with `t.Run` make the next item on the list one more row. `go test -run ''TestCartTotal/exactly''` reruns just the newest case. The first red is often a compile error: the test calls `CartTotal` before it exists.'
+      seenIn: '`go test -count=1` bypasses the test cache. `gotestsum --watch` reruns the tests of a package when its files change.'
+
+  python:
+    before:
+      file: cart.py · test_cart.py
+      source: |
+        # cart.py: written in one sitting from the ticket
+        def cart_total(items: list[Item], coupon: str | None = None) -> int:
+            total = sum(it.price_cents * it.qty for it in items)
+            if total > 10_000:
+                total -= total // 10
+            if coupon == "SAVE5":
+                total -= 500
+            return total
+
+
+        # test_cart.py: written afterwards, expected value copied from what the code returned
+        def test_cart_total():
+            assert cart_total([lamp(1)]) == 10_000
+      roles: { code: [2, 8], boundary: [4, 4], coupon: [6, 7], test: [12, 13], pasted: [13, 13] }
+      change:
+        - { line: 4, replace: '    if total >= 10_000:  # fixed: the ticket said "$100 or more"' }
+        - { line: 7, replace: '        total = max(0, total - 500)  # a $3 order with SAVE5 came out at -$2' }
+        - { line: 13, replace: '    assert cart_total([lamp(1)]) == 9_000  # the test asserted the bug' }
+    after:
+      file: test_cart.py · cart.py
+      source: |
+        # test_cart.py: written one row at a time, each seen red first
+        @pytest.mark.parametrize("items, coupon, want", [
+            ([], None, 0),                 # an empty cart costs $0.00
+            ([mug(2)], None, 2_400),       # two mugs
+            ([lamp(1)], None, 9_000),      # exactly $100.00 gets 10% off
+            ([mug(2)], "SAVE5", 1_900),    # SAVE5 takes $5.00 off
+            ([sticker(1)], "SAVE5", 0),    # never below zero
+        ])
+        def test_cart_total(items, coupon, want):
+            assert cart_total(items, coupon) == want
+
+
+        # cart.py: no line without a test that asked for it
+        def cart_total(items: list[Item], coupon: str | None = None) -> int:
+            total = subtotal(items)
+            if total >= BULK_FROM_CENTS:
+                total -= total // 10
+            if coupon == "SAVE5":
+                total = max(0, total - SAVE5_CENTS)
+            return total
+      roles: { list: [3, 7], red: [5, 5], test: [2, 10], code: [14, 20], green: [16, 17], refactor: [15, 15] }
+    again:
+      file: test_cart.py
+      source: |
+        # The same ticket, test first: two new rows, each run and seen red before any fix
+        ([lamp(1)], None, 9_000),      # red: assert 10000 == 9000
+        ([sticker(1)], "SAVE5", 0),    # red: assert -200 == 0
+
+        # then the smallest change for each, one at a time, running pytest after each:
+        if total >= BULK_FROM_CENTS:           # was >
+            total = max(0, total - SAVE5_CENTS)  # was total -= 500
+    cost:
+      before: { text: 2 refunds · 1 test that asserted a bug, value: 0.75 }
+      after: { text: 2 rows, each seen red, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Built in
+      note: 'pytest collects `test_*` functions, and `@pytest.mark.parametrize` turns the test list into rows. `pytest -x` stops at the first failure. The first red is often a `NameError` or `ImportError`, because the function does not exist yet.'
+      seenIn: '`pytest --lf` reruns only the tests that failed last time. `pytest --sw` (stepwise) stops at the first failure and resumes from it on the next run.'
+
+  typescript:
+    before:
+      file: cart.ts · cart.test.ts
+      source: |
+        // cart.ts: written in one sitting from the ticket
+        export function cartTotal(items: Item[], coupon?: string): number {
+          let total = items.reduce((t, it) => t + it.priceCents * it.qty, 0);
+          if (total > 10_000) total -= Math.floor(total / 10);
+          if (coupon === "SAVE5") total -= 500;
+          return total;
+        }
+
+        // cart.test.ts: written afterwards, expected value copied from what the code returned
+        test("cart total", () => {
+          expect(cartTotal([lamp(1)])).toBe(10_000);
+        });
+      roles: { code: [2, 7], boundary: [4, 4], coupon: [5, 5], test: [10, 12], pasted: [11, 11] }
+      change:
+        - { line: 4, replace: '  if (total >= 10_000) total -= Math.floor(total / 10); // fixed: "$100 or more"' }
+        - { line: 5, replace: '  if (coupon === "SAVE5") total = Math.max(0, total - 500); // was -$2 for a $3 order' }
+        - { line: 11, replace: '  expect(cartTotal([lamp(1)])).toBe(9_000); // the test asserted the bug' }
+    after:
+      file: cart.test.ts · cart.ts
+      source: |
+        // cart.test.ts: written one row at a time, each seen red first
+        test.each([
+          { items: [], coupon: undefined, want: 0 },            // an empty cart costs $0.00
+          { items: [mug(2)], coupon: undefined, want: 2_400 },  // two mugs
+          { items: [lamp(1)], coupon: undefined, want: 9_000 }, // exactly $100.00 gets 10% off
+          { items: [mug(2)], coupon: "SAVE5", want: 1_900 },    // SAVE5 takes $5.00 off
+          { items: [sticker(1)], coupon: "SAVE5", want: 0 },    // never below zero
+        ])("cartTotal($items, $coupon) is $want", ({ items, coupon, want }) => {
+          expect(cartTotal(items, coupon)).toBe(want);
+        });
+
+        // cart.ts: no line without a test that asked for it
+        export function cartTotal(items: Item[], coupon?: string): number {
+          let total = subtotal(items);
+          if (total >= BULK_FROM_CENTS) total -= Math.floor(total / 10);
+          if (coupon === "SAVE5") total = Math.max(0, total - SAVE5_CENTS);
+          return total;
+        }
+      roles: { list: [3, 7], red: [5, 5], test: [2, 10], code: [13, 18], green: [15, 15], refactor: [14, 14] }
+    again:
+      file: cart.test.ts
+      source: |
+        // The same ticket, test first: two new rows, each run and seen red before any fix
+        { items: [lamp(1)], coupon: undefined, want: 9_000 }, // red: expected 10000 to be 9000
+        { items: [sticker(1)], coupon: "SAVE5", want: 0 },    // red: expected -200 to be 0
+
+        // then the smallest change for each, one at a time, with the watcher rerunning:
+        if (total >= BULK_FROM_CENTS) total -= Math.floor(total / 10); // was >
+        if (coupon === "SAVE5") total = Math.max(0, total - SAVE5_CENTS); // was total -= 500
+    cost:
+      before: { text: 2 refunds · 1 test that asserted a bug, value: 0.75 }
+      after: { text: 2 rows, each seen red, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Built in
+      note: 'Vitest starts in watch mode in an interactive terminal, and Jest has `--watch`; both rerun the affected tests on save, which is what keeps the loop fast. `test.todo("...")` keeps the test list inside the test file until each item is written.'
+      seenIn: '`test.each` turns rows into named cases. Running `tsc --noEmit` alongside makes a type error the first red, before any test runs.'
+
+  rust:
+    before:
+      file: cart.rs
+      source: |
+        // cart.rs: written in one sitting from the ticket
+        pub fn cart_total(items: &[Item], coupon: Option<&str>) -> i64 {
+            let mut total: i64 = items.iter().map(|it| it.price_cents * it.qty).sum();
+            if total > 10_000 {
+                total -= total / 10;
+            }
+            if coupon == Some("SAVE5") {
+                total -= 500;
+            }
+            total
+        }
+
+        // written afterwards, expected value copied from what the code returned
+        #[test]
+        fn cart_total_works() {
+            assert_eq!(cart_total(&[lamp(1)], None), 10_000);
+        }
+      roles: { code: [2, 11], boundary: [4, 4], coupon: [7, 9], test: [14, 17], pasted: [16, 16] }
+      change:
+        - { line: 4, replace: '    if total >= 10_000 { // fixed: the ticket said "$100 or more"' }
+        - { line: 8, replace: '        total = (total - 500).max(0); // a $3 order with SAVE5 came out at -$2' }
+        - { line: 16, replace: '    assert_eq!(cart_total(&[lamp(1)], None), 9_000); // the test asserted the bug' }
+    after:
+      file: cart.rs
+      source: |
+        // tests: written one case at a time, each seen red first
+        #[test]
+        fn cart_totals() {
+            let cases = [
+                (vec![], None, 0),                     // an empty cart costs $0.00
+                (vec![mug(2)], None, 2_400),           // two mugs
+                (vec![lamp(1)], None, 9_000),          // exactly $100.00 gets 10% off
+                (vec![mug(2)], Some("SAVE5"), 1_900),  // SAVE5 takes $5.00 off
+                (vec![sticker(1)], Some("SAVE5"), 0),  // never below zero
+            ];
+            for (items, coupon, want) in cases {
+                assert_eq!(cart_total(&items, coupon), want, "{items:?} {coupon:?}");
+            }
+        }
+
+        // no line without a test that asked for it
+        pub fn cart_total(items: &[Item], coupon: Option<&str>) -> i64 {
+            let mut total = subtotal(items);
+            if total >= BULK_FROM_CENTS {
+                total -= total / 10;
+            }
+            if coupon == Some("SAVE5") {
+                total = (total - SAVE5_CENTS).max(0);
+            }
+            total
+        }
+      roles: { list: [5, 9], red: [7, 7], test: [2, 14], code: [17, 26], green: [19, 21], refactor: [18, 18] }
+    again:
+      file: cart.rs
+      source: |
+        // The same ticket, test first: two new cases, each run and seen red before any fix
+        (vec![lamp(1)], None, 9_000),         // red: left: 10000, right: 9000
+        (vec![sticker(1)], Some("SAVE5"), 0), // red: left: -200, right: 0
+
+        // then the smallest change for each, one at a time, running cargo test after each:
+        if total >= BULK_FROM_CENTS {             // was >
+            total = (total - SAVE5_CENTS).max(0); // was total -= 500
+    cost:
+      before: { text: 2 refunds · 1 test that asserted a bug, value: 0.75 }
+      after: { text: 2 cases, each seen red, value: 0.15 }
+    lens:
+      need: 3
+      needLabel: Built in
+      note: '`cargo test` builds and runs the `#[test]` functions. The compiler adds an extra red step: the test does not compile until the function and its types exist, and `todo!()` lets you name a function before writing its body. `cargo watch -x test`, from the cargo-watch tool, reruns on save.'
+      seenIn: '`#[should_panic]` for cases that must panic. `cargo nextest` is a faster test runner many projects use in the loop.'
+
+walk:
+  - text: Start from the test list, the behaviours the ticket asks for, written as plain sentences. Nothing about how the code will look.
+    nodes: [list]
+    edges: []
+    role: list
+  - text: Turn one item into a test, here the exact $100.00 case, and run it. It fails. That proves the test can fail and that the behaviour is missing.
+    nodes: [list, red]
+    edges: [list>red]
+    role: red
+  - text: Make it pass with the smallest change. One comparison, `>=`, because the test says exactly $100.00. Run every test, not just the new one.
+    nodes: [red, green, code]
+    edges: [red>green]
+    role: green
+  - text: With everything green, clean up. Here the sum moved into `subtotal`. The tests are the proof that the behaviour did not change.
+    nodes: [green, refactor, code]
+    edges: [green>refactor]
+    role: refactor
+  - text: Cross the item off, add any new idea to the list, and write the next test.
+    nodes: [refactor, list]
+    edges: [refactor>list]
+    role: list
+
+checks:
+  overview:
+    question: In test-driven development, what comes first?
+    options:
+      - text: A small test that fails, because the behaviour it describes does not exist yet.
+        correct: true
+        why: Right. Red first. Then the smallest change to make it pass, then clean-up.
+      - text: All the tests for the feature, before any code.
+        why: TDD writes one test at a time. Writing them all up front means rewriting many of them once the code teaches you something.
+      - text: A rough version of the code, so there is something to test.
+        why: That is testing after. The test is written first, so it can fail first.
+  engineer:
+    question: The second test is "two $12.00 mugs cost $24.00". Why is it fine to make it pass with `return 2400`?
+    options:
+      - text: It gets to green fast, and the duplication between the test and the code (2400 in both) is removed in the next step or forced out by the next test.
+        correct: true
+        why: Right. Green first, then clean. The hard-coded value is a stepping stone that never survives long, because removing duplication turns it into the real computation.
+      - text: Because shipping hard-coded answers is acceptable when the tests pass.
+        why: It is not left there. The refactor step or the next test replaces it with real code.
+      - text: It is not fine; you should always write the general solution.
+        why: When the general solution is obvious, write it. When it is not, a fake answer gets you to green and lets the next test show the general shape.
+  deep:
+    question: Why see the new test fail before writing the code to pass it?
+    options:
+      - text: It proves the test can fail and is checking something the code does not do yet. A test that never failed might be testing nothing.
+        correct: true
+        why: Right. A test that passes from the start may have a wrong assertion, or call the wrong function, and you would never know.
+      - text: Red bars make the test runner faster on the next run.
+        why: Runners do not get faster after a failure.
+      - text: It is a ritual from early TDD books with no practical purpose.
+        why: It catches broken tests. It also defines exactly what done means for this step.
+
+reference:
+  roles:
+    - role: Test list
+      example: "empty cart · two mugs · exactly $100 · SAVE5 · never below zero"
+      job: The behaviours still to cover. One item at a time becomes a test.
+    - role: Red
+      example: { go: "go test: CartTotal() = 10000, want 9000", python: "pytest: assert 10000 == 9000", typescript: "vitest: expected 10000 to be 9000", rust: "cargo test: left: 10000, right: 9000" }
+      job: The new test fails, for the reason you expect.
+    - role: Green
+      example: "> becomes >="
+      job: The smallest change that makes every test pass.
+    - role: Refactor
+      example: extract subtotal, name the constants
+      job: Improve the code while every test stays green.
+  useWhen:
+    - The behaviour can be stated as examples before you write the code, such as pricing rules, parsers, validation and state machines.
+    - The code will change often, so a fast, trusted suite pays back many times.
+    - A bug report arrives. Write the failing test that reproduces it first, then fix.
+  avoidWhen:
+    - You are exploring and do not know the shape yet, such as a spike or a prototype. Throw it away afterwards and test-drive the real version.
+    - The result is judged by eye, such as visual layout. Test the logic beneath it instead.
+  tradeoffs:
+    - Small steps feel slow at first; the time comes back as fewer debugging sessions, because a red bar can only be the last few lines.
+    - TDD shapes the design of each unit. It does not decide the architecture; that still needs thought.
+    - Tests written first are only as good as the list. Missing cases stay missing.
+  lookalikes:
+    - name: Test-after
+      how: Write the code, then the tests. The tests often copy what the code does, bugs included.
+    - name: Behaviour-driven development
+      how: TDD with tests phrased as examples in the domain's language, often shared with non-developers.
+    - name: Writing all tests first
+      how: Not TDD. TDD writes one test, makes it pass, and lets each step inform the next test.
+---
+
+## [concept] Red, green, refactor
+
+**Write one test that fails. Make it pass with the smallest change. Clean up while everything is green. Repeat.**
+
+<Term id="red-green-refactor">Red, green, refactor</Term> is the cycle of test-driven development. Red: a new test fails, because the behaviour is not there yet. Green: the quickest change that makes every test pass, even a hard-coded answer. Refactor: improve the code, with the tests proving nothing broke.
+
+Keep a <Term id="test-list">test list</Term> beside you: the behaviours you still need, in plain words. Each cycle turns one item into a test. The steps are small on purpose. When a bar goes red unexpectedly, the cause can only be the last few lines.
+
+<Depth level={2}>
+Two rules drive it. Write no new code unless a failing test asks for it. Remove duplication once the tests are green. Do not mix the two: get to green first, then refactor, and never refactor while red. Adjust the step size as you go. After a surprise, take smaller steps; when it is going smoothly, take bigger ones.
+</Depth>
+
+<Depth level={3}>
+Kent Beck described the cycle in *Test-Driven Development: By Example* (2002). In his 2023 article *Canon TDD* he restated it as a list, then one test, then make it pass, then optionally refactor, and named the common mistakes: writing every test up front, copying the code's output into the expected values, and mixing refactoring into making a test pass. The claims about fewer defects come from practitioners' experience; studies of TDD's effect on defects disagree.
+</Depth>
+
+## [problem] Code first, tests after
+
+A ticket asks for a cart total: sum the items, take 10% off from $100.00, let the SAVE5 coupon take $5.00 off, never go below zero. An engineer writes the whole function in one sitting, from memory of the ticket.
+
+Then they write a test for the discount. To get the expected number, they run the code and paste what it returned.
+
+<Depth level={2}>
+The test passes, of course. It was written to agree with the code. It never failed, so nobody knows it can, and it checks what the code does rather than what the ticket asked for.
+</Depth>
+
+<Depth level={3}>
+Coverage tools report the discount line as covered. Coverage says a line ran; it does not say the result was right.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** Finance found two refunds: a $100.00 order got no discount, and a $3.00 order with SAVE5 was charged -$2.00.
+
+The marked lines are the fixes: `>` should have been `>=`, and the coupon needs a floor at zero. The third marked line is the test, which asserted the bug and has to change too.
+
+<Depth level={2}>
+Both cases were in the ticket. They were missed because nothing forced anyone to write them down as examples before the code existed. The boundary case and the negative total are exactly what a test list catches.
+</Depth>
+
+<Depth level={3}>
+A test written from the code's output can never disagree with the code. That is the failure Beck lists for the green step: copying computed values into the expected values defeats the check.
+</Depth>
+
+## [morph] Let failing tests pull the code
+
+Drag the slider. The one-shot function and its pasted test become a loop: take an item from the list, see it fail, make it pass, clean up, take the next.
+
+Hover a box in the diagram to see its code.
+
+<Depth level={2}>
+The finished code looks much like the original. The difference is that each line arrived because a test asked for it, and each test was seen to fail first. The exact-$100.00 row and the never-below-zero row are on the list from the start, so the two refunds never happen.
+</Depth>
+
+<Depth level={3}>
+Refactoring is where design happens in TDD. Extracting `subtotal` and naming the constants did not change any result; the green bar proves it, which is what makes these changes cheap enough to do every cycle.
+</Depth>
+
+## [walk] Follow one cycle
+
+One trip round the loop, for the exact-$100.00 case. Step through it with the numbered buttons.
+
+<Depth level={3}>
+<Lang only="go">`t.Run` gives each row its own name, so `go test -run 'TestCartTotal/exactly'` reruns only the new case while you work on it, and the full suite before you move on.</Lang>
+<Lang only="python">`parametrize` makes each row a separate test with its own id, so a failure names the row. `pytest -x` stops at the first one.</Lang>
+<Lang only="typescript">`test.each` interpolates `$items` and `$want` into the name, so the watcher reports exactly which row went red.</Lang>
+<Lang only="rust">Rust's red often comes in two stages: first the test does not compile, then it compiles and fails. Both count. The message on `assert_eq!` prints the inputs for the failing case.</Lang>
+</Depth>
+
+## [again] The two refunds, the second time
+
+The same request, test first. Two new rows go on the list, and each is run and seen red before any fix. Then the smallest change for each, one at a time, with the whole suite green in between.
+
+<Depth level={2}>
+This is also how to handle any bug report in TDD: reproduce it as a failing test first. The test proves you found the bug, proves the fix works, and stays to stop it coming back.
+</Depth>
+
+<Depth level={3}>
+Notice what did not happen: nobody edited an existing test to make it pass. In a test-first suite, an existing test that must change means the requirement changed, and that is worth a conversation.
+</Depth>
+
+## [play] Drive a cart total test-first
+
+Build the same cart total by picking tests from the list and changes from a menu. The bar history shows your rhythm: red, green, green, red, green.
+
+Try it once with the smallest steps you can, and once by writing everything at the first test. Compare the numbers.
+
+## [lens] How each language writes it
+
+Every language here has a test runner that can rerun on save, and that fast loop is what makes small steps bearable. Compiled languages add a free red step: the test does not compile until the function exists.
+
+Switch the language at the top of the page; the code, the diagram labels and the note follow.
+
+<Depth level={2}>
+Table-driven tests (Go), `parametrize` (pytest), `test.each` (Vitest and Jest) and arrays of cases (Rust) make each new item on the list one more row.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="tdd-red-green-refactor" />
+
+### Three ways to get to green
+
+When the answer is obvious, write it. When it is not, return a constant and let the next test force the real code. When you are unsure of the general shape, add a second example and generalise only when both pass. The next lesson covers these three gears and when to switch between them.

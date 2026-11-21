@@ -1,0 +1,7 @@
+# Terms introduced by testing/tdd-red-green-refactor
+- id: red-green-refactor
+  term: Red, green, refactor
+  short: The TDD cycle. Write a failing test (red), make it pass with the smallest change (green), then improve the code while every test stays green (refactor).
+- id: test-list
+  term: Test list
+  short: A plain list of the behaviours a change must have, kept beside you during TDD. Each item becomes one test; new ideas are added as you go.
