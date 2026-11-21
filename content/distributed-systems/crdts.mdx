@@ -1,0 +1,682 @@
+---
+title: CRDTs
+track: distributed-systems
+group: Replication
+order: 14
+summary: Design the data type so that any two replicas can merge without asking anyone. If the merge is commutative, associative and idempotent, every replica that has seen the same edits holds the same state.
+intent: Let every device edit offline and sync in any order, any number of times, and still end up identical, with no conflict for a person to resolve.
+changeRequest: Removing an item on one phone must stick, and two people adding eggs offline must both count.
+languages: [go, python, typescript, rust]
+glossary: [crdt, strong-eventual-consistency, pn-counter, or-set, lww-register, last-write-wins, version-vector, eventual-consistency]
+
+# ---------------------------------------------------------------- roadmap metadata
+prerequisites: [distributed-systems/vector-clocks, distributed-systems/anti-entropy-and-gossip]
+skills: [replication]
+depths: [overview, engineer, deep]
+
+# ---------------------------------------------------------------- playground (lesson step "Try it")
+playground:
+  model: crdts
+  scenarios:
+    - try: "On Phone A tap + twice, on Phone B tap + once. Sync A to B and B to A, then do it again."
+      notice: "Both show 4. P is [3,1,0]: each phone's taps live in its own entry, and merge takes the maximum per entry. The second round changes nothing. The naive line says 3."
+    - try: "Sync A to B. On A remove bread. Sync B to A."
+      notice: "Bread stays gone on A, because its tag is tombstoned. The naive union, which only knows names, puts it back."
+    - try: "On A remove bread. On B remove bread, then add it again. Sync B to A."
+      notice: "Bread is back on A. A's remove only killed the tag it had seen; B's re-add has a new tag. In an OR-Set, a concurrent add wins."
+    - try: "Pick Sat 18:00 on A and Sun 10:00 on B, then press Sync everyone."
+      notice: "Everyone agrees on Sun 10:00, and A's pick is gone without a trace. The register converged by discarding a choice. That is the LWW anomaly."
+
+# ---------------------------------------------------------------- diagram
+diagram:
+  width: 560
+  height: 270
+  nodes:
+    - id: client
+      kind: client
+      before: { x: 12, y: 111, w: 100, h: 48, title: Phone, sub: edits offline }
+      after:  { x: 12, y: 111, w: 100, h: 48, title: Phone, sub: edits offline }
+    - id: context
+      kind: context
+      before: { x: 132, y: 18, w: 256, h: 236, title: Sync, sub: union of item names }
+      after:  { x: 132, y: 111, w: 110, h: 48, title: Merge, sub: union of state }
+    - id: strategy
+      kind: strategy
+      appears: after
+      before: { x: 262, y: 104, w: 132, h: 62, title: "" }
+      after:  { x: 262, y: 104, w: 132, h: 62, title: OR-Set state, sub: tags + tombstones }
+    - id: add
+      kind: concrete
+      before: { x: 152, y: 76, w: 216, h: 40, title: "add: items[x] = true" }
+      after:  { x: 420, y: 20, w: 128, h: 48, title: Add, sub: fresh tag }
+    - id: remove
+      kind: concrete
+      before: { x: 152, y: 128, w: 216, h: 40, title: "remove: delete x" }
+      after:  { x: 420, y: 111, w: 128, h: 48, title: Remove, sub: tombstone seen tags }
+    - id: value
+      kind: concrete
+      appears: after
+      before: { x: 152, y: 180, w: 216, h: 40, title: "" }
+      after:  { x: 420, y: 202, w: 128, h: 48, title: Value, sub: any live tag }
+  edges:
+    - { from: client, to: context, label: sync }
+    - { from: context, to: strategy, label: union }
+    - { from: strategy, to: add, label: adds }
+    - { from: strategy, to: remove, label: dead }
+    - { from: strategy, to: value, label: read }
+
+# ---------------------------------------------------------------- code
+code:
+  go:
+    before:
+      file: list.go
+      source: |
+        // list.go: sync a shared shopping list between devices
+        type List struct {
+            Items map[string]bool
+        }
+
+        // Merge folds another device's copy into ours.
+        func (l *List) Merge(other List) {
+            for item := range other.Items {
+                l.Items[item] = true // union: never lose an add
+            }
+        }
+
+        func (l *List) Add(item string)    { l.Items[item] = true }
+        func (l *List) Remove(item string) { delete(l.Items, item) }
+      roles: { client: [13, 14], context: [6, 11], add: [13, 13], remove: [14, 14] }
+      change:
+        - { after: 3, add: ['    Removed map[string]bool // never resurrect what was removed'] }
+        - { line: 9, replace: '        if !l.Removed[item] && !other.Removed[item] { l.Items[item] = true } // and never re-add it' }
+        - { line: 14, replace: 'func (l *List) Remove(item string) { delete(l.Items, item); l.Removed[item] = true }' }
+    after:
+      file: list.go
+      source: |
+        // list.go: an observed-remove set (OR-Set) of items
+        type Tag struct {
+            Replica string
+            Seq     uint64
+        }
+
+        type List struct {
+            me   string
+            seq  uint64
+            Adds map[Tag]string   // every add, with a tag nobody else uses
+            Dead map[Tag]struct{} // tombstones: tags some remove has seen
+        }
+
+        func (l *List) Add(item string) {
+            l.seq++
+            l.Adds[Tag{l.me, l.seq}] = item
+        }
+
+        // Remove kills only the tags this replica has seen. A concurrent add elsewhere survives.
+        func (l *List) Remove(item string) {
+            for t, it := range l.Adds {
+                if it == item {
+                    l.Dead[t] = struct{}{}
+                }
+            }
+        }
+
+        func (l *List) Has(item string) bool {
+            for t, it := range l.Adds {
+                if _, dead := l.Dead[t]; it == item && !dead {
+                    return true
+                }
+            }
+            return false
+        }
+
+        // Merge is a union of both maps: commutative, associative and idempotent.
+        func (l *List) Merge(other *List) {
+            for t, it := range other.Adds {
+                l.Adds[t] = it
+            }
+            for t := range other.Dead {
+                l.Dead[t] = struct{}{}
+            }
+        }
+      roles: { client: [14, 26], context: [37, 45], strategy: [2, 12], add: [14, 17], remove: [19, 26], value: [28, 35], offline: [14, 26], merge: [37, 45], read: [28, 35], converge: [37, 45] }
+    again:
+      file: quantity.go
+      source: |
+        // quantity.go: the same request for quantities, two people bumping eggs offline
+        // A PN-Counter: one entry per replica for increments, one for decrements.
+        type Counter struct {
+            P, N map[string]uint64
+        }
+
+        func (c *Counter) Inc(me string) { c.P[me]++ }
+        func (c *Counter) Dec(me string) { c.N[me]++ }
+
+        func (c *Counter) Value() int64 {
+            var v int64
+            for _, x := range c.P {
+                v += int64(x)
+            }
+            for _, x := range c.N {
+                v -= int64(x)
+            }
+            return v
+        }
+
+        // Merge takes the max per replica, never the sum, so a repeated sync cannot double count.
+        func (c *Counter) Merge(o *Counter) {
+            for k, x := range o.P {
+                c.P[k] = max(c.P[k], x)
+            }
+            for k, x := range o.N {
+                c.N[k] = max(c.N[k], x)
+            }
+        }
+    cost:
+      before: { text: removed items come back · concurrent taps lost · no error, value: 0.7 }
+      after: { text: 0 edits lost · one tag per add · one tombstone per removed add, value: 0.25 }
+    lens:
+      need: 3
+      needLabel: You write it
+      note: 'Go has no dominant CRDT library. `automerge-go` wraps the Rust Automerge core through cgo. For a few counters and sets, write them as above: a map per piece of state, `max` or union to merge. A struct `Tag` works as a map key because it is comparable.'
+      seenIn: 'Redis Enterprise Active-Active databases replicate counters, sets and strings across regions as CRDTs. Riak''s data types (counters, sets, maps, registers, flags) are CRDTs too.'
+
+  python:
+    before:
+      file: shopping_list.py
+      source: |
+        # shopping_list.py: sync a shared shopping list between devices
+        @dataclass
+        class ShoppingList:
+            items: set[str] = field(default_factory=set)
+
+            def merge(self, other: "ShoppingList") -> None:
+                """Fold another device's copy into ours."""
+                self.items |= other.items  # union: never lose an add
+
+            def add(self, item: str) -> None:
+                self.items.add(item)
+
+            def remove(self, item: str) -> None:
+                self.items.discard(item)
+      roles: { client: [10, 14], context: [6, 8], add: [10, 11], remove: [13, 14] }
+      change:
+        - { after: 4, add: ['    removed: set[str] = field(default_factory=set)  # never resurrect what was removed'] }
+        - { line: 8, replace: '        self.items = (self.items | other.items) - self.removed - other.removed  # and never re-add it' }
+        - { line: 14, replace: '        self.items.discard(item); self.removed.add(item)' }
+    after:
+      file: shopping_list.py
+      source: |
+        # shopping_list.py: an observed-remove set (OR-Set) of items
+        Tag = tuple[str, int]  # (replica, sequence): unique per add
+
+
+        @dataclass
+        class ShoppingList:
+            me: str
+            seq: int = 0
+            adds: dict[Tag, str] = field(default_factory=dict)
+            dead: set[Tag] = field(default_factory=set)  # tombstones: tags some remove has seen
+
+            def add(self, item: str) -> None:
+                self.seq += 1
+                self.adds[(self.me, self.seq)] = item
+
+            def remove(self, item: str) -> None:
+                """Kill only the tags this replica has seen. A concurrent add elsewhere survives."""
+                self.dead |= {t for t, it in self.adds.items() if it == item}
+
+            def __contains__(self, item: str) -> bool:
+                return any(it == item and t not in self.dead for t, it in self.adds.items())
+
+            def merge(self, other: "ShoppingList") -> None:
+                """A union of both: commutative, associative and idempotent."""
+                self.adds |= other.adds
+                self.dead |= other.dead
+      roles: { client: [12, 18], context: [23, 26], strategy: [2, 10], add: [12, 14], remove: [16, 18], value: [20, 21], offline: [12, 18], merge: [23, 26], read: [20, 21], converge: [23, 26] }
+    again:
+      file: quantity.py
+      source: |
+        # quantity.py: the same request for quantities, two people bumping eggs offline
+        @dataclass
+        class PNCounter:
+            """One entry per replica for increments, one for decrements."""
+            p: dict[str, int] = field(default_factory=dict)
+            n: dict[str, int] = field(default_factory=dict)
+
+            def inc(self, me: str) -> None:
+                self.p[me] = self.p.get(me, 0) + 1
+
+            def dec(self, me: str) -> None:
+                self.n[me] = self.n.get(me, 0) + 1
+
+            @property
+            def value(self) -> int:
+                return sum(self.p.values()) - sum(self.n.values())
+
+            def merge(self, other: "PNCounter") -> None:
+                """Max per replica, never the sum, so a repeated sync cannot double count."""
+                for k, x in other.p.items():
+                    self.p[k] = max(self.p.get(k, 0), x)
+                for k, x in other.n.items():
+                    self.n[k] = max(self.n.get(k, 0), x)
+    cost:
+      before: { text: removed items come back · concurrent taps lost · no error, value: 0.7 }
+      after: { text: 0 edits lost · one tag per add · one tombstone per removed add, value: 0.25 }
+    lens:
+      need: 2
+      needLabel: Library
+      note: 'For documents, use `pycrdt`, the Python binding of the Yjs core: a `Doc` holds shared `Map`, `Array` and `Text` types, and peers exchange binary updates. For a counter or a set in your own service, the dataclasses above are enough; `dict | dict` and `set | set` are the merges.'
+      seenIn: '`pycrdt` underpins JupyterLab''s real-time collaboration, which syncs notebooks as Yjs documents. Automerge also ships Python bindings over its Rust core.'
+
+  typescript:
+    before:
+      file: list.ts
+      source: |
+        // list.ts: sync a shared shopping list between devices
+        export class ShoppingList {
+          items = new Set<string>();
+
+          // Fold another device's copy into ours.
+          merge(other: ShoppingList): void {
+            for (const item of other.items) this.items.add(item); // union: never lose an add
+          }
+
+          add(item: string): void {
+            this.items.add(item);
+          }
+
+          remove(item: string): void {
+            this.items.delete(item);
+          }
+        }
+      roles: { client: [10, 16], context: [5, 8], add: [10, 12], remove: [14, 16] }
+      change:
+        - { after: 3, add: ['  removed = new Set<string>(); // never resurrect what was removed'] }
+        - { line: 7, replace: '    for (const item of other.items) if (!this.removed.has(item) && !other.removed.has(item)) this.items.add(item); // and never re-add it' }
+        - { line: 15, replace: '    this.items.delete(item); this.removed.add(item);' }
+    after:
+      file: list.ts
+      source: |
+        // list.ts: an observed-remove set (OR-Set) of items
+        type Tag = `${string}:${number}`; // replica:sequence, unique per add
+
+        export class ShoppingList {
+          private seq = 0;
+          adds = new Map<Tag, string>();
+          dead = new Set<Tag>(); // tombstones: tags some remove has seen
+          constructor(private readonly me: string) {}
+
+          add(item: string): void {
+            this.adds.set(`${this.me}:${++this.seq}`, item);
+          }
+
+          // Kill only the tags this replica has seen. A concurrent add elsewhere survives.
+          remove(item: string): void {
+            for (const [t, it] of this.adds) if (it === item) this.dead.add(t);
+          }
+
+          has(item: string): boolean {
+            for (const [t, it] of this.adds) if (it === item && !this.dead.has(t)) return true;
+            return false;
+          }
+
+          // A union of both: commutative, associative and idempotent.
+          merge(other: ShoppingList): void {
+            for (const [t, it] of other.adds) this.adds.set(t, it);
+            for (const t of other.dead) this.dead.add(t);
+          }
+        }
+      roles: { client: [10, 17], context: [24, 28], strategy: [2, 8], add: [10, 12], remove: [14, 17], value: [19, 22], offline: [10, 17], merge: [24, 28], read: [19, 22], converge: [24, 28] }
+    again:
+      file: quantity.ts
+      source: |
+        // quantity.ts: the same request for quantities, two people bumping eggs offline
+        // A PN-Counter: one entry per replica for increments, one for decrements.
+        export class PNCounter {
+          p: Record<string, number> = {};
+          n: Record<string, number> = {};
+
+          inc(me: string): void { this.p[me] = (this.p[me] ?? 0) + 1; }
+          dec(me: string): void { this.n[me] = (this.n[me] ?? 0) + 1; }
+
+          get value(): number {
+            const sum = (r: Record<string, number>) => Object.values(r).reduce((a, b) => a + b, 0);
+            return sum(this.p) - sum(this.n);
+          }
+
+          // Max per replica, never the sum, so a repeated sync cannot double count.
+          merge(o: PNCounter): void {
+            for (const [k, x] of Object.entries(o.p)) this.p[k] = Math.max(this.p[k] ?? 0, x);
+            for (const [k, x] of Object.entries(o.n)) this.n[k] = Math.max(this.n[k] ?? 0, x);
+          }
+        }
+    cost:
+      before: { text: removed items come back · concurrent taps lost · no error, value: 0.7 }
+      after: { text: 0 edits lost · one tag per add · one tombstone per removed add, value: 0.25 }
+    lens:
+      need: 1
+      needLabel: Library
+      note: 'Use a library. Yjs: `doc.getArray("items")`, then `Y.encodeStateAsUpdate(doc)` on one side and `Y.applyUpdate(other, update)` on the other. Automerge: `Automerge.change(doc, d => { ... })`, `Automerge.merge(a, b)`, and `new Automerge.Counter()` for a PN-Counter-like field. Both compress their metadata far better than the tags here.'
+      seenIn: 'Yjs runs collaborative editing in many editors, such as Tiptap''s collaboration extension. Automerge powers local-first apps whose documents sync peer to peer.'
+
+  rust:
+    before:
+      file: list.rs
+      source: |
+        // list.rs: sync a shared shopping list between devices
+        #[derive(Default, Clone)]
+        pub struct ShoppingList {
+            pub items: BTreeSet<String>,
+        }
+
+        impl ShoppingList {
+            /// Fold another device's copy into ours.
+            pub fn merge(&mut self, other: &ShoppingList) {
+                self.items.extend(other.items.iter().cloned()); // union: never lose an add
+            }
+
+            pub fn add(&mut self, item: &str) {
+                self.items.insert(item.to_string());
+            }
+
+            pub fn remove(&mut self, item: &str) {
+                self.items.remove(item);
+            }
+        }
+      roles: { client: [13, 19], context: [8, 11], add: [13, 15], remove: [17, 19] }
+      change:
+        - { after: 4, add: ['    pub removed: BTreeSet<String>, // never resurrect what was removed'] }
+        - { line: 10, replace: '        self.items.extend(other.items.iter().filter(|i| !self.removed.contains(*i) && !other.removed.contains(*i)).cloned()); // and never re-add it' }
+        - { line: 18, replace: '        self.items.remove(item); self.removed.insert(item.to_string());' }
+    after:
+      file: list.rs
+      source: |
+        // list.rs: an observed-remove set (OR-Set) of items
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// (replica, sequence): unique per add.
+        pub type Tag = (String, u64);
+
+        #[derive(Clone, Default)]
+        pub struct ShoppingList {
+            me: String,
+            seq: u64,
+            pub adds: BTreeMap<Tag, String>,
+            pub dead: BTreeSet<Tag>, // tombstones: tags some remove has seen
+        }
+
+        impl ShoppingList {
+            pub fn add(&mut self, item: &str) {
+                self.seq += 1;
+                self.adds.insert((self.me.clone(), self.seq), item.to_string());
+            }
+
+            /// Kill only the tags this replica has seen. A concurrent add elsewhere survives.
+            pub fn remove(&mut self, item: &str) {
+                let seen = self.adds.iter().filter(|(_, it)| *it == item).map(|(t, _)| t.clone());
+                self.dead.extend(seen);
+            }
+
+            pub fn contains(&self, item: &str) -> bool {
+                self.adds.iter().any(|(t, it)| it == item && !self.dead.contains(t))
+            }
+
+            /// A union of both: commutative, associative and idempotent.
+            pub fn merge(&mut self, other: &ShoppingList) {
+                self.adds.extend(other.adds.iter().map(|(t, it)| (t.clone(), it.clone())));
+                self.dead.extend(other.dead.iter().cloned());
+            }
+        }
+      roles: { client: [16, 25], context: [31, 35], strategy: [4, 13], add: [16, 19], remove: [21, 25], value: [27, 29], offline: [16, 25], merge: [31, 35], read: [27, 29], converge: [31, 35] }
+    again:
+      file: quantity.rs
+      source: |
+        // quantity.rs: the same request for quantities, two people bumping eggs offline
+        /// A PN-Counter: one entry per replica for increments, one for decrements.
+        #[derive(Clone, Default)]
+        pub struct PnCounter {
+            p: BTreeMap<String, u64>,
+            n: BTreeMap<String, u64>,
+        }
+
+        impl PnCounter {
+            pub fn inc(&mut self, me: &str) { *self.p.entry(me.to_string()).or_default() += 1; }
+            pub fn dec(&mut self, me: &str) { *self.n.entry(me.to_string()).or_default() += 1; }
+
+            pub fn value(&self) -> i64 {
+                self.p.values().sum::<u64>() as i64 - self.n.values().sum::<u64>() as i64
+            }
+
+            /// Max per replica, never the sum, so a repeated sync cannot double count.
+            pub fn merge(&mut self, other: &PnCounter) {
+                for (side, theirs) in [(&mut self.p, &other.p), (&mut self.n, &other.n)] {
+                    for (k, &x) in theirs {
+                        let e = side.entry(k.clone()).or_default();
+                        *e = (*e).max(x);
+                    }
+                }
+            }
+        }
+    cost:
+      before: { text: removed items come back · concurrent taps lost · no error, value: 0.7 }
+      after: { text: 0 edits lost · one tag per add · one tombstone per removed add, value: 0.25 }
+    lens:
+      need: 2
+      needLabel: Library
+      note: 'Automerge''s reference implementation is the Rust `automerge` crate: `AutoCommit::new()`, `put` and `insert` on object ids, `merge(&mut other)`. `yrs` is the Rust port of Yjs. The `crdts` crate has the textbook types (`GCounter`, `PNCounter`, `Orswot`, `LWWReg`, `MVReg`) behind `CvRDT` and `CmRDT` traits.'
+      seenIn: 'The JavaScript Automerge package is compiled from the Rust core to WebAssembly. The Zed editor keeps collaborative buffers in a CRDT of its own.'
+
+# ---------------------------------------------------------------- how it works
+walk:
+  - text: Both phones have bread under tag B0. Offline, phone A removes bread, so A tombstones B0. Phone B removes bread too and then adds it again, which tombstones B0 and creates tag B1.
+    nodes: [client]
+    edges: []
+    role: offline
+  - text: A receives B's state. Merge is a union of both maps of tags and both sets of tombstones. Nothing is compared and nothing is chosen.
+    nodes: [context, strategy]
+    edges: [client>context, context>strategy]
+    role: merge
+  - text: Is bread on the list? A looks for a tag that no tombstone covers. B1 is live, so bread stays. A's remove only covered the tag it had seen.
+    nodes: [strategy, value]
+    edges: [strategy>value]
+    role: read
+  - text: B receives A's state. The union holds the same tags and the same tombstones, so the phones are identical. Another sync, in either direction, changes nothing.
+    nodes: [context, strategy, add, remove]
+    edges: [context>strategy, strategy>add, strategy>remove]
+    role: converge
+
+# ---------------------------------------------------------------- checks, one per depth
+checks:
+  overview:
+    question: Two replicas of a CRDT have each received every update, in different orders. What is guaranteed?
+    options:
+      - text: They hold identical state.
+        correct: true
+        why: Right. That is strong eventual consistency. The merge does not depend on order or repetition, so the same updates give the same state.
+      - text: They hold the value with the latest wall-clock time.
+        why: Only an LWW-Register picks by timestamp, and even it uses a logical time with a tie-break. Counters and sets keep every update.
+      - text: They agree only if updates arrived in the same order on both.
+        why: That is what CRDTs remove. Commutative merges make the order irrelevant.
+  engineer:
+    question: Why does an OR-Set give every add its own tag?
+    options:
+      - text: So a remove deletes only the adds it has seen, and a concurrent add of the same item survives.
+        correct: true
+        why: Right. With names alone, a merge cannot tell "removed after you added" from "added after I removed". Tags make each add distinct.
+      - text: So the set can be sorted by when items were added.
+        why: Tags are unique, not ordered in time. The set's value ignores them except to decide what is live.
+      - text: So the set uses less memory than storing the names.
+        why: It uses more. Each add keeps a tag, and each removed tag stays as a tombstone until it can be collected.
+  deep:
+    question: A prepaid balance is a PN-Counter, and each replica refuses a withdrawal that would take its local balance below zero. What can happen?
+    options:
+      - text: Two replicas each approve a withdrawal of the last funds, and after the merge the balance is negative.
+        correct: true
+        why: Right. Each check saw only local state. Invariants like "never below zero" or "unique username" need coordination, or a share of the budget handed to each replica in advance.
+      - text: The merge clamps the balance at zero.
+        why: Clamping would break the merge laws and lose information. The merge is a per-replica max, and the value is whatever the sums say.
+      - text: The second withdrawal is rejected when the replicas merge.
+        why: Merges never reject. Both decrements are already applied locally, and the merge only combines them.
+
+# ---------------------------------------------------------------- reference page
+reference:
+  roles:
+    - role: Replica
+      example: a phone, a laptop, a region
+      job: Applies edits to its own copy at once, with no coordination.
+    - role: State (payload)
+      example: P and N vectors; tags and tombstones; (value, timestamp)
+      job: Records enough history that two copies can be combined without guessing.
+    - role: Merge
+      example: { go: "Merge(other)", python: "merge(other)", typescript: "merge(other)", rust: "merge(&other)" }
+      job: Combines two states into their least upper bound, so it is commutative, associative and idempotent.
+    - role: Value
+      example: sum(P) − sum(N); items with a live tag
+      job: What the app shows, computed from the state.
+  useWhen:
+    - Devices or regions must accept writes while disconnected, and sync later in any order.
+    - The data has a natural merge, such as counters, sets, maps of these, or collaborative text.
+    - Sync runs over unreliable transport, where messages are duplicated, reordered or relayed through other peers.
+  avoidWhen:
+    - An invariant spans replicas, such as a balance that must stay non-negative or a unique username. That needs coordination.
+    - Users expect one winner chosen with intent, and silently discarding the other (LWW) would be wrong.
+    - Metadata growth matters and there is no way to collect tombstones, for example with replicas that may stay offline for months.
+  tradeoffs:
+    - State grows with history (tags, tombstones, one entry per replica); garbage collection needs to know every replica has seen a removal.
+    - Convergence is guaranteed; matching what users meant is not. Add-wins, remove-wins and LWW are product decisions.
+    - State-based CRDTs send whole states, which is simple and tolerant of loss; op-based or delta CRDTs send less but need stronger delivery guarantees.
+  lookalikes:
+    - name: Version vectors and siblings
+      how: Detect concurrent versions and hand them to the app to merge. A CRDT builds the merge into the type.
+    - name: Last-write-wins
+      how: A CRDT in the strict sense, since it converges, but it does so by dropping concurrent writes.
+    - name: Operational transformation
+      how: Rewrites concurrent operations against each other, usually through a central server, as in Google Docs.
+    - name: Consensus (Raft)
+      how: Agrees on one order of operations before applying them. It can keep any invariant, at the cost of a majority round trip per write.
+---
+
+## [concept] CRDTs
+
+**Design the data type so that any two replicas can merge without asking anyone. If the merge is commutative, associative and idempotent, every replica that has seen the same edits holds the same state.**
+
+A <Term id="crdt">CRDT</Term> (conflict-free replicated data type) is a counter, register, set, map or text type that any replica can edit offline. Two replicas exchange state, merge it, and come out identical. No leader decides the order and no person resolves a conflict.
+
+<Depth level={2}>
+The guarantee is <Term id="strong-eventual-consistency">strong eventual consistency</Term>: replicas that have received the same updates are in the same state. <Term id="eventual-consistency">Eventual consistency</Term> alone only promises that replicas agree once writes stop. The price is that each type has fixed rules for concurrent edits. A <Term id="pn-counter">PN-Counter</Term> keeps every increment. An <Term id="or-set">OR-Set</Term> lets an add win over a concurrent remove. An <Term id="lww-register">LWW-Register</Term> keeps one value and drops the other.
+</Depth>
+
+<Depth level={3}>
+Shapiro, Preguiça, Baquero and Zawirski formalised two families in 2011. State-based CRDTs (CvRDTs) ship whole states. The states form a join semilattice, merge computes the least upper bound, and every update moves the state up. That makes merge commutative, associative and idempotent, so lost, reordered and duplicated messages are all harmless. Op-based CRDTs (CmRDTs) ship operations instead. Concurrent operations must commute, and the network must deliver them reliably, in causal order where the type requires it.
+</Depth>
+
+## [problem] Union the lists
+
+A grocery app shares a household's shopping list across phones that are often offline in the shop. When a phone reconnects, it sends its copy and the server merges: the union of the items, so that no add is ever lost. Each phone does the same with what it gets back.
+
+Read it once. The merge assumes that an item missing from one copy means "not added yet".
+
+<Depth level={2}>
+It can also mean "removed". A set of names cannot tell the two apart. The previous lesson met the same problem: merging siblings by union can bring deleted items back. Amazon's Dynamo paper reports exactly this for its shopping cart.
+</Depth>
+
+<Depth level={3}>
+A counter has the mirror-image problem. A plain number merged by max loses one side's concurrent increments. Merged by sum, it counts the same increment again on every repeated sync. Neither merge is both correct and idempotent, because the number has forgotten who incremented.
+</Depth>
+
+## [pain] Then a change request arrives
+
+**Change request:** removing an item on one phone must stick, and two people adding eggs offline must both count.
+
+Users report deleted items coming back after a sync. Someone adds a `removed` set and subtracts it on every merge, the marked lines. Deleted items stay deleted. Now a user who removes bread can never put bread back on the list, on any phone, ever.
+
+<Depth level={2}>
+That fix is a two-phase set: remove wins, forever. It converges, but it encodes a rule no user expects. Names are the wrong identity. The second "bread" is a new add and needs an identity of its own.
+</Depth>
+
+<Depth level={3}>
+Shapiro et al. call this the 2P-Set and contrast it with the OR-Set, which gives the opposite answer for a concurrent add and remove of the same element. Neither is wrong as a CRDT; the choice is about meaning. The paper picks the OR-Set for its shopping cart example because it minimises anomalies.
+</Depth>
+
+## [morph] Tag every add, tombstone what you saw
+
+Drag the slider. The OR-Set state appears between the merge and the list: tags on adds, tombstones for removes, and a value computed from them.
+
+Every add gets a tag that no other add will ever use, such as the replica name and a local sequence number. A remove tombstones the tags of that item which this replica can see. An item is on the list while it has at least one tag that no tombstone covers. Merge is a plain union of tags and of tombstones.
+
+<Depth level={2}>
+Union is the whole merge, and union is commutative, associative and idempotent. That is why you never have to think about sync order or duplicate deliveries again. All the thinking moved into the state, which now remembers which add each remove saw.
+</Depth>
+
+<Depth level={3}>
+<Lang only="go">`Tag` is a comparable struct, so it can key a map directly. `map[Tag]struct{}` is the idiomatic set; the empty struct takes no space.</Lang>
+<Lang only="python">A tuple is hashable, so `(replica, seq)` keys a dict and fills a set. `dict |= dict` and `set |= set` are the merge, in place.</Lang>
+<Lang only="typescript">A template literal type, `` `${string}:${number}` ``, keeps tags as strings that `Map` and `Set` compare by value. Tuples would be compared by reference.</Lang>
+<Lang only="rust">`BTreeMap` and `BTreeSet` keep tags sorted, so two equal states serialise to the same bytes. `extend` with cloned entries is the union.</Lang>
+</Depth>
+
+## [walk] Follow one concurrent remove and add
+
+Two phones, both holding bread, both offline. One removes it; the other removes it and adds it again. Use the numbered buttons.
+
+<Depth level={2}>
+Add-wins is a product decision. For a shopping list it is what people expect: if anyone asked for bread, buy bread. For an access-control list, you might want remove-wins instead, so a revoked permission cannot come back through a concurrent grant.
+</Depth>
+
+<Depth level={3}>
+Tombstones accumulate. They can be dropped only once every replica has seen the removal, which needs to know every replica and to hear from it; Shapiro et al. describe this with vector clocks. Optimised designs such as ORSWOT (OR-Set without tombstones) replace the tombstone set with a version vector per replica and a dot per element.
+</Depth>
+
+## [again] The same request, for quantities
+
+The second half of the request: two people bumping the egg count offline. A new field gets its own CRDT, a PN-Counter, with one entry per replica for increments and one for decrements. The document's merge merges each field with its own rule. Nothing in the list code changes.
+
+<Depth level={2}>
+Merge takes the maximum of each entry, never the sum. Each replica only ever raises its own entry, so the maximum is always the latest value for that replica, and merging the same state twice gives the same result.
+</Depth>
+
+<Depth level={3}>
+This composition is how real CRDT documents work: a map of registers, counters, lists and text, each merging by its own rules. Jake Lazaroff's interactive introduction builds an LWW map this way, one register per key. What no composition can give you is an invariant across replicas. Two phones that each remove the last egg will merge to −1.
+</Depth>
+
+## [play] Edit offline, then sync
+
+Three replicas of one shopping list, each with a delivery slot (LWW-Register), an egg count (PN-Counter) and the items (OR-Set). Nothing syncs until you press a Sync button. Under each replica, a naive merge runs on the same edits so you can see what it would show.
+
+Make every challenge happen, then sync in any order and watch the merge laws hold.
+
+## [lens] How each language gets CRDTs
+
+You can write a counter or a set in a page, as above. For documents and text, use a library: the sequence types are hard to get right and the good libraries compress their metadata heavily.
+
+Switch the language at the top of the page; the code and the note follow.
+
+<Depth level={2}>
+Yjs and Automerge are the two widely used document libraries. Both sync by exchanging what the other side is missing: Yjs sends a state vector, Automerge exchanges change hashes. Both run in the browser and on servers, and Automerge's core is Rust.
+</Depth>
+
+<Depth level={3}>
+Text is where CRDT design gets subtle. Concurrent inserts at the same position must interleave the same way on every replica, and some algorithms interleave runs of characters from two typists. Each insert gets an identifier ordered by a Lamport-style counter and a replica id, which is the lesson before last at work inside the data type.
+</Depth>
+
+## [check] Check yourself
+
+The question matches your depth setting. Pass it at each depth to mark the lesson done at that depth.
+
+## [reference]
+
+### Try it
+
+<Playground model="crdts" />
+
+### What each type does with concurrent edits
+
+| Type | State | Merge | Concurrent edits |
+|---|---|---|---|
+| G-Counter | one count per replica | max per entry | every increment kept |
+| PN-Counter | two G-Counters | max per entry, both | every increment and decrement kept; no bound holds |
+| LWW-Register | value + (Lamport, replica) | larger stamp wins | one assignment silently dropped |
+| 2P-Set | adds + removes | union, both | remove wins forever; no re-add |
+| OR-Set | tagged adds + tombstones | union, both | add wins over a concurrent remove |
+
+The playground's idea of two replicas editing offline and syncing by hand comes from Jake Lazaroff's [An Interactive Intro to CRDTs](https://jakelazaroff.com/words/an-interactive-intro-to-crdts/), which builds an LWW register and map step by step. It is the best next read.

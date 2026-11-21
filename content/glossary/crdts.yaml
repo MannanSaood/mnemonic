@@ -1,0 +1,16 @@
+# Terms introduced by distributed-systems/crdts.
+- id: crdt
+  term: CRDT
+  short: Conflict-free replicated data type. A data type whose replicas can be updated independently and always converge, because its merge (or its operations) is designed to commute.
+- id: strong-eventual-consistency
+  term: Strong eventual consistency
+  short: Eventual consistency plus a guarantee about state. Any two replicas that have received the same set of updates are in the same state, whatever the order, with no rollback or conflict resolution step.
+- id: pn-counter
+  term: PN-Counter
+  short: A counter CRDT made of two grow-only counters, one entry per replica for increments (P) and one for decrements (N). The value is the sum of P minus the sum of N; merge takes the maximum per entry.
+- id: or-set
+  term: OR-Set
+  short: Observed-remove set. Every add carries a unique tag, and a remove deletes only the tags its replica has seen, so a concurrent add of the same element survives. Removed tags are kept as tombstones.
+- id: lww-register
+  term: LWW-Register
+  short: A single-value CRDT that keeps the assignment with the largest timestamp, usually a Lamport time with the replica id as tie-break. It converges by discarding concurrent assignments.
